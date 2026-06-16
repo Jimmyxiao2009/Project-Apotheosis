@@ -3,6 +3,7 @@
 #include "MainPage.g.hpp"
 #include "WebCoreDriver.h"
 #include "JitProbe.h"
+#include "GpuProbe.h"
 
 #include <robuffer.h>
 #include <wrl.h>
@@ -754,6 +755,15 @@ void MainPage::OnPageWheel(Platform::Object^, Windows::UI::Xaml::Input::PointerR
     if (!m_sessionActive) return;
     int delta = e->GetCurrentPoint(PageScroller)->Properties->MouseWheelDelta;   // 上滚=+120
     if (delta != 0) { FreeScrollBy(-delta); e->Handled = true; }                 // 上滚 → 内容上移(dy<0)
+}
+
+// ---- GPU 路径1 探针 ----
+void MainPage::OnGpuPanelLoaded(Platform::Object^, RoutedEventArgs^)
+{
+    static bool s_done = false;
+    if (s_done) return;   // 只跑一次
+    s_done = true;
+    try { RunGpuProbe(GpuPanel, ref new String(LocalStateDir().c_str())); } catch (...) {}
 }
 
 // ---- 输入法/屏幕键盘 ----

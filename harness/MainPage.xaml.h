@@ -72,6 +72,8 @@ namespace Harness {
         void CloseKeyboard();
         // kind: 0=插入文本(text),1=回车,2=退格。转发到引擎并重绘。
         void SendKeyToEngine(int kind, Platform::String^ text);
+        // GPU 路径1 探针:SwapChainPanel 就绪后启动 ANGLE 三角形探针(验 GPU 管线在 App Container 通)。
+        void OnGpuPanelLoaded(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 把一帧引擎渲染结果(rgba)贴到位图 + 同步标题/地址/链接表;navUrl 非空表示会话内发生了导航。
         void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                               Platform::String^ title, Platform::String^ navUrl,

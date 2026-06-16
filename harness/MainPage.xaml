@@ -80,6 +80,11 @@
                 </ScrollViewer>
             </Border>
 
+            <!-- GPU 路径1 探针面板:ANGLE(D3D11 FL9_3)经 SwapChainPanel 在此画三角形,验 GPU 管线在 App Container 通。
+                 覆盖在网页渲染之上;Loaded 时启动探针。验证通过后再决定接入 WebCore TextureMapper / 做软硬切换。 -->
+            <SwapChainPanel x:Name="GpuPanel" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                            Loaded="OnGpuPanelLoaded"/>
+
             <!-- 输入法捕获框:不可见(1×1 透明),聚焦它即唤起屏幕键盘;键入经 TextChanged/KeyDown 转发给引擎活会话。 -->
             <TextBox x:Name="ImeBox" Width="1" Height="1" Opacity="0" Margin="0" Padding="0"
                      BorderThickness="0" MinWidth="0" MinHeight="0"
