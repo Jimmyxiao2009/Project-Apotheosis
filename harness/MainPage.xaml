@@ -1,0 +1,143 @@
+<Page
+    x:Class="Harness.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Page.Resources>
+        <!-- 工具栏图标按钮:透明底,按下高亮。移动端紧凑尺寸。 -->
+        <Style x:Key="IconBtn" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#E8E8E8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="Width" Value="38"/>
+            <Setter Property="Height" Value="38"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Margin" Value="0"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style x:Key="TabBtn" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#CFCFCF"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="Padding" Value="10,0"/>
+        </Style>
+    </Page.Resources>
+
+    <Grid Background="#202225">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- ===== 工具栏 ===== -->
+        <Grid Grid.Row="0" Background="#2B2D31" Padding="3,4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource IconBtn}" Content="&#x25C0;" Click="OnBack" IsEnabled="False"/>
+            <Button x:Name="FwdBtn"  Grid.Column="1" Style="{StaticResource IconBtn}" Content="&#x25B6;" Click="OnForward" IsEnabled="False"/>
+            <Button x:Name="HomeBtn" Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#x2302;" FontSize="17" Click="OnHome"/>
+            <Border Grid.Column="3" Background="#1B1D20" CornerRadius="5" Margin="3,0">
+                <TextBox x:Name="UrlBox" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
+                         Foreground="#F0F0F0" VerticalContentAlignment="Center" Padding="8,0"
+                         InputScope="Url" Text="" PlaceholderText="搜索或输入网址" KeyDown="OnUrlKeyDown"/>
+            </Border>
+            <Button x:Name="GoBtn"   Grid.Column="4" Style="{StaticResource IconBtn}" Content="&#x2192;" FontSize="19" Click="OnGo"/>
+            <Button x:Name="MenuBtn" Grid.Column="5" Style="{StaticResource IconBtn}" Content="&#x2630;" Click="OnMenu"/>
+        </Grid>
+
+        <!-- ===== 进度 + 标题 ===== -->
+        <Grid Grid.Row="1" Background="#2B2D31">
+            <ProgressBar x:Name="Progress" Height="2" VerticalAlignment="Top" Foreground="#3AA0FF"
+                         Background="Transparent" IsIndeterminate="False" Visibility="Collapsed"/>
+            <TextBlock x:Name="TitleText" Text="EdgeHTML Reborn" Foreground="#9AA0A6" FontSize="11"
+                       Margin="10,2,10,4" TextTrimming="CharacterEllipsis"/>
+        </Grid>
+
+        <!-- ===== 内容区:网页渲染 + 抽屉覆盖层 ===== -->
+        <Grid Grid.Row="2">
+            <Border Background="White" BorderBrush="#000000" BorderThickness="0,1,0,0">
+                <!-- 双指捏合缩放 + 平移:ZoomMode=Enabled。0.5~5 倍。 -->
+                <!-- 竖向滚动交给引擎(VerticalScrollMode=Disabled),单指拖拽/滚轮经指针事件 → 合并成 WebCoreScrollBy;
+                     保留捏合缩放(ZoomMode)。单指小位移仍触发 Tapped(点击转发引擎),越阈值则判为拖拽滚动。 -->
+                <ScrollViewer x:Name="PageScroller" VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Auto"
+                              ZoomMode="Enabled" MinZoomFactor="0.5" MaxZoomFactor="5.0"
+                              HorizontalScrollMode="Enabled" VerticalScrollMode="Disabled"
+                              IsTapEnabled="True" Tapped="OnPageTapped"
+                              PointerPressed="OnPagePointerPressed" PointerMoved="OnPagePointerMoved"
+                              PointerReleased="OnPagePointerReleased" PointerCanceled="OnPagePointerReleased"
+                              PointerWheelChanged="OnPageWheel">
+                    <Image x:Name="RenderImage" Stretch="None" VerticalAlignment="Top" HorizontalAlignment="Left"/>
+                </ScrollViewer>
+            </Border>
+
+            <!-- 输入法捕获框:不可见(1×1 透明),聚焦它即唤起屏幕键盘;键入经 TextChanged/KeyDown 转发给引擎活会话。 -->
+            <TextBox x:Name="ImeBox" Width="1" Height="1" Opacity="0" Margin="0" Padding="0"
+                     BorderThickness="0" MinWidth="0" MinHeight="0"
+                     HorizontalAlignment="Left" VerticalAlignment="Top" IsTabStop="True"
+                     TextChanged="OnImeTextChanged" KeyDown="OnImeKeyDown"/>
+
+            <!-- 悬浮翻页按钮(引擎滚动:触发懒加载图片/查看下方内容)。仅有会话时显示。 -->
+            <!-- 注:Win10 Mobile 契约 ≤5.0,不能用 Button.CornerRadius(7.0)/StackPanel.Spacing(5.0);
+                 用 Border.CornerRadius(1.0,安全)包裹透明 Button 实现圆形 FAB,间距用 Margin。 -->
+            <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                        Margin="0,0,14,20" Visibility="Collapsed">
+                <Border Width="50" Height="50" CornerRadius="25" Background="#CC2B2D31" Margin="0,0,0,10">
+                    <Button Width="50" Height="50" Padding="0" Background="Transparent" Foreground="#FFFFFF"
+                            FontSize="20" BorderThickness="0" Content="&#x25B2;" Click="OnScrollUp"/>
+                </Border>
+                <Border Width="50" Height="50" CornerRadius="25" Background="#E63AA0FF">
+                    <Button Width="50" Height="50" Padding="0" Background="Transparent" Foreground="#FFFFFF"
+                            FontSize="20" BorderThickness="0" Content="&#x25BC;" Click="OnScrollDown"/>
+                </Border>
+            </StackPanel>
+
+            <!-- 抽屉:收藏/历史/下载 -->
+            <Grid x:Name="Drawer" Background="#F7202225" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- 抽屉标题栏 -->
+                <Grid Grid.Row="0" Background="#2B2D31">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="菜单" Foreground="#FFFFFF" FontSize="22" Margin="16,0" VerticalAlignment="Center"/>
+                    <Button Grid.Column="1" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
+                </Grid>
+
+                <!-- 标签 -->
+                <Grid Grid.Row="1" Background="#26282B">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="TabFav"  Grid.Column="0" Style="{StaticResource TabBtn}" Content="&#x2605; 收藏" Click="OnTabFav"/>
+                    <Button x:Name="TabHist" Grid.Column="1" Style="{StaticResource TabBtn}" Content="&#x1F551; 历史" Click="OnTabHist"/>
+                    <Button x:Name="TabDl"   Grid.Column="2" Style="{StaticResource TabBtn}" Content="&#x2193; 下载" Click="OnTabDl"/>
+                    <Button x:Name="ActionBtn" Grid.Column="3" Style="{StaticResource TabBtn}" Foreground="#3AA0FF" Content="&#x2605; 收藏此页" Click="OnPrimaryAction"/>
+                </Grid>
+
+                <!-- 列表(代码动态填充) -->
+                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="DrawerList" Margin="8"/>
+                </ScrollViewer>
+            </Grid>
+        </Grid>
+    </Grid>
+</Page>

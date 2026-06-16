@@ -1,0 +1,14 @@
+<Page
+    x:Class="JITTest.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid Background="#101418">
+        <ScrollViewer Padding="16">
+            <StackPanel>
+                <TextBlock Text="JIT 可执行内存可行性测试" Foreground="#7FD0FF" FontSize="22" FontWeight="Bold" Margin="0,8,0,12"/>
+                <TextBlock x:Name="ResultText" Foreground="#E6E6E6" FontFamily="Consolas" FontSize="15"
+                           TextWrapping="Wrap" Text="运行中…"/>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

@@ -1,0 +1,56 @@
+[binaries]
+cmake = ['C:/vcpkg/downloads/tools/cmake-4.3.2-windows/cmake-4.3.2-windows-x86_64/bin/cmake.exe']
+ninja = ['C:\vcpkg\downloads\tools\ninja-1.13.2-windows\ninja.exe']
+pkg-config = ['C:/vcpkg/downloads/tools/msys2/3e71d1f8e22ab23f/mingw64/bin/pkg-config.exe']
+mt = ['C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe']
+ar = ['C:/Program Files (x86)/Microsoft Visual Studio/2017/Community/VC/Tools/MSVC/14.16.27023/bin/Hostx64/arm/lib.exe', '-machine:ARM', '-nologo']
+windres = ['C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe', '-c65001', '-DWIN32', '-D_WINDOWS', '-D_UNICODE', '-DUNICODE', '-DWINAPI_FAMILY=WINAPI_FAMILY_APP', '-D__WRL_NO_DEFAULT_LIB__', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00']
+c = ['C:/Program Files/LLVM/bin/clang-cl.exe', '--target=thumbv7-unknown-windows-msvc', '-DWIN32', '-D_WINDOWS', '-D_UNICODE', '-DUNICODE', '-DWINAPI_FAMILY=WINAPI_FAMILY_APP', '-D__WRL_NO_DEFAULT_LIB__', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-Z7', '-MP', '-GS', '-Gd', '-Gm-', '-W3', '-WX-', '-Zc:wchar_t', '-Zc:inline', '-Zc:forScope', '-fp:precise', '-Oy-', '-EHsc', '-utf-8', '-DUCONFIG_NO_MF2=1', '-MD', '-O2', '-Oi', '-Gy', '-DNDEBUG']
+c_ld = ['C:/Program Files/LLVM/bin/lld-link.exe']
+cpp = ['C:/Program Files/LLVM/bin/clang-cl.exe', '--target=thumbv7-unknown-windows-msvc', '-DWIN32', '-D_WINDOWS', '-D_UNICODE', '-DUNICODE', '-DWINAPI_FAMILY=WINAPI_FAMILY_APP', '-D__WRL_NO_DEFAULT_LIB__', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-Z7', '-MP', '-GS', '-Gd', '-Gm-', '-W3', '-WX-', '-Zc:wchar_t', '-Zc:inline', '-Zc:forScope', '-fp:precise', '-Oy-', '-EHsc', '-utf-8', '-DUCONFIG_NO_MF2=1', '-MD', '-O2', '-Oi', '-Gy', '-DNDEBUG']
+cpp_ld = ['C:/Program Files/LLVM/bin/lld-link.exe']
+
+
+
+
+
+
+
+
+[properties]
+cmake_toolchain_file  = 'C:/vcpkg/scripts/buildsystems/vcpkg.cmake'
+
+[cmake]
+CMAKE_BUILD_TYPE = 'Release'
+VCPKG_TARGET_TRIPLET = 'arm-uwp'
+VCPKG_HOST_TRIPLET = 'x64-windows'
+VCPKG_CHAINLOAD_TOOLCHAIN_FILE = 'C:/vcpkg/scripts/toolchains/uwp.cmake'
+VCPKG_CRT_LINKAGE = 'dynamic'
+_VCPKG_INSTALLED_DIR = 'C:/vcpkg/installed'
+[build_machine]
+endian = 'little'
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+[host_machine]
+endian = 'little'
+system = 'windows'
+cpu_family = 'arm'
+cpu = 'armv7hl'
+[built-in options]
+default_library = 'shared'
+werror = false
+c_args = ['-DWIN32', '-D_WINDOWS', '-D_UNICODE', '-DUNICODE', '-DWINAPI_FAMILY=WINAPI_FAMILY_APP', '-D__WRL_NO_DEFAULT_LIB__', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-nologo', '-Z7', '-MP', '-GS', '-Gd', '-Gm-', '-W3', '-WX-', '-Zc:wchar_t', '-Zc:inline', '-Zc:forScope', '-fp:precise', '-Oy-', '-EHsc', '-utf-8', '-DUCONFIG_NO_MF2=1', '-MD', '-O2', '-Oi', '-Gy', '-DNDEBUG', '-IC:/vcpkg/installed/arm-uwp/include']
+c_link_args = ['-MANIFEST:NO', '-NXCOMPAT', '-DYNAMICBASE', '-DEBUG', '-WINMD:NO', '-APPCONTAINER', '-SUBSYSTEM:CONSOLE', '-MANIFESTUAC:NO', '-LIBPATH:C:/PROGRA~2/WI3CF2~1/10/Lib/100226~1.0/um/arm', '-LIBPATH:C:/PROGRA~2/WI3CF2~1/10/Lib/100226~1.0/ucrt/arm', '-DEBUG', '-INCREMENTAL:NO', '-OPT:REF', '-OPT:ICF', '/LIBPATH:C:/vcpkg/installed/arm-uwp/lib', 'WindowsApp.lib']
+
+cpp_args = ['-DWIN32', '-D_WINDOWS', '-D_UNICODE', '-DUNICODE', '-DWINAPI_FAMILY=WINAPI_FAMILY_APP', '-D__WRL_NO_DEFAULT_LIB__', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-nologo', '-Z7', '-MP', '-GS', '-Gd', '-Gm-', '-W3', '-WX-', '-Zc:wchar_t', '-Zc:inline', '-Zc:forScope', '-fp:precise', '-Oy-', '-EHsc', '-utf-8', '-DUCONFIG_NO_MF2=1', '-MD', '-O2', '-Oi', '-Gy', '-DNDEBUG', '-IC:/vcpkg/installed/arm-uwp/include']
+cpp_link_args = ['-MANIFEST:NO', '-NXCOMPAT', '-DYNAMICBASE', '-DEBUG', '-WINMD:NO', '-APPCONTAINER', '-SUBSYSTEM:CONSOLE', '-MANIFESTUAC:NO', '-LIBPATH:C:/PROGRA~2/WI3CF2~1/10/Lib/100226~1.0/um/arm', '-LIBPATH:C:/PROGRA~2/WI3CF2~1/10/Lib/100226~1.0/ucrt/arm', '-DEBUG', '-INCREMENTAL:NO', '-OPT:REF', '-OPT:ICF', '/LIBPATH:C:/vcpkg/installed/arm-uwp/lib', 'WindowsApp.lib']
+
+
+
+
+# b_vscrt
+b_vscrt = 'md'
+# c_winlibs/cpp_winlibs
+c_winlibs = ['WindowsApp.lib']
+cpp_winlibs = ['WindowsApp.lib']

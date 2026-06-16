@@ -1,0 +1,256 @@
+// ============================================================================
+// draft-ResourceHandleCurl-patch.txt
+//
+// PATCH TARGET: Source/WebCore/platform/network/ResourceHandle.cpp
+//   Replace the `#if USE(SOUP) || USE(CURL)` ASSERT_NOT_REACHED block at
+//   L312-376 with the WK_WINUWP curl-driven implementation below.
+//
+// DECISION: patch ResourceHandle.cpp in-place (NOT a separate
+//   ResourceHandleCurlWinUWP.cpp). Rationale:
+//   - ResourceHandle::start()/cancel()/platformSetDefersLoading()/~ResourceHandle()
+//     are symbols COMPILED INTO WebCore.lib. A separate TU defining them =>
+//     LNK2005 duplicate symbol. They can only have ONE definition, and it must
+//     be the one inside WebCore.lib. So the bridge body must live in this TU.
+//   - The bridge needs the per-load curl state (Ref<CurlRequest>, m_response,
+//     m_redirectCount, m_user/m_password). That state is added to
+//     ResourceHandleInternal (see companion patch to ResourceHandleInternal.h).
+//   - The CurlRequestClient adapter (RefCounted, AbstractRefCounted) cannot be
+//     ResourceHandleInternal itself (not refcounted, lifetime tied to handle).
+//     => introduce a small ref-counted forwarder, CurlResourceHandleDelegate,
+//     defined in this same TU, holding a raw back-pointer to ResourceHandle and
+//     nulled out on cancel/destruction.
+//
+// WHAT IS DELIBERATELY OMITTED IN THIS DRAFT (mark-as-uncertain, Phase-later):
+//   - HTTP redirects (willPerformHTTPRedirection): drafted as a TODO; the first
+//     milestone only needs 200-path GET to render a remote page.
+//   - HTTP/proxy/serverTrust auth challenges: stubbed to cancel.
+//   - Cookie read/write via NetworkStorageSession: gated behind a null check;
+//     see "STILL MISSING" in the report.
+//   - Synchronous load (platformLoadResourceSynchronously): left as a spin-loop
+//     TODO; sync XHR is not on the render critical path.
+// ============================================================================
+
+#if USE(CURL) && defined(WK_WINUWP)
+
+#include "CurlContext.h"
+#include "CurlRequest.h"
+#include "CurlRequestClient.h"
+#include "CurlResponse.h"
+#include "NetworkLoadMetrics.h"
+#include "ResourceError.h"
+#include "ResourceResponse.h"
+#include "SharedBuffer.h"
+#include <wtf/MainThread.h>
+
+namespace WebCore {
+
+// --- ref-counted forwarder: curl callbacks -> ResourceHandleClient ----------
+// CurlRequest holds a Ref<> to its client (CurlRequestClient : AbstractRefCounted).
+// We cannot make ResourceHandleInternal the client (not refcounted; its lifetime
+// is the handle's unique_ptr). So this thin object IS the CurlRequestClient and
+// forwards into the handle. invalidate() severs the back-pointer when the handle
+// cancels/dies, so late curl callbacks are dropped safely.
+class CurlResourceHandleDelegate final : public CurlRequestClient {
+public:
+    static Ref<CurlResourceHandleDelegate> create(ResourceHandle& handle)
+    {
+        return adoptRef(*new CurlResourceHandleDelegate(handle));
+    }
+
+    void ref() const final { m_refCount++; }
+    void deref() const final { if (!--m_refCount) delete this; }
+
+    void invalidate() { m_handle = nullptr; }
+
+    // CurlRequestClient
+    void curlDidSendData(CurlRequest&, unsigned long long bytesSent, unsigned long long totalToSend) final
+    {
+        if (RefPtr handle = m_handle)
+            handle->curlDidSendData(bytesSent, totalToSend);
+    }
+    void curlDidReceiveResponse(CurlRequest& request, CurlResponse&& response) final
+    {
+        if (RefPtr handle = m_handle)
+            handle->curlDidReceiveResponse(request, WTF::move(response));
+    }
+    void curlDidReceiveData(CurlRequest&, Ref<SharedBuffer>&& buffer) final
+    {
+        if (RefPtr handle = m_handle)
+            handle->curlDidReceiveData(WTF::move(buffer));
+    }
+    void curlDidComplete(CurlRequest&, NetworkLoadMetrics&& metrics) final
+    {
+        if (RefPtr handle = m_handle)
+            handle->curlDidComplete(WTF::move(metrics));
+    }
+    void curlDidFailWithError(CurlRequest&, ResourceError&& error, CertificateInfo&&) final
+    {
+        if (RefPtr handle = m_handle)
+            handle->curlDidFailWithError(WTF::move(error));
+    }
+
+private:
+    explicit CurlResourceHandleDelegate(ResourceHandle& handle)
+        : m_handle(&handle) { }
+
+    mutable uint32_t m_refCount { 1 };
+    RefPtr<ResourceHandle> m_handle; // raw lifetime-wise; see invalidate()
+};
+
+ResourceHandleInternal::~ResourceHandleInternal() = default;
+
+ResourceHandle::~ResourceHandle()
+{
+    // Make sure no in-flight curl callback can touch a destroyed handle.
+    if (d->m_curlDelegate)
+        d->m_curlDelegate->invalidate();
+    if (d->m_curlRequest)
+        d->m_curlRequest->invalidateClient();
+}
+
+bool ResourceHandle::start()
+{
+    ASSERT(isMainThread());
+
+    // Ensure libcurl + scheduler thread are up. Idempotent (NeverDestroyed).
+    CurlContext::singleton();
+
+    ResourceRequest request = d->m_firstRequest;
+
+    // Credentials embedded in the URL were stripped into m_user/m_password by
+    // ResourceHandleInternal's ctor; re-apply them onto the CurlRequest below.
+    d->m_curlDelegate = CurlResourceHandleDelegate::create(*this);
+    d->m_curlRequest = CurlRequest::create(request, *d->m_curlDelegate,
+        CurlRequest::CaptureNetworkLoadMetrics::Basic);
+
+    if (!d->m_user.isEmpty() || !d->m_password.isEmpty()) {
+        d->m_curlRequest->setUserPass(d->m_user, d->m_password);
+        d->m_curlRequest->setAuthenticationScheme(ProtectionSpace::AuthenticationScheme::HTTPBasic);
+    }
+
+    // CurlRequest is created suspended; resume() hands it to the scheduler thread.
+    if (!d->m_defersLoading)
+        d->m_curlRequest->resume();
+
+    return true;
+}
+
+void ResourceHandle::cancel()
+{
+    if (d->m_curlDelegate)
+        d->m_curlDelegate->invalidate();
+    if (d->m_curlRequest) {
+        d->m_curlRequest->cancel();
+        d->m_curlRequest->invalidateClient();
+    }
+}
+
+void ResourceHandle::platformSetDefersLoading(bool defers)
+{
+    if (!d->m_curlRequest)
+        return;
+    if (defers)
+        d->m_curlRequest->cancel();   // CurlRequest has no pause(); cancel+recreate on resume (TODO: real suspend)
+    else
+        d->m_curlRequest->resume();
+}
+
+// --- curl -> client translation (mirrors NetworkDataTaskCurl) ---------------
+
+void ResourceHandle::curlDidSendData(unsigned long long bytesSent, unsigned long long totalToSend)
+{
+    if (!client())
+        return;
+    client()->didSendData(this, bytesSent, totalToSend);
+}
+
+void ResourceHandle::curlDidReceiveResponse(CurlRequest& request, CurlResponse&& receivedResponse)
+{
+    if (!client())
+        return;
+
+    d->m_curlResponse = ResourceResponse(receivedResponse);
+
+    // TODO(redirect): if 3xx + Location -> build redirect request, call
+    // client()->willSendRequestAsync(...), recreate CurlRequest. Omitted for v1.
+    // TODO(auth): 401/407 handling. Omitted for v1 (treat as normal response).
+
+    // didReceiveResponse() forwards to client()->didReceiveResponseAsync with a
+    // completion handler that must call completeDidReceiveResponse() to unblock
+    // the body. This is the critical async hop.
+    ResourceResponse responseCopy = d->m_curlResponse;
+    didReceiveResponse(WTF::move(responseCopy), [this, protectedThis = Ref { *this }] {
+        if (d->m_curlRequest)
+            d->m_curlRequest->completeDidReceiveResponse();
+    });
+}
+
+void ResourceHandle::curlDidReceiveData(Ref<SharedBuffer>&& buffer)
+{
+    if (!client())
+        return;
+    // ResourceHandleClient consumes FragmentedSharedBuffer; SharedBuffer is one.
+    client()->didReceiveBuffer(this, buffer.get(), buffer->size());
+}
+
+void ResourceHandle::curlDidComplete(NetworkLoadMetrics&& metrics)
+{
+    if (!client())
+        return;
+    client()->didFinishLoading(this, metrics);
+}
+
+void ResourceHandle::curlDidFailWithError(ResourceError&& error)
+{
+    if (!client())
+        return;
+    client()->didFail(this, error);
+}
+
+// --- remaining stubs kept loud until implemented ----------------------------
+
+void ResourceHandle::platformLoadResourceSynchronously(NetworkingContext*, const ResourceRequest&, StoredCredentialsPolicy, SecurityOrigin*, ResourceError& error, ResourceResponse&, Vector<uint8_t>&)
+{
+    // TODO: drive a CurlRequest with a nested run loop / MessageQueue and block.
+    // Not on the render critical path; fail loudly for now.
+    error = ResourceError("WebKitInternal"_s, 0, URL { }, "sync load not implemented (WinUWP curl)"_s);
+}
+
+bool ResourceHandle::shouldUseCredentialStorage() { return false; }
+void ResourceHandle::didReceiveAuthenticationChallenge(const AuthenticationChallenge&) { }
+void ResourceHandle::receivedCredential(const AuthenticationChallenge&, const Credential&) { }
+void ResourceHandle::receivedRequestToContinueWithoutCredential(const AuthenticationChallenge&) { }
+void ResourceHandle::receivedCancellation(const AuthenticationChallenge&) { if (client()) client()->receivedCancellation(this, { }); }
+void ResourceHandle::receivedRequestToPerformDefaultHandling(const AuthenticationChallenge&) { }
+void ResourceHandle::receivedChallengeRejection(const AuthenticationChallenge&) { }
+
+} // namespace WebCore
+
+#elif USE(SOUP) || USE(CURL)
+// ... original ASSERT_NOT_REACHED block stays here for non-WinUWP curl builds ...
+#endif
+
+// ============================================================================
+// COMPANION PATCH: Source/WebCore/platform/network/ResourceHandle.h
+//   Add, inside `class ResourceHandle`, guarded by #if USE(CURL) && WK_WINUWP:
+//
+//     void curlDidSendData(unsigned long long, unsigned long long);
+//     void curlDidReceiveResponse(CurlRequest&, CurlResponse&&);
+//     void curlDidReceiveData(Ref<SharedBuffer>&&);
+//     void curlDidComplete(NetworkLoadMetrics&&);
+//     void curlDidFailWithError(ResourceError&&);
+//
+//   and forward-declare CurlRequest / CurlResponse / class CurlResourceHandleDelegate.
+//   These are public-ish (called by the delegate); put them under `public:` or
+//   friend CurlResourceHandleDelegate.
+//
+// COMPANION PATCH: Source/WebCore/platform/network/ResourceHandleInternal.h
+//   Add members (guarded #if USE(CURL) && WK_WINUWP):
+//
+//     RefPtr<CurlResourceHandleDelegate> m_curlDelegate;
+//     RefPtr<CurlRequest>                m_curlRequest;
+//     ResourceResponse                   m_curlResponse;
+//     unsigned                           m_redirectCount { 0 };
+//
+//   plus #include "CurlRequest.h" forward decls. m_user/m_password already exist.
+// ============================================================================

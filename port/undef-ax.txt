@@ -1,0 +1,10 @@
+private: void __cdecl WebCore::AXObjectCache::attachWrapper(class WebCore::AccessibilityObject &)
+protected: virtual void __cdecl WebCore::AccessibilityObject::detachPlatformWrapper(enum WebCore::AccessibilityDetachmentType)
+protected: void __cdecl WebCore::AXObjectCache::frameLoadingEventPlatformNotification(class WebCore::RenderView *, enum WebCore::AXLoadingEvent)
+protected: void __cdecl WebCore::AXObjectCache::nodeTextChangePlatformNotification(class WebCore::AccessibilityObject *, enum WebCore::AXTextChange, unsigned int, class WTF::String const &)
+protected: void __cdecl WebCore::AXObjectCache::platformHandleFocusedUIElementChanged(class WebCore::Element *, class WebCore::Element *)
+protected: void __cdecl WebCore::AXObjectCache::platformPerformDeferredCacheUpdate(void)
+protected: void __cdecl WebCore::AXObjectCache::postPlatformNotification(class WebCore::AccessibilityObject &, enum WebCore::AXNotification)
+public: bool __cdecl WebCore::AccessibilityObject::accessibilityIgnoreAttachment(void) const
+public: enum WebCore::AccessibilityObjectInclusion __cdecl WebCore::AccessibilityObject::accessibilityPlatformIncludesObject(void) const
+public: void __cdecl WebCore::AXObjectCache::handleScrolledToAnchor(class WebCore::Node const &)

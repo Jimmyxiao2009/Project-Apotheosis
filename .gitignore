@@ -1,0 +1,64 @@
+# ==== 构建产物 / 中间文件 ====
+build-*/
+build-clang-webcore/
+build-clang-jit/
+build-clang-release/
+build-release/
+deps-build/
+*-build/
+harness/AppPackages/
+harness/ARM/
+harness/Harness/
+jittest/JITTest/
+harness/Generated Files/
+harness/obj/
+*.pch
+*.dmp
+crash/
+*.appx
+*.appxsym
+*.appxbundle
+
+# ==== 二进制 / 中间产物 ====
+*.obj
+*.lib
+*.dll
+*.pdb
+*.exe
+*.ilk
+*.exp
+*.winmd
+*.pri
+*.tlog
+*.idb
+*.iobj
+*.ipdb
+
+# ==== 矢量化 WebKit 源(GB 级;引擎补丁另行记录于 memory)====
+WebKit/
+
+# ==== 下载的 ANGLE 二进制(可重新下载;头文件 angle/include 仍跟踪)====
+angle/arm/
+angle-windowsstore/
+
+# ==== 日志 / 运行期状态文件 ====
+*.log
+jit-verify-result.txt
+jit-verify-status.txt
+gpu-verify-result.txt
+gpu-verify-status.txt
+deploy-status.txt
+stage.txt
+gpuprobe.txt
+jitresult.txt
+
+# ==== 字体(几 MB,标准字体可重新获取)====
+*.ttf
+*.ttc
+*.otf
+
+# ==== fork 临时备份 ====
+.gpu-backup/
+
+# ==== 签名密钥 ====
+*.pfx

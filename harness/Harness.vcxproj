@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|ARM">
+      <Configuration>Release</Configuration>
+      <Platform>ARM</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-0001-4E5F-9A0B-EDGEHTML0001}</ProjectGuid>
+    <RootNamespace>Harness</RootNamespace>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>14.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>true</AppContainerApplication>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.15063.0</WindowsTargetPlatformMinVersion>
+    <ProjectName>Harness</ProjectName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <AppxBundle>Never</AppxBundle>
+    <AppxPackageSigningEnabled>true</AppxPackageSigningEnabled>
+    <PackageCertificateKeyFile>Harness_TemporaryKey.pfx</PackageCertificateKeyFile>
+    <PackageCertificatePassword>apotheosis</PackageCertificatePassword>
+    <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+    <AppxAutoIncrementPackageRevision>false</AppxAutoIncrementPackageRevision>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <Optimization>MaxSpeed</Optimization>
+    </ClCompile>
+    <Link>
+      <!-- Phase 1b: 链接 build-clang-webcore 的 4 个引擎库 + 驱动/stub 库 + 全部软渲染依赖。
+           顺序 WebCore->JSC->PAL->WTF(被依赖者在后);MS link.exe 多遍解析,顺序容错。 -->
+      <AdditionalDependencies>WebCoreDriver-jit.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>E:\Apotheosis\port;E:\Apotheosis\build-clang-jit\lib;C:\vcpkg\installed\arm-uwp\lib;C:\icu-arm-uwp\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- 与 lld-link 验证一致:/OPT:REF 死剥未引用代码,只保留渲染路径闭包(146 stub 覆盖之)。 -->
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>false</EnableCOMDATFolding>
+      <!-- Apotheosis: JSC CLoop 解释器(无 JIT)极耗原生栈;真实站点 JS 递归会爆默认 1MB
+           线程栈 → 栈溢出闪退(且无 dump)。把 exe 默认栈预留调到 16MB,std::thread 用
+           的就是这个 PE 默认栈大小。 -->
+      <StackReserveSize>16777216</StackReserveSize>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h" />
+    <ClInclude Include="MainPage.xaml.h" />
+    <ClInclude Include="WebCoreDriver.h" />
+    <ClInclude Include="JitProbe.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="App.xaml.cpp" />
+    <ClCompile Include="MainPage.xaml.cpp" />
+    <ClCompile Include="JitProbe.cpp">
+      <CompileAsWinRT>false</CompileAsWinRT>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml">
+      <SubType>Designer</SubType>
+    </ApplicationDefinition>
+    <Page Include="MainPage.xaml">
+      <SubType>Designer</SubType>
+    </Page>
+  </ItemGroup>
+
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest">
+      <SubType>Designer</SubType>
+    </AppxManifest>
+  </ItemGroup>
+
+  <!-- 运行期动态依赖 DLL:全部随 appx 打包(设备无对应版本)。软渲染栈 + ICU。 -->
+  <ItemGroup>
+    <None Include="C:\icu-arm-uwp\bin\icuuc78.dll"><DeploymentContent>true</DeploymentContent><Link>icuuc78.dll</Link></None>
+    <None Include="C:\icu-arm-uwp\bin\icuin78.dll"><DeploymentContent>true</DeploymentContent><Link>icuin78.dll</Link></None>
+    <None Include="C:\icu-arm-uwp\bin\icudt78.dll"><DeploymentContent>true</DeploymentContent><Link>icudt78.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\cairo-2.dll"><DeploymentContent>true</DeploymentContent><Link>cairo-2.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\pixman-1-0.dll"><DeploymentContent>true</DeploymentContent><Link>pixman-1-0.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\freetype.dll"><DeploymentContent>true</DeploymentContent><Link>freetype.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\fontconfig-1.dll"><DeploymentContent>true</DeploymentContent><Link>fontconfig-1.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libexpat.dll"><DeploymentContent>true</DeploymentContent><Link>libexpat.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\harfbuzz.dll"><DeploymentContent>true</DeploymentContent><Link>harfbuzz.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\jpeg62.dll"><DeploymentContent>true</DeploymentContent><Link>jpeg62.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libpng16.dll"><DeploymentContent>true</DeploymentContent><Link>libpng16.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libwebp.dll"><DeploymentContent>true</DeploymentContent><Link>libwebp.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libwebpdemux.dll"><DeploymentContent>true</DeploymentContent><Link>libwebpdemux.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libsharpyuv.dll"><DeploymentContent>true</DeploymentContent><Link>libsharpyuv.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libxml2.dll"><DeploymentContent>true</DeploymentContent><Link>libxml2.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\z.dll"><DeploymentContent>true</DeploymentContent><Link>z.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\bz2.dll"><DeploymentContent>true</DeploymentContent><Link>bz2.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\brotlidec.dll"><DeploymentContent>true</DeploymentContent><Link>brotlidec.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\brotlicommon.dll"><DeploymentContent>true</DeploymentContent><Link>brotlicommon.dll</Link></None>
+    <!-- 网络栈(Phase 1b):curl + OpenSSL 3.6.3(TLS 1.3)。 -->
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libcurl.dll"><DeploymentContent>true</DeploymentContent><Link>libcurl.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libssl-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libssl-3-arm.dll</Link></None>
+    <None Include="C:\vcpkg\installed\arm-uwp\bin\libcrypto-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libcrypto-3-arm.dll</Link></None>
+    <!-- CA 根证书包(App Container 无系统证书库,curl 用 CURLOPT_CAINFO 指向它做 TLS 校验)。 -->
+    <None Include="Assets\cacert.pem"><DeploymentContent>true</DeploymentContent><Link>cacert.pem</Link></None>
+    <!-- 字体(App Container 拿不到设备系统字体,必须打包;fontconfig 在运行期经 LocalFolder\fonts.conf 指向这里)。 -->
+    <None Include="Assets\fonts\segoeui.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeui.ttf</Link></None>
+    <None Include="Assets\fonts\arial.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arial.ttf</Link></None>
+    <None Include="Assets\fonts\times.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\times.ttf</Link></None>
+    <None Include="Assets\fonts\cour.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\cour.ttf</Link></None>
+    <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
+    <None Include="Assets\fonts\simhei.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Image Include="Assets\Square150x150Logo.png" />
+    <Image Include="Assets\Square44x44Logo.png" />
+    <Image Include="Assets\StoreLogo.png" />
+    <Image Include="Assets\SplashScreen.png" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
