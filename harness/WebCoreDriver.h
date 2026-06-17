@@ -78,6 +78,9 @@ int WebCoreKeyAction(int action, uint8_t* outBuf);
 // UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后需重新加载页面生效。
 void WebCoreSetUserAgentMobile(int mobile);
 
+// M1:GPU 合成是否在跑(根 GraphicsLayer 已附)。加载后查,返回 1/0。
+int WebCoreEnableCompositing();
+
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);
 

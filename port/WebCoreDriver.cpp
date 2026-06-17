@@ -82,6 +82,7 @@
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
+#include "PortChromeClient.h"            // WebCorePort::PortChromeClient(开合成,捕获根图层)
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
 #include <WebCore/LocalFrame.h>          // WebCore::LocalFrame
@@ -277,6 +278,7 @@ struct Session {
     RefPtr<WebCore::Page> page;            // 稳定根;frame/view/document 每次从它重取
     RefPtr<WebCore::LocalFrame> mainFrame; // 同帧导航间稳定;跨导航 view 会被重建
     WebCorePort::LoadingFrameLoaderClient* client = nullptr; // 原始指针,建会话时捕获,teardown 置空回调用
+    WebCorePort::PortChromeClient* chrome = nullptr;          // 原始指针(Page 持有 UniqueRef);读根图层/present 标志(GPU 合成)
     int w = 0, h = 0;
     DriverLoadState load;                  // 堆上(随会话存活):晚到的 didFinishLoad 不会 deref 已释放栈
 };
@@ -376,7 +378,13 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     {
         GraphicsContextCairo context(adoptRef(cr));
         // ScrollView::paint 内部已按 -scrollPosition 平移,始终从原点绘制,绝不另加 scrollY。
+        // ★ M1:开合成后页面内容进 GraphicsLayer,普通 paint 会漏合成层 → 软件渲染变空。
+        //   设 FlattenCompositingLayers 把合成层拍平进这次软件绘制(M2 起改 GPU 呈现就不走这条)。
+        //   非合成路径(RenderHtml/LoadUrl)无合成层,此标志无害。
+        auto oldBehavior = view.paintBehavior();
+        view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
         view.paint(context, IntRect(IntPoint(), size));
+        view.setPaintBehavior(oldBehavior);
     }
     cairo_surface_flush(surface);
 
@@ -559,6 +567,14 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // HTTP(Cookie/Set-Cookie 头)路由 LoadingFrameLoaderClient::createNetworkingContext 提供,二者共用同一 jar。
     pageConfiguration.cookieJar = WebCore::CookieJar::create(WebCorePort::makeStorageSessionProvider());
 
+    // GPU 合成(M1):用真 ChromeClient(PortChromeClient)替换 EmptyChromeClient(其合成钩子 final{} 不能覆写),
+    // 它在 attachRootGraphicsLayer 捕获根 GraphicsLayer。配合下面 setAcceleratedCompositingEnabled(true) → 建图层树。
+    {
+        auto chrome = WTF::makeUniqueRefWithoutRefCountedCheck<WebCorePort::PortChromeClient>();
+        g_session->chrome = chrome.ptr();             // Page 持有 UniqueRef,裸指针随 Page 存活
+        pageConfiguration.chromeClient = WTF::move(chrome);
+    }
+
     DriverLoadState* loadPtr = &g_session->load;   // 稳定:g_session 在建会话期间不 reset
     WebCorePort::LoadingFrameLoaderClient** clientSlot = &g_session->client;
     {
@@ -590,7 +606,8 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     page->settings().setScriptEnabled(true);
     page->settings().setLoadsImagesAutomatically(true);
-    page->settings().setAcceleratedCompositingEnabled(false);
+    page->settings().setAcceleratedCompositingEnabled(true);   // M1:开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层)。M2 起经 TextureMapper GPU 呈现
+    page->settings().setForceCompositingMode(true);            // 简单页也建图层树(否则 usesCompositing 可能为假)
     page->settings().setShouldAllowUserInstalledFonts(false);
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
@@ -1375,6 +1392,15 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
 void WebCoreSetUserAgentMobile(int mobile)
 {
     g_apoUaMobile = (mobile != 0);
+}
+
+// M1 验证:GPU 合成是否在跑。PortChromeClient 的 attachRootGraphicsLayer 被调=合成激活+图层树已建;
+// 根图层非空即证。加载后查(图层树在布局/合成更新时建)。返回 1=合成在跑,0=未。
+int WebCoreEnableCompositing()
+{
+    if (!g_session || !g_session->chrome)
+        return 0;
+    return g_session->chrome->rootLayer() != nullptr ? 1 : 0;
 }
 
 int WebCoreFocusedEditable()

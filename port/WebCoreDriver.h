@@ -49,6 +49,7 @@ int WebCoreFocusedEditable();                         // 1 if an editable elemen
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable
 int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Windows UA
+int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 unsigned WebCoreGetFrameHash();                       // pixel hash of the last frame (idle detection)

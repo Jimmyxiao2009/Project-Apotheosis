@@ -52,8 +52,8 @@
     <Link>
       <!-- Phase 1b: 链接 build-clang-webcore 的 4 个引擎库 + 驱动/stub 库 + 全部软渲染依赖。
            顺序 WebCore->JSC->PAL->WTF(被依赖者在后);MS link.exe 多遍解析,顺序容错。 -->
-      <AdditionalDependencies>libEGL.lib;libGLESv2.lib;WebCoreDriver-jit.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>E:\Apotheosis\angle\arm;E:\Apotheosis\port;E:\Apotheosis\build-clang-jit\lib;C:\vcpkg\installed\arm-uwp\lib;C:\icu-arm-uwp\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libEGL.lib;libGLESv2.lib;WebCoreDriver-gpu.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>E:\Apotheosis\angle\arm;E:\Apotheosis\port;E:\Apotheosis\build-clang-gpu\lib;C:\vcpkg\installed\arm-uwp\lib;C:\icu-arm-uwp\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- 与 lld-link 验证一致:/OPT:REF 死剥未引用代码,只保留渲染路径闭包(146 stub 覆盖之)。 -->
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>false</EnableCOMDATFolding>

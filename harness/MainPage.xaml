@@ -78,15 +78,10 @@
                 </Grid>
             </Border>
 
-            <!-- 0.1.7 M0 SPIKE(gate):ScrollViewer 包 SwapChainPanel,验系统原生 DirectManipulation
-                 能否平移+捏合缩放 ANGLE 渲染的表面(三角形)。手势期间应是纯 GPU 变换、无重渲染。
-                 成→整个原生平移/缩放路成立(M1-M6);不成→退 InteractionTracker。 -->
-            <ScrollViewer x:Name="GpuScroller" ZoomMode="Enabled" MinZoomFactor="0.5" MaxZoomFactor="5.0"
-                          HorizontalScrollMode="Enabled" VerticalScrollMode="Enabled"
-                          HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
-                          IsZoomInertiaEnabled="True" IsScrollInertiaEnabled="True" Background="#202225">
-                <SwapChainPanel x:Name="GpuPanel" Width="720" Height="1080" Loaded="OnGpuPanelLoaded"/>
-            </ScrollViewer>
+            <!-- GPU 渲染面(SwapChainPanel)。GPU 管线已真机验证(0.1.5 黄三角形);0.1.6 默认隐藏让浏览器可用,
+                 0.1.7 将复用此面承载 WebCore TextureMapper 的 GPU 合成输出(替代软件 RenderImage)。 -->
+            <SwapChainPanel x:Name="GpuPanel" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                            Visibility="Collapsed"/>
 
             <!-- 输入法捕获框:不可见(1×1 透明),聚焦它即唤起屏幕键盘;键入经 TextChanged/KeyDown 转发给引擎活会话。 -->
             <TextBox x:Name="ImeBox" Width="1" Height="1" Opacity="0" Margin="0" Padding="0"

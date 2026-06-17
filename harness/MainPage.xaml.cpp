@@ -384,7 +384,8 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 int netRc = WebCoreSessionLoad(surl.c_str(), kW, kH, rgba->data());   // 常驻会话加载
                 char t[512] = ""; WebCoreGetTitle(t, sizeof t);
                 char diag[4096] = ""; WebCoreGetDiag(diag, sizeof diag);
-                WriteStage(("after-load rc=" + std::to_string(netRc) + "\n" + diag).c_str());
+                int comp = 0; try { comp = WebCoreEnableCompositing(); } catch (...) {}   // M1 验证:合成是否在跑(根图层已附)
+                WriteStage(("after-load rc=" + std::to_string(netRc) + " compositing=" + std::to_string(comp) + "\n" + diag).c_str());
                 if (netRc == 0) {
                     rc = 0;
                     loadOk = true;
