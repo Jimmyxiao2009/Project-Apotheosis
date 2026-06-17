@@ -31,7 +31,11 @@ WebCore::NetworkStorageSession& defaultPortStorageSession()
     ASSERT(isMainThread());
     static NeverDestroyed<std::unique_ptr<WebCore::NetworkStorageSession>> session;
     if (!session.get())
-        session.get() = makeUnique<WebCore::NetworkStorageSession>(PAL::SessionID::defaultSessionID());
+        // ★ 临时(ephemeral)会话 → NetworkStorageSessionCurl.cpp:93 用 ":memory:" CookieJarDB(纯内存,不碰磁盘)。
+        //   避开 App Container 里 defaultCookieJarPath()(localUserSpecificStorageDirectory 不可写)→ open() 崩
+        //   (0.1.6.0 访问任何网页闪退的根因)。代价:cookie 不跨重启持久(登录在 app 开着时有效)。
+        //   持久化后续:确认不崩后加 WebCoreSetCookieJarPath 把 CURL_COOKIE_JAR_PATH 指到 LocalState。
+        session.get() = makeUnique<WebCore::NetworkStorageSession>(PAL::SessionID::generateEphemeralSessionID());
     return *session.get();
 }
 
