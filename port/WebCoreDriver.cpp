@@ -79,6 +79,9 @@
 #include <WebCore/WebCoreJITOperations.h>// WebCore::populateJITOperations (no-op w/ C_LOOP)
 #include <WebCore/EmptyClients.h>        // pageConfigurationWithEmptyClients
 #include <WebCore/PageConfiguration.h>   // WebCore::PageConfiguration
+#include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
+#include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
+#include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
 #include <WebCore/LocalFrame.h>          // WebCore::LocalFrame
@@ -198,6 +201,7 @@ static char g_lastDiag[4096] = "";   // 渲染诊断(URL/标题/内容尺寸/非
 static char g_lastTitle[512] = "";   // 最近加载页面的标题(供历史/书签用)
 static char g_lastUrl[1024] = "";    // 最近渲染文档的最终 URL(会话点击/导航后检测 URL 变化用)
 static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判断画面是否变化 → 静止页自动停帧省电)
+extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
@@ -401,8 +405,9 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
             }
             if (drow[x * 4 + 0] != 255 || drow[x * 4 + 1] != 255 || drow[x * 4 + 2] != 255)
                 ++nonWhite;
-            // 每 16 像素采样进哈希(整帧扫太多;采样足够区分动/静)
-            if (((x | y) & 15) == 0) {
+            // 每 4 像素采样进哈希(原 16px 网格太疏,漏掉 Bing 小加载圈等小动画 → 误判静止停帧;
+            // 4px 网格密 16 倍,能侦测到小圈圈的变化,让实时循环对动画持续重绘;真静止页仍会停帧省电)。
+            if (((x | y) & 3) == 0) {
                 hash = (hash ^ drow[x * 4 + 0]) * 16777619u;
                 hash = (hash ^ drow[x * 4 + 1]) * 16777619u;
                 hash = (hash ^ drow[x * 4 + 2]) * 16777619u;
@@ -549,6 +554,10 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     auto pageConfiguration = pageConfigurationWithEmptyClients(
         std::nullopt, PAL::SessionID::defaultSessionID());
+
+    // cookie 持久化:DOM(document.cookie)路换成真 jar(默认是 EmptyStorageSessionProvider→nullptr→cookie 被丢)。
+    // HTTP(Cookie/Set-Cookie 头)路由 LoadingFrameLoaderClient::createNetworkingContext 提供,二者共用同一 jar。
+    pageConfiguration.cookieJar = WebCore::CookieJar::create(WebCorePort::makeStorageSessionProvider());
 
     DriverLoadState* loadPtr = &g_session->load;   // 稳定:g_session 在建会话期间不 reset
     WebCorePort::LoadingFrameLoaderClient** clientSlot = &g_session->client;
@@ -1362,6 +1371,12 @@ int WebCoreScrollBy(int dy, uint8_t* outRGBA)
 }
 
 // 当前会话是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ harness 据此弹/收输入法。
+// UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后由 UI 重新加载页面生效。
+void WebCoreSetUserAgentMobile(int mobile)
+{
+    g_apoUaMobile = (mobile != 0);
+}
+
 int WebCoreFocusedEditable()
 {
     if (!g_session || !g_session->mainFrame || g_inPump)

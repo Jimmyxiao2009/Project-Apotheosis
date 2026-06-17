@@ -47,6 +47,7 @@ jit-verify-result.txt
 jit-verify-status.txt
 gpu-verify-result.txt
 gpu-verify-status.txt
+gpu-build-status.txt
 deploy-status.txt
 stage.txt
 gpuprobe.txt
