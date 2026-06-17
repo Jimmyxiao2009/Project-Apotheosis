@@ -432,8 +432,6 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     s->m_sessionActive = sessionActive;
                     s->ScrollFab->Visibility = sessionActive
                         ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
-                    // 新页面回到顶部(引擎与位图都从 scroll=0 起)
-                    s->PageScroller->ChangeView(nullptr, 0.0, nullptr, true);
                     // 实时渲染:有会话则启动(让动画动、SPA 渐进挂载);无会话(主页/错误页)停。
                     s->m_lastFrameHash = 0;
                     if (sessionActive) s->StartLiveMode(); else s->StopLiveMode();
@@ -624,7 +622,6 @@ void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgb
             UpdateNavButtons();
         }
         AddHistory(m_currentUrl, m_currentTitle);
-        PageScroller->ChangeView(nullptr, 0.0, nullptr, true);   // 新页面回顶部
     }
 }
 
@@ -669,7 +666,6 @@ void MainPage::EngineScroll(int dy)
                         wb->Invalidate();
                         s->RenderImage->Source = wb;
                         s->m_pageLinks = *links;
-                        s->PageScroller->ChangeView(nullptr, 0.0, nullptr, true);
                         s->m_lastFrameHash = 0;
                         s->StartLiveMode();   // 滚动后重启实时(新视口的懒加载/动画)
                     }
@@ -721,40 +717,15 @@ void MainPage::PumpScroll()
         } catch (...) {}
     });
 }
-void MainPage::OnPagePointerPressed(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e)
+// 自由滚动:内容区 ManipulationDelta(去掉 ScrollViewer 后,触摸不再被吞)。单指拖拽的累计 ΔY → 引擎滚动。
+// TranslateInertia 让松手后继续惯性滚(ManipulationDelta 在惯性期持续触发)。点击经 Tapped 走(手势识别器
+// 区分点按 vs 拖拽,小位移=Tapped、越阈值=Manipulation,不会冲突)。
+void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e)
 {
     if (!m_sessionActive) return;
-    if (m_pointerDown) { m_pointerDown = false; m_dragging = false; return; }   // 第二指按下 → 捏合缩放,不当拖拽
-    double y = e->GetCurrentPoint(PageScroller)->Position.Y;
-    m_pointerDown = true; m_dragging = false;
-    m_dragStartY = y; m_dragLastY = y;
-}
-void MainPage::OnPagePointerMoved(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e)
-{
-    if (!m_pointerDown || !m_sessionActive) return;
-    double y = e->GetCurrentPoint(PageScroller)->Position.Y;
-    double moved = y - m_dragStartY;
-    if (!m_dragging) {
-        if (moved < 12.0 && moved > -12.0) return;   // 未越阈值,可能是点击,先不滚
-        m_dragging = true;
-    }
-    double zf = PageScroller->ZoomFactor; if (zf <= 0.01) zf = 1.0;
-    double ddy = (m_dragLastY - y) / zf;             // 手指上移 → 内容下滚(dy>0);按缩放换算成内容像素
-    m_dragLastY = y;
-    int dy = (int)(ddy < 0 ? ddy - 0.5 : ddy + 0.5);
-    if (dy != 0) FreeScrollBy(dy);
-    e->Handled = true;                                // 认领拖拽手势
-}
-void MainPage::OnPagePointerReleased(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e)
-{
-    if (m_dragging) e->Handled = true;                // 是拖拽:吃掉,别让它变成 Tapped(点击)
-    m_pointerDown = false; m_dragging = false;        // 小位移 → 不 Handled,交给 Tapped 走点击转发
-}
-void MainPage::OnPageWheel(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e)
-{
-    if (!m_sessionActive) return;
-    int delta = e->GetCurrentPoint(PageScroller)->Properties->MouseWheelDelta;   // 上滚=+120
-    if (delta != 0) { FreeScrollBy(-delta); e->Handled = true; }                 // 上滚 → 内容上移(dy<0)
+    double dy = -e->Delta.Translation.Y;             // 手指上移(ΔY<0)→ 内容下滚(dy>0)
+    int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
+    if (idy != 0) FreeScrollBy(idy);
 }
 
 // ---- GPU 路径1 探针 ----
