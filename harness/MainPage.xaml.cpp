@@ -774,6 +774,17 @@ void MainPage::CloseKeyboard()
 }
 void MainPage::OnImeTextChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^)
 {
+    // 诊断埋点:记录本回调是否触发 + 门控状态 + ImeBox 文本(写 LocalState\imedebug.txt,真机测后拉取)。
+    // 若打字后此文件为空 → OnImeTextChanged 没触发 → 隐藏 ImeBox 收不到 IME 文本(UI 层问题);
+    // 若有记录但输入框没字 → 引擎层(看 SendKeyToEngine 写的 rc:kErrNoDocument=canEdit 丢焦点)。
+    try {
+        std::wstring d = LocalStateDir();
+        if (!d.empty()) {
+            std::ofstream f(WideToUtf8(d) + "\\imedebug.txt", std::ios::app | std::ios::binary);
+            if (f) { std::string s = "TC open=" + std::to_string(m_imeOpen) + " sess=" + std::to_string(m_sessionActive)
+                + " sync=" + std::to_string(m_imeSyncing) + " text=[" + WideToUtf8(ImeBox->Text ? std::wstring(ImeBox->Text->Data()) : L"") + "]\n"; f.write(s.data(), s.size()); }
+        }
+    } catch (...) {}
     if (m_imeSyncing || !m_imeOpen || !m_sessionActive) return;
     std::wstring cur = ImeBox->Text ? std::wstring(ImeBox->Text->Data()) : L"";
     std::wstring prev = m_lastImeText;
@@ -815,6 +826,8 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
             else if (kind == 1) rc = WebCoreKeyAction(1, rgba->data());
             else rc = WebCoreKeyAction(0, rgba->data());
         } catch (...) { rc = -1000; }
+        // 诊断:记引擎返回(rc=-6/kErrNoDocument → 打字时 canEdit 为 false=丢了可编辑焦点;rc=0 → 引擎接受了)。
+        try { std::wstring dd = LocalStateDir(); if (!dd.empty()) { std::ofstream f(WideToUtf8(dd) + "\\imedebug.txt", std::ios::app | std::ios::binary); if (f) { std::string s = "  SK kind=" + std::to_string(kind) + " rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } } } catch (...) {}
         std::wstring navUrl, title;
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0 && kind == 1) {   // 回车可能导航 → 取新 url/title/链接
@@ -939,6 +952,18 @@ void MainPage::OnForward(Platform::Object^, RoutedEventArgs^)
     NavigateTo(ref new String(m_navStack[m_navIndex].c_str()), false);
 }
 void MainPage::OnMenu(Platform::Object^, RoutedEventArgs^) { ShowDrawer(m_tab); }
+
+// UA 切换:手机/桌面。切引擎 UA 后重载当前页生效。
+void MainPage::OnToggleUA(Platform::Object^, RoutedEventArgs^)
+{
+    m_uaMobile = !m_uaMobile;
+    UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
+    int mobile = m_uaMobile ? 1 : 0;
+    WebEngine::instance().post([mobile]() { try { WebCoreSetUserAgentMobile(mobile); } catch (...) {} });
+    HideDrawer();
+    if (!m_currentUrl.empty())
+        NavigateTo(ref new String(m_currentUrl.c_str()), false);   // 重载使新 UA 生效
+}
 
 // ---- 抽屉 ----
 void MainPage::OnDrawerClose(Platform::Object^, RoutedEventArgs^) { HideDrawer(); }

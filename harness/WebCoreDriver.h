@@ -75,6 +75,9 @@ int WebCoreTypeText(const char* utf8, uint8_t* outBuf);
 // 特殊键:0=退格,1=回车(可能触发表单提交导航),重绘到 outBuf。返回 0 成功。
 int WebCoreKeyAction(int action, uint8_t* outBuf);
 
+// UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后需重新加载页面生效。
+void WebCoreSetUserAgentMobile(int mobile);
+
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);
 

@@ -31,6 +31,8 @@ namespace Harness {
         void OnGo(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
         void OnMenu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // UA 切换:手机/桌面,切后重载当前页(遇到对移动 UA 抽风的站点用)。
+        void OnToggleUA(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 
         // ---- 抽屉 ----
         void OnDrawerClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -113,6 +115,7 @@ namespace Harness {
         std::wstring m_lastImeText;   // ImeBox 上次文本(算增量转发)
         bool m_imeOpen { false };     // 屏幕键盘是否为当前输入打开
         bool m_imeSyncing { false };  // 正在程序化改 ImeBox.Text(避免 TextChanged 回环)
+        bool m_uaMobile { true };     // UA 模式:true=手机(默认),false=桌面
         // 自由滚动状态
         int  m_scrollAccum { 0 };     // 未冲刷的累积滚动位移(像素,>0 向下)
         bool m_scrollBusy { false };  // 有 WebCoreScrollBy 任务在引擎线程飞行

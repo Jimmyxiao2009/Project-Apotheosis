@@ -21,6 +21,7 @@
 #include <WebCore/HistoryItem.h>
 #include <WebCore/LocalFrame.h>
 #include <WebCore/NetworkStorageSession.h>
+#include "PortNetworkStorageSession.h"   // cookie 持久化:真 storageSession
 #include <WebCore/ResourceError.h>
 #include <WebCore/ResourceRequest.h>
 #include <WebCore/ResourceResponse.h>
@@ -462,12 +463,16 @@ void LoadingFrameLoaderClient::setTitle(const StringWithDirection&, const URL&)
 {
 }
 
+extern "C" bool g_apoUaMobile;   // WebCoreDriver.cpp 定义(extern "C" 跨命名空间);UI 可切换手机/桌面,切后重载生效
+
 String LoadingFrameLoaderClient::userAgent(const URL&) const
 {
-    // Apotheosis: 这是手机,用移动版 iPhone Safari UA——站点发移动布局(更窄、更轻、适配 ~390px
-    // 视口),配合驱动里的移动视口宽度,百度等才能完整显示而不是只出桌面版左半边。我们引擎本就是
-    // WebKit(605.1.15),移动 Safari UA 最诚实、站点发 WebKit 兼容内容。
-    return "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"_s;
+    // Apotheosis: 默认移动版 iPhone Safari UA——站点发移动布局(更窄更轻,适配 ~390px 视口),
+    // 配合驱动移动视口宽度,百度等才完整显示。引擎本就是 WebKit(605.1.15),移动 Safari UA 最诚实。
+    if (g_apoUaMobile)
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"_s;
+    // 桌面版(部分流氓站点对移动 UA 抽风时,UI 一键切到这个)
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15"_s;
 }
 
 void LoadingFrameLoaderClient::savePlatformDataToCachedFrame(CachedFrame*)
@@ -607,7 +612,9 @@ void LoadingFrameLoaderClient::dispatchLoadEventToOwnerElementInAnotherProcess()
 
 Ref<FrameNetworkingContext> LoadingFrameLoaderClient::createNetworkingContext()
 {
-    return LoadingFrameNetworkingContext::create();
+    // cookie 持久化:返回带真 storageSession 的 networking context(HTTP Cookie/Set-Cookie 头经此到达 jar)。
+    // frame 传 nullptr(同原 LoadingFrameNetworkingContext;networking context 只用 storageSession)。
+    return WebCorePort::makeFrameNetworkingContext(nullptr);
 }
 
 void LoadingFrameLoaderClient::sendH2Ping(const URL& url, CompletionHandler<void(Expected<Seconds, ResourceError>&&)>&& completionHandler)

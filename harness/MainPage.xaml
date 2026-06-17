@@ -114,9 +114,13 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Text="菜单" Foreground="#FFFFFF" FontSize="22" Margin="16,0" VerticalAlignment="Center"/>
-                    <Button Grid.Column="1" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
+                    <!-- UA 切换:遇到对移动 UA 抽风的站点(如百度)一键切桌面版再重载 -->
+                    <Button x:Name="UaBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="#3AA0FF"
+                            Content="&#x1F4F1; 手机UA" Click="OnToggleUA" VerticalAlignment="Center"/>
+                    <Button Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
                 </Grid>
 
                 <!-- 标签 -->
