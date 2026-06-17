@@ -1306,7 +1306,7 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
 
 // 垂直滚动 dy 像素(正=向下)并重绘。每 tick isolatedUpdateRendering 驱动 IntersectionObserver,
 // 使下方/懒加载图片(bilibili 封面等)真正加载。位置钳制到 [min,max]。返回 0 成功。
-int WebCoreScrollBy(int dy, uint8_t* outRGBA)
+int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
 {
     using namespace WebCore;
     if (!outRGBA)
@@ -1330,7 +1330,7 @@ int WebCoreScrollBy(int dy, uint8_t* outRGBA)
     ScrollPosition cur = view->scrollPosition();
     ScrollPosition minP = view->minimumScrollPosition();
     ScrollPosition maxP = view->maximumScrollPosition();
-    int tx = cur.x();
+    int tx = cur.x() + dx;
     int ty = cur.y() + dy;
     if (tx < minP.x()) tx = minP.x();
     if (tx > maxP.x()) tx = maxP.x();
@@ -1397,9 +1397,19 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA)
     g_inPump = true;
     PumpGuard guard;
     RefPtr<LocalFrame> lf = g_session->mainFrame;
-    if (!lf->editor().canEdit())
-        return kErrNoDocument;   // 没有可编辑焦点,忽略
-    lf->editor().insertText(String::fromUTF8(utf8), nullptr);
+    // ★ 文字改走和 Enter 同款的合成键事件路径(eventHandler().keyEvent),而非 editor().insertText:
+    //   headless 下 editor().canEdit() 可能假阴(文档没被标 focused 等)→ insertText 直接被早退/静默丢弃,
+    //   用户实测"只有 Enter 进得去"——因为 Enter(WebCoreKeyAction)走的就是 keyEvent、不查 canEdit。
+    //   Char 事件的 text 由默认 keypress 动作插入聚焦可编辑元素(IME 整串 commit 一次性插入)。
+    String text = String::fromUTF8(utf8);
+    OptionSet<PlatformEvent::Modifier> mods;
+    MonotonicTime t = MonotonicTime::now();
+    PlatformKeyboardEvent raw(PlatformEvent::Type::RawKeyDown, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+    lf->eventHandler().keyEvent(raw);
+    PlatformKeyboardEvent ch(PlatformEvent::Type::Char, text, text, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+    lf->eventHandler().keyEvent(ch);
+    PlatformKeyboardEvent up(PlatformEvent::Type::KeyUp, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, MonotonicTime::now());
+    lf->eventHandler().keyEvent(up);
     pumpLoop(*lf, nullptr, true, 0, 4.0, g_session->page.get());
     return finishInteractionPaint(outRGBA);
 }

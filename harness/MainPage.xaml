@@ -71,7 +71,7 @@
                      导致之前指针方案滚不动。Grid(Background=White=可命中)整片接手势;点击仍走 Tapped
                      (GetPosition(RenderImage) 坐标不变)。捏合缩放后续用 ManipulationDelta.Scale 加回。 -->
                 <Grid x:Name="ContentArea" Background="White"
-                      ManipulationMode="TranslateY,TranslateInertia"
+                      ManipulationMode="TranslateX,TranslateY,TranslateInertia"
                       IsTapEnabled="True" Tapped="OnPageTapped"
                       ManipulationDelta="OnImageManipDelta">
                     <Image x:Name="RenderImage" Stretch="None" VerticalAlignment="Top" HorizontalAlignment="Left"/>

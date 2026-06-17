@@ -639,7 +639,7 @@ void MainPage::EngineScroll(int dy)
     WebEngine::instance().post([disp, self, dy, mySeq]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
-        try { rc = WebCoreScrollBy(dy, rgba->data()); } catch (...) { rc = -1000; }
+        try { rc = WebCoreScrollBy(0, dy, rgba->data()); } catch (...) { rc = -1000; }
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0) {
             int lc = WebCoreGetLinkCount();
@@ -677,24 +677,26 @@ void MainPage::OnScrollUp(Platform::Object^, RoutedEventArgs^)   { EngineScroll(
 void MainPage::OnScrollDown(Platform::Object^, RoutedEventArgs^) { EngineScroll(900); }
 
 // ---- 自由滚动:指针拖拽 / 滚轮 → 累积位移 → 合并成引擎滚动(无 spinner,跟手)----
-void MainPage::FreeScrollBy(int dy)
+void MainPage::FreeScrollBy(int dx, int dy)
 {
-    if (!m_sessionActive || dy == 0) return;
+    if (!m_sessionActive || (dx == 0 && dy == 0)) return;
+    m_scrollAccumX += dx;
     m_scrollAccum += dy;
     if (!m_scrollBusy) PumpScroll();
 }
 void MainPage::PumpScroll()
 {
-    if (m_scrollAccum == 0 || !m_sessionActive) { m_scrollBusy = false; return; }
+    if ((m_scrollAccum == 0 && m_scrollAccumX == 0) || !m_sessionActive) { m_scrollBusy = false; return; }
     int dy = m_scrollAccum; m_scrollAccum = 0;
+    int dx = m_scrollAccumX; m_scrollAccumX = 0;
     m_scrollBusy = true;
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // 不自增:被动滚动不作废点击/导航令牌,但被它们作废(导航后丢弃迟到滚动帧)
-    WebEngine::instance().post([disp, self, dy, mySeq]() {
+    WebEngine::instance().post([disp, self, dx, dy, mySeq]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
-        try { rc = WebCoreScrollBy(dy, rgba->data()); } catch (...) { rc = -1000; }
+        try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0) {
             int lc = WebCoreGetLinkCount();
@@ -723,9 +725,11 @@ void MainPage::PumpScroll()
 void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e)
 {
     if (!m_sessionActive) return;
+    double dx = -e->Delta.Translation.X;             // 手指左移(ΔX<0)→ 内容右滚(dx>0)
     double dy = -e->Delta.Translation.Y;             // 手指上移(ΔY<0)→ 内容下滚(dy>0)
+    int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
-    if (idy != 0) FreeScrollBy(idy);
+    if (idx != 0 || idy != 0) FreeScrollBy(idx, idy);
 }
 
 // ---- GPU 路径1 探针 ----

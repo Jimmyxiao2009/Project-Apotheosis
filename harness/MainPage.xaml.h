@@ -56,7 +56,7 @@ namespace Harness {
         void OnScrollUp(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnScrollDown(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 自由滚动:内容区 ManipulationDelta(单指拖拽 ΔY)→ 累积位移 → 合并成引擎滚动(无 spinner,带惯性)。
-        void FreeScrollBy(int dy);   // 累积 dy 并在引擎空闲时冲刷
+        void FreeScrollBy(int dx, int dy);   // 累积 dx/dy 并在引擎空闲时冲刷
         void PumpScroll();           // 把累积位移作为一次 WebCoreScrollBy 派发(完成后若仍有累积再派发)
         void OnImageManipDelta(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
@@ -116,7 +116,8 @@ namespace Harness {
         bool m_imeSyncing { false };  // 正在程序化改 ImeBox.Text(避免 TextChanged 回环)
         bool m_uaMobile { true };     // UA 模式:true=手机(默认),false=桌面
         // 自由滚动状态
-        int  m_scrollAccum { 0 };     // 未冲刷的累积滚动位移(像素,>0 向下)
+        int  m_scrollAccum { 0 };     // 未冲刷的累积竖向滚动位移(像素,>0 向下)
+        int  m_scrollAccumX { 0 };    // 未冲刷的累积横向滚动位移(像素,>0 向右)
         bool m_scrollBusy { false };  // 有 WebCoreScrollBy 任务在引擎线程飞行
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)

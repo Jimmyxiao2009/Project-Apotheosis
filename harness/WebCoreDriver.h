@@ -62,7 +62,7 @@ void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 
 // 垂直滚动 dy 像素(正=向下),触发懒加载图片后重绘到 outBuf。
-int WebCoreScrollBy(int dy, uint8_t* outBuf);
+int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
 
 // 不交互,仅按当前会话状态重绘到 outBuf。
 int WebCoreSessionPaint(uint8_t* outBuf);

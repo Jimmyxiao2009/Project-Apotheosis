@@ -42,7 +42,7 @@ void WebCoreSetCACertPath(const char* path);
 int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA);
 void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
-int WebCoreScrollBy(int dy, uint8_t* outRGBA);        // dy>0 scrolls down
+int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
 int WebCoreSessionPaint(uint8_t* outRGBA);
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
