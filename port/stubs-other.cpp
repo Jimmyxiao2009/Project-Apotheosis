@@ -171,11 +171,15 @@ void PlatformKeyboardEvent::disambiguateKeyDownEvent(Type, bool)
 // ============================================================================
 // GraphicsLayer (graphics/GraphicsLayer.h). Type == GraphicsLayerType. The
 // non-compositing render path must never construct a GraphicsLayer.
+// GPU 构建(USE_TEXTURE_MAPPER)由 GraphicsLayerTextureMapper.cpp 提供真实现 →
+// 这里只在软件构建(无 texmap)给 stub,否则与真实现重复符号(M2 链接撞 duplicate)。
 // ============================================================================
+#if !USE(TEXTURE_MAPPER)
 Ref<GraphicsLayer> GraphicsLayer::create(GraphicsLayerFactory*, GraphicsLayerClient&, Type)
 {
     RELEASE_ASSERT_NOT_REACHED();
 }
+#endif
 
 // ============================================================================
 // ImageAdapter (graphics/ImageAdapter.h). loadPlatformResource returns the

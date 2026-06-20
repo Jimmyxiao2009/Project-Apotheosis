@@ -201,9 +201,14 @@ private:
     std::deque<std::function<void()>> m_q;
 };
 
+// GPU 直呈现模式:引擎已 swapBuffers 到可见 GpuPanel,无需把 rgba blit 进 WriteableBitmap(RenderImage 已隐藏)。
+//   置位后 BlitToBitmap 直接返回,省掉每帧 3MB 的 RGBA→BGRA 拷贝(冲 60fps)。引擎线程与 UI 线程都可能读,用 atomic。
+static std::atomic<bool> g_directPresent { false };
+
 // ===== 渲染缓冲 → WriteableBitmap(RGBA→BGRA)=====
 static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, int W, int H)
 {
+    if (g_directPresent.load()) return;   // 直呈现:跳过软件 blit(GpuPanel 已由引擎呈现)
     ComPtr<Windows::Storage::Streams::IBufferByteAccess> bba;
     reinterpret_cast<IInspectable*>(wb->PixelBuffer)->QueryInterface(IID_PPV_ARGS(&bba));
     byte* dst = nullptr;
@@ -215,6 +220,34 @@ static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, 
         dst[i * 4 + 1] = src[i * 4 + 1];
         dst[i * 4 + 2] = src[i * 4 + 0];
         dst[i * 4 + 3] = src[i * 4 + 3];
+    }
+}
+
+// 把 RGBA(上→下)写成 32 位 BMP(BGRA,自下而上)——供自动诊断把 GPU readback 的实际帧落盘,
+// 经 WDP 拉回当"截图"看(无 UI、无 PNG 编码器依赖;ARM 上头部用 memcpy 避免非对齐写)。
+static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int h)
+{
+    const uint32_t dataSize = (uint32_t)w * h * 4;
+    uint8_t fh[54] = {0};
+    fh[0] = 'B'; fh[1] = 'M';
+    auto put32 = [&](int off, uint32_t v) { memcpy(fh + off, &v, 4); };
+    auto put16 = [&](int off, uint16_t v) { memcpy(fh + off, &v, 2); };
+    put32(2, 54 + dataSize); put32(10, 54);
+    put32(14, 40); put32(18, (uint32_t)w); put32(22, (uint32_t)h);   // 正高=自下而上
+    put16(26, 1); put16(28, 32); put32(30, 0); put32(34, dataSize);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f.write((char*)fh, 54);
+    std::vector<uint8_t> row((size_t)w * 4);
+    for (int fy = 0; fy < h; ++fy) {
+        const uint8_t* src = rgba + (size_t)(h - 1 - fy) * w * 4;
+        for (int x = 0; x < w; ++x) {
+            row[x * 4 + 0] = src[x * 4 + 2]; // B
+            row[x * 4 + 1] = src[x * 4 + 1]; // G
+            row[x * 4 + 2] = src[x * 4 + 0]; // R
+            row[x * 4 + 3] = src[x * 4 + 3]; // A
+        }
+        f.write((char*)row.data(), (std::streamsize)w * 4);
     }
 }
 
@@ -251,7 +284,70 @@ MainPage::MainPage()
                 testUrl.pop_back();
         }
     } catch (...) {}
-    if (!testUrl.empty())
+    // 自动诊断钩子:若 LocalState\autodiag.txt 存在(每行一个 URL,# 开头忽略),启动后在引擎线程
+    //   自动 GpuInit(离屏)+ 逐个 GPU 合成加载 + dump 各页 diag/层树到 autodump.txt,供 WDP 全自动抓取
+    //   (免 UI 点按 GPU 两下)。用于定位"某些页 GPU 合成全白"——对比能渲染的页与全白页的层树差异。
+    std::vector<std::string> diagUrls;
+    try {
+        std::wstring d = LocalStateDir();
+        if (!d.empty()) {
+            std::ifstream f(WideToUtf8(d) + "\\autodiag.txt", std::ios::binary);
+            std::string line;
+            while (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+                    line.pop_back();
+                if (!line.empty() && line[0] != '#')
+                    diagUrls.push_back(line);
+            }
+        }
+    } catch (...) {}
+    // (诊断用)autodiag.txt 存在时才跑;正常浏览不受影响。需要再抓时临时放 autodiag.txt(每行一个 URL,DESKTOP: 前缀=桌面 UA)。
+    if (!diagUrls.empty()) {
+        CoreDispatcher^ disp = this->Dispatcher;
+        Platform::Agile<MainPage^> self(this);
+        WebEngine::instance().post([disp, self, diagUrls]() {
+            std::string dump;
+            int gi = -999;
+            try { gi = WebCoreGpuInit(nullptr, kW, kH); } catch (...) { gi = -1000; }
+            dump += "WebCoreGpuInit(offscreen) rc=" + std::to_string(gi) + "\n\n";
+            auto rgba = std::vector<uint8_t>((size_t)kW * kH * 4, 0);
+            std::wstring dd = LocalStateDir();
+            int idx = 0;
+            for (const auto& rawUrl : diagUrls) {
+                std::string url = rawUrl;
+                bool desktop = false;
+                if (url.rfind("DESKTOP:", 0) == 0) { desktop = true; url = url.substr(8); }
+                try { WebCoreSetUserAgentMobile(desktop ? 0 : 1); } catch (...) {}
+                dump += "########## URL: " + url + (desktop ? " [desktop UA]" : " [mobile UA]") + " ##########\n";
+                int lrc = -999;
+                try { lrc = WebCoreSessionLoad(url.c_str(), kW, kH, rgba.data()); } catch (...) { lrc = -1000; }
+                dump += "SessionLoad rc=" + std::to_string(lrc) + "\n";
+                std::vector<char> dg(4096, 0);
+                try { WebCoreGetDiag(dg.data(), (int)dg.size()); } catch (...) {}
+                dump += "diag: " + std::string(dg.data()) + "\n";
+                std::vector<char> li(65536, 0);
+                try { WebCoreGpuLayerInfo(li.data(), (int)li.size()); } catch (...) {}
+                dump += std::string(li.data());
+                dump += "\n\n";
+                // 落盘这页 GPU readback 的实际帧(BMP),供 WDP 拉回当截图看
+                try { if (!dd.empty()) WriteBmp32(WideToUtf8(dd) + "\\shot_" + std::to_string(idx) + ".bmp", rgba.data(), kW, kH); } catch (...) {}
+                ++idx;
+            }
+            try {
+                std::wstring d2 = LocalStateDir();
+                if (!d2.empty()) {
+                    std::ofstream f(WideToUtf8(d2) + "\\autodump.txt", std::ios::binary | std::ios::trunc);
+                    if (f) f.write(dump.data(), dump.size());
+                }
+            } catch (...) {}
+            try {
+                disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self]() {
+                    MainPage^ s = self.Get(); if (!s) return;
+                    s->TitleText->Text = ref new Platform::String(L"AUTODIAG DONE");
+                }));
+            } catch (...) {}
+        });
+    } else if (!testUrl.empty())
         NavigateTo(ref new String(testUrl.c_str()), true);
     else
         NavigateTo(ref new String(L"about:home"), true);
@@ -340,6 +436,11 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     std::wstring wurl = url ? std::wstring(url->Data()) : L"about:home";
     const bool isHome = wurl.empty() || wurl == L"about:home";
     m_currentUrl = isHome ? L"about:home" : wurl;
+
+    // M4:导航=新页面,引擎 pageScaleFactor 复位 1.0 → harness 缩放状态/显示变换同步复位(否则下次捏合基准错)。
+    m_pinching = false; m_liveScale = 1.0f; m_pageScale = 1.0f;
+    if (GpuPanel) GpuPanel->RenderTransform = nullptr;
+    if (RenderImage) RenderImage->RenderTransform = nullptr;
 
     if (pushHistory) {
         if (m_navIndex >= 0 && m_navIndex < (int)m_navStack.size() - 1)
@@ -480,7 +581,10 @@ void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
 void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
 {
     if (m_loading || m_interacting) return;
-    auto pt = e->GetPosition(RenderImage);
+    // 取相对 ContentArea(承接手势/点击的层,始终参与布局)的坐标。★ 不能用 RenderImage:直呈现模式下它被
+    //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
+    //   ContentArea 左上角 = 渲染视口原点,故二者在软件模式下等价,直呈现模式下正确。
+    auto pt = e->GetPosition(ContentArea);
     int px = static_cast<int>(pt.X), py = static_cast<int>(pt.Y);
     if (px < 0 || py < 0 || px >= kW || py >= kH) return;
 
@@ -598,10 +702,13 @@ void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgb
                                Platform::String^ title, Platform::String^ navUrl,
                                const std::shared_ptr<std::vector<PageLink>>& links)
 {
-    auto wb = ref new WriteableBitmap(kW, kH);
-    BlitToBitmap(wb, *rgba, kW, kH);
-    wb->Invalidate();
-    RenderImage->Source = wb;
+    // present 模式:引擎点击已 swapBuffers 到 GpuPanel,无需建位图(BlitToBitmap 本就空转,RenderImage 已隐藏)。
+    if (!m_gpuPresent) {
+        auto wb = ref new WriteableBitmap(kW, kH);
+        BlitToBitmap(wb, *rgba, kW, kH);
+        wb->Invalidate();
+        RenderImage->Source = wb;
+    }
     m_pageLinks = *links;
     m_lastFrameHash = 0;        // 强制下一实时帧重贴(交互改了画面)
     StartLiveMode();            // 交互后重启实时(可能触发了动画/SPA 更新)
@@ -694,10 +801,41 @@ void MainPage::PumpScroll()
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // 不自增:被动滚动不作废点击/导航令牌,但被它们作废(导航后丢弃迟到滚动帧)
-    WebEngine::instance().post([disp, self, dx, dy, mySeq]() {
+    bool present = m_gpuPresent;
+    // ★ 提速:滚动期间不再每帧跨 FFI 拷贝链接表(引擎侧也跳过了 extractLinks),present 模式连 WriteableBitmap
+    //   都不建(引擎已直呈现到 GpuPanel,BlitToBitmap 本就空转)。链接表在滚动停止后由 SyncLinksAfterScroll 一次性补。
+    WebEngine::instance().post([disp, self, dx, dy, mySeq, present]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; return; }   // 被导航/点击取代,丢弃迟到帧
+                if (rcCopy == 0) {
+                    if (!present) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
+                    s->m_lastFrameHash = 0;
+                }
+                s->m_scrollBusy = false;
+                if (s->m_scrollAccum != 0) s->PumpScroll();   // 拖拽期间又攒了位移,继续冲刷
+                else { s->SyncLinksAfterScroll(); s->StartLiveMode(); }  // 滚动停了 → 补链接表 + 重启实时(新视口懒加载/动画)
+            }));
+        } catch (...) {}
+    });
+}
+
+// 滚动停止后一次性刷新链接命中表(滚动期间为提速跳过了引擎 extractLinks)。点击走引擎实时命中测试(权威),
+// 故此刷新主要服务点击兜底/主页路径;陈旧窗口仅限"刚停手到这帧返回"之间,无碍。
+void MainPage::SyncLinksAfterScroll()
+{
+    if (!m_sessionActive) return;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;
+    WebEngine::instance().post([disp, self, mySeq]() {
+        int rc = -999;
+        try { rc = WebCoreSyncLinks(); } catch (...) { rc = -1000; }
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0) {
             int lc = WebCoreGetLinkCount();
@@ -705,17 +843,10 @@ void MainPage::PumpScroll()
         }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, links, rcCopy, mySeq]() {
+            disp->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, links, rcCopy, mySeq]() {
                 MainPage^ s = self.Get(); if (!s) return;
-                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; return; }   // 被导航/点击取代,丢弃迟到帧
-                if (rcCopy == 0) {
-                    auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb;
-                    s->m_pageLinks = *links;
-                    s->m_lastFrameHash = 0;
-                }
-                s->m_scrollBusy = false;
-                if (s->m_scrollAccum != 0) s->PumpScroll();   // 拖拽期间又攒了位移,继续冲刷
-                else s->StartLiveMode();                      // 滚动停了 → 重启实时(新视口懒加载/动画)
+                if (s->m_opSeq != mySeq) return;   // 被新操作取代
+                if (rcCopy == 0) s->m_pageLinks = *links;
             }));
         } catch (...) {}
     });
@@ -726,11 +857,78 @@ void MainPage::PumpScroll()
 void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e)
 {
     if (!m_sessionActive) return;
+    // M4 捏合缩放:本次增量 Scale≠1(或已进入捏合)→ 捏合模式:只对显示层做实时 ScaleTransform(零引擎调用,
+    //   丝滑),不走引擎滚动;松手(OnImageManipCompleted)再把累计缩放提交给引擎按新尺度重栅格。
+    float ds = e->Delta.Scale;
+    if (m_pinching || (ds > 0.0f && (ds > 1.002f || ds < 0.998f))) {
+        m_pinching = true;
+        if (ds > 0.0f) m_liveScale *= ds;
+        float total = m_pageScale * m_liveScale;          // 钳总缩放到 [0.5,6.0]
+        if (total < 0.5f) m_liveScale = 0.5f / m_pageScale;
+        if (total > 6.0f) m_liveScale = 6.0f / m_pageScale;
+        auto fp = e->Position;                            // 捏合焦点(相对 ContentArea = 视口坐标)
+        m_focalX = fp.X; m_focalY = fp.Y;
+        ApplyLiveZoom();
+        return;
+    }
     double dx = -e->Delta.Translation.X;             // 手指左移(ΔX<0)→ 内容右滚(dx>0)
     double dy = -e->Delta.Translation.Y;             // 手指上移(ΔY<0)→ 内容下滚(dy>0)
     int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
     if (idx != 0 || idy != 0) FreeScrollBy(idx, idy);
+}
+
+// 实时缩放变换:把 ScaleTransform(以焦点为中心)挂到当前显示层(present=GpuPanel,readback=RenderImage)。
+//   只变换已渲染像素 → 捏合期间 60fps 丝滑,不调引擎。
+void MainPage::ApplyLiveZoom()
+{
+    auto t = ref new Windows::UI::Xaml::Media::ScaleTransform();
+    t->ScaleX = m_liveScale; t->ScaleY = m_liveScale;
+    t->CenterX = m_focalX; t->CenterY = m_focalY;
+    if (m_gpuPresent) GpuPanel->RenderTransform = t;
+    else RenderImage->RenderTransform = t;
+}
+
+// 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
+void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^)
+{
+    if (!m_pinching) return;
+    m_pinching = false;
+    float live = m_liveScale; m_liveScale = 1.0f;
+    float newScale = m_pageScale * live;
+    if (newScale < 0.5f) newScale = 0.5f;
+    if (newScale > 6.0f) newScale = 6.0f;
+    PinchCommit(newScale, (int)(m_focalX + 0.5), (int)(m_focalY + 0.5));
+}
+
+// 把缩放提交给引擎线程:WebCoreSetPageScale → 新清晰帧;回 UI 后更新已提交尺度 + 复位 RenderTransform + 显示。
+void MainPage::PinchCommit(float newScale, int focalX, int focalY)
+{
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = ++m_opSeq;
+    bool present = m_gpuPresent;
+    WebEngine::instance().post([disp, self, newScale, focalX, focalY, mySeq, present]() {
+        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        int rc = -999;
+        try { rc = WebCoreSetPageScale(newScale, focalX, focalY, rgba->data()); } catch (...) { rc = -1000; }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, newScale, mySeq, present]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
+                if (rcCopy == 0) {
+                    s->m_pageScale = newScale;
+                    if (!present) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
+                    // present 模式:引擎已 swapBuffers 到 GpuPanel,新清晰帧已在面板上。
+                }
+                // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
+                s->GpuPanel->RenderTransform = nullptr;
+                s->RenderImage->RenderTransform = nullptr;
+                s->StartLiveMode();
+            }));
+        } catch (...) {}
+    });
 }
 
 // ---- GPU 路径1 探针 ----
@@ -949,6 +1147,99 @@ void MainPage::OnToggleUA(Platform::Object^, RoutedEventArgs^)
     HideDrawer();
     if (!m_currentUrl.empty())
         NavigateTo(ref new String(m_currentUrl.c_str()), false);   // 重载使新 UA 生效
+}
+
+// GPU 合成开关(M2):一次性开启(引擎侧 g_gpuActive 无 teardown,重启回软件)。开启 = 引擎线程
+// WebCoreGpuInit(nullptr=离屏)成功 → g_gpuActive=true → 重载当前页 → buildSession 开合成 → 经
+// TextureMapper 合成到离屏纹理、readback 出像素(仍走 WriteableBitmap 显示)。结果写 gpuinit.txt 供真机回报。
+// GPU 朝向标签:🖥 GPU·<HV/H/V/->(供真机循环时看当前组合并回报)。
+static Platform::String^ GpuOrientLabel(int orient)
+{
+    const wchar_t* tag = (orient == 0) ? L"-" : (orient == 1) ? L"H" : (orient == 2) ? L"V" : L"HV";
+    return ref new Platform::String((std::wstring(L"\U0001F5A5 GPU·") + tag).c_str());   // 🖥 GPU·HV
+}
+
+// GPU 合成开关(M2):首点 = 引擎线程 WebCoreGpuInit(离屏)→ 成功后重载当前页(buildSession 开合成→
+//   经 TextureMapper 合成 readback 出像素)。已开后每点一次 = 循环 4 种 readback 朝向(none/H/V/HV)并重绘
+//   当前帧——真机朝向经验未定,点到画面正常那个,把标签(H/V/HV/-)告诉我即可定死。重启回软件。
+void MainPage::OnToggleGpu(Platform::Object^, RoutedEventArgs^)
+{
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+
+    if (!m_gpuOn) {
+        // 首次开启:GPU 直呈现到可见 GpuPanel(SwapChainPanel)。先让面板可见(有尺寸),用 PropertySet
+        //   (EGLNativeWindowTypeProperty=面板 + EGLRenderSurfaceSizeProperty=固定渲染尺寸)做 ANGLE 原生窗口,
+        //   交引擎线程 WebCoreGpuInit(window) 建窗口表面;此后各帧 gpuPresent 直接 swapBuffers 到面板,
+        //   省掉 readback+blit(冲 60fps)。失败回退面板隐藏。
+        GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        auto props = ref new Windows::Foundation::Collections::PropertySet();
+        props->Insert(L"EGLNativeWindowTypeProperty", GpuPanel);
+        props->Insert(L"EGLRenderSurfaceSizeProperty",
+                      Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
+        m_gpuProps = props;   // 保活(EGL 表面整个生命周期引用它)
+        void* win = reinterpret_cast<void*>(reinterpret_cast<IInspectable*>(props));
+        WebEngine::instance().post([disp, self, win]() {
+            int rc = -999;
+            try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
+            try {
+                std::wstring d = LocalStateDir();
+                if (!d.empty()) {
+                    std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc);
+                    if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); }
+                }
+            } catch (...) {}
+            int rcCopy = rc;
+            try {
+                disp->RunAsync(CoreDispatcherPriority::Normal,
+                    ref new DispatchedHandler([self, rcCopy]() {
+                        MainPage^ s = self.Get(); if (!s) return;
+                        if (rcCopy == 0) {
+                            s->m_gpuOn = true;
+                            s->m_gpuPresent = true;
+                            g_directPresent.store(true);
+                            s->RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;   // 软件位图层让位给 GpuPanel
+                            s->GpuBtn->Content = GpuOrientLabel(s->m_gpuOrient);
+                            s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::LimeGreen);
+                            s->HideDrawer();
+                            if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
+                                s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
+                        } else {
+                            s->GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                            s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU✗");   // 🖥 GPU✗(初始化失败,看 gpuinit.txt 的 rc)
+                            s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
+                            s->HideDrawer();
+                        }
+                    }));
+            } catch (...) {}
+        });
+        return;
+    }
+
+    // 已开(朝向已定 none):再点 = 抓合成图层树诊断 → 写 LocalState\layertree.txt + 标题显示关键标量
+    //   (scrollPos/contents/view/docBg/usesCompositing),供定位"背景丢失 / 不能滚动"。
+    HideDrawer();
+    WebEngine::instance().post([disp, self]() {
+        auto buf = std::make_shared<std::vector<char>>(65536, 0);
+        try { WebCoreGpuLayerInfo(buf->data(), (int)buf->size()); } catch (...) {}
+        std::string info(buf->data());
+        try {
+            std::wstring d = LocalStateDir();
+            if (!d.empty()) {
+                std::ofstream f(WideToUtf8(d) + "\\layertree.txt", std::ios::binary | std::ios::trunc);
+                if (f) f.write(info.data(), info.size());
+            }
+        } catch (...) {}
+        std::string head = info.substr(0, info.find('\n'));
+        std::wstring headW = Utf8ToWide(head);
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal,
+                ref new DispatchedHandler([self, headW]() {
+                    MainPage^ s = self.Get(); if (!s) return;
+                    s->TitleText->Text = ref new Platform::String(headW.c_str());   // 标题临时显示诊断首行
+                }));
+        } catch (...) {}
+    });
 }
 
 // ---- 抽屉 ----

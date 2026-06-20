@@ -33,6 +33,8 @@ namespace Harness {
         void OnMenu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // UA 切换:手机/桌面,切后重载当前页(遇到对移动 UA 抽风的站点用)。
         void OnToggleUA(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // GPU 合成开关(M2):一次性开启(引擎线程 WebCoreGpuInit 离屏成功→重载当前页走 TextureMapper 合成)。
+        void OnToggleGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 
         // ---- 抽屉 ----
         void OnDrawerClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -58,7 +60,12 @@ namespace Harness {
         // 自由滚动:内容区 ManipulationDelta(单指拖拽 ΔY)→ 累积位移 → 合并成引擎滚动(无 spinner,带惯性)。
         void FreeScrollBy(int dx, int dy);   // 累积 dx/dy 并在引擎空闲时冲刷
         void PumpScroll();           // 把累积位移作为一次 WebCoreScrollBy 派发(完成后若仍有累积再派发)
+        void SyncLinksAfterScroll(); // 滚动停止后一次性刷新链接命中表(滚动期跳过了引擎 extractLinks)
         void OnImageManipDelta(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e);
+        // M4 捏合缩放:捏合期间对显示层做实时 ScaleTransform(零引擎),松手提交给引擎按新尺度重栅格(文字清晰)。
+        void OnImageManipCompleted(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^ e);
+        void ApplyLiveZoom();
+        void PinchCommit(float newScale, int focalX, int focalY);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
@@ -115,10 +122,19 @@ namespace Harness {
         bool m_imeOpen { false };     // 屏幕键盘是否为当前输入打开
         bool m_imeSyncing { false };  // 正在程序化改 ImeBox.Text(避免 TextChanged 回环)
         bool m_uaMobile { true };     // UA 模式:true=手机(默认),false=桌面
+        bool m_gpuOn { false };       // GPU 合成是否已开(一次性;引擎侧 g_gpuActive 无 teardown,重启回软件)
+        bool m_gpuPresent { false };  // GPU 直呈现模式(合成直接画到 GpuPanel,省 readback+blit)
+        Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
+        int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态
         int  m_scrollAccum { 0 };     // 未冲刷的累积竖向滚动位移(像素,>0 向下)
         int  m_scrollAccumX { 0 };    // 未冲刷的累积横向滚动位移(像素,>0 向右)
         bool m_scrollBusy { false };  // 有 WebCoreScrollBy 任务在引擎线程飞行
+        // M4 捏合缩放状态
+        bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
+        float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)
+        float  m_pageScale { 1.0f };   // 已提交给引擎的页面缩放因子(Page::pageScaleFactor)
+        double m_focalX { 360 }, m_focalY { 540 };  // 捏合焦点(ContentArea/视口坐标)
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)
         double m_dragLastY { 0 };     // 上次指针 Y(算增量)

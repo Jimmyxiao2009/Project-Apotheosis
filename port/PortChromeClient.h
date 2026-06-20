@@ -53,6 +53,10 @@ public:
     {
         return static_cast<WebCore::ChromeClient::CompositingTriggerFlags>(WebCore::ChromeClient::AllTriggers);
     }
+    // 注意:不要给主帧开 tiled backing(shouldUseTiledBackingForFrameView 保持默认 false)。真机实测开了之后
+    //   主帧内容被路由进 "Page TiledBacking containment" 的 TileController 瓦片,而同步 GraphicsLayerTextureMapper
+    //   合成路径根本不渲染 TileController → 内容照样全丢。根内容不画的真因是 RenderLayerBacking::paintsIntoWindow()
+    //   对 TextureMapper 端没返回 false(已在引擎侧打补丁修正),与 tiled backing 无关。
 
     // ======================================================================
     // No-op pure-virtuals (mirror of EmptyChromeClient)

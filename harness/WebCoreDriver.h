@@ -63,6 +63,13 @@ int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 
 // 垂直滚动 dy 像素(正=向下),触发懒加载图片后重绘到 outBuf。
 int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
+// 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
+int WebCoreSyncLinks();
+
+// M4 捏合缩放:把页面缩放因子设为 scale(钳 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 锚定,重栅格(文字清晰)后重绘到 outBuf。返回 0。
+int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outBuf);
+// M4:当前页面缩放因子 ×1000(1000=1.0x)。
+int WebCoreGetPageScale();
 
 // 不交互,仅按当前会话状态重绘到 outBuf。
 int WebCoreSessionPaint(uint8_t* outBuf);
@@ -80,6 +87,18 @@ void WebCoreSetUserAgentMobile(int mobile);
 
 // M1:GPU 合成是否在跑(根 GraphicsLayer 已附)。加载后查,返回 1/0。
 int WebCoreEnableCompositing();
+
+// M2:GPU 合成呈现(引擎线程调)。详见 WebCoreDriver.cpp。
+// nativeWindow=SwapChainPanel 的 PropertySet 的 IInspectable*(直呈现);nullptr=离屏(仅 readback)。成功后引擎对网络会话开合成。
+int WebCoreGpuInit(void* nativeWindow, int w, int h);
+// 把当前会话图层树直呈现到窗口表面(eglSwapBuffers)。仅 GpuInit(nativeWindow!=null) 后有意义。返回 0 成功。
+int WebCoreComposite();
+// 离屏合成 + readback 出 RGBA 到 outBuf(>= w*h*4),用现有 WriteableBitmap 显示。返回 0 成功。
+int WebCoreCompositeReadback(uint8_t* outBuf);
+// 调试:设离屏 readback 翻转(找正确朝向)。flipH/flipV 非0=反转列/行。设完重绘当前帧生效。
+void WebCoreGpuSetFlip(int flipH, int flipV);
+// 调试:把 FrameView 滚动/内容尺寸 + 合成图层树文本写入 outBuf(定位背景丢失/滚动失效)。返回 0 成功。
+int WebCoreGpuLayerInfo(char* outBuf, int len);
 
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);

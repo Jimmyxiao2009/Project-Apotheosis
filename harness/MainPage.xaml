@@ -71,9 +71,10 @@
                      导致之前指针方案滚不动。Grid(Background=White=可命中)整片接手势;点击仍走 Tapped
                      (GetPosition(RenderImage) 坐标不变)。捏合缩放后续用 ManipulationDelta.Scale 加回。 -->
                 <Grid x:Name="ContentArea" Background="White"
-                      ManipulationMode="TranslateX,TranslateY,TranslateInertia"
+                      ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale"
                       IsTapEnabled="True" Tapped="OnPageTapped"
-                      ManipulationDelta="OnImageManipDelta">
+                      ManipulationDelta="OnImageManipDelta"
+                      ManipulationCompleted="OnImageManipCompleted">
                     <Image x:Name="RenderImage" Stretch="None" VerticalAlignment="Top" HorizontalAlignment="Left"/>
                 </Grid>
             </Border>
@@ -81,7 +82,7 @@
             <!-- GPU 渲染面(SwapChainPanel)。GPU 管线已真机验证(0.1.5 黄三角形);0.1.6 默认隐藏让浏览器可用,
                  0.1.7 将复用此面承载 WebCore TextureMapper 的 GPU 合成输出(替代软件 RenderImage)。 -->
             <SwapChainPanel x:Name="GpuPanel" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                            Visibility="Collapsed"/>
+                            IsHitTestVisible="False" Visibility="Collapsed"/>
 
             <!-- 输入法捕获框:不可见(1×1 透明),聚焦它即唤起屏幕键盘;键入经 TextChanged/KeyDown 转发给引擎活会话。 -->
             <TextBox x:Name="ImeBox" Width="1" Height="1" Opacity="0" Margin="0" Padding="0"
@@ -118,12 +119,17 @@
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Text="菜单" Foreground="#FFFFFF" FontSize="22" Margin="16,0" VerticalAlignment="Center"/>
+                    <!-- GPU 合成开关(M2):点亮后重载当前页,引擎对网络会话开合成、经 TextureMapper 合成出像素(离屏 readback)。
+                         默认关=纯软件(稳);一次性开启(本会话内不可关,重启即回软件)。 -->
+                    <Button x:Name="GpuBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="#9AA0A6"
+                            Content="&#x1F5A5; GPU" Click="OnToggleGpu" VerticalAlignment="Center"/>
                     <!-- UA 切换:遇到对移动 UA 抽风的站点(如百度)一键切桌面版再重载 -->
-                    <Button x:Name="UaBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="#3AA0FF"
+                    <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="#3AA0FF"
                             Content="&#x1F4F1; 手机UA" Click="OnToggleUA" VerticalAlignment="Center"/>
-                    <Button Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
+                    <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
                 </Grid>
 
                 <!-- 标签 -->

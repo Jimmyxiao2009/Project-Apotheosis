@@ -43,6 +43,9 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA);
 void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
+int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
+int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal
+int WebCoreGetPageScale();             // M4: current pageScaleFactor ×1000
 int WebCoreSessionPaint(uint8_t* outRGBA);
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
@@ -50,6 +53,11 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into f
 int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Windows UA
 int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
+int WebCoreGpuInit(void* nativeWindow, int w, int h); // M2: init GPU present (engine thread). nativeWindow=SwapChainPanel PropertySet IInspectable*; nullptr=offscreen(readback)
+int WebCoreComposite();                               // M2: composite current session layer tree to the window surface (swapBuffers)
+int WebCoreCompositeReadback(uint8_t* outRGBA);       // M2: offscreen composite + readback RGBA (verify), shown via existing WriteableBitmap path
+void WebCoreGpuSetFlip(int flipH, int flipV);         // M2 debug: set readback flip (find correct orientation); repaint to apply
+int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scroll/contents + layerTreeAsText dump
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 unsigned WebCoreGetFrameHash();                       // pixel hash of the last frame (idle detection)

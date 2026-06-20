@@ -148,6 +148,26 @@
 #include <WebCore/CertificateInfo.h>        // CertificateInfo::Certificate == Vector<uint8_t>
 #include <wtf/Vector.h>
 
+// ---- M2 GPU 合成呈现(TextureMapper → ANGLE)----
+// 把开合成后建出的 GraphicsLayerTextureMapper 图层树经 TextureMapper 合成到 GL:
+//   - 离屏 BitmapTexture + glReadPixels → 复用现有 WriteableBitmap 通道(先验证合成像素正确);
+//   - 或直呈现到 SwapChainPanel 窗口表面(eglSwapBuffers)。
+// 仅当 g_gpuActive(WebCoreGpuInit 成功)时启用;否则纯软件 cairo(见 paintToRGBA 顶部分支)。
+// ★ TextureMapper::create() 硬要求 GLContext::current()!=null(TextureMapper.cpp:216)——必须经 WebCore
+//   的 GLContext/PlatformDisplay,不能用裸 EGL。GLContext::create(display, nativeWindow) 把窗口指针经
+//   纯 C cast 直传 eglCreateWindowSurface(GLContext.cpp:170),正好喂 ANGLE.WindowsStore 的 PropertySet。
+#define GL_GLEXT_PROTOTYPES 1               // 这版 ms-master ANGLE 的 gl2.h 把核心 GL 原型放此宏下(否则 glReadPixels/glViewport C3861)
+#include <WebCore/PlatformDisplay.h>        // PlatformDisplay::sharedDisplay()(WIN→PlatformDisplayWin,起 ANGLE EGLDisplay)
+#include <WebCore/GLContext.h>              // GLContext::create/createOffscreen + makeContextCurrent + swapBuffers
+#include "texmap/TextureMapper.h"           // TextureMapper::create/beginPainting/endPainting(platform/graphics 已在 -I 上)
+#include "texmap/TextureMapperLayer.h"      // TextureMapperLayer::paint/applyAnimationsRecursively
+#include "texmap/GraphicsLayerTextureMapper.h" // 根 GraphicsLayer 实为它;.layer()/updateBackingStoreIncludingSubLayers
+#include "texmap/BitmapTexture.h"           // 离屏渲染目标 + bindAsSurface
+#include <WebCore/GraphicsLayer.h>          // GraphicsLayer(chrome->rootLayer() 返回类型,static_cast 基类)
+#include <WebCore/RenderView.h>             // view->renderView()->compositor()
+#include <WebCore/RenderLayerCompositor.h>  // compositor().frameViewDidScroll()(同步 TextureMapper 路径滚动)
+#include <memory>                           // std::unique_ptr
+
 // Installs the PlatformStrategies singleton (loader strategy = WebResourceLoadScheduler).
 // Defined in port/PortPlatformStrategies.cpp. Idempotent.
 extern void installPortPlatformStrategies();
@@ -205,6 +225,23 @@ static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
+
+// GPU 合成是否就绪:仅当 WebCoreGpuInit 成功建好 GL 上下文 + TextureMapper 后才置 true。
+// 严格 gate 开合成的两个开关 + PortChromeClient——GPU 未起时走纯软件 cairo(老设备/未起 GPU 的
+// 通用稳定底座,零回归)。无条件开合成是 0.1.7.1 真机闪退的根因。
+static bool g_gpuActive = false;
+// M2 GPU 状态(只在唯一引擎线程访问;WebCoreGpuInit 建,故意不析构=随进程存活,避免退出时跨线程 eglDestroy)。
+static WebCore::GLContext* g_glContext = nullptr;
+static WebCore::TextureMapper* g_textureMapper = nullptr;
+static int g_gpuW = 0, g_gpuH = 0;
+// 离屏 readback 的方向校正:对 glReadPixels(自下而上)结果可选水平/垂直翻转。真机朝向(TextureMapper
+// 离屏渲染 + FBO 读回的净朝向)经验未定 → 运行时可调(WebCoreGpuSetFlip),harness 点 GPU 按钮循环
+// 4 种组合(none/H/V/HV)找对的那个。默认 H(=把 bottom-up 读到的再水平镜像,纯 180° 解释下的校正)。
+static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即正确,默认 false
+static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
+static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
+static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
+static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 
 // 子资源加载诊断计数(主文档 + CSS/JS/图片全经 ResourceHandle 桥)。由 ResourceHandle.cpp
 // 的 WebCorePortBumpLoad 累加;在 WebCoreLoadUrl 开头清零,结束并入 g_lastDiag,真机定位"子资源不加载"。
@@ -357,12 +394,156 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     watchdog.stop();
 }
 
+// ============================ M2 GPU 合成 recipe ============================
+// 递归把整棵 GraphicsLayer 标脏(setNeedsDisplay)。同步 TextureMapper 路径下,内容 tile 仅在 m_needsDisplay/
+// m_needsDisplayRect 非空时才被 updateBackingStoreIfNeeded 重绘;而页面布局产生的脏区在 pumpLoop 的若干次
+// rendering-update 中已被消费,轮到我们手动合成时内容层已"干净"→ tile 空 → 内容根本没画进 readback(真机实测
+// contentPx≈0、整屏只剩 clearColor 背景)。合成前强制全树标脏,确保每帧内容都重绘上传。drawsContent=false 的层
+// setNeedsDisplay 内部直接返回,无害。
+static void forceDirtyTree(WebCore::GraphicsLayer& l)
+{
+    l.setNeedsDisplay();
+    for (const auto& c : l.children())
+        forceDirtyTree(c.get());
+    if (auto* r = l.replicaLayer())
+        forceDirtyTree(*r);
+    if (auto* m = l.maskLayer())
+        m->setNeedsDisplay();
+}
+
+// 把已提交的图层变更刷进 TextureMapperLayer 树、上传脏 tile、推进动画。调用前 g_glContext 已 current。
+// 仿 WCScene::update 的顺序(同步 GraphicsLayerTextureMapper 路径)。
+static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerTextureMapper& glRoot)
+{
+    using namespace WebCore;
+    // flushCompositingStateForThisFrame 在 needsLayout() 时直接返回不 flush → 先确保布局就绪。
+    view.updateLayoutAndStyleIfNeededRecursive();
+    // 文档/base 背景:合成路径下不会自动进图层(无 embedder 给根层设背景色)→ 离屏 FBO 透出底白,
+    // 任何页面背景都丢。显式把文档背景色设到根层(TextureMapperLayer::paintSelf 会以纯色渲染有效
+    // backgroundColor)。只解决纯色/base 背景;body 背景图仍靠各自元素图层的 backing(若仍缺另议)。
+    {
+        Color docBg = view.documentBackgroundColor();
+        glRoot.setBackgroundColor(docBg.isValid() ? docBg : Color::white);
+    }
+    view.flushCompositingStateIncludingSubframes();        // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
+    // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
+    // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
+    // 当时状态重置滚动层位置,放在 flush 前会被它覆盖 → 画面不滚。这里在 flush 后、paint 前显式定位一次,
+    // 让 -scrollPosition 成为合成前对 scrolled-contents 层的最后一次定位。无滚动层时为 no-op。
+    if (auto* renderView = view.renderView())
+        renderView->compositor().frameViewDidScroll();
+    // 滚动帧跳过强制全树重绘:滚动不改内容,tile 早已画好,只需移动滚动层重新合成 → 避免每帧重画所有 tile
+    //   (长页尤其卡)。加载/点击/输入/动画帧仍全量重绘保正确。g_gpuScrollFast 由 WebCoreScrollBy 置位、此处消费。
+    if (!g_gpuScrollFast)
+        forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
+    g_gpuScrollFast = false;
+    glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
+    glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻
+}
+
+// 离屏合成 + 读回:把图层树合成进 w*h 的 BitmapTexture(FBO),glReadPixels 出 RGBA 到 outRGBA。
+// 顺带统计非白像素 + 帧哈希(与 cairo 路径一致,供实时循环/诊断)。返回 kOK / 负错误码。
+static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
+                                WebCore::GraphicsLayer& root, uint8_t* outRGBA, int& nonWhiteOut)
+{
+    using namespace WebCore;
+    if (!g_glContext || !g_textureMapper)
+        return kErrNoView;
+    g_glContext->makeContextCurrent();
+    auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
+    gpuPrepare(view, glRoot);
+
+    Ref<BitmapTexture> texture = BitmapTexture::create(IntSize(w, h),
+        { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
+    Color docBg = view.documentBackgroundColor();
+    if (!docBg.isValid())
+        docBg = Color::white;
+    g_textureMapper->beginPainting(TextureMapper::FlipY::No, texture.ptr());   // 绑 texture 的 FBO + 设视口
+    // 文档 base 背景:根层 0×0、合成路径不把"传播到视口的 body/html 背景色"画进任何图层 → FBO 透出
+    // 透明黑(bindAsSurface 清的)→ readback 后呈白。这里在 paint 前用文档背景色清整张 FBO(此刻 scissor
+    // 已是全表面)。documentBackgroundColor 已混合 base+html+body 纯色;背景图无法纳入(见 LocalFrameView
+    // 注释),故纯色页背景就此修复,背景图仍待其元素图层自身绘制。
+    g_textureMapper->clearColor(docBg);
+    glRoot.layer().paint(*g_textureMapper);
+    // texture 的 FBO 此刻仍绑定 → 直接读回(endPainting 会还原帧缓冲绑定,故必须读在前)。
+    std::vector<uint8_t> tmp(static_cast<size_t>(w) * h * 4);
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
+    g_textureMapper->endPainting();
+
+    // 取像素 + 方向校正(g_gpuFlipH/V)+ 非白统计 + 内容像素统计(与背景色不同,诊断内容是否合成进来)+ 帧哈希。
+    auto [bgrf, bggf, bgbf, bgaf] = docBg.toColorTypeLossy<SRGBA<float>>().resolved();
+    const int bgR = (int)(bgrf * 255 + 0.5f), bgG = (int)(bggf * 255 + 0.5f), bgB = (int)(bgbf * 255 + 0.5f);
+    int nonWhite = 0, contentPx = 0;
+    uint32_t hash = 2166136261u;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* srow = tmp.data() + static_cast<size_t>(g_gpuFlipV ? (h - 1 - y) : y) * w * 4;
+        uint8_t* drow = outRGBA + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* s = srow + static_cast<size_t>(g_gpuFlipH ? (w - 1 - x) : x) * 4;
+            const uint8_t r = s[0], g = s[1], b = s[2], a = s[3];
+            drow[x * 4 + 0] = r; drow[x * 4 + 1] = g; drow[x * 4 + 2] = b; drow[x * 4 + 3] = a;
+            if (r != 255 || g != 255 || b != 255)
+                ++nonWhite;
+            if (std::abs((int)r - bgR) + std::abs((int)g - bgG) + std::abs((int)b - bgB) > 24)
+                ++contentPx;
+            if (((x | y) & 3) == 0) {
+                hash = (hash ^ r) * 16777619u;
+                hash = (hash ^ g) * 16777619u;
+                hash = (hash ^ b) * 16777619u;
+            }
+        }
+    }
+    nonWhiteOut = nonWhite;
+    g_lastContentPx = contentPx;
+    g_lastFrameHash = hash;
+    return kOK;
+}
+
+// 直呈现:把图层树合成进默认帧缓冲(GpuInit 绑的窗口表面)并 eglSwapBuffers。返回 kOK / 负错误码。
+static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::GraphicsLayer& root)
+{
+    using namespace WebCore;
+    if (!g_glContext || !g_textureMapper)
+        return kErrNoView;
+    g_glContext->makeContextCurrent();
+    auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
+    gpuPrepare(view, glRoot);
+    glViewport(0, 0, w, h);
+    g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);   // nullptr → 默认帧缓冲
+    {
+        Color docBg = view.documentBackgroundColor();
+        g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);   // 文档 base 背景(同 readback,见上)
+    }
+    glRoot.layer().paint(*g_textureMapper);
+    g_textureMapper->endPainting();
+    g_glContext->swapBuffers();
+    return kOK;
+}
+
 // view->paint → Cairo ARGB32 → 调用方 RGBA8888 缓冲(B<->R 交换 + 去预乘)。统计非白像素数。
 // 同时供一次性 WebCoreLoadUrl 与会话各入口复用(单一绘制实现)。
 static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* outRGBA, int& nonWhiteOut)
 {
     using namespace WebCore;
     nonWhiteOut = 0;
+
+    // M2:GPU 已起且本次绘制的正是当前会话的 view(其图层树已建)→ 经 TextureMapper 合成 + 离屏 readback
+    //   出像素,替代下面的 cairo 软件绘制。任一前提不满足(主页/一次性渲染无 session/无图层树)或合成失败
+    //   → 落回 cairo(软件兜底,零回归)。view 匹配检查防止用旧会话图层树画无关 view。
+    if (g_gpuActive && g_textureMapper && g_session && g_session->chrome
+        && g_session->mainFrame && g_session->mainFrame->view() == &view) {
+        if (WebCore::GraphicsLayer* root = g_session->chrome->rootLayer()) {
+            // 直呈现模式(GpuInit 收到窗口表面):合成直接 swapBuffers 到可见 SwapChainPanel,省掉 readback+blit
+            //   两次 3MB 拷贝(冲 60fps)。outRGBA 不填(调用方据 g_directPresent 跳过 BlitToBitmap)。
+            if (g_gpuPresentMode) {
+                if (gpuPresent(view, w, h, *root) == kOK)
+                    return kOK;
+            } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK)
+                return kOK;
+        }
+    }
+
     const IntSize size(w, h);
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
@@ -567,9 +748,12 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // HTTP(Cookie/Set-Cookie 头)路由 LoadingFrameLoaderClient::createNetworkingContext 提供,二者共用同一 jar。
     pageConfiguration.cookieJar = WebCore::CookieJar::create(WebCorePort::makeStorageSessionProvider());
 
-    // GPU 合成(M1):用真 ChromeClient(PortChromeClient)替换 EmptyChromeClient(其合成钩子 final{} 不能覆写),
-    // 它在 attachRootGraphicsLayer 捕获根 GraphicsLayer。配合下面 setAcceleratedCompositingEnabled(true) → 建图层树。
-    {
+    // GPU 合成:仅当 GPU(GL 上下文 + TextureMapper)已初始化才用真 ChromeClient(PortChromeClient,
+    // 它在 attachRootGraphicsLayer 捕获根 GraphicsLayer)+ 下面开合成。GPU 未起时保持
+    // pageConfigurationWithEmptyClients 设的 EmptyChromeClient + 关合成 = 纯软件 cairo 路径(零回归)。
+    // ⚠ 0.1.7.1 真机闪退教训:无条件开合成但 M1 还没 GL/TextureMapper 后端,网络页一加载就在
+    //   合成更新/PlatformDisplay 路径 fail-fast(before-load 后进程消失、无 after-load、连 dump/WER 都没有)。
+    if (g_gpuActive) {
         auto chrome = WTF::makeUniqueRefWithoutRefCountedCheck<WebCorePort::PortChromeClient>();
         g_session->chrome = chrome.ptr();             // Page 持有 UniqueRef,裸指针随 Page 存活
         pageConfiguration.chromeClient = WTF::move(chrome);
@@ -606,8 +790,8 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     page->settings().setScriptEnabled(true);
     page->settings().setLoadsImagesAutomatically(true);
-    page->settings().setAcceleratedCompositingEnabled(true);   // M1:开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层)。M2 起经 TextureMapper GPU 呈现
-    page->settings().setForceCompositingMode(true);            // 简单页也建图层树(否则 usesCompositing 可能为假)
+    page->settings().setAcceleratedCompositingEnabled(g_gpuActive);   // 仅 GPU 就绪才开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层),经 TextureMapper GPU 呈现
+    page->settings().setForceCompositingMode(g_gpuActive);            // 同上;GPU 未起时关闭 → 纯软件 cairo,零回归
     page->settings().setShouldAllowUserInstalledFonts(false);
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
@@ -1355,36 +1539,102 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     if (ty > maxP.y()) ty = maxP.y();
     view->setScrollPosition(ScrollPosition(tx, ty));
 
-    g_session->page->isolatedUpdateRendering();   // 立即触发一次 runScrollSteps/IntersectionObserver
-    // 无导航语义:空闲(懒加载图片都到位)即停,最多 8s。每 tick 继续驱动多轮 IO/懒加载。
-    pumpLoop(*lf, /*mainDone*/ nullptr, /*allowEarlyStopWithoutNav*/ true,
-             /*settleCapTicks*/ 0, /*watchdog*/ 8.0, /*pageForRendering*/ g_session->page.get());
+    // ★ M3 快滚:不再每帧跑 pumpLoop(8s 看门狗的多轮 rendering-update)+ 重取帧 + resize + 二次 layout
+    //   —— 那是"很卡"的元凶。这里只一次 isolatedUpdateRendering(驱动 scroll steps/IntersectionObserver 注册,
+    //   轻量)+ 刷新链接表 + 合成。懒加载图片/动画交给滚动停止后的 StartLiveMode(WebCoreLiveTick 逐帧补)。
+    //   纯滚动不跑 JS 不会导航,故不重取帧(导航只发生在 click/输入/load)。
+    g_session->page->isolatedUpdateRendering();
+    // ★ 提速:滚动期间不再每帧 extractLinks(其对每个锚点调 boundingClientRect,长页/链接多时是每帧大头)
+    //   也不写诊断串。点击走引擎真实命中测试(权威,不依赖链接表);链接表由滚动停止后 WebCoreSyncLinks 一次性刷新。
+    int nonWhite = 0;
+    g_gpuScrollFast = true;   // 滚动快路径:本次合成跳过 forceDirtyTree(内容未变,只移动滚动层)→ 去卡顿
+    int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    if (prc != kOK)
+        return prc;
+    return kOK;
+}
 
-    // 滚动处理器 / 懒加载 JS 可能触发导航并重建/替换主帧,重新校验 + 重取(否则 lf->view() 解引用已脱离的帧)。
-    lf = g_session->page->localMainFrame();
-    if (!lf) {
-        teardownSession();
-        return kErrFrameGone;
-    }
-    g_session->mainFrame = lf;
-    view = lf->view();
+// 滚动停止后刷新链接命中表(滚动期间为提速跳过了 extractLinks)。轻量:仅布局 + 提取,不绘制、不派发事件。
+// 点击路径用引擎实时命中测试(权威),链接表只作兜底/主页用,故滚动中暂时陈旧无碍,停手时这里补齐。
+int WebCoreSyncLinks()
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
     if (!view)
         return kErrNoView;
-    view->setTransparent(false);
-    view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(g_session->w, g_session->h));
-    doc = lf->document();
+    RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
     doc->updateLayoutIgnorePendingStylesheets();
     extractLinks(doc.get(), g_session->h);
+    return kOK;
+}
+
+// M4 捏合缩放:把页面缩放因子设为 scale(钳到 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 为锚 —— 缩放后让焦点
+//   下的内容点仍停在焦点处(据此算新滚动原点)。setPageScaleFactor 触发按新尺度重栅格(TextureMapper backing 的
+//   contentsScale = pageScaleFactor*deviceScale → 文字清晰)。重绘到 outRGBA。引擎线程串行调。返回 0。
+//   注:焦点/滚动坐标空间在本无头配置下可能略有偏差,真机微调;核心(缩放生效+按新尺度重栅格)是主目标。
+int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!outRGBA)
+        return kErrBadArgs;
+    if (!g_session || !g_session->page || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();
+
+    if (scale < 0.5f) scale = 0.5f;
+    if (scale > 6.0f) scale = 6.0f;
+
+    float oldScale = g_session->page->pageScaleFactor();
+    if (oldScale <= 0.0f) oldScale = 1.0f;
+    ScrollPosition scroll = view->scrollPosition();
+    // 焦点下的内容点(未缩放 CSS 像素)= (scroll + focal)/oldScale;新滚动 = 内容点*newScale - focal(焦点锚定)。
+    double cx = (static_cast<double>(scroll.x()) + focalX) / oldScale;
+    double cy = (static_cast<double>(scroll.y()) + focalY) / oldScale;
+    int nsx = static_cast<int>(cx * scale - focalX + 0.5);
+    int nsy = static_cast<int>(cy * scale - focalY + 0.5);
+    if (nsx < 0) nsx = 0;
+    if (nsy < 0) nsy = 0;
+
+    g_session->page->setPageScaleFactor(scale, IntPoint(nsx, nsy));
+    g_session->page->isolatedUpdateRendering();
+    doc->updateLayoutIgnorePendingStylesheets();
 
     int nonWhite = 0;
+    // 不置 g_gpuScrollFast:缩放改变尺度,需全树重绘按新 contentsScale 重栅格(否则文字模糊)。
     int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
     if (prc != kOK)
         return prc;
     writeDiag(*doc, *view, g_session->w, g_session->h, nonWhite);
     return kOK;
+}
+
+// M4:取当前页面缩放因子 ×1000 的整数(1000=1.0x,2500=2.5x),供 harness 跟踪缩放状态。
+int WebCoreGetPageScale()
+{
+    if (!g_session || !g_session->page)
+        return 1000;
+    float s = g_session->page->pageScaleFactor();
+    if (s <= 0.0f) s = 1.0f;
+    return static_cast<int>(s * 1000.0f + 0.5f);
 }
 
 // 当前会话是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ harness 据此弹/收输入法。
@@ -1401,6 +1651,144 @@ int WebCoreEnableCompositing()
     if (!g_session || !g_session->chrome)
         return 0;
     return g_session->chrome->rootLayer() != nullptr ? 1 : 0;
+}
+
+// M2:初始化 GPU 合成呈现。引擎线程调一次。
+//   nativeWindow = ANGLE 原生窗口(SwapChainPanel 的 PropertySet 的 IInspectable*,harness 端构造)→ 直呈现窗口表面;
+//   nullptr → 离屏(surfaceless/pbuffer),仅 readback,用于先验证合成正确(本版默认走这条)。
+//   w/h = 呈现像素尺寸。成功后置 g_gpuActive=true(此后 buildSession 才开合成、建 GraphicsLayerTextureMapper 树)。
+// 返回 0 成功;-1 bad args;-20 建 GLContext 失败;-21 makeCurrent 失败;-22 建 TextureMapper 失败。
+int WebCoreGpuInit(void* nativeWindow, int w, int h)
+{
+    using namespace WebCore;
+    if (w <= 0 || h <= 0)
+        return kErrBadArgs;
+    if (g_gpuActive)
+        return kOK;   // 幂等
+    ensureWebCoreInitialized();
+    PlatformDisplay& display = PlatformDisplay::sharedDisplay();   // WIN → PlatformDisplayWin,起 ANGLE EGLDisplay
+    std::unique_ptr<GLContext> ctx = nativeWindow
+        ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
+        : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
+    if (!ctx)
+        return -20;
+    if (!ctx->makeContextCurrent())
+        return -21;
+    std::unique_ptr<TextureMapper> tm = TextureMapper::create();   // 需 GLContext::current() 非空(刚 makeCurrent 满足)
+    if (!tm)
+        return -22;
+    g_glContext = ctx.release();        // 故意泄漏=随进程存活(避免退出时在错误线程 eglDestroyContext)
+    g_textureMapper = tm.release();
+    g_gpuW = w;
+    g_gpuH = h;
+    g_gpuPresentMode = (nativeWindow != nullptr);   // 有窗口表面 → 直呈现;否则离屏 readback
+    g_gpuActive = true;
+    return kOK;
+}
+
+// M2:把当前会话图层树直呈现到 GpuInit 绑定的窗口表面(eglSwapBuffers)。引擎线程调。
+//   仅在 WebCoreGpuInit(nativeWindow!=null) 后有意义(离屏模式无窗口表面,swapBuffers 为 no-op)。返回 0 成功。
+int WebCoreComposite()
+{
+    using namespace WebCore;
+    if (!g_gpuActive || !g_session || !g_session->page || !g_session->chrome)
+        return kErrNoSession;
+    RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
+    RefPtr<LocalFrameView> view = lf ? lf->view() : nullptr;
+    GraphicsLayer* root = g_session->chrome->rootLayer();
+    if (!view || !root)
+        return kErrNoView;
+    return gpuPresent(*view, g_gpuW, g_gpuH, *root);
+}
+
+// M2(离屏验证):把当前会话图层树经 TextureMapper 合成到离屏纹理,readback 出 RGBA 到 outRGBA(>= w*h*4)。
+//   用现有 WriteableBitmap 通道显示,先证合成像素正确。返回 0 成功。
+//   注:本版会话各绘制点已在 paintToRGBA 顶部自动走此路(GPU 起后),此导出供需要显式呈现时用。
+int WebCoreCompositeReadback(uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_gpuActive || !g_session || !g_session->page || !g_session->chrome)
+        return kErrNoSession;
+    if (!outRGBA)
+        return kErrBadArgs;
+    RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
+    RefPtr<LocalFrameView> view = lf ? lf->view() : nullptr;
+    GraphicsLayer* root = g_session->chrome->rootLayer();
+    if (!view || !root)
+        return kErrNoView;
+    int nonWhite = 0;
+    return gpuCompositeReadback(*view, g_gpuW, g_gpuH, *root, outRGBA, nonWhite);
+}
+
+// M2 调试:运行时设离屏 readback 的翻转(找正确朝向用)。flipH/flipV 非0=反转列/行。
+void WebCoreGpuSetFlip(int flipH, int flipV)
+{
+    g_gpuFlipH = (flipH != 0);
+    g_gpuFlipV = (flipV != 0);
+}
+
+// M2 调试:把当前会话的 FrameView 滚动/内容尺寸 + 合成图层树文本写入 out(供定位背景丢失/滚动失效)。
+// 首行=关键标量(scrollPos/contents/view/docBg有效/usesCompositing),其后是 GraphicsLayer::layerTreeAsText()。
+int WebCoreGpuLayerInfo(char* out, int len)
+{
+    using namespace WebCore;
+    if (!out || len <= 0)
+        return kErrBadArgs;
+    out[0] = 0;
+    if (!g_session || !g_session->page || !g_session->chrome)
+        return kErrNoSession;
+    std::string s;
+    RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
+    RefPtr<LocalFrameView> view = lf ? lf->view() : nullptr;
+    IntPoint origScroll;
+    bool didProbe = false;
+    if (view) {
+        IntPoint sp = view->scrollPosition();
+        origScroll = sp;
+        IntPoint minP = view->minimumScrollPosition();
+        IntPoint maxP = view->maximumScrollPosition();
+        IntSize cs = view->contentsSize();
+        Color bg = view->documentBackgroundColor();
+        auto [r, g, b, a] = (bg.isValid() ? bg : Color::white).toColorTypeLossy<SRGBA<float>>().resolved();
+        bool usesComp = view->renderView() && view->renderView()->usesCompositing();
+        char h[512];
+        snprintf(h, sizeof h,
+                 "docBg=#%02X%02X%02X%02X valid=%d lastContentPx=%d\n"
+                 "scrollPos=%d,%d min=%d,%d max=%d,%d contents=%dx%d view=%dx%d usesCompositing=%d\n",
+                 (int)(r * 255 + 0.5f), (int)(g * 255 + 0.5f), (int)(b * 255 + 0.5f), (int)(a * 255 + 0.5f),
+                 bg.isValid() ? 1 : 0, g_lastContentPx,
+                 sp.x(), sp.y(), minP.x(), minP.y(), maxP.x(), maxP.y(),
+                 cs.width(), cs.height(), g_session->w, g_session->h, usesComp ? 1 : 0);
+        s += h;
+        // 探针滚动:setScrollPosition(0,300)+frameViewDidScroll,看 ① 滚动量是否被钳到 0(maxScroll=0?)
+        // ② scrolled-contents 层是否真移到 (0,-300)。其后的 layerTreeAsText 即反映探针后的层位置。最后复位。
+        view->setScrollPosition(ScrollPosition(0, 300));
+        if (auto* rv = view->renderView())
+            rv->compositor().frameViewDidScroll();
+        IntPoint sp2 = view->scrollPosition();
+        char h2[160];
+        snprintf(h2, sizeof h2, "-- after setScrollPosition(0,300)+frameViewDidScroll: scrollPos=%d,%d (层树为此刻状态) --\n",
+                 sp2.x(), sp2.y());
+        s += h2;
+        didProbe = true;
+    }
+    if (GraphicsLayer* root = g_session->chrome->rootLayer()) {
+        String tree = root->layerTreeAsText(AllLayerTreeAsTextOptions);   // 全调试标志:paintsIntoWindow/tileCache/drawsContent/backingStoreAttached
+        CString u = tree.utf8();
+        s.append(u.data(), u.length());
+    } else {
+        s += "(no root GraphicsLayer)\n";
+    }
+    if (didProbe && view) {   // 复位滚动,别让调试 tap 把页面留在 300
+        view->setScrollPosition(origScroll);
+        if (auto* rv = view->renderView())
+            rv->compositor().frameViewDidScroll();
+    }
+    int n = static_cast<int>(s.size());
+    if (n > len - 1) n = len - 1;
+    memcpy(out, s.data(), static_cast<size_t>(n));
+    out[n] = 0;
+    return kOK;
 }
 
 int WebCoreFocusedEditable()
