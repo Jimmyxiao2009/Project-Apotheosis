@@ -51,6 +51,8 @@ namespace Harness {
         void OnLoadWatchdog(Platform::Object^ sender, Platform::Object^ e);
         // 网页点击:有会话则把点击转发到引擎(按钮/表单/链接统一走真实事件);无会话(主页)走链接表。
         void OnPageTapped(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        // 把内容区显示坐标(DIP)映回引擎像素空间(直呈现下表面被拉伸+设备分辨率缩放),修点击/焦点偏移。
+        void MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy);
         // 把位图像素 (px,py) 的点击转发到引擎活会话(WebCoreClickAt),完成后同步地址栏/历史/链接表。
         void ForwardClickToEngine(int px, int py);
         // 引擎滚动 dy 像素(触发懒加载图片)后重绘。dy>0 向下。

@@ -129,7 +129,7 @@ public:
     WebCore::IntPoint accessibilityScreenToRootView(const WebCore::IntPoint& p) const final { return p; }
     WebCore::IntRect rootViewToAccessibilityScreen(const WebCore::IntRect& r) const final { return r; }
 
-    void didFinishLoadingImageForElement(WebCore::HTMLImageElement&) final { }
+    void didFinishLoadingImageForElement(WebCore::HTMLImageElement&) final { m_needsPresent = true; }
 
     PlatformPageClient platformPageClient() const final { return 0; }
     void contentsSizeChanged(WebCore::LocalFrame&, const WebCore::IntSize&) const final { }

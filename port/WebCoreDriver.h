@@ -44,6 +44,7 @@ void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
+int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal
 int WebCoreGetPageScale();             // M4: current pageScaleFactor ×1000
 int WebCoreSessionPaint(uint8_t* outRGBA);
@@ -60,6 +61,7 @@ void WebCoreGpuSetFlip(int flipH, int flipV);         // M2 debug: set readback 
 int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scroll/contents + layerTreeAsText dump
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
+int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document
 unsigned WebCoreGetFrameHash();                       // pixel hash of the last frame (idle detection)
 
 #ifdef __cplusplus

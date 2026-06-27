@@ -128,6 +128,10 @@
 #include <WebCore/HandleUserInputEventResult.h> // EventHandler 鼠标方法返回类型(否则不完整类型报错)
 #include <WebCore/FocusController.h>         // page->focusController().setActive/setFocused(headless 处理 JS 事件必需)
 #include <WebCore/Editor.h>                  // editor().canEdit()/insertText()/command(输入法文本插入)
+#include <WebCore/HTMLInputElement.h>        // 聚焦 input 置选区(setSelectionRange)→ 让 canEdit 成立
+#include <WebCore/HTMLTextAreaElement.h>     // 同上,textarea
+#include <WebCore/HTMLElement.h>             // isContentEditable()(contenteditable 检测)
+#include <WebCore/Document.h>                // elementFromPoint / focusedElement(命中点显式聚焦可编辑元素)
 #include <WebCore/PlatformKeyboardEvent.h>   // Enter/退格 真键盘事件
 #include <WebCore/ScriptController.h>        // frame->script().canExecuteScripts / executeScript(诊断 SPA)
 #include <WebCore/DOMWrapperWorld.h>         // mainThreadNormalWorldSingleton()(WebCoreEvalJS)
@@ -222,6 +226,7 @@ static char g_lastDiag[4096] = "";   // 渲染诊断(URL/标题/内容尺寸/非
 static char g_lastTitle[512] = "";   // 最近加载页面的标题(供历史/书签用)
 static char g_lastUrl[1024] = "";    // 最近渲染文档的最终 URL(会话点击/导航后检测 URL 变化用)
 static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判断画面是否变化 → 静止页自动停帧省电)
+static int g_lastPendingResources = 0; // 最近文档仍在加载/未知状态的缓存资源数(防实时循环过早停)
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
@@ -261,6 +266,21 @@ extern "C" void WebCorePortBumpLoad(int kind)
 // UI 在点击时自行判断点中哪个矩形 → 导航。无需常驻 WebCore 会话、点击时不调引擎,安全。
 struct LinkRect { int x, y, w, h; std::string url; };
 static std::vector<LinkRect> g_links;
+static std::string g_imeDiag;   // 最近一次 WebCoreTypeText 的可编辑/聚焦/插入诊断(WebCoreEditDebug 读)
+
+static int countPendingResources(WebCore::Document& document)
+{
+    int pending = 0;
+    for (auto& kv : document.cachedResourceLoader().allCachedResources()) {
+        WebCore::CachedResource* res = kv.value.get();
+        if (!res)
+            continue;
+        auto status = res->status();
+        if (status == WebCore::CachedResource::Unknown || status == WebCore::CachedResource::Pending)
+            ++pending;
+    }
+    return pending;
+}
 
 static void extractLinks(WebCore::Document* document, int renderH)
 {
@@ -627,13 +647,15 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     if (RefPtr root = document.getElementById(AtomString { "root"_s }))
         rootKids = static_cast<int>(root->childElementCount());
     int bodyKids = document.body() ? static_cast<int>(document.body()->childElementCount()) : -1;
+    int pendingResources = countPendingResources(document);
+    g_lastPendingResources = pendingResources;
     std::snprintf(g_lastTitle, sizeof g_lastTitle, "%s", titleStr.data());
     std::snprintf(g_lastUrl, sizeof g_lastUrl, "%s", urlStr.data());
     int mainLen = std::snprintf(g_lastDiag, sizeof g_lastDiag,
-        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d loads=S%d/R%d/C%d/F%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d spa=[%.220s] lasterr=[%.150s]",
+        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d spa=[%.220s] lasterr=[%.150s]",
         urlStr.data(), titleStr.data(), cs.width(), cs.height(),
         document.body() ? 1 : 0, nonWhite, w * h,
-        g_loadStarted, g_loadResponse, g_loadComplete, g_loadFail,
+        g_loadStarted, g_loadResponse, g_loadComplete, g_loadFail, pendingResources,
         jsEnabled, canExec, scriptCount, rootKids, bodyKids, g_spaProbe, g_lastNetError);
     // 已请求资源清单(诊断 SPA 模块图):每项 文件名(s状态)。status: 0未知 1加载中 2成功 3加载失败 4解码失败。
     // 若 pigai.shop 的 5 个 chunk(react-core/semi-ui/...)根本不在表里 = import 没去拉(模块图没解析);
@@ -1407,6 +1429,7 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
     teardownSession();
     g_lastNetError[0] = '\0';
     g_spaProbe[0] = '\0';
+    g_lastPendingResources = 0;
     g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
     g_session.emplace();
     g_session->w = w;
@@ -1473,6 +1496,23 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     lf->eventHandler().handleMousePressEvent(down);    // 安装 UserGestureIndicator
     PlatformMouseEvent up(p, p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0.0, SyntheticClickType::NoTap);
     lf->eventHandler().handleMouseReleaseEvent(up);    // 派发 DOM 'click' + 默认动作(导航/提交)
+
+    // ★ 显式聚焦命中点的可编辑元素:headless 下合成点击对"设置焦点"的副作用不稳定(时灵时不灵 → 键盘
+    //   时弹时不弹)。这里命中测试点击点,若落在 text input / textarea / contenteditable 上就直接 focus(),
+    //   让 WebCoreFocusedEditable 稳定返回 1(弹键盘)、后续 WebCoreTypeText 有确定的插入目标。
+    if (RefPtr<Document> hdoc = lf->document()) {
+        if (RefPtr<Element> hit = hdoc->elementFromPoint(static_cast<double>(x), static_cast<double>(y))) {
+            RefPtr<Element> target;
+            for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+                if ((is<HTMLInputElement>(*e) && downcast<HTMLInputElement>(*e).isTextField())
+                    || is<HTMLTextAreaElement>(*e)) { target = e; break; }
+            }
+            if (!target && is<HTMLElement>(*hit) && downcast<HTMLElement>(*hit).isContentEditable())
+                target = hit;
+            if (target)
+                target->focus();
+        }
+    }
 
     // 同步处理器(JS onclick 等)已返回;导航(若有)异步 → settle。无导航则空闲早停。
     pumpLoop(*lf, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ true,
@@ -1793,12 +1833,26 @@ int WebCoreGpuLayerInfo(char* out, int len)
 
 int WebCoreFocusedEditable()
 {
+    using namespace WebCore;
     if (!g_session || !g_session->mainFrame || g_inPump)
         return 0;
-    return g_session->mainFrame->editor().canEdit() ? 1 : 0;
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    // 优先按聚焦元素类型判定(确定性):text input / textarea / contenteditable → 可编辑(弹键盘)。
+    //   canEdit() 在 headless 下时有假阴,故只作兜底。
+    if (RefPtr<Document> doc = lf->document()) {
+        if (RefPtr<Element> fe = doc->focusedElement()) {
+            if (is<HTMLInputElement>(*fe))
+                return downcast<HTMLInputElement>(*fe).isTextField() ? 1 : 0;
+            if (is<HTMLTextAreaElement>(*fe))
+                return 1;
+            if (is<HTMLElement>(*fe) && downcast<HTMLElement>(*fe).isContentEditable())
+                return 1;
+        }
+    }
+    return lf->editor().canEdit() ? 1 : 0;
 }
 
-// 向聚焦的可编辑元素插入文本(派发 beforeinput/input,SPA 框架可感知),pump 让 JS 反应,重绘。返回 0 成功。
+// 向聚焦的可编辑元素插入文本,pump 让 JS 反应,重绘。返回 0 成功。
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA)
 {
     using namespace WebCore;
@@ -1811,21 +1865,74 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA)
     g_inPump = true;
     PumpGuard guard;
     RefPtr<LocalFrame> lf = g_session->mainFrame;
-    // ★ 文字改走和 Enter 同款的合成键事件路径(eventHandler().keyEvent),而非 editor().insertText:
-    //   headless 下 editor().canEdit() 可能假阴(文档没被标 focused 等)→ insertText 直接被早退/静默丢弃,
-    //   用户实测"只有 Enter 进得去"——因为 Enter(WebCoreKeyAction)走的就是 keyEvent、不查 canEdit。
-    //   Char 事件的 text 由默认 keypress 动作插入聚焦可编辑元素(IME 整串 commit 一次性插入)。
+    RefPtr<Document> doc = lf->document();
     String text = String::fromUTF8(utf8);
-    OptionSet<PlatformEvent::Modifier> mods;
-    MonotonicTime t = MonotonicTime::now();
-    PlatformKeyboardEvent raw(PlatformEvent::Type::RawKeyDown, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
-    lf->eventHandler().keyEvent(raw);
-    PlatformKeyboardEvent ch(PlatformEvent::Type::Char, text, text, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
-    lf->eventHandler().keyEvent(ch);
-    PlatformKeyboardEvent up(PlatformEvent::Type::KeyUp, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, MonotonicTime::now());
-    lf->eventHandler().keyEvent(up);
+
+    // ★ "打字不进框"根因:headless 下合成点击给了元素 DOM focus,但常没在其内建立选区/插入点 →
+    //   editor().canEdit() 假阴 → 无论 insertText 还是 Char 默认动作都静默丢字(rc 仍 0,故诊断看不出)。
+    //   修复:把聚焦的 input/textarea 选区移到末尾(setSelectionRange)→ canEdit 成立 → 直接插入。
+    //   无可识别可编辑元素时退回合成键事件路径(原行为)。
+    int canEditBefore = lf->editor().canEdit() ? 1 : 0;
+    const char* feTag = "none";
+    if (doc) {
+        if (RefPtr<Element> fe = doc->focusedElement()) {
+            if (is<HTMLInputElement>(*fe)) {
+                feTag = "input";
+                auto& input = downcast<HTMLInputElement>(*fe);
+                input.focus();
+                input.setSelectionRange(0x3FFFFFFF, 0x3FFFFFFF);   // 钳到末尾,置入插入点
+            } else if (is<HTMLTextAreaElement>(*fe)) {
+                feTag = "textarea";
+                auto& ta = downcast<HTMLTextAreaElement>(*fe);
+                ta.focus();
+                ta.setSelectionRange(0x3FFFFFFF, 0x3FFFFFFF);
+            } else {
+                feTag = "other";   // contenteditable / 自定义编辑器:靠 keyEvent 兜底
+            }
+        }
+    }
+    int canEditAfter = lf->editor().canEdit() ? 1 : 0;
+    int inserted = 0;
+    if (canEditAfter) {
+        // ★ 不走 editor().insertText(它经 handleTextInputEvent 派发 textInput 事件,headless 下事件目标
+        //   解析不到 → 不插入,实测 val 仍空)。直接走 insertTextWithoutSendingTextEvent → TypingCommand 直插 DOM。
+        lf->editor().insertTextWithoutSendingTextEvent(text, false, nullptr);
+        inserted = 1;
+    } else {
+        // 兜底:合成键事件(Char 默认动作)。contenteditable 等非 form 控件走这里。
+        OptionSet<PlatformEvent::Modifier> mods;
+        MonotonicTime t = MonotonicTime::now();
+        PlatformKeyboardEvent raw(PlatformEvent::Type::RawKeyDown, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+        lf->eventHandler().keyEvent(raw);
+        PlatformKeyboardEvent ch(PlatformEvent::Type::Char, text, text, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+        lf->eventHandler().keyEvent(ch);
+        PlatformKeyboardEvent up(PlatformEvent::Type::KeyUp, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, MonotonicTime::now());
+        lf->eventHandler().keyEvent(up);
+    }
+    // 诊断:回读聚焦元素的 value 长度,确认文本是否真进了 DOM,但不把用户输入内容写入 LocalState 日志。
+    unsigned feValLen = 0;
+    if (doc) {
+        if (RefPtr<Element> fe2 = doc->focusedElement()) {
+            if (is<HTMLInputElement>(*fe2))
+                feValLen = downcast<HTMLInputElement>(*fe2).value()->length();
+            else if (is<HTMLTextAreaElement>(*fe2))
+                feValLen = downcast<HTMLTextAreaElement>(*fe2).value()->length();
+        }
+    }
+    g_imeDiag = std::string("canEditBefore=") + std::to_string(canEditBefore)
+              + " fe=" + feTag + " canEditAfter=" + std::to_string(canEditAfter)
+              + " inserted=" + std::to_string(inserted) + " valueLen=" + std::to_string(feValLen);
     pumpLoop(*lf, nullptr, true, 0, 4.0, g_session->page.get());
     return finishInteractionPaint(outRGBA);
+}
+
+// 诊断:最近一次 WebCoreTypeText 的可编辑/聚焦/插入状态(排查"打字不进框")。
+int WebCoreEditDebug(char* out, int cap)
+{
+    if (!out || cap <= 0)
+        return kErrBadArgs;
+    std::snprintf(out, static_cast<size_t>(cap), "%s", g_imeDiag.c_str());
+    return kOK;
 }
 
 // 特殊键:0=退格(DeleteBackward),1=回车(派发真键盘事件:单行 input 触发表单提交、textarea 换行,可能导航)。
@@ -1912,6 +2019,10 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
 
+    // 网络 / 图片解码完成回调经 RunLoop 任务投递。仅 isolatedUpdateRendering 不会取这些任务,
+    // 所以空白占位图会一直等到下一次点击/滚动的 pumpLoop 才刷新。实时 tick 先轻量转几轮队列。
+    for (int i = 0; i < 3; ++i)
+        RunLoop::cycle();
     g_session->page->isolatedUpdateRendering();   // 推进一帧动画/rAF/IO(可能跑 JS,甚至导航/换帧)
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     if (!lf)
@@ -1923,9 +2034,16 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
+    doc->eventLoop().performMicrotaskCheckpoint();
     doc->updateLayoutIgnorePendingStylesheets();
+    g_lastPendingResources = countPendingResources(*doc);
     int nonWhite = 0;
     return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+}
+
+int WebCoreGetPendingResourceCount()
+{
+    return g_lastPendingResources;
 }
 
 // 取最近一帧的像素哈希。实时模式下 harness 比较连续帧哈希:不变即画面静止 → 停帧省电(下次交互/滚动/导航再启)。

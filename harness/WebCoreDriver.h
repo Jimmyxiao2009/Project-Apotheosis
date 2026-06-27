@@ -65,6 +65,8 @@ int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();
+// 诊断:最近一次 WebCoreTypeText 的可编辑/聚焦/插入状态(排查"打字不进框")。
+int WebCoreEditDebug(char* out, int cap);
 
 // M4 捏合缩放:把页面缩放因子设为 scale(钳 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 锚定,重栅格(文字清晰)后重绘到 outBuf。返回 0。
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outBuf);
@@ -105,6 +107,8 @@ int WebCoreEvalJS(const char* script, char* out, int len);
 
 // 实时一帧:推进动画/rAF/SPA 一帧并重绘到 outBuf(供低帧率定时器驱动,让动画动起来、SPA 渐进挂载)。
 int WebCoreLiveTick(uint8_t* outBuf);
+// 当前文档仍处于 Pending/Unknown 的缓存资源数。用于图片/解码未完成时保持实时 tick。
+int WebCoreGetPendingResourceCount();
 // 最近一帧像素哈希:实时模式比较连续帧,画面静止则停帧省电。
 unsigned WebCoreGetFrameHash();
 

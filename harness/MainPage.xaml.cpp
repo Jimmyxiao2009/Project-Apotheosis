@@ -578,6 +578,26 @@ void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
 // 网页点击:RenderImage 局部坐标 = 位图像素(Stretch=None)= 视口像素。
 //  有会话(网络页):转发到引擎 WebCoreClickAt,经真实命中测试 + 默认动作(链接/表单/按钮 onclick/SPA)。
 //  无会话(主页/错误页):退回链接命中表导航。
+// 把内容区显示坐标(DIP)映回引擎像素空间(kW×kH)。直呈现模式下 GpuPanel 把 720×1080 表面拉伸填满内容区
+//   (并叠加设备分辨率缩放),故点击/焦点坐标需按 (kW/ActualWidth, kH/ActualHeight) 缩放回引擎像素;
+//   软件模式 RenderImage Stretch=None 为 1:1,直接取整。★ 这是"直呈现下点击固定/渐增偏移"的根因修复。
+void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
+{
+    if (dipX < 0.0 || dipY < 0.0) {
+        outPx = -1;
+        outPy = -1;
+        return;
+    }
+    double aw = ContentArea->ActualWidth, ah = ContentArea->ActualHeight;
+    if (m_gpuPresent && aw > 1.0 && ah > 1.0) {
+        outPx = static_cast<int>(dipX * static_cast<double>(kW) / aw + 0.5);
+        outPy = static_cast<int>(dipY * static_cast<double>(kH) / ah + 0.5);
+    } else {
+        outPx = static_cast<int>(dipX + 0.5);
+        outPy = static_cast<int>(dipY + 0.5);
+    }
+}
+
 void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
 {
     if (m_loading || m_interacting) return;
@@ -585,7 +605,7 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
     //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
     //   ContentArea 左上角 = 渲染视口原点,故二者在软件模式下等价,直呈现模式下正确。
     auto pt = e->GetPosition(ContentArea);
-    int px = static_cast<int>(pt.X), py = static_cast<int>(pt.Y);
+    int px, py; MapTapToEngine(pt.X, pt.Y, px, py);
     if (px < 0 || py < 0 || px >= kW || py >= kH) return;
 
     // 有会话:一律转发引擎真实点击。引擎命中测试是权威的——正确处理弹窗/遮罩层(z-order)、按钮、表单、
@@ -769,10 +789,12 @@ void MainPage::EngineScroll(int dy)
                     if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
                     s->SetLoading(false);
                     if (rcCopy == 0) {
-                        auto wb = ref new WriteableBitmap(kW, kH);
-                        BlitToBitmap(wb, *rgba, kW, kH);
-                        wb->Invalidate();
-                        s->RenderImage->Source = wb;
+                        if (!s->m_gpuPresent) {
+                            auto wb = ref new WriteableBitmap(kW, kH);
+                            BlitToBitmap(wb, *rgba, kW, kH);
+                            wb->Invalidate();
+                            s->RenderImage->Source = wb;
+                        }
                         s->m_pageLinks = *links;
                         s->m_lastFrameHash = 0;
                         s->StartLiveMode();   // 滚动后重启实时(新视口的懒加载/动画)
@@ -898,7 +920,9 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     float newScale = m_pageScale * live;
     if (newScale < 0.5f) newScale = 0.5f;
     if (newScale > 6.0f) newScale = 6.0f;
-    PinchCommit(newScale, (int)(m_focalX + 0.5), (int)(m_focalY + 0.5));
+    // 焦点同样从显示坐标(DIP,用于 ScaleTransform 中心)映回引擎像素空间再交引擎,避免缩放锚点偏。
+    int fpx, fpy; MapTapToEngine(m_focalX, m_focalY, fpx, fpy);
+    PinchCommit(newScale, fpx, fpy);
 }
 
 // 把缩放提交给引擎线程:WebCoreSetPageScale → 新清晰帧;回 UI 后更新已提交尺度 + 复位 RenderTransform + 显示。
@@ -958,7 +982,7 @@ void MainPage::CloseKeyboard()
 }
 void MainPage::OnImeTextChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^)
 {
-    // 诊断埋点:记录本回调是否触发 + 门控状态 + ImeBox 文本(写 LocalState\imedebug.txt,真机测后拉取)。
+    // 诊断埋点:记录本回调是否触发 + 门控状态 + ImeBox 文本长度(写 LocalState\imedebug.txt,真机测后拉取)。
     // 若打字后此文件为空 → OnImeTextChanged 没触发 → 隐藏 ImeBox 收不到 IME 文本(UI 层问题);
     // 若有记录但输入框没字 → 引擎层(看 SendKeyToEngine 写的 rc:kErrNoDocument=canEdit 丢焦点)。
     try {
@@ -966,7 +990,7 @@ void MainPage::OnImeTextChanged(Platform::Object^, Windows::UI::Xaml::Controls::
         if (!d.empty()) {
             std::ofstream f(WideToUtf8(d) + "\\imedebug.txt", std::ios::app | std::ios::binary);
             if (f) { std::string s = "TC open=" + std::to_string(m_imeOpen) + " sess=" + std::to_string(m_sessionActive)
-                + " sync=" + std::to_string(m_imeSyncing) + " text=[" + WideToUtf8(ImeBox->Text ? std::wstring(ImeBox->Text->Data()) : L"") + "]\n"; f.write(s.data(), s.size()); }
+                + " sync=" + std::to_string(m_imeSyncing) + " textLen=" + std::to_string(ImeBox->Text ? ImeBox->Text->Length() : 0) + "\n"; f.write(s.data(), s.size()); }
         }
     } catch (...) {}
     if (m_imeSyncing || !m_imeOpen || !m_sessionActive) return;
@@ -1011,7 +1035,8 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
             else rc = WebCoreKeyAction(0, rgba->data());
         } catch (...) { rc = -1000; }
         // 诊断:记引擎返回(rc=-6/kErrNoDocument → 打字时 canEdit 为 false=丢了可编辑焦点;rc=0 → 引擎接受了)。
-        try { std::wstring dd = LocalStateDir(); if (!dd.empty()) { std::ofstream f(WideToUtf8(dd) + "\\imedebug.txt", std::ios::app | std::ios::binary); if (f) { std::string s = "  SK kind=" + std::to_string(kind) + " rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } } } catch (...) {}
+        char edbg[256] = ""; try { WebCoreEditDebug(edbg, sizeof edbg); } catch (...) {}
+        try { std::wstring dd = LocalStateDir(); if (!dd.empty()) { std::ofstream f(WideToUtf8(dd) + "\\imedebug.txt", std::ios::app | std::ios::binary); if (f) { std::string s = "  SK kind=" + std::to_string(kind) + " rc=" + std::to_string(rc) + " [" + edbg + "]\n"; f.write(s.data(), s.size()); } } } catch (...) {}
         std::wstring navUrl, title;
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0 && kind == 1) {   // 回车可能导航 → 取新 url/title/链接
@@ -1030,8 +1055,9 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
                     s->ApplyEngineFrame(rgba, ref new String(titleW->c_str()), ref new String(navW->c_str()), links);   // 回车导航:同步地址栏/历史
                     s->CloseKeyboard();
                 } else {
-                    auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb;
+                    if (!s->m_gpuPresent) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
                     s->m_lastFrameHash = 0;
+                    s->StartLiveMode();   // 打字后重启实时循环 → 后续帧把输入内容再合成/呈现一次(防单帧合成漏掉新文字)
                 }
             }));
         } catch (...) {}
@@ -1071,18 +1097,19 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
     m_liveBusyAge = 0;
     m_liveBusy = true;
     unsigned long long mySeq = m_opSeq;    // 只读不自增:实时帧是被动的,绝不能作废正在进行的真操作
+    bool present = m_gpuPresent;
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
-    WebEngine::instance().post([disp, self, mySeq]() {
+    WebEngine::instance().post([disp, self, mySeq, present]() {
         MainPage^ s0 = self.Get();
         if (!s0 || !s0->m_appForeground) return;   // 已切后台:别在 PLM 冻结风险下跑 JS+绘制(m_liveBusy 由恢复时 StartLiveMode 清)
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
-        int rc = -999; unsigned hash = 0;
-        try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) hash = WebCoreGetFrameHash(); } catch (...) { rc = -1000; }
-        int rcCopy = rc; unsigned hashCopy = hash;
+        int rc = -999; unsigned hash = 0; int pending = 0;
+        try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
+        int rcCopy = rc; unsigned hashCopy = hash; int pendingCopy = pending;
         try {
             disp->RunAsync(CoreDispatcherPriority::Low,
-                ref new DispatchedHandler([self, rgba, rcCopy, hashCopy, mySeq]() {
+                ref new DispatchedHandler([self, rgba, rcCopy, hashCopy, pendingCopy, mySeq, present]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     s->m_liveBusy = false;
                     if (s->m_opSeq != mySeq) return;   // 期间发生了导航/滚动/点击/超时 → 丢弃这帧旧像素(防闪回旧页)
@@ -1096,15 +1123,28 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                         return;
                     }
                     if (hashCopy == s->m_lastFrameHash) {        // 画面没变:连续静止则停帧省电
-                        if (++s->m_liveStaticTicks >= 12) s->StopLiveMode();   // ~2.4s 静止 → 停
+                        if (pendingCopy > 0) {
+                            s->m_liveStaticTicks = 0;            // 仍有图片/子资源在途:继续 tick,等待完成回调和解码
+                            int ticks = ++s->m_liveTotalTicks;
+                            if (ticks == 150 && s->m_liveTimer) {
+                                Windows::Foundation::TimeSpan slow; slow.Duration = 10000000LL;   // 1s ≈ 1fps
+                                s->m_liveTimer->Interval = slow;
+                            }
+                            if (ticks >= 300)
+                                s->StopLiveMode();
+                            return;
+                        }
+                        if (++s->m_liveStaticTicks >= 40) s->StopLiveMode();   // ~8s 静止 → 停,给慢图片/解码留余量
                         return;
                     }
                     s->m_liveStaticTicks = 0;
                     s->m_lastFrameHash = hashCopy;
-                    auto wb = ref new WriteableBitmap(kW, kH);
-                    BlitToBitmap(wb, *rgba, kW, kH);
-                    wb->Invalidate();
-                    s->RenderImage->Source = wb;
+                    if (!present) {
+                        auto wb = ref new WriteableBitmap(kW, kH);
+                        BlitToBitmap(wb, *rgba, kW, kH);
+                        wb->Invalidate();
+                        s->RenderImage->Source = wb;
+                    }
                     // 永久动画防失控:连续动画超 ~150 帧(30s)无交互 → 降到 ~1fps(不硬停,免得动画卡死);
                     // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复 200ms。
                     if (++s->m_liveTotalTicks == 150 && s->m_liveTimer) {
