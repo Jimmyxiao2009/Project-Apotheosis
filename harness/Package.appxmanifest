@@ -7,7 +7,7 @@
 
   <Identity Name="EdgeHTMLReborn.Harness"
             Publisher="CN=EdgeHTMLReborn"
-            Version="0.1.7.29"
+            Version="0.1.8.3"
             ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity PhoneProductId="b3a9e5c2-1d4f-4a7b-9c8e-0f1a2b3c4d5e" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>

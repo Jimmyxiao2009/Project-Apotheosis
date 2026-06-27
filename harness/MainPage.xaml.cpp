@@ -19,7 +19,10 @@
 #include <deque>
 #include <functional>
 #include <algorithm>
+#include <cwctype>
 #include <cstdlib>
+#include <ppltasks.h>
+#include <collection.h>
 
 using namespace Harness;
 using namespace Platform;
@@ -150,6 +153,91 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
         "<p style='color:#d93025;font-size:22px;word-break:break-all'>" + e + "</p></div></body></html>";
 }
 
+// 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
+static std::wstring g_searchPrefix = L"https://cn.bing.com/search?q=";
+static std::wstring g_homeUrl = L"about:home";
+static std::wstring SearchPrefixFor(int idx)
+{
+    switch (idx) {
+        case 1: return L"https://www.google.com/search?q=";
+        case 2: return L"https://duckduckgo.com/?q=";
+        case 3: return L"https://www.baidu.com/s?wd=";
+        default: return L"https://cn.bing.com/search?q=";
+    }
+}
+
+static std::string HtmlEscape(const std::string& s)
+{
+    std::string out; out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default: out += c;
+        }
+    }
+    return out;
+}
+static std::string HostOfU8(const std::string& u)
+{
+    size_t p = u.find("://");
+    size_t s = (p == std::string::npos) ? 0 : p + 3;
+    size_t e = u.find('/', s);
+    return u.substr(s, (e == std::string::npos) ? std::string::npos : e - s);
+}
+
+// 动态新标签页:书签优先、历史补足的速拨磁贴(最多 8)。磁贴=<a>,经渲染时链接提取→点击导航。
+static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, const std::vector<Harness::Entry>& history)
+{
+    std::vector<Harness::Entry> tiles;
+    std::vector<std::wstring> seen;
+    auto add = [&](const std::vector<Harness::Entry>& src) {
+        for (const auto& e : src) {
+            if (tiles.size() >= 8) break;
+            if (e.url.empty() || e.url == L"about:home") continue;
+            if (std::find(seen.begin(), seen.end(), e.url) != seen.end()) continue;
+            seen.push_back(e.url);
+            tiles.push_back(e);
+        }
+    };
+    add(bookmarks);
+    add(history);
+
+    std::string h;
+    h += "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
+    h += "*{box-sizing:border-box}body{margin:0;background:#f5f6f8;font-family:sans-serif;color:#202124}";
+    h += ".hero{background:linear-gradient(135deg,#00aa77,#0088cc);color:#fff;padding:46px 26px 38px}";
+    h += ".hero h1{margin:0;font-size:46px;letter-spacing:-1px}.hero p{margin:10px 0 0;font-size:20px;opacity:.92}";
+    h += ".wrap{padding:24px}.sec{font-size:17px;color:#5f6368;margin:0 0 14px}";
+    h += ".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}";
+    h += "a.tile{display:block;text-decoration:none;background:#fff;border-radius:16px;padding:18px 18px 20px;box-shadow:0 2px 10px rgba(0,0,0,.08);color:#202124}";
+    h += ".tile .t{font-size:20px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+    h += ".tile .u{font-size:15px;color:#80868b;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+    h += "</style></head><body>";
+    h += "<div class='hero'><h1>EdgeHTML Reborn</h1><p>\xE7\x8E\xB0\xE4\xBB\xA3\xE6\xB5\x8F\xE8\xA7\x88\xE5\x99\xA8\xE5\xBC\x95\xE6\x93\x8E &middot; Windows 10 Mobile &middot; ARM32</p></div>";
+    h += "<div class='wrap'>";
+    if (tiles.empty()) {
+        h += "<p class='sec'>\xE5\x9C\xA8\xE4\xB8\x8A\xE6\x96\xB9\xE5\x9C\xB0\xE5\x9D\x80\xE6\xA0\x8F\xE8\xBE\x93\xE5\x85\xA5\xE7\xBD\x91\xE5\x9D\x80\xE8\xAE\xBF\xE9\x97\xAE\xE7\xBD\x91\xE9\xA1\xB5\xE3\x80\x82</p><div class='grid'>";
+        const char* defs[][2] = { {"https://example.com","example.com"}, {"https://github.com","github.com"}, {"https://cn.bing.com","bing.com"}, {"https://en.wikipedia.org","wikipedia.org"} };
+        for (auto& d : defs) { h += "<a class='tile' href='"; h += d[0]; h += "'><div class='t'>"; h += d[1]; h += "</div><div class='u'>"; h += d[0]; h += "</div></a>"; }
+        h += "</div>";
+    } else {
+        h += "<p class='sec'>\xE5\xB8\xB8\xE7\x94\xA8\xE7\xAB\x99\xE7\x82\xB9</p><div class='grid'>";
+        for (const auto& e : tiles) {
+            std::string href = HtmlEscape(WideToUtf8(e.url));
+            std::string title = HtmlEscape(WideToUtf8(e.title.empty() ? e.url : e.title));
+            std::string host = HtmlEscape(HostOfU8(WideToUtf8(e.url)));
+            h += "<a class='tile' href='" + href + "'><div class='t'>" + title + "</div><div class='u'>" + host + "</div></a>";
+        }
+        h += "</div>";
+    }
+    h += "</div></body></html>";
+    return h;
+}
+
 static Platform::String^ NormalizeUrl(Platform::String^ raw)
 {
     std::wstring s = raw ? std::wstring(raw->Data()) : L"";
@@ -164,7 +252,7 @@ static Platform::String^ NormalizeUrl(Platform::String^ raw)
     if (!looksUrl) {
         std::wstring q;
         for (wchar_t c : s) { if (c == L' ') q += L"%20"; else q += c; }
-        return ref new String((L"https://cn.bing.com/search?q=" + q).c_str());
+        return ref new String((g_searchPrefix + q).c_str());
     }
     if (s.find(L"://") == std::wstring::npos)
         s = L"https://" + s;
@@ -257,6 +345,31 @@ static const int kW = 720, kH = 1080;
 MainPage::MainPage()
 {
     InitializeComponent();
+
+    // 分享:注册一次 DataRequested(原生分享契约,App Container/1607 起可用)。分享当前页 URL+标题。
+    try {
+        auto dtm = Windows::ApplicationModel::DataTransfer::DataTransferManager::GetForCurrentView();
+        dtm->DataRequested += ref new Windows::Foundation::TypedEventHandler<
+            Windows::ApplicationModel::DataTransfer::DataTransferManager^,
+            Windows::ApplicationModel::DataTransfer::DataRequestedEventArgs^>(
+            [this](Windows::ApplicationModel::DataTransfer::DataTransferManager^,
+                   Windows::ApplicationModel::DataTransfer::DataRequestedEventArgs^ e) {
+                if (m_currentUrl.empty() || m_currentUrl == L"about:home") {
+                    e->Request->FailWithDisplayText(ref new Platform::String(L"无可分享内容"));
+                    return;
+                }
+                auto req = e->Request;
+                req->Data->Properties->Title = ref new Platform::String(
+                    m_currentTitle.empty() ? m_currentUrl.c_str() : m_currentTitle.c_str());
+                req->Data->Properties->Description = ref new Platform::String(m_currentUrl.c_str());
+                try {
+                    req->Data->SetWebLink(ref new Windows::Foundation::Uri(ref new Platform::String(m_currentUrl.c_str())));
+                } catch (...) {
+                    req->Data->SetText(ref new Platform::String(m_currentUrl.c_str()));
+                }
+            });
+    } catch (...) {}
+
     // 一次性可执行内存探针(JIT 可行性),结果写 LocalState\jitresult.txt 供 WDP 拉取。
     try {
         std::string jit = RunJitProbe();
@@ -267,12 +380,46 @@ MainPage::MainPage()
         }
     } catch (...) {}
     LoadData();
+    LoadSettings();   // 搜索引擎/主页/默认UA/缩放/标签模式(在首次导航前应用)
+    // 初始化标签集合:活动标签的实时状态用全局成员表示,此处占位 1 个(首次导航填充其全局状态)。
+    { Tab t0; t0.currentUrl = g_homeUrl; m_tabs.push_back(t0); m_activeTab = 0; }
+    UpdateTabCount();
+    // GPU 崩溃环路保护:上次自动开 GPU 没干净返回(标记残留)→ 这次别再默认开,并持久化关掉(避免每次启动即崩)。
+    {
+        std::wstring d = LocalStateDir();
+        if (!d.empty() && GetFileAttributesW((d + L"\\gpu-crash.flag").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            m_gpuDefault = false;
+            try { DeleteFileW((d + L"\\gpu-crash.flag").c_str()); } catch (...) {}
+            SaveSettings();
+        }
+    }
     // 前后台切换:后台暂停实时渲染(省电、避免后台跑引擎被 PLM 冻结时堆积)。
     Window::Current->VisibilityChanged += ref new Windows::UI::Xaml::WindowVisibilityChangedEventHandler(
         [this](Platform::Object^, Windows::UI::Core::VisibilityChangedEventArgs^ e) {
             m_appForeground = e->Visible;
             if (e->Visible) StartLiveMode(); else StopLiveMode();
         });
+    // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
+    //   (地址胶囊+建议浮到键盘上方);网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
+    try {
+        auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
+        ip->Showing += ref new Windows::Foundation::TypedEventHandler<
+            Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
+            [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
+                if (m_urlFocused && RootShift) {
+                    RootShift->Y = -e->OccludedRect.Height;
+                    e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
+                }
+            });
+        ip->Hiding += ref new Windows::Foundation::TypedEventHandler<
+            Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
+            [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
+                if (RootShift && RootShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
+                    RootShift->Y = 0;
+                    e->EnsuredFocusedElementInView = true;
+                }
+            });
+    } catch (...) {}
     // 测试钩子:若 LocalState\testurl.txt 存在,启动直接导航到它(供 WDP 远程自动化测试,免 UI 输入)。
     std::wstring testUrl;
     try {
@@ -350,7 +497,7 @@ MainPage::MainPage()
     } else if (!testUrl.empty())
         NavigateTo(ref new String(testUrl.c_str()), true);
     else
-        NavigateTo(ref new String(L"about:home"), true);
+        NavigateTo(ref new String(g_homeUrl.c_str()), true);   // 主页(设置可改)
 }
 
 // ---- 持久化 ----
@@ -427,6 +574,7 @@ void MainPage::SetLoading(bool loading)
     m_loading = loading;
     Progress->IsIndeterminate = loading;
     Progress->Visibility = loading ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+    UpdateUrlActionGlyph();   // 加载态切到 ✕ 停止 / 结束回 → 或 ⟳
 }
 
 void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
@@ -449,7 +597,11 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         m_navIndex = (int)m_navStack.size() - 1;
     }
     UpdateNavButtons();
+    UpdateLockIcon();
+    HideSuggestions();
+    m_urlSyncing = true;
     UrlBox->Text = isHome ? ref new String(L"") : url;
+    m_urlSyncing = false;
     TitleText->Text = isHome ? ref new String(L"主页") : ref new String((L"加载中  " + wurl).c_str());
     SetLoading(true);
 
@@ -467,8 +619,10 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     Platform::Agile<MainPage^> self(this);
     std::string surl = ToUtf8(url);
     unsigned long long mySeq = ++m_opSeq;
+    // 主页:用当前书签/历史动态生成新标签页(速拨磁贴=<a>,渲染时提取进链接表→点击导航)。
+    std::string homeHtml = isHome ? BuildHomeHtml(m_bookmarks, m_historyList) : std::string();
 
-    WebEngine::instance().post([disp, self, surl, isHome, mySeq]() {
+    WebEngine::instance().post([disp, self, surl, isHome, homeHtml, mySeq]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         bool loadOk = false;   // 网络加载是否真成功(区别于错误页渲染成功),决定是否进历史
@@ -477,7 +631,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         try {
             if (isHome) {
                 WebCoreCloseSession();   // 离开网络页:销毁会话,释放 Page + 取消在途加载
-                rc = WebCoreRenderHtml(kHomeHtml, kW, kH, rgba->data());
+                rc = WebCoreRenderHtml(homeHtml.c_str(), kW, kH, rgba->data());
                 loadOk = (rc == 0);
                 title = L"主页";
             } else {
@@ -552,10 +706,29 @@ void MainPage::OnNavDone(Platform::String^ finalTitle, bool ok, bool loadOk)
     TitleText->Text = (m_currentTitle.empty() ? ref new String(L"EdgeHTML Reborn") : finalTitle);
     if (loadOk && m_currentUrl != L"about:home")   // 仅真正加载成功才记历史,失败不污染
         AddHistory(m_currentUrl, m_currentTitle);
-    if (m_currentUrl != L"about:home")
+    if (m_currentUrl != L"about:home") {
+        m_urlSyncing = true;
         UrlBox->Text = ref new String(m_currentUrl.c_str());
+        m_urlSyncing = false;
+    }
+    UpdateLockIcon();
     SetLoading(false);
     UpdateNavButtons();
+    // 启动静默自检更新:首个网络页加载成功后跑一次(此时 CA blob 已注入,WebCoreDownload 才能过 TLS);
+    //   有新版才提示,无更新/失败静默。manual 检查在设置里按钮。
+    if (!m_updateAutoChecked && loadOk && m_currentUrl != L"about:home") {
+        m_updateAutoChecked = true;
+        CheckForUpdate(false);
+    }
+    // 默认 GPU:首个网络页加载完、开关开 → 自动开 GPU(EnableGpu 成功会重载本页,届时再走一遍 OnNavDone)。
+    if (m_gpuDefault && !m_gpuOn && !m_gpuAutoTried && m_sessionActive && m_currentUrl != L"about:home") {
+        m_gpuAutoTried = true;
+        EnableGpu();
+        return;   // 缩放在重载后的 OnNavDone 应用,避免双重栅格
+    }
+    // 默认缩放:有会话且默认非 100% 时,按新尺度重栅格(复用捏合提交路径)。
+    if (m_sessionActive && m_defaultZoom != 100)
+        PinchCommit(m_defaultZoom / 100.0f, kW / 2, kH / 2);
     (void)ok;
 }
 
@@ -600,6 +773,7 @@ void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
 
 void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
 {
+    HideSuggestions();   // 点页面即收起地址栏建议下拉(否则只能靠导航/清空关 → "关不掉")
     if (m_loading || m_interacting) return;
     // 取相对 ContentArea(承接手势/点击的层,始终参与布局)的坐标。★ 不能用 RenderImage:直呈现模式下它被
     //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
@@ -739,7 +913,11 @@ void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgb
     if (navUrl != nullptr) {
         std::wstring nu = std::wstring(navUrl->Data());
         m_currentUrl = nu;
+        m_urlSyncing = true;
         UrlBox->Text = navUrl;
+        m_urlSyncing = false;
+        UpdateLockIcon();
+        UpdateUrlActionGlyph();
         // 仅当与当前栈顶不同才压栈,避免会话内重定向链/同页微变产生相邻重复项(导致"后退无反应")。
         bool dup = (m_navIndex >= 0 && m_navIndex < (int)m_navStack.size() && m_navStack[m_navIndex] == nu);
         if (!dup) {
@@ -1069,6 +1247,9 @@ void MainPage::StartLiveMode()
 {
     if (!m_sessionActive || !m_appForeground) return;
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
+    if (ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
+    if (SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
+    if (TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
     m_liveBusy = false;        // 重置(若上次 RunAsync 抛/后台早退卡住,这里恢复)
     m_liveBusyAge = 0;
     m_liveStaticTicks = 0;
@@ -1089,7 +1270,10 @@ void MainPage::StopLiveMode()
 void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
 {
     if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
-    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible) { StopLiveMode(); return; }
+    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) { StopLiveMode(); return; }
     if (m_liveBusy) {                      // 上一帧引擎任务还没回
         if (++m_liveBusyAge < 5) return;   // 正常等(~1s 内)
         m_liveBusy = false;                // 卡过久 → RunAsync 很可能丢了,自愈不死循环
@@ -1162,7 +1346,7 @@ void MainPage::OnUrlKeyDown(Platform::Object^, Windows::UI::Xaml::Input::KeyRout
 {
     if (e->Key == Windows::System::VirtualKey::Enter) NavigateTo(NormalizeUrl(UrlBox->Text), true);
 }
-void MainPage::OnHome(Platform::Object^, RoutedEventArgs^) { NavigateTo(ref new String(L"about:home"), true); }
+void MainPage::OnHome(Platform::Object^, RoutedEventArgs^) { NavigateTo(ref new String(g_homeUrl.c_str()), true); }
 void MainPage::OnBack(Platform::Object^, RoutedEventArgs^)
 {
     if (m_loading || m_navIndex <= 0) return;
@@ -1175,18 +1359,13 @@ void MainPage::OnForward(Platform::Object^, RoutedEventArgs^)
     ++m_navIndex;
     NavigateTo(ref new String(m_navStack[m_navIndex].c_str()), false);
 }
-void MainPage::OnMenu(Platform::Object^, RoutedEventArgs^) { ShowDrawer(m_tab); }
+void MainPage::OnMenu(Platform::Object^, RoutedEventArgs^) { ShowActionMenu(); }
 
-// UA 切换:手机/桌面。切引擎 UA 后重载当前页生效。
+// UA 切换:手机/桌面。切引擎 UA 后重载当前页生效。(抽屉头部按钮)
 void MainPage::OnToggleUA(Platform::Object^, RoutedEventArgs^)
 {
-    m_uaMobile = !m_uaMobile;
-    UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
-    int mobile = m_uaMobile ? 1 : 0;
-    WebEngine::instance().post([mobile]() { try { WebCoreSetUserAgentMobile(mobile); } catch (...) {} });
     HideDrawer();
-    if (!m_currentUrl.empty())
-        NavigateTo(ref new String(m_currentUrl.c_str()), false);   // 重载使新 UA 生效
+    DoToggleUA();
 }
 
 // GPU 合成开关(M2):一次性开启(引擎侧 g_gpuActive 无 teardown,重启回软件)。开启 = 引擎线程
@@ -1207,54 +1386,7 @@ void MainPage::OnToggleGpu(Platform::Object^, RoutedEventArgs^)
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
 
-    if (!m_gpuOn) {
-        // 首次开启:GPU 直呈现到可见 GpuPanel(SwapChainPanel)。先让面板可见(有尺寸),用 PropertySet
-        //   (EGLNativeWindowTypeProperty=面板 + EGLRenderSurfaceSizeProperty=固定渲染尺寸)做 ANGLE 原生窗口,
-        //   交引擎线程 WebCoreGpuInit(window) 建窗口表面;此后各帧 gpuPresent 直接 swapBuffers 到面板,
-        //   省掉 readback+blit(冲 60fps)。失败回退面板隐藏。
-        GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
-        auto props = ref new Windows::Foundation::Collections::PropertySet();
-        props->Insert(L"EGLNativeWindowTypeProperty", GpuPanel);
-        props->Insert(L"EGLRenderSurfaceSizeProperty",
-                      Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
-        m_gpuProps = props;   // 保活(EGL 表面整个生命周期引用它)
-        void* win = reinterpret_cast<void*>(reinterpret_cast<IInspectable*>(props));
-        WebEngine::instance().post([disp, self, win]() {
-            int rc = -999;
-            try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
-            try {
-                std::wstring d = LocalStateDir();
-                if (!d.empty()) {
-                    std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc);
-                    if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); }
-                }
-            } catch (...) {}
-            int rcCopy = rc;
-            try {
-                disp->RunAsync(CoreDispatcherPriority::Normal,
-                    ref new DispatchedHandler([self, rcCopy]() {
-                        MainPage^ s = self.Get(); if (!s) return;
-                        if (rcCopy == 0) {
-                            s->m_gpuOn = true;
-                            s->m_gpuPresent = true;
-                            g_directPresent.store(true);
-                            s->RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;   // 软件位图层让位给 GpuPanel
-                            s->GpuBtn->Content = GpuOrientLabel(s->m_gpuOrient);
-                            s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::LimeGreen);
-                            s->HideDrawer();
-                            if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
-                                s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
-                        } else {
-                            s->GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
-                            s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU✗");   // 🖥 GPU✗(初始化失败,看 gpuinit.txt 的 rc)
-                            s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
-                            s->HideDrawer();
-                        }
-                    }));
-            } catch (...) {}
-        });
-        return;
-    }
+    if (!m_gpuOn) { HideDrawer(); EnableGpu(); return; }   // 首次开启 → 统一走 EnableGpu(含崩溃环路保护)
 
     // 已开(朝向已定 none):再点 = 抓合成图层树诊断 → 写 LocalState\layertree.txt + 标题显示关键标量
     //   (scrollPos/contents/view/docBg/usesCompositing),供定位"背景丢失 / 不能滚动"。
@@ -1291,17 +1423,8 @@ void MainPage::OnTabDl(Platform::Object^, RoutedEventArgs^)   { ShowDrawer(Drawe
 void MainPage::OnPrimaryAction(Platform::Object^, RoutedEventArgs^)
 {
     if (m_tab == DrawerTab::Favorites) {
-        // 收藏当前页(或取消收藏)
-        if (m_currentUrl.empty() || m_currentUrl == L"about:home") return;
-        if (IsBookmarked(m_currentUrl)) {
-            m_bookmarks.erase(std::remove_if(m_bookmarks.begin(), m_bookmarks.end(),
-                [&](const Entry& e) { return e.url == m_currentUrl; }), m_bookmarks.end());
-        } else {
-            Entry e; e.url = m_currentUrl; e.title = m_currentTitle.empty() ? m_currentUrl : m_currentTitle;
-            m_bookmarks.insert(m_bookmarks.begin(), e);
-        }
-        SaveBookmarks();
-        RebuildDrawerList();
+        ToggleBookmark();   // 收藏/取消(内部含保存 + 抽屉可见时刷新列表)
+        ActionBtn->Content = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? ref new String(L"★ 取消收藏") : ref new String(L"★ 收藏此页");
     } else if (m_tab == DrawerTab::History) {
         m_historyList.clear(); SaveHistory(); RebuildDrawerList();
     } else {
@@ -1314,6 +1437,7 @@ void MainPage::OnPrimaryAction(Platform::Object^, RoutedEventArgs^)
 void MainPage::ShowDrawer(DrawerTab tab)
 {
     m_tab = tab;
+    HideSuggestions();
     Drawer->Visibility = Windows::UI::Xaml::Visibility::Visible;
     // 主操作按钮文案随标签变化
     if (tab == DrawerTab::Favorites)
@@ -1478,4 +1602,795 @@ void MainPage::StartDownload(Platform::String^ url)
                 }));
         } catch (...) {}
     }).detach();
+}
+
+// ============================================================================
+// 增量1:地址栏(上下文键 Go/刷新/停止 + 安全锁标 + 历史/书签建议下拉)
+// 纯 UI 层,不碰 ContentArea 坐标映射 / 引擎交互路径。
+// ============================================================================
+
+void MainPage::Reload()
+{
+    if (m_currentUrl.empty() || m_currentUrl == L"about:home")
+        NavigateTo(ref new String(L"about:home"), false);
+    else
+        NavigateTo(ref new String(m_currentUrl.c_str()), false);
+}
+
+// 上下文键:加载中=停止;有未提交输入=Go;否则=刷新当前页。
+void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
+{
+    if (m_loading) {
+        // 停止:作废在途回调(opSeq++),停看门狗,排队关会话取消网络(单引擎线程串行,加载 job 跑完后才执行)。
+        ++m_opSeq;
+        m_interacting = false;
+        if (m_loadWatchdog) m_loadWatchdog->Stop();
+        WebEngine::instance().post([]() { try { WebCoreCloseSession(); } catch (...) {} });
+        m_sessionActive = false;
+        ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+        SetLoading(false);
+        TitleText->Text = ref new String(L"已停止");
+        return;
+    }
+    std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
+    bool pendingEdit = (m_currentUrl == L"about:home") ? !boxText.empty() : (boxText != m_currentUrl);
+    HideSuggestions();
+    if (pendingEdit) NavigateTo(NormalizeUrl(UrlBox->Text), true);
+    else Reload();
+}
+
+void MainPage::UpdateUrlActionGlyph()
+{
+    if (!UrlActionBtn) return;
+    if (m_loading) { UrlActionBtn->Content = ref new String(L"\x2715"); return; }   // ✕ 停止
+    std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
+    bool pendingEdit = (m_currentUrl == L"about:home") ? !boxText.empty() : (boxText != m_currentUrl);
+    UrlActionBtn->Content = ref new String(pendingEdit ? L"\x2192" : L"\x21BB");     // → Go / ⟳ 刷新
+}
+
+// Segoe MDL2 Assets:Lock=E72E,Warning=E7BA。本地/主页留空。
+void MainPage::UpdateLockIcon()
+{
+    if (!LockIcon) return;
+    const std::wstring& u = m_currentUrl;
+    if (u.empty() || u == L"about:home" || u.rfind(L"about:", 0) == 0) {
+        LockIcon->Text = ref new String(L"");
+    } else if (u.rfind(L"https://", 0) == 0) {
+        LockIcon->Text = ref new String(L"\xE72E");
+        LockIcon->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x5C, 0xB8, 0x5C));
+    } else if (u.rfind(L"http://", 0) == 0) {
+        LockIcon->Text = ref new String(L"\xE7BA");
+        LockIcon->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0xE0, 0xA0, 0x30));
+    } else {
+        LockIcon->Text = ref new String(L"");
+    }
+}
+
+void MainPage::OnUrlChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^)
+{
+    UpdateUrlActionGlyph();
+    if (m_urlSyncing) { HideSuggestions(); return; }   // 程序化同步地址栏(导航/回调):绝不弹建议
+    if (!m_urlFocused) { HideSuggestions(); return; }   // 没在编辑地址栏:绝不弹(杜绝"莫名其妙弹出")
+    std::wstring q = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
+    if (q.empty()) { HideSuggestions(); return; }
+    ShowSuggestions(q);
+}
+
+void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^) { m_urlFocused = true; }
+// 不在 LostFocus 里收建议:点建议项会先夺焦再触发其 Click,提前收会取消点击。改由点页面(OnPageTapped)/导航收。
+void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^) { m_urlFocused = false; }
+
+// 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。
+void MainPage::ShowSuggestions(const std::wstring& query)
+{
+    if (!SuggestPanel || !SuggestList) return;
+    SuggestList->Children->Clear();
+    std::wstring ql = query;
+    std::transform(ql.begin(), ql.end(), ql.begin(), [](wchar_t c) { return (wchar_t)::towlower(c); });
+
+    std::vector<Entry> matches;
+    std::vector<std::wstring> seen;
+    auto consider = [&](const std::vector<Entry>& src) {
+        for (const auto& e : src) {
+            if (matches.size() >= 8) break;
+            std::wstring ul = e.url, tl = e.title;
+            std::transform(ul.begin(), ul.end(), ul.begin(), [](wchar_t c) { return (wchar_t)::towlower(c); });
+            std::transform(tl.begin(), tl.end(), tl.begin(), [](wchar_t c) { return (wchar_t)::towlower(c); });
+            if (ul.find(ql) == std::wstring::npos && tl.find(ql) == std::wstring::npos) continue;
+            if (std::find(seen.begin(), seen.end(), e.url) != seen.end()) continue;
+            seen.push_back(e.url);
+            matches.push_back(e);
+        }
+    };
+    consider(m_bookmarks);
+    consider(m_historyList);
+    if (matches.empty()) { HideSuggestions(); return; }
+
+    Platform::Agile<MainPage^> self(this);
+    for (const auto& e : matches) {
+        std::wstring u = e.url;
+        auto row = MakeRow(ref new String(e.title.empty() ? e.url.c_str() : e.title.c_str()),
+                           ref new String(e.url.c_str()),
+                           ColorHelper::FromArgb(255, 0xF0, 0xF0, 0xF0));
+        auto btn = ref new Button();
+        btn->Background = ref new SolidColorBrush(Colors::Transparent);
+        btn->BorderThickness = Thickness(0);
+        btn->Padding = Thickness(0);
+        btn->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        btn->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        btn->Content = row;
+        btn->Click += ref new RoutedEventHandler([self, u](Platform::Object^, RoutedEventArgs^) {
+            MainPage^ s = self.Get(); if (!s) return;
+            s->HideSuggestions();
+            s->m_urlSyncing = true; s->UrlBox->Text = ref new String(u.c_str()); s->m_urlSyncing = false;
+            s->NavigateTo(ref new String(u.c_str()), true);
+        });
+        SuggestList->Children->Append(btn);
+    }
+    SuggestPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+}
+
+void MainPage::HideSuggestions()
+{
+    if (SuggestPanel) SuggestPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+}
+
+// ============================================================================
+// 增量2:动作面板(菜单键弹出的 action sheet)+ 分享/复制链接/收藏/UA
+// ============================================================================
+
+void MainPage::ShowActionMenu()
+{
+    HideSuggestions();
+    if (ActFavLabel)
+        ActFavLabel->Text = ref new String((!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L"已收藏" : L"收藏");
+    if (ActUaLabel)
+        ActUaLabel->Text = ref new String(m_uaMobile ? L"桌面版网站" : L"移动版网站");
+    ActionMenu->Visibility = Windows::UI::Xaml::Visibility::Visible;
+    StopLiveMode();   // 面板盖住网页,暂停实时渲染省电
+}
+
+void MainPage::HideActionMenu()
+{
+    ActionMenu->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+    StartLiveMode();
+}
+
+void MainPage::OnActionScrimTap(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^)
+{
+    HideActionMenu();   // 点遮罩空白处关闭
+}
+
+void MainPage::OnSheetTap(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
+{
+    e->Handled = true;  // 点面板本体不冒泡到遮罩(否则点空白区会误关)
+}
+
+// 动作分发:读 Button.Tag。先关面板再执行(避免动作触发的 UI 变化被面板挡住)。
+void MainPage::OnAction(Platform::Object^ sender, RoutedEventArgs^)
+{
+    std::wstring t;
+    auto btn = dynamic_cast<Button^>(sender);
+    if (btn) { auto tag = dynamic_cast<Platform::String^>(btn->Tag); if (tag) t = std::wstring(tag->Data()); }
+    HideActionMenu();
+    if (t == L"reload") Reload();
+    else if (t == L"share") DoShare();
+    else if (t == L"copylink") DoCopyLink();
+    else if (t == L"bookmark") ToggleBookmark();
+    else if (t == L"newtab") NewTab();
+    else if (t == L"home") NavigateTo(ref new String(g_homeUrl.c_str()), true);
+    else if (t == L"ua") DoToggleUA();
+    else if (t == L"find") ShowFindBar();
+    else if (t == L"download") { if (!m_currentUrl.empty() && m_currentUrl != L"about:home") StartDownload(ref new String(m_currentUrl.c_str())); }
+    else if (t == L"bookmarks") ShowDrawer(DrawerTab::Favorites);
+    else if (t == L"history") ShowDrawer(DrawerTab::History);
+    else if (t == L"downloads") ShowDrawer(DrawerTab::Downloads);
+    else if (t == L"settings") ShowSettings();
+}
+
+void MainPage::ToggleBookmark()
+{
+    if (m_currentUrl.empty() || m_currentUrl == L"about:home") return;
+    if (IsBookmarked(m_currentUrl)) {
+        m_bookmarks.erase(std::remove_if(m_bookmarks.begin(), m_bookmarks.end(),
+            [&](const Entry& e) { return e.url == m_currentUrl; }), m_bookmarks.end());
+        TitleText->Text = ref new String(L"已取消收藏");
+    } else {
+        Entry e; e.url = m_currentUrl; e.title = m_currentTitle.empty() ? m_currentUrl : m_currentTitle;
+        m_bookmarks.insert(m_bookmarks.begin(), e);
+        TitleText->Text = ref new String(L"已收藏");
+    }
+    SaveBookmarks();
+    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible && m_tab == DrawerTab::Favorites)
+        RebuildDrawerList();
+}
+
+void MainPage::DoShare()
+{
+    if (m_currentUrl.empty() || m_currentUrl == L"about:home") { TitleText->Text = ref new String(L"无可分享内容"); return; }
+    try { Windows::ApplicationModel::DataTransfer::DataTransferManager::ShowShareUI(); } catch (...) {}
+}
+
+void MainPage::DoCopyLink()
+{
+    if (m_currentUrl.empty() || m_currentUrl == L"about:home") return;
+    try {
+        auto dp = ref new Windows::ApplicationModel::DataTransfer::DataPackage();
+        dp->SetText(ref new String(m_currentUrl.c_str()));
+        Windows::ApplicationModel::DataTransfer::Clipboard::SetContent(dp);
+        TitleText->Text = ref new String(L"已复制链接");
+    } catch (...) {}
+}
+
+void MainPage::DoToggleUA()
+{
+    m_uaMobile = !m_uaMobile;
+    if (UaBtn) UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
+    int mobile = m_uaMobile ? 1 : 0;
+    WebEngine::instance().post([mobile]() { try { WebCoreSetUserAgentMobile(mobile); } catch (...) {} });
+    if (!m_currentUrl.empty() && m_currentUrl != L"about:home")
+        NavigateTo(ref new String(m_currentUrl.c_str()), false);   // 重载使新 UA 生效
+}
+
+// ============================================================================
+// 增量3:设置页(搜索引擎/主页/默认UA/缩放/标签模式)+ 清除数据 + 调试导出
+// ============================================================================
+
+void MainPage::ApplySettings()
+{
+    g_searchPrefix = SearchPrefixFor(m_setSearch);
+    if (m_defaultZoom < 50) m_defaultZoom = 50;
+    if (m_defaultZoom > 200) m_defaultZoom = 200;
+    m_uaMobile = !m_setUaDesktop;
+    int mobile = m_uaMobile ? 1 : 0;
+    std::string ua = WideToUtf8(m_uaCustom);
+    WebEngine::instance().post([mobile, ua]() {
+        try { WebCoreSetUserAgentMobile(mobile); } catch (...) {}
+        try { WebCoreSetUserAgentString(ua.empty() ? nullptr : ua.c_str()); } catch (...) {}   // 自定义 UA(空=清除回退开关)
+    });
+    if (UaBtn) UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
+}
+
+void MainPage::LoadSettings()
+{
+    std::wstring d = LocalStateDir();
+    if (d.empty()) { ApplySettings(); return; }
+    std::ifstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary);
+    if (f) {
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+            if (k == "search") m_setSearch = atoi(v.c_str());
+            else if (k == "home") g_homeUrl = v.empty() ? L"about:home" : Utf8ToWide(v);
+            else if (k == "ua") m_setUaDesktop = (atoi(v.c_str()) != 0);
+            else if (k == "zoom") m_defaultZoom = atoi(v.c_str());
+            else if (k == "tabmode") m_tabMode = atoi(v.c_str());
+            else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
+            else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
+        }
+    }
+    if (m_setSearch < 0 || m_setSearch > 3) m_setSearch = 0;
+    ApplySettings();
+}
+
+void MainPage::SaveSettings()
+{
+    std::wstring d = LocalStateDir();
+    if (d.empty()) return;
+    std::string s;
+    s += "search=" + std::to_string(m_setSearch) + "\n";
+    s += "home=" + (g_homeUrl == L"about:home" ? std::string() : WideToUtf8(g_homeUrl)) + "\n";
+    s += "ua=" + std::to_string(m_setUaDesktop ? 1 : 0) + "\n";
+    s += "zoom=" + std::to_string(m_defaultZoom) + "\n";
+    s += "tabmode=" + std::to_string(m_tabMode) + "\n";
+    s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
+    s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
+    std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
+    if (f) f.write(s.data(), s.size());
+}
+
+void MainPage::ShowSettings()
+{
+    HideActionMenu();
+    if (SetSearchCombo) SetSearchCombo->SelectedIndex = m_setSearch;
+    if (SetHomeBox) SetHomeBox->Text = ref new String(g_homeUrl == L"about:home" ? L"" : g_homeUrl.c_str());
+    if (SetUaSwitch) SetUaSwitch->IsOn = m_setUaDesktop;
+    if (SetTabModeSwitch) SetTabModeSwitch->IsOn = (m_tabMode == 1);
+    if (SetZoomSlider) SetZoomSlider->Value = m_defaultZoom;
+    if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring(m_defaultZoom) + L"%").c_str());
+    if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
+    if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
+    if (VersionText) {
+        auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
+        std::wstring v = L"版本 " + std::to_wstring(pv.Major) + L"." + std::to_wstring(pv.Minor)
+                       + L"." + std::to_wstring(pv.Build) + L"." + std::to_wstring(pv.Revision);
+        VersionText->Text = ref new String(v.c_str());
+    }
+    SettingsPage->Visibility = Windows::UI::Xaml::Visibility::Visible;
+    StopLiveMode();
+}
+
+void MainPage::HideSettings()
+{
+    if (SetSearchCombo && SetSearchCombo->SelectedIndex >= 0) m_setSearch = SetSearchCombo->SelectedIndex;
+    if (SetHomeBox) {
+        std::wstring h = SetHomeBox->Text ? std::wstring(SetHomeBox->Text->Data()) : L"";
+        while (!h.empty() && (h.front() == L' ' || h.front() == L'\t')) h.erase(h.begin());
+        while (!h.empty() && (h.back() == L' ' || h.back() == L'\t')) h.pop_back();
+        if (h.empty() || h == L"about:home") g_homeUrl = L"about:home";
+        else { if (h.rfind(L"http", 0) != 0 && h.rfind(L"about:", 0) != 0) h = L"https://" + h; g_homeUrl = h; }
+    }
+    if (SetUaSwitch) m_setUaDesktop = SetUaSwitch->IsOn;
+    if (SetTabModeSwitch) m_tabMode = SetTabModeSwitch->IsOn ? 1 : 0;
+    if (SetZoomSlider) m_defaultZoom = (int)(SetZoomSlider->Value + 0.5);
+    if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
+    if (SetUaCustomBox) {
+        std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
+        while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
+        while (!u.empty() && (u.back() == L' ' || u.back() == L'\t' || u.back() == L'\r' || u.back() == L'\n')) u.pop_back();
+        m_uaCustom = u;
+    }
+    ApplySettings();
+    SaveSettings();
+    SettingsPage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+    StartLiveMode();
+}
+
+void MainPage::OnSettingsBack(Platform::Object^, RoutedEventArgs^) { HideSettings(); }
+
+void MainPage::OnZoomChanged(Platform::Object^, Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs^ e)
+{
+    if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring((int)(e->NewValue + 0.5)) + L"%").c_str());
+}
+
+void MainPage::OnSettingsBtn(Platform::Object^ sender, RoutedEventArgs^)
+{
+    std::wstring t;
+    auto b = dynamic_cast<Button^>(sender);
+    if (b) { auto tag = dynamic_cast<Platform::String^>(b->Tag); if (tag) t = std::wstring(tag->Data()); }
+    if (t == L"clearhist") { m_historyList.clear(); SaveHistory(); TitleText->Text = ref new String(L"历史记录已清除"); }
+    else if (t == L"clearfav") { m_bookmarks.clear(); SaveBookmarks(); TitleText->Text = ref new String(L"收藏已清除"); }
+    else if (t == L"cleardl") { m_downloads.clear(); SaveDownloads(); TitleText->Text = ref new String(L"下载记录已清除"); }
+    else if (t == L"export") ExportDebug();
+    else if (t == L"gpu") { HideSettings(); OnToggleGpu(nullptr, nullptr); }
+    else if (t == L"checkupdate") CheckForUpdate(true);
+}
+
+// ---- 检测更新 ----
+// 后台线程(独立 curl,WebCoreDownload 不碰引擎 Page 状态,可离引擎线程跑)拉 GitHub Releases API,
+// 比对当前 appx 版本(Package.Current)。有新版弹对话框→可直接在本浏览器里打开发布页下载 appx 手动装。
+// manual=true:用户在设置里点的,无更新/失败也提示;false:启动静默自检,仅有新版才提示。
+static bool ParseDottedVersion(const std::string& s, int out[4])
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    int idx = 0; long cur = 0; bool any = false;
+    for (size_t i = 0; i <= s.size() && idx < 4; ++i) {
+        if (i < s.size() && s[i] >= '0' && s[i] <= '9') { cur = cur * 10 + (s[i] - '0'); any = true; }
+        else if (i == s.size() || s[i] == '.') { out[idx++] = (int)cur; cur = 0; if (i == s.size()) break; }
+        else break;   // 非数字非点(如 tag 后缀)→ 停
+    }
+    return any;
+}
+
+void MainPage::CheckForUpdate(bool manual)
+{
+    if (m_updateChecking) return;
+    m_updateChecking = true;
+    if (manual) TitleText->Text = ref new String(L"正在检查更新…");
+
+    // 当前版本(从 appx 清单读,不写死)
+    auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
+    int cur[4] = { pv.Major, pv.Minor, pv.Build, pv.Revision };
+    std::wstring dir = LocalStateDir();
+    std::string jsonPath = dir.empty() ? std::string() : WideToUtf8(dir + L"\\update.json");
+
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    std::thread([disp, self, manual, jsonPath, cur]() {
+        int rc = -1;
+        std::string body;
+        if (!jsonPath.empty()) {
+            try { rc = WebCoreDownload(
+                "https://api.github.com/repos/Jimmyxiao2009/Project-Apotheosis/releases/latest",
+                jsonPath.c_str()); } catch (...) {}
+            if (rc == 200) {
+                std::ifstream f(jsonPath, std::ios::binary);
+                if (f) { std::stringstream ss; ss << f.rdbuf(); body = ss.str(); }
+            }
+        }
+        // 极简 JSON 取值(取 key 后第一个带引号字符串)
+        auto pick = [&](const char* key) -> std::string {
+            std::string pat = std::string("\"") + key + "\"";
+            size_t p = body.find(pat); if (p == std::string::npos) return {};
+            p = body.find(':', p + pat.size()); if (p == std::string::npos) return {};
+            size_t a = body.find('"', p); if (a == std::string::npos) return {};
+            size_t b = body.find('"', a + 1); if (b == std::string::npos) return {};
+            return body.substr(a + 1, b - a - 1);
+        };
+        std::string tag = pick("tag_name");      // 形如 v0.1.8.4
+        std::string page = pick("html_url");     // 发布页(release 对象第一个 html_url)
+        bool ok = (rc == 200 && !tag.empty());
+        bool newer = false;
+        std::string verStr = tag;
+        if (!verStr.empty() && (verStr[0] == 'v' || verStr[0] == 'V')) verStr = verStr.substr(1);
+        if (ok) {
+            int rel[4]; ParseDottedVersion(verStr, rel);
+            for (int i = 0; i < 4; ++i) { if (rel[i] != cur[i]) { newer = rel[i] > cur[i]; break; } }
+        }
+        std::wstring tagW = Utf8ToWide(tag), pageW = Utf8ToWide(page);
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler(
+                [self, manual, ok, newer, tagW, pageW]() {
+                    MainPage^ s = self.Get(); if (!s) return;
+                    s->m_updateChecking = false;
+                    if (!ok) { if (manual) s->TitleText->Text = ref new String(L"检查更新失败(网络?)"); return; }
+                    if (!newer) { if (manual) s->TitleText->Text = ref new String((L"已是最新版 " + tagW).c_str()); return; }
+                    // 有新版:提示 + 可直接在本浏览器打开发布页下载
+                    s->TitleText->Text = ref new String((L"发现新版本 " + tagW).c_str());
+                    std::wstring target = pageW.empty()
+                        ? std::wstring(L"https://github.com/Jimmyxiao2009/Project-Apotheosis/releases/latest")
+                        : pageW;
+                    try {
+                        auto dlg = ref new Windows::UI::Popups::MessageDialog(
+                            ref new String((L"发现新版本 " + tagW + L"\n是否打开发布页下载 appx?").c_str()),
+                            ref new String(L"有可用更新"));
+                        auto go = ref new Windows::UI::Popups::UICommand(ref new String(L"前往下载"));
+                        auto later = ref new Windows::UI::Popups::UICommand(ref new String(L"稍后"));
+                        dlg->Commands->Append(go);
+                        dlg->Commands->Append(later);
+                        dlg->DefaultCommandIndex = 0;
+                        dlg->CancelCommandIndex = 1;
+                        Platform::Agile<MainPage^> self2(s);
+                        concurrency::create_task(dlg->ShowAsync()).then(
+                            [self2, go, target](Windows::UI::Popups::IUICommand^ chosen) {
+                                MainPage^ s2 = self2.Get(); if (!s2) return;
+                                if (chosen == go) {
+                                    if (s2->SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible) s2->HideSettings();
+                                    s2->NavigateTo(ref new String(target.c_str()), true);
+                                }
+                            });
+                    } catch (...) {}
+                }));
+        } catch (...) {}
+    }).detach();
+}
+
+// 调试导出:把 LocalState 下的诊断文本拼成一份报告,FileSavePicker 让用户存到 OneDrive/SD 卡。
+void MainPage::ExportDebug()
+{
+    std::wstring d = LocalStateDir();
+    std::string report = "=== Apotheosis 调试报告 ===\n";
+    report += "harness / WebCore 2.52.4 / ARM32 UWP\n\n";
+    if (!d.empty()) {
+        std::string dd = WideToUtf8(d);
+        const char* names[] = { "stage.txt", "gpuinit.txt", "gpuresult.txt", "layertree.txt", "autodump.txt", "imedebug.txt", "jitresult.txt", "diag.txt" };
+        for (const char* fn : names) {
+            std::ifstream f(dd + "\\" + fn, std::ios::binary);
+            if (!f) continue;
+            std::stringstream ss; ss << f.rdbuf();
+            report += std::string("---------- ") + fn + " ----------\n" + ss.str() + "\n\n";
+        }
+        report += "---------- crash dumps ----------\n(崩溃 dump 文件在 LocalState 根目录,可经 Device Portal 拉取)\n";
+        try { std::ofstream o(dd + "\\debug-report.txt", std::ios::binary | std::ios::trunc); if (o) o.write(report.data(), report.size()); } catch (...) {}
+    }
+    Platform::String^ reportW = ref new String(Utf8ToWide(report).c_str());
+    try {
+        auto picker = ref new Windows::Storage::Pickers::FileSavePicker();
+        picker->SuggestedStartLocation = Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary;
+        picker->SuggestedFileName = ref new String(L"apotheosis-debug");
+        auto exts = ref new Platform::Collections::Vector<Platform::String^>();
+        exts->Append(".txt");
+        picker->FileTypeChoices->Insert(ref new String(L"文本文件"), exts);
+        concurrency::create_task(picker->PickSaveFileAsync()).then([reportW](Windows::Storage::StorageFile^ file) {
+            if (file) concurrency::create_task(Windows::Storage::FileIO::WriteTextAsync(file, reportW));
+        });
+        TitleText->Text = ref new String(L"选择保存位置以导出…");
+    } catch (...) {
+        TitleText->Text = ref new String(L"导出失败");
+    }
+}
+
+// ============================================================================
+// 增量4:页内查找(查找条 + 引擎 WebCoreFindString/Next/Clear)
+// ============================================================================
+
+void MainPage::ShowFindBar()
+{
+    if (!m_sessionActive) { TitleText->Text = ref new String(L"当前页不可查找"); return; }
+    HideActionMenu();
+    HideSuggestions();
+    FindBar->Visibility = Windows::UI::Xaml::Visibility::Visible;
+    FindCount->Text = ref new String(L"");
+    FindBox->Text = ref new String(L"");   // 触发一次空查找(清除残留高亮),无害
+    FindBox->Focus(Windows::UI::Xaml::FocusState::Programmatic);
+}
+
+void MainPage::OnFindChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^) { DoFind(0); }
+
+void MainPage::OnFindKeyDown(Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e)
+{
+    if (e->Key == Windows::System::VirtualKey::Enter) { e->Handled = true; DoFind(1); }
+}
+
+void MainPage::OnFindNext(Platform::Object^, RoutedEventArgs^) { DoFind(1); }
+void MainPage::OnFindPrev(Platform::Object^, RoutedEventArgs^) { DoFind(2); }
+
+void MainPage::OnFindClose(Platform::Object^, RoutedEventArgs^)
+{
+    FindBar->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+    FindBox->Text = ref new String(L"");   // 触发空查找 → 引擎清除高亮
+}
+
+// 查找派发(引擎线程串行)。mode:0=查找(标记全部+选第一个),1=下一个,2=上一个。空串=清除。
+void MainPage::DoFind(int mode)
+{
+    if (!m_sessionActive) { if (FindCount) FindCount->Text = ref new String(L""); return; }
+    if (m_loading || m_interacting) return;
+    std::wstring query = FindBox->Text ? std::wstring(FindBox->Text->Data()) : L"";
+    bool clear = (mode == 0 && query.empty());
+
+    m_interacting = true;
+    SetLoading(true);
+    if (m_loadWatchdog) m_loadWatchdog->Start();
+    std::string q = WideToUtf8(query);
+    bool present = m_gpuPresent;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = ++m_opSeq;
+    WebEngine::instance().post([disp, self, q, mode, clear, present, mySeq]() {
+        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        int rc = -999;
+        try {
+            if (clear) rc = WebCoreFindClear(rgba->data());
+            else if (mode == 0) rc = WebCoreFindString(q.c_str(), /*matchCase*/ 0, /*wrap*/ 1, rgba->data());
+            else rc = WebCoreFindNext(mode == 1 ? 1 : 0, rgba->data());
+        } catch (...) { rc = -1000; }
+        int rcCopy = rc; int modeCopy = mode; bool clearCopy = clear;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal,
+                ref new DispatchedHandler([self, rgba, rcCopy, modeCopy, clearCopy, present, mySeq]() {
+                    MainPage^ s = self.Get(); if (!s) return;
+                    if (s->m_opSeq != mySeq) return;   // 被更新操作/看门狗取代
+                    s->m_interacting = false;
+                    if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
+                    s->SetLoading(false);
+                    if (rcCopy < 0) {
+                        if (rcCopy == -12 || rcCopy == -14) {   // 会话没了
+                            s->m_sessionActive = false;
+                            s->ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                        }
+                        s->FindCount->Text = ref new String(L"");
+                        return;
+                    }
+                    if (!present) {
+                        auto wb = ref new WriteableBitmap(kW, kH);
+                        BlitToBitmap(wb, *rgba, kW, kH);
+                        wb->Invalidate();
+                        s->RenderImage->Source = wb;
+                    }
+                    s->m_lastFrameHash = 0;
+                    if (clearCopy) s->FindCount->Text = ref new String(L"");
+                    else if (modeCopy == 0) s->FindCount->Text = ref new String(rcCopy > 0 ? (std::to_wstring(rcCopy) + L" 处").c_str() : L"无结果");
+                    else s->FindCount->Text = ref new String(rcCopy ? L"" : L"无更多");
+                }));
+        } catch (...) {}
+    });
+}
+
+// ============================================================================
+// 增量5:标签(Mode A 单热会话)。活动标签实时状态=全局成员;切换时与 m_tabs 互拷并重载。
+// ============================================================================
+
+void MainPage::UpdateTabCount()
+{
+    if (TabCountText) TabCountText->Text = ref new String(std::to_wstring(m_tabs.size()).c_str());
+}
+
+void MainPage::SaveActiveTab()
+{
+    if (m_activeTab < 0 || m_activeTab >= (int)m_tabs.size()) return;
+    Tab& t = m_tabs[m_activeTab];
+    t.navStack = m_navStack;
+    t.navIndex = m_navIndex;
+    t.currentUrl = m_currentUrl.empty() ? L"about:home" : m_currentUrl;
+    t.currentTitle = m_currentTitle;
+    t.pageScale = m_pageScale;
+}
+
+void MainPage::RestoreTab(int i)
+{
+    if (i < 0 || i >= (int)m_tabs.size()) return;
+    m_activeTab = i;
+    const Tab& t = m_tabs[i];
+    m_navStack = t.navStack;
+    m_navIndex = t.navIndex;
+    m_currentUrl = t.currentUrl;
+    m_currentTitle = t.currentTitle;
+    m_pageScale = t.pageScale;
+    // 切到该标签:作废在途、清加载锁,重载其 URL 重建单热会话。
+    ++m_opSeq;
+    m_interacting = false;
+    if (m_loadWatchdog) m_loadWatchdog->Stop();
+    m_loading = false;
+    UpdateNavButtons();
+    UpdateLockIcon();
+    m_urlSyncing = true;
+    UrlBox->Text = ref new String(m_currentUrl == L"about:home" ? L"" : m_currentUrl.c_str());
+    m_urlSyncing = false;
+    NavigateTo(ref new String(m_currentUrl.c_str()), false);
+}
+
+void MainPage::NewTab()
+{
+    SaveActiveTab();
+    Tab t; t.currentUrl = g_homeUrl;
+    m_tabs.push_back(t);
+    m_activeTab = (int)m_tabs.size() - 1;
+    // 清空全局,作废在途,重载主页。
+    ++m_opSeq;
+    m_interacting = false;
+    if (m_loadWatchdog) m_loadWatchdog->Stop();
+    m_loading = false;
+    m_navStack.clear(); m_navIndex = -1;
+    m_currentUrl.clear(); m_currentTitle.clear();
+    m_pageScale = 1.0f;
+    UpdateTabCount();
+    NavigateTo(ref new String(g_homeUrl.c_str()), true);
+}
+
+void MainPage::CloseTab(int i)
+{
+    if (i < 0 || i >= (int)m_tabs.size()) return;
+    bool wasActive = (i == m_activeTab);
+    m_tabs.erase(m_tabs.begin() + i);
+    if (m_tabs.empty()) {                      // 关到空:留一个主页标签
+        Tab t; t.currentUrl = g_homeUrl;
+        m_tabs.push_back(t);
+        m_activeTab = 0;
+        ++m_opSeq; m_interacting = false; if (m_loadWatchdog) m_loadWatchdog->Stop(); m_loading = false;
+        m_navStack.clear(); m_navIndex = -1; m_currentUrl.clear(); m_currentTitle.clear(); m_pageScale = 1.0f;
+        UpdateTabCount();
+        NavigateTo(ref new String(g_homeUrl.c_str()), true);
+        return;
+    }
+    if (m_activeTab >= (int)m_tabs.size()) m_activeTab = (int)m_tabs.size() - 1;
+    else if (i < m_activeTab) m_activeTab--;   // 索引左移
+    UpdateTabCount();
+    if (wasActive) RestoreTab(m_activeTab);    // 关掉的是活动标签 → 载入新活动标签
+}
+
+void MainPage::SwitchTab(int i)
+{
+    if (i == m_activeTab) return;
+    SaveActiveTab();
+    RestoreTab(i);
+}
+
+void MainPage::OnTabs(Platform::Object^, RoutedEventArgs^) { ShowTabSwitcher(); }
+void MainPage::OnNewTab(Platform::Object^, RoutedEventArgs^) { HideTabSwitcher(); NewTab(); }
+void MainPage::OnTabSwitcherDone(Platform::Object^, RoutedEventArgs^) { HideTabSwitcher(); }
+
+void MainPage::ShowTabSwitcher()
+{
+    HideActionMenu();
+    HideSuggestions();
+    SaveActiveTab();
+    RebuildTabSwitcher();
+    TabSwitcher->Visibility = Windows::UI::Xaml::Visibility::Visible;
+    StopLiveMode();
+}
+
+void MainPage::HideTabSwitcher()
+{
+    TabSwitcher->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+    StartLiveMode();
+}
+
+void MainPage::RebuildTabSwitcher()
+{
+    UpdateTabCount();
+    if (TabSwitcherTitle) TabSwitcherTitle->Text = ref new String((L"标签 (" + std::to_wstring(m_tabs.size()) + L")").c_str());
+    TabList->Children->Clear();
+    Platform::Agile<MainPage^> self(this);
+    Color blue = ColorHelper::FromArgb(255, 0x3A, 0xA0, 0xFF);
+    Color white = ColorHelper::FromArgb(255, 0xF0, 0xF0, 0xF0);
+    for (size_t i = 0; i < m_tabs.size(); ++i) {
+        int idx = (int)i;
+        const Tab& t = m_tabs[i];
+        bool active = (idx == m_activeTab);
+        std::wstring title = t.currentTitle.empty()
+            ? (t.currentUrl == L"about:home" ? std::wstring(L"主页") : t.currentUrl)
+            : t.currentTitle;
+        std::wstring sub = (t.currentUrl == L"about:home") ? std::wstring(L"about:home") : t.currentUrl;
+
+        auto cell = ref new Grid();
+        cell->Margin = Thickness(0, 0, 0, 8);
+
+        auto sw = ref new Button();
+        sw->Background = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x2B, 0x2D, 0x31));
+        sw->BorderThickness = active ? Thickness(2) : Thickness(0);
+        sw->BorderBrush = ref new SolidColorBrush(blue);
+        sw->Padding = Thickness(0, 0, 40, 0);   // 右留位给关闭键
+        sw->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        sw->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
+        sw->Content = MakeRow(ref new String(title.c_str()), ref new String(sub.c_str()), active ? blue : white);
+        sw->Click += ref new RoutedEventHandler([self, idx](Platform::Object^, RoutedEventArgs^) {
+            MainPage^ s = self.Get(); if (!s) return;
+            s->HideTabSwitcher();
+            s->SwitchTab(idx);
+        });
+        cell->Children->Append(sw);
+
+        auto cb = ref new Button();
+        cb->Content = ref new String(L"\x2715");
+        cb->Background = ref new SolidColorBrush(Colors::Transparent);
+        cb->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x9A, 0xA0, 0xA6));
+        cb->BorderThickness = Thickness(0);
+        cb->Width = 44; cb->Height = 44;
+        cb->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;
+        cb->VerticalAlignment = Windows::UI::Xaml::VerticalAlignment::Center;
+        cb->Click += ref new RoutedEventHandler([self, idx](Platform::Object^, RoutedEventArgs^) {
+            MainPage^ s = self.Get(); if (!s) return;
+            s->CloseTab(idx);
+            s->RebuildTabSwitcher();
+        });
+        cell->Children->Append(cb);
+
+        TabList->Children->Append(cell);
+    }
+}
+
+// ============================================================================
+// 默认 GPU:把 OnToggleGpu 首点路径抽出复用,带崩溃环路保护(GpuInit 硬崩→下次启动自动关)。
+// ============================================================================
+void MainPage::EnableGpu()
+{
+    if (m_gpuOn) return;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+    auto props = ref new Windows::Foundation::Collections::PropertySet();
+    props->Insert(L"EGLNativeWindowTypeProperty", GpuPanel);
+    props->Insert(L"EGLRenderSurfaceSizeProperty",
+                  Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
+    m_gpuProps = props;
+    void* win = reinterpret_cast<void*>(reinterpret_cast<IInspectable*>(props));
+    // 崩溃环路保护:开 GPU 前落 gpu-crash.flag;回调(成功或优雅失败)删它。GpuInit 硬崩则无回调→标记残留→下次启动检测到→关默认GPU。
+    {
+        std::wstring fd = LocalStateDir();
+        if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
+    }
+    WebEngine::instance().post([disp, self, win]() {
+        int rc = -999;
+        try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
+        try {
+            std::wstring d = LocalStateDir();
+            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
+        } catch (...) {}
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rcCopy]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                std::wstring d2 = LocalStateDir();   // 回调到达=没硬崩 → 删崩溃标记
+                if (!d2.empty()) { try { DeleteFileW((d2 + L"\\gpu-crash.flag").c_str()); } catch (...) {} }
+                if (rcCopy == 0) {
+                    s->m_gpuOn = true;
+                    s->m_gpuPresent = true;
+                    g_directPresent.store(true);
+                    s->RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                    s->GpuBtn->Content = GpuOrientLabel(s->m_gpuOrient);
+                    s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::LimeGreen);
+                    if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
+                        s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
+                } else {
+                    s->GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                    s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU\x2717");
+                    s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
+                }
+            }));
+        } catch (...) {}
+    });
 }

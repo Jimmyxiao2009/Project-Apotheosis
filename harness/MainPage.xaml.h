@@ -19,6 +19,16 @@ namespace Harness {
     // 网页链接命中矩形(位图坐标)+ URL,用于点击交互。
     struct PageLink { int x, y, w, h; std::wstring url; };
 
+    // 标签(Mode A:单热会话+快照)。只有活动标签是引擎活会话;其余只存状态,切回时重载。
+    // 活动标签的"实时状态"用 MainPage 现有全局成员表示;切换时与本结构互拷。
+    struct Tab {
+        std::vector<std::wstring> navStack;
+        int navIndex { -1 };
+        std::wstring currentUrl { L"about:home" };
+        std::wstring currentTitle;
+        float pageScale { 1.0f };
+    };
+
     public ref class MainPage sealed {
     public:
         MainPage();
@@ -31,10 +41,69 @@ namespace Harness {
         void OnGo(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
         void OnMenu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // 地址栏右侧上下文键:加载中=停止✕(作废在途+取消网络),有未提交输入=Go→,否则=刷新⟳。
+        void OnUrlAction(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void Reload();
+        void UpdateUrlActionGlyph();   // 按 m_loading / 是否有未提交输入 切 ✕/→/⟳
+        void UpdateLockIcon();         // 按 m_currentUrl 协议设安全标(https=锁/http=警告)
+        // 地址栏输入变化:刷新上下文键 + 弹/收历史+书签建议下拉。
+        void OnUrlChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::TextChangedEventArgs^ e);
+        void ShowSuggestions(const std::wstring& query);
+        void HideSuggestions();
+        void OnUrlGotFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnUrlLostFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+
+        // ---- 动作面板(菜单键弹出的 action sheet)----
+        void ShowActionMenu();
+        void HideActionMenu();
+        void OnActionScrimTap(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        void OnSheetTap(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        void OnAction(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);   // 按 Button.Tag 分发
+        void ToggleBookmark();
+        void DoShare();
+        void DoCopyLink();
+        void DoToggleUA();
+
+        // ---- 设置页 ----
+        void ShowSettings();
+        void HideSettings();
+        void OnSettingsBack(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnSettingsBtn(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);   // tag: clearhist/clearfav/cleardl/export/gpu
+        void OnZoomChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs^ e);
+        void LoadSettings();
+        void SaveSettings();
+        void ApplySettings();
+        void ExportDebug();
+        // 检测更新:后台线程拉 GitHub Releases API,比对版本;manual=true 时无更新/失败也提示。
+        void CheckForUpdate(bool manual);
+
+        // ---- 页内查找 ----
+        void ShowFindBar();
+        void OnFindChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::TextChangedEventArgs^ e);
+        void OnFindKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
+        void OnFindNext(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnFindPrev(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnFindClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void DoFind(int mode);   // 0=查找(标记全部) 1=下一个 2=上一个
+
+        // ---- 标签(Mode A)----
+        void OnTabs(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnNewTab(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void OnTabSwitcherDone(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void ShowTabSwitcher();
+        void HideTabSwitcher();
+        void RebuildTabSwitcher();
+        void SaveActiveTab();       // 当前全局状态 → m_tabs[m_activeTab]
+        void RestoreTab(int i);     // m_tabs[i] → 全局状态 + 重载该标签 URL(重建会话)
+        void NewTab();
+        void CloseTab(int i);
+        void SwitchTab(int i);
+        void UpdateTabCount();
         // UA 切换:手机/桌面,切后重载当前页(遇到对移动 UA 抽风的站点用)。
         void OnToggleUA(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // GPU 合成开关(M2):一次性开启(引擎线程 WebCoreGpuInit 离屏成功→重载当前页走 TextureMapper 合成)。
         void OnToggleGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void EnableGpu();   // 开 GPU 直呈现(OnToggleGpu 首点 + 默认GPU自动触发 共用;含崩溃环路保护)
 
         // ---- 抽屉 ----
         void OnDrawerClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -124,8 +193,23 @@ namespace Harness {
         bool m_imeOpen { false };     // 屏幕键盘是否为当前输入打开
         bool m_imeSyncing { false };  // 正在程序化改 ImeBox.Text(避免 TextChanged 回环)
         bool m_uaMobile { true };     // UA 模式:true=手机(默认),false=桌面
+        bool m_urlSyncing { false };  // 正在程序化改 UrlBox.Text(导航/回调同步地址栏)→ 抑制建议下拉回环
+        bool m_urlFocused { false };  // 地址栏是否聚焦(编辑中)→ 仅聚焦时才弹建议,杜绝"莫名其妙弹出"
+        bool m_updateChecking { false };  // 检测更新进行中(防并发重复点)
+        bool m_updateAutoChecked { false };  // 启动后已静默自检过一次(首个网络页加载完触发,CA 此时已就绪)
+        // 设置(持久化到 LocalState\settings.ini;搜索前缀/主页是全局,见 .cpp)
+        int  m_setSearch { 0 };       // 搜索引擎索引(0 Bing/1 Google/2 DuckDuckGo/3 百度)
+        bool m_setUaDesktop { false };// 启动默认请求桌面版网站
+        int  m_defaultZoom { 100 };   // 默认缩放百分比(50–200)
+        int  m_tabMode { 0 };         // 0=单热会话 / 1=并发多引擎(实验);增量5/7 使用
+        std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom
+        // 标签集合(Mode A:仅活动标签有引擎会话)。
+        std::vector<Tab> m_tabs;
+        int m_activeTab { 0 };
         bool m_gpuOn { false };       // GPU 合成是否已开(一次性;引擎侧 g_gpuActive 无 teardown,重启回软件)
         bool m_gpuPresent { false };  // GPU 直呈现模式(合成直接画到 GpuPanel,省 readback+blit)
+        bool m_gpuDefault { true };   // 默认启用 GPU(设置可关;启动后首个网络页加载完自动开)
+        bool m_gpuAutoTried { false };// 本次会话已自动尝试过开 GPU(不重复)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
         int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态

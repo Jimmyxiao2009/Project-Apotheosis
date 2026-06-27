@@ -10,4 +10,6 @@ Write-Host "=== [1/2] 生成 XAML .g.hpp(MarkupCompilePass1+2) ===" -ForegroundC
 
 Write-Host "=== [2/2] 全量构建 + 打包 appx ===" -ForegroundColor Cyan
 & $msbuild $proj /p:Configuration=Release /p:Platform=ARM /m /v:minimal 2>&1 | Tee-Object $log
-Write-Host "=== MSBuild 退出码: $LASTEXITCODE ==="
+$code = $LASTEXITCODE
+Write-Host "=== MSBuild 退出码: $code ==="
+exit $code   # 传播 MSBuild 退出码(否则脚本恒返回 0,掩盖编译失败)

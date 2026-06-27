@@ -63,3 +63,7 @@ jitresult.txt
 
 # ==== 签名密钥 ====
 *.pfx
+
+# ==== 第三方参考(LBrowser 解压)/ 预处理调试残留 ====
+_ref/
+Navigator.i

@@ -463,16 +463,19 @@ void LoadingFrameLoaderClient::setTitle(const StringWithDirection&, const URL&)
 {
 }
 
-extern "C" bool g_apoUaMobile;   // WebCoreDriver.cpp 定义(extern "C" 跨命名空间);UI 可切换手机/桌面,切后重载生效
+extern "C" bool g_apoUaMobile;        // WebCoreDriver.cpp 定义;UI 可切换手机/桌面,切后重载生效
+extern "C" char g_apoCustomUA[2048];  // WebCoreDriver.cpp 定义;非空则覆盖 mobile/desktop(WebCoreSetUserAgentString 设)
 
 String LoadingFrameLoaderClient::userAgent(const URL&) const
 {
-    // Apotheosis: 默认移动版 iPhone Safari UA——站点发移动布局(更窄更轻,适配 ~390px 视口),
-    // 配合驱动移动视口宽度,百度等才完整显示。引擎本就是 WebKit(605.1.15),移动 Safari UA 最诚实。
+    // Apotheosis: 自定义 UA 优先(用户在设置里填,绕开按 UA 拦截的站点,如 microsoft)。
+    if (g_apoCustomUA[0])
+        return String::fromUTF8(g_apoCustomUA);
+    // 默认移动版 iPhone Safari UA——站点发移动布局(更窄更轻,适配 ~390px 视口)。
     if (g_apoUaMobile)
         return "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1"_s;
-    // 桌面版(部分流氓站点对移动 UA 抽风时,UI 一键切到这个)
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15"_s;
+    // 桌面版:用当代 Edge/Chromium UA(旧 Safari-on-Windows 串会被 microsoft 等站点拦)。
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"_s;
 }
 
 void LoadingFrameLoaderClient::savePlatformDataToCachedFrame(CachedFrame*)

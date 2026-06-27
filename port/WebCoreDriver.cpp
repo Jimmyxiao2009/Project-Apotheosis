@@ -128,6 +128,8 @@
 #include <WebCore/HandleUserInputEventResult.h> // EventHandler 鼠标方法返回类型(否则不完整类型报错)
 #include <WebCore/FocusController.h>         // page->focusController().setActive/setFocused(headless 处理 JS 事件必需)
 #include <WebCore/Editor.h>                  // editor().canEdit()/insertText()/command(输入法文本插入)
+#include <WebCore/FindOptions.h>             // WebCore::FindOption / FindOptions(页内查找)
+#include <WebCore/SimpleRange.h>             // Page::FindStringData 内含 std::optional<SimpleRange>
 #include <WebCore/HTMLInputElement.h>        // 聚焦 input 置选区(setSelectionRange)→ 让 canEdit 成立
 #include <WebCore/HTMLTextAreaElement.h>     // 同上,textarea
 #include <WebCore/HTMLElement.h>             // isContentEditable()(contenteditable 检测)
@@ -228,6 +230,7 @@ static char g_lastUrl[1024] = "";    // 最近渲染文档的最终 URL(会话�
 static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判断画面是否变化 → 静止页自动停帧省电)
 static int g_lastPendingResources = 0; // 最近文档仍在加载/未知状态的缓存资源数(防实时循环过早停)
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
+extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobile/desktop。WebCoreSetUserAgentString 设。
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
@@ -267,6 +270,9 @@ extern "C" void WebCorePortBumpLoad(int kind)
 struct LinkRect { int x, y, w, h; std::string url; };
 static std::vector<LinkRect> g_links;
 static std::string g_imeDiag;   // 最近一次 WebCoreTypeText 的可编辑/聚焦/插入诊断(WebCoreEditDebug 读)
+// 页内查找:记住上次查找词 + 基础选项,供 WebCoreFindNext 不重新标记直接换下一个。
+static WTF::String g_findText;
+static WebCore::FindOptions g_findOpts;
 
 static int countPendingResources(WebCore::Document& document)
 {
@@ -1615,6 +1621,87 @@ int WebCoreSyncLinks()
     return kOK;
 }
 
+// 页内查找:标记并高亮全部匹配 + 选中(从当前选区起)第一个,滚动到它,重绘。返回匹配数(>=0)或负错误码。
+//   matchCase!=0 区分大小写;wrap!=0 到底回绕。空串=清除高亮(等价 WebCoreFindClear)。
+int WebCoreFindString(const char* utf8, int matchCase, int wrap, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!utf8 || !outRGBA)
+        return kErrBadArgs;
+    if (!g_session || !g_session->page || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;
+
+    String text = String::fromUTF8(utf8);
+    OptionSet<FindOption> opts;
+    if (!matchCase) opts.add(FindOption::CaseInsensitive);
+    if (wrap)       opts.add(FindOption::WrapAround);
+    g_findText = text;
+    g_findOpts = opts;
+
+    if (text.isEmpty()) {
+        g_session->page->unmarkAllTextMatches();
+        int prc = finishInteractionPaint(outRGBA);
+        return prc == kOK ? 0 : prc;
+    }
+    unsigned count = g_session->page->markAllMatchesForText(text, opts, /*shouldHighlight*/ true, /*max*/ 1000);
+    auto data = g_session->page->findString(text, opts);
+    if (data.range)
+        g_session->page->revealCurrentSelection();
+    int prc = finishInteractionPaint(outRGBA);
+    if (prc != kOK)
+        return prc;
+    return static_cast<int>(count);
+}
+
+// 查找下一个/上一个(沿用上次查找词+选项,不重新标记)。forward!=0 向下。返回 1=命中 / 0=无 / 负=错误。
+int WebCoreFindNext(int forward, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!outRGBA)
+        return kErrBadArgs;
+    if (!g_session || !g_session->page)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    if (g_findText.isEmpty())
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    OptionSet<FindOption> opts = g_findOpts;
+    if (!forward) opts.add(FindOption::Backwards);
+    auto data = g_session->page->findString(g_findText, opts);
+    if (data.range)
+        g_session->page->revealCurrentSelection();
+    int prc = finishInteractionPaint(outRGBA);
+    if (prc != kOK)
+        return prc;
+    return data.range ? 1 : 0;
+}
+
+// 清除查找高亮/选区,重绘。返回 0 成功。
+int WebCoreFindClear(uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!outRGBA)
+        return kErrBadArgs;
+    if (!g_session || !g_session->page)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;
+
+    g_session->page->unmarkAllTextMatches();
+    g_findText = WTF::String();
+    int prc = finishInteractionPaint(outRGBA);
+    return prc == kOK ? 0 : prc;
+}
+
 // M4 捏合缩放:把页面缩放因子设为 scale(钳到 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 为锚 —— 缩放后让焦点
 //   下的内容点仍停在焦点处(据此算新滚动原点)。setPageScaleFactor 触发按新尺度重栅格(TextureMapper backing 的
 //   contentsScale = pageScaleFactor*deviceScale → 文字清晰)。重绘到 outRGBA。引擎线程串行调。返回 0。
@@ -1682,6 +1769,16 @@ int WebCoreGetPageScale()
 void WebCoreSetUserAgentMobile(int mobile)
 {
     g_apoUaMobile = (mobile != 0);
+}
+
+// 自定义 UA:非空则 userAgent() 直接返回它(覆盖 mobile/desktop);空串=清除回退开关。切后 UI 重载生效。
+void WebCoreSetUserAgentString(const char* ua)
+{
+    if (!ua || !*ua) { g_apoCustomUA[0] = '\0'; return; }
+    size_t n = std::strlen(ua);
+    if (n >= sizeof(g_apoCustomUA)) n = sizeof(g_apoCustomUA) - 1;
+    std::memcpy(g_apoCustomUA, ua, n);
+    g_apoCustomUA[n] = '\0';
 }
 
 // M1 验证:GPU 合成是否在跑。PortChromeClient 的 attachRootGraphicsLayer 被调=合成激活+图层树已建;

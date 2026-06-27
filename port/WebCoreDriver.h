@@ -52,7 +52,8 @@ int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable
 int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
-void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Windows UA
+void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Edge UA
+void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
 int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
 int WebCoreGpuInit(void* nativeWindow, int w, int h); // M2: init GPU present (engine thread). nativeWindow=SwapChainPanel PropertySet IInspectable*; nullptr=offscreen(readback)
 int WebCoreComposite();                               // M2: composite current session layer tree to the window surface (swapBuffers)
@@ -63,6 +64,11 @@ int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the ses
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document
 unsigned WebCoreGetFrameHash();                       // pixel hash of the last frame (idle detection)
+
+// ---- find-in-page ----
+int WebCoreFindString(const char* utf8, int matchCase, int wrap, uint8_t* outRGBA); // mark+highlight all, select first; returns match count (>=0) or neg error
+int WebCoreFindNext(int forward, uint8_t* outRGBA);   // next/prev with last query (no re-mark); 1=hit, 0=none, neg=error
+int WebCoreFindClear(uint8_t* outRGBA);               // clear find highlight + selection
 
 #ifdef __cplusplus
 } // extern "C"

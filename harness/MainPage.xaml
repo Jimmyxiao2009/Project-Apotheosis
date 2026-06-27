@@ -1,75 +1,102 @@
 <Page
     x:Class="Harness.MainPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    RequestedTheme="Dark">
+
+    <!-- ============================================================================
+         视觉改版(向 LBrowser):底部单栏  [标签] | 🔒地址 | ⋯   + 滑出动作菜单 + 全屏抽屉。
+         约束:保留全部 x:Name 与事件 handler(2132 行 code-behind 直接引用,改名=编译/运行崩);
+               WinRT 契约 ≤5.0 → 不用 Button.CornerRadius/StackPanel.Spacing,圆角用 Border 包裹。
+         ============================================================================ -->
 
     <Page.Resources>
-        <!-- 工具栏图标按钮:透明底,按下高亮。移动端紧凑尺寸。 -->
+        <!-- 统一深色调(贴近 LBrowser 暗色 chrome;不依赖 ThemeResource 解析,设备上确定一致) -->
+        <SolidColorBrush x:Key="PageBg"   Color="#FF161618"/>
+        <SolidColorBrush x:Key="Chrome"   Color="#FF2A2A2C"/>
+        <SolidColorBrush x:Key="Surface"  Color="#FF323234"/>
+        <SolidColorBrush x:Key="Inset"    Color="#FF1B1B1D"/>
+        <SolidColorBrush x:Key="Sep"      Color="#22FFFFFF"/>
+        <SolidColorBrush x:Key="TxtHi"    Color="#FFF2F2F3"/>
+        <SolidColorBrush x:Key="TxtLo"    Color="#FF9BA0A6"/>
+        <SolidColorBrush x:Key="Accent"   Color="#FF3AA0FF"/>
+        <SolidColorBrush x:Key="Scrim"    Color="#B3000000"/>
+
+        <!-- 底栏图标键:大触摸目标,透明底 -->
+        <Style x:Key="NavBtn" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+            <Setter Property="FontSize" Value="19"/>
+            <Setter Property="Width" Value="50"/>
+            <Setter Property="Height" Value="54"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="VerticalAlignment" Value="Stretch"/>
+        </Style>
+        <!-- 小图标键(查找条/抽屉关闭等) -->
         <Style x:Key="IconBtn" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="Foreground" Value="#E8E8E8"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontSize" Value="16"/>
-            <Setter Property="Width" Value="38"/>
-            <Setter Property="Height" Value="38"/>
+            <Setter Property="Width" Value="40"/>
+            <Setter Property="Height" Value="40"/>
             <Setter Property="Padding" Value="0"/>
-            <Setter Property="Margin" Value="0"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
         </Style>
         <Style x:Key="TabBtn" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="Foreground" Value="#CFCFCF"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtLo}"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontSize" Value="14"/>
-            <Setter Property="Height" Value="40"/>
+            <Setter Property="Height" Value="42"/>
             <Setter Property="Padding" Value="10,0"/>
+        </Style>
+        <!-- 动作面板:顶部快捷图标列 -->
+        <Style x:Key="QuickBtn" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="Padding" Value="0,10"/>
+        </Style>
+        <!-- 动作面板:整行菜单项 -->
+        <Style x:Key="MenuRow" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="FontSize" Value="17"/>
+            <Setter Property="Padding" Value="18,13"/>
+        </Style>
+        <!-- 设置页的整行按钮 -->
+        <Style x:Key="SetRow" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource Surface}"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Padding" Value="14,12"/>
         </Style>
     </Page.Resources>
 
-    <Grid Background="#202225">
+    <Grid x:Name="RootGrid" Background="{StaticResource PageBg}">
+        <!-- 软键盘弹出时整体上移(仅地址栏聚焦时,见 code-behind InputPane 处理) -->
+        <Grid.RenderTransform>
+            <TranslateTransform x:Name="RootShift" Y="0"/>
+        </Grid.RenderTransform>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="*"/>      <!-- 内容(网页) -->
+            <RowDefinition Height="Auto"/>   <!-- 底部 chrome -->
         </Grid.RowDefinitions>
 
-        <!-- ===== 工具栏 ===== -->
-        <Grid Grid.Row="0" Background="#2B2D31" Padding="3,4">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource IconBtn}" Content="&#x25C0;" Click="OnBack" IsEnabled="False"/>
-            <Button x:Name="FwdBtn"  Grid.Column="1" Style="{StaticResource IconBtn}" Content="&#x25B6;" Click="OnForward" IsEnabled="False"/>
-            <Button x:Name="HomeBtn" Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#x2302;" FontSize="17" Click="OnHome"/>
-            <Border Grid.Column="3" Background="#1B1D20" CornerRadius="5" Margin="3,0">
-                <TextBox x:Name="UrlBox" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
-                         Foreground="#F0F0F0" VerticalContentAlignment="Center" Padding="8,0"
-                         InputScope="Url" Text="" PlaceholderText="搜索或输入网址" KeyDown="OnUrlKeyDown"/>
-            </Border>
-            <Button x:Name="GoBtn"   Grid.Column="4" Style="{StaticResource IconBtn}" Content="&#x2192;" FontSize="19" Click="OnGo"/>
-            <Button x:Name="MenuBtn" Grid.Column="5" Style="{StaticResource IconBtn}" Content="&#x2630;" Click="OnMenu"/>
-        </Grid>
-
-        <!-- ===== 进度 + 标题 ===== -->
-        <Grid Grid.Row="1" Background="#2B2D31">
-            <ProgressBar x:Name="Progress" Height="2" VerticalAlignment="Top" Foreground="#3AA0FF"
-                         Background="Transparent" IsIndeterminate="False" Visibility="Collapsed"/>
-            <TextBlock x:Name="TitleText" Text="EdgeHTML Reborn" Foreground="#9AA0A6" FontSize="11"
-                       Margin="10,2,10,4" TextTrimming="CharacterEllipsis"/>
-        </Grid>
-
-        <!-- ===== 内容区:网页渲染 + 抽屉覆盖层 ===== -->
-        <Grid Grid.Row="2">
-            <Border Background="White" BorderBrush="#000000" BorderThickness="0,1,0,0">
-                <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖拽→引擎滚动,带惯性 TranslateInertia)。
-                     去掉了 ScrollViewer——它的 DirectManipulation(捏合缩放)占着触摸通道、把单指拖拽吞了,
-                     导致之前指针方案滚不动。Grid(Background=White=可命中)整片接手势;点击仍走 Tapped
-                     (GetPosition(RenderImage) 坐标不变)。捏合缩放后续用 ManipulationDelta.Scale 加回。 -->
+        <!-- ===== 内容区:网页渲染 + 浮层 ===== -->
+        <Grid Grid.Row="0">
+            <Border Background="White">
+                <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖→引擎滚动+惯性,捏合→Scale)。
+                     点击走 Tapped;坐标用 GetPosition(ContentArea) 映回引擎像素(MapTapToEngine)。 -->
                 <Grid x:Name="ContentArea" Background="White"
                       ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale"
                       IsTapEnabled="True" Tapped="OnPageTapped"
@@ -79,78 +106,378 @@
                 </Grid>
             </Border>
 
-            <!-- GPU 渲染面(SwapChainPanel)。GPU 管线已真机验证(0.1.5 黄三角形);0.1.6 默认隐藏让浏览器可用,
-                 0.1.7 将复用此面承载 WebCore TextureMapper 的 GPU 合成输出(替代软件 RenderImage)。 -->
+            <!-- GPU 直呈现面(SwapChainPanel);GPU 起来后承载 TextureMapper 合成输出。 -->
             <SwapChainPanel x:Name="GpuPanel" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
                             IsHitTestVisible="False" Visibility="Collapsed"/>
 
-            <!-- 输入法捕获框:不可见(1×1 透明),聚焦它即唤起屏幕键盘;键入经 TextChanged/KeyDown 转发给引擎活会话。 -->
+            <!-- 输入法捕获框:1×1 透明,聚焦唤起键盘;键入转发给引擎活会话。 -->
             <TextBox x:Name="ImeBox" Width="1" Height="1" Opacity="0" Margin="0" Padding="0"
                      BorderThickness="0" MinWidth="0" MinHeight="0"
                      HorizontalAlignment="Left" VerticalAlignment="Top" IsTabStop="True"
                      TextChanged="OnImeTextChanged" KeyDown="OnImeKeyDown"/>
 
-            <!-- 悬浮翻页按钮(引擎滚动:触发懒加载图片/查看下方内容)。仅有会话时显示。 -->
-            <!-- 注:Win10 Mobile 契约 ≤5.0,不能用 Button.CornerRadius(7.0)/StackPanel.Spacing(5.0);
-                 用 Border.CornerRadius(1.0,安全)包裹透明 Button 实现圆形 FAB,间距用 Margin。 -->
+            <!-- 顶部加载进度条 -->
+            <ProgressBar x:Name="Progress" Height="2.5" VerticalAlignment="Top" Foreground="{StaticResource Accent}"
+                         Background="Transparent" IsIndeterminate="False" Visibility="Collapsed"/>
+
+            <!-- 悬浮翻页键(触发懒加载/看下方内容)。仅有会话时显示。 -->
             <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                        Margin="0,0,14,20" Visibility="Collapsed">
-                <Border Width="50" Height="50" CornerRadius="25" Background="#CC2B2D31" Margin="0,0,0,10">
-                    <Button Width="50" Height="50" Padding="0" Background="Transparent" Foreground="#FFFFFF"
-                            FontSize="20" BorderThickness="0" Content="&#x25B2;" Click="OnScrollUp"/>
+                        Margin="0,0,14,16" Visibility="Collapsed">
+                <Border Width="48" Height="48" CornerRadius="24" Background="#CC2A2A2C" Margin="0,0,0,10">
+                    <Button Width="48" Height="48" Padding="0" Background="Transparent" Foreground="#FFFFFFFF"
+                            FontSize="19" BorderThickness="0" Content="&#x25B2;" Click="OnScrollUp"/>
                 </Border>
-                <Border Width="50" Height="50" CornerRadius="25" Background="#E63AA0FF">
-                    <Button Width="50" Height="50" Padding="0" Background="Transparent" Foreground="#FFFFFF"
-                            FontSize="20" BorderThickness="0" Content="&#x25BC;" Click="OnScrollDown"/>
+                <Border Width="48" Height="48" CornerRadius="24" Background="#E63AA0FF">
+                    <Button Width="48" Height="48" Padding="0" Background="Transparent" Foreground="#FFFFFFFF"
+                            FontSize="19" BorderThickness="0" Content="&#x25BC;" Click="OnScrollDown"/>
                 </Border>
             </StackPanel>
 
-            <!-- 抽屉:收藏/历史/下载 -->
-            <Grid x:Name="Drawer" Background="#F7202225" Visibility="Collapsed">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-
-                <!-- 抽屉标题栏 -->
-                <Grid Grid.Row="0" Background="#2B2D31">
+            <!-- 页内查找条(顶部浮条) -->
+            <Border x:Name="FindBar" VerticalAlignment="Top" HorizontalAlignment="Stretch"
+                    Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1" Visibility="Collapsed">
+                <Grid Margin="8,6">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="菜单" Foreground="#FFFFFF" FontSize="22" Margin="16,0" VerticalAlignment="Center"/>
-                    <!-- GPU 合成开关(M2):点亮后重载当前页,引擎对网络会话开合成、经 TextureMapper 合成出像素(离屏 readback)。
-                         默认关=纯软件(稳);一次性开启(本会话内不可关,重启即回软件)。 -->
-                    <Button x:Name="GpuBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="#9AA0A6"
-                            Content="&#x1F5A5; GPU" Click="OnToggleGpu" VerticalAlignment="Center"/>
-                    <!-- UA 切换:遇到对移动 UA 抽风的站点(如百度)一键切桌面版再重载 -->
-                    <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="#3AA0FF"
-                            Content="&#x1F4F1; 手机UA" Click="OnToggleUA" VerticalAlignment="Center"/>
-                    <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
-                </Grid>
-
-                <!-- 标签 -->
-                <Grid Grid.Row="1" Background="#26282B">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <Button x:Name="TabFav"  Grid.Column="0" Style="{StaticResource TabBtn}" Content="&#x2605; 收藏" Click="OnTabFav"/>
-                    <Button x:Name="TabHist" Grid.Column="1" Style="{StaticResource TabBtn}" Content="&#x1F551; 历史" Click="OnTabHist"/>
-                    <Button x:Name="TabDl"   Grid.Column="2" Style="{StaticResource TabBtn}" Content="&#x2193; 下载" Click="OnTabDl"/>
-                    <Button x:Name="ActionBtn" Grid.Column="3" Style="{StaticResource TabBtn}" Foreground="#3AA0FF" Content="&#x2605; 收藏此页" Click="OnPrimaryAction"/>
+                    <Border Grid.Column="0" Background="{StaticResource Inset}" CornerRadius="8">
+                        <TextBox x:Name="FindBox" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
+                                 Foreground="{StaticResource TxtHi}" VerticalContentAlignment="Center" Padding="10,0"
+                                 PlaceholderText="页内查找" KeyDown="OnFindKeyDown" TextChanged="OnFindChanged"/>
+                    </Border>
+                    <TextBlock x:Name="FindCount" Grid.Column="1" Text="" Foreground="{StaticResource TxtLo}" FontSize="13" VerticalAlignment="Center" Margin="10,0"/>
+                    <Button x:Name="FindPrev" Grid.Column="2" Style="{StaticResource IconBtn}" Content="&#x25B2;" FontSize="13" Click="OnFindPrev"/>
+                    <Button x:Name="FindNext" Grid.Column="3" Style="{StaticResource IconBtn}" Content="&#x25BC;" FontSize="13" Click="OnFindNext"/>
+                    <Button x:Name="FindClose" Grid.Column="4" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnFindClose"/>
                 </Grid>
+            </Border>
 
-                <!-- 列表(代码动态填充) -->
-                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
-                    <StackPanel x:Name="DrawerList" Margin="8"/>
+            <!-- 地址栏建议下拉:锚定内容区底部 → 浮在底栏正上方。点项即导航。 -->
+            <Border x:Name="SuggestPanel" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
+                    Background="#F22A2A2C" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0" Visibility="Collapsed">
+                <ScrollViewer MaxHeight="340" VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="SuggestList" Margin="8,6"/>
                 </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- ===== 底部 chrome:状态行 + 导航栏 ===== -->
+        <Grid Grid.Row="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- 细状态行:页面标题 / 临时提示(code 大量写 TitleText 当 toast) -->
+            <Border Grid.Row="0" Background="{StaticResource Chrome}">
+                <TextBlock x:Name="TitleText" Text="EdgeHTML Reborn" Foreground="{StaticResource TxtLo}" FontSize="11"
+                           HorizontalAlignment="Center" Margin="14,3,14,2" TextTrimming="CharacterEllipsis"/>
+            </Border>
+
+            <!-- 导航栏:[标签数] | 🔒 地址 [Go/⟳/✕] | ⋯ -->
+            <Grid Grid.Row="1" Height="54" Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- 标签键:方框数字,点开标签切换器 -->
+                <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="50" Height="54" Padding="0" Click="OnTabs">
+                    <Border BorderBrush="{StaticResource TxtHi}" BorderThickness="2" CornerRadius="5" Width="24" Height="24">
+                        <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource TxtHi}" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                </Button>
+
+                <Rectangle Grid.Column="1" Fill="{StaticResource Sep}" Width="1" Height="22" VerticalAlignment="Center"/>
+
+                <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。三者统一 38 高、垂直居中。 -->
+                <Border Grid.Column="2" Background="{StaticResource Inset}" CornerRadius="9" Margin="6,8" Padding="0" Height="38">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
+                        <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
+                                   FontSize="14" Foreground="{StaticResource TxtLo}" TextLineBounds="Tight"
+                                   VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0"/>
+                        <TextBox x:Name="UrlBox" Grid.Column="1" FontSize="15" Height="38" BorderThickness="0" Background="Transparent"
+                                 Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,0"
+                                 InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
+                                 KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
+                                 GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
+                        <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
+                                Foreground="{StaticResource TxtHi}" Width="40" Height="38" Padding="0" FontSize="16"
+                                VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
+                                Content="&#x21BB;" Click="OnUrlAction"/>
+                    </Grid>
+                </Border>
+
+                <Rectangle Grid.Column="3" Fill="{StaticResource Sep}" Width="1" Height="22" VerticalAlignment="Center"/>
+
+                <!-- 菜单(More):弹出底部动作面板 -->
+                <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>
             </Grid>
+        </Grid>
+
+        <!-- ============================================================================
+             以下为全屏/底部浮层。Grid.RowSpan=2 覆盖内容+底栏。
+             ============================================================================ -->
+
+        <!-- ===== 动作面板(⋯ 弹出的底部 sheet)===== -->
+        <Grid x:Name="ActionMenu" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource Scrim}" Visibility="Collapsed" Tapped="OnActionScrimTap">
+            <Border VerticalAlignment="Bottom" Background="{StaticResource Surface}" CornerRadius="16,16,0,0" Tapped="OnSheetTap">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="520">
+                    <StackPanel Margin="0,10,0,16">
+                        <!-- 抓手条 -->
+                        <Border Width="40" Height="4" CornerRadius="2" Background="#55FFFFFF" Margin="0,0,0,12"/>
+
+                        <!-- 快捷:后退 / 前进 / 刷新 / 收藏 -->
+                        <Grid Margin="6,2,6,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="BackBtn" Grid.Column="0" Click="OnBack" Style="{StaticResource QuickBtn}" IsEnabled="False">
+                                <StackPanel>
+                                    <TextBlock Text="&#xE72B;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
+                                    <TextBlock Text="后退" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="FwdBtn" Grid.Column="1" Click="OnForward" Style="{StaticResource QuickBtn}" IsEnabled="False">
+                                <StackPanel>
+                                    <TextBlock Text="&#xE72A;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
+                                    <TextBlock Text="前进" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                </StackPanel>
+                            </Button>
+                            <Button Grid.Column="2" Tag="reload" Click="OnAction" Style="{StaticResource QuickBtn}">
+                                <StackPanel>
+                                    <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
+                                    <TextBlock Text="刷新" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                </StackPanel>
+                            </Button>
+                            <Button Grid.Column="3" Tag="bookmark" Click="OnAction" Style="{StaticResource QuickBtn}">
+                                <StackPanel>
+                                    <TextBlock Text="&#xE734;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="#FFFFD24A"/>
+                                    <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                </StackPanel>
+                            </Button>
+                        </Grid>
+
+                        <Border Height="1" Background="{StaticResource Sep}" Margin="14,4"/>
+
+                        <Button Tag="newtab" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="新标签页" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="home" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE80F;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="主页" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="ua" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE7F4;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock x:Name="ActUaLabel" Text="桌面版网站" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="find" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE721;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="页内查找" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="share" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE72D;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="分享" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="copylink" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE8C8;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="复制链接" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="download" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE896;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="下载此页" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+
+                        <Border Height="1" Background="{StaticResource Sep}" Margin="14,4"/>
+
+                        <Button Tag="bookmarks" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE734;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="书签" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="history" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE81C;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="历史记录" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                        <Button Tag="downloads" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE7B8;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="下载内容" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+
+                        <Border Height="1" Background="{StaticResource Sep}" Margin="14,4"/>
+
+                        <Button Tag="settings" Click="OnAction" Style="{StaticResource MenuRow}">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}"/>
+                                <TextBlock Text="设置" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+
+        <!-- ===== 抽屉:收藏/历史/下载 ===== -->
+        <Grid x:Name="Drawer" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Background="{StaticResource Chrome}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="菜单" Foreground="{StaticResource TxtHi}" FontSize="22" FontWeight="SemiBold" Margin="16,0" VerticalAlignment="Center"/>
+                <Button x:Name="GpuBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource TxtLo}"
+                        Content="&#x1F5A5; GPU" Click="OnToggleGpu" VerticalAlignment="Center"/>
+                <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}"
+                        Content="&#x1F4F1; 手机UA" Click="OnToggleUA" VerticalAlignment="Center"/>
+                <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="&#x2715;" Click="OnDrawerClose"/>
+            </Grid>
+
+            <Grid Grid.Row="1" Background="{StaticResource Surface}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Button x:Name="TabFav"  Grid.Column="0" Style="{StaticResource TabBtn}" Content="&#x2605; 收藏" Click="OnTabFav"/>
+                <Button x:Name="TabHist" Grid.Column="1" Style="{StaticResource TabBtn}" Content="&#x1F551; 历史" Click="OnTabHist"/>
+                <Button x:Name="TabDl"   Grid.Column="2" Style="{StaticResource TabBtn}" Content="&#x2193; 下载" Click="OnTabDl"/>
+                <Button x:Name="ActionBtn" Grid.Column="3" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="&#x2605; 收藏此页" Click="OnPrimaryAction"/>
+            </Grid>
+
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="DrawerList" Margin="8"/>
+            </ScrollViewer>
+        </Grid>
+
+        <!-- ===== 设置页(全屏)===== -->
+        <Grid x:Name="SettingsPage" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="3,6">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="&#xE72B;" Click="OnSettingsBack"/>
+                <TextBlock Grid.Column="1" Text="设置" Foreground="{StaticResource TxtHi}" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Margin="6,0"/>
+            </Grid>
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel Margin="18,12">
+                    <TextBlock Text="默认搜索引擎" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,8,0,4"/>
+                    <ComboBox x:Name="SetSearchCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem Content="Bing"/>
+                        <ComboBoxItem Content="Google"/>
+                        <ComboBoxItem Content="DuckDuckGo"/>
+                        <ComboBoxItem Content="百度"/>
+                    </ComboBox>
+
+                    <TextBlock Text="主页(URL,留空用内置主页)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <TextBox x:Name="SetHomeBox" HorizontalAlignment="Stretch" InputScope="Url" PlaceholderText="about:home"/>
+
+                    <ToggleSwitch x:Name="SetUaSwitch" Header="启动请求桌面版网站" Foreground="{StaticResource TxtHi}" Margin="0,18,0,0"/>
+
+                    <TextBlock Text="自定义 User-Agent(留空=用上面的开关;改后刷新网页生效)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,16,0,4"/>
+                    <TextBox x:Name="SetUaCustomBox" HorizontalAlignment="Stretch" TextWrapping="Wrap" AcceptsReturn="False"
+                             PlaceholderText="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/120 Safari/537.36 Edg/120"/>
+
+                    <Grid Margin="0,16,0,0">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="默认缩放" Foreground="{StaticResource TxtHi}" FontSize="16" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" x:Name="SetZoomLabel" Text="100%" Foreground="{StaticResource TxtLo}" FontSize="14" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Slider x:Name="SetZoomSlider" Minimum="50" Maximum="200" StepFrequency="10" Value="100" ValueChanged="OnZoomChanged"/>
+
+                    <ToggleSwitch x:Name="SetTabModeSwitch" Header="并发多引擎标签(暂搁置,后续实现)" IsEnabled="False" Foreground="{StaticResource TxtHi}" Margin="0,4,0,0"/>
+
+                    <TextBlock Text="GPU" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <Button Tag="gpu" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)"/>
+
+                    <TextBlock Text="清除数据" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <Button Tag="clearhist" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="清除历史记录" Margin="0,0,0,6"/>
+                    <Button Tag="clearfav" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="清除全部收藏" Margin="0,0,0,6"/>
+                    <Button Tag="cleardl" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="清除下载记录"/>
+
+                    <TextBlock Text="诊断" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <Button Tag="export" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump"/>
+
+                    <TextBlock Text="关于 / 更新" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>
+                    <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="检查更新(GitHub Releases)"/>
+
+                    <TextBlock Text="EdgeHTML Reborn / Apotheosis — WebKit (WebCore) 2.52.4 — ARM32 UWP"
+                               Foreground="#FF80868B" FontSize="12" TextWrapping="Wrap" Margin="0,22,0,24"/>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+
+        <!-- ===== 标签切换器(全屏)===== -->
+        <Grid x:Name="TabSwitcher" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="6,6">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock x:Name="TabSwitcherTitle" Grid.Column="0" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Margin="10,0"/>
+                <Button Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="完成" Click="OnTabSwitcherDone"/>
+            </Grid>
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="TabList" Margin="10,10"/>
+            </ScrollViewer>
+            <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                    Background="{StaticResource Chrome}" Foreground="{StaticResource Accent}" Padding="0,15" Click="OnNewTab">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="&#xE710;" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}"/>
+                    <TextBlock Text="新建标签页" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Accent}"/>
+                </StackPanel>
+            </Button>
         </Grid>
     </Grid>
 </Page>

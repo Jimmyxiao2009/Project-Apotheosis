@@ -84,8 +84,10 @@ int WebCoreTypeText(const char* utf8, uint8_t* outBuf);
 // 特殊键:0=退格,1=回车(可能触发表单提交导航),重绘到 outBuf。返回 0 成功。
 int WebCoreKeyAction(int action, uint8_t* outBuf);
 
-// UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后需重新加载页面生效。
+// UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Edge UA。切后需重新加载页面生效。
 void WebCoreSetUserAgentMobile(int mobile);
+// 自定义 UA:非空覆盖 mobile/desktop(绕开按 UA 拦截的站点如 microsoft);空串=清除回退开关。切后重载生效。
+void WebCoreSetUserAgentString(const char* ua);
 
 // M1:GPU 合成是否在跑(根 GraphicsLayer 已附)。加载后查,返回 1/0。
 int WebCoreEnableCompositing();
@@ -111,5 +113,14 @@ int WebCoreLiveTick(uint8_t* outBuf);
 int WebCoreGetPendingResourceCount();
 // 最近一帧像素哈希:实时模式比较连续帧,画面静止则停帧省电。
 unsigned WebCoreGetFrameHash();
+
+// ---- 页内查找 find-in-page ----
+// 标记并高亮全部匹配 + 选中第一个,滚动到它,重绘到 outBuf。matchCase!=0 区分大小写;wrap!=0 回绕。
+// 空串=清除高亮。返回匹配数(>=0)或负错误码。
+int WebCoreFindString(const char* utf8, int matchCase, int wrap, uint8_t* outBuf);
+// 沿用上次查找词查下一个/上一个(不重新标记)。forward!=0 向下。返回 1=命中 / 0=无 / 负=错误。
+int WebCoreFindNext(int forward, uint8_t* outBuf);
+// 清除查找高亮/选区,重绘。返回 0 成功。
+int WebCoreFindClear(uint8_t* outBuf);
 
 }

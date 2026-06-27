@@ -63,10 +63,20 @@ for ($i = 0; $i -lt 60; $i++) {
 # 查实际 FullName + 开崩溃收集
 $pkgs = (GET '/api/app/packagemanager/packages' | ConvertFrom-Json).InstalledPackages | Where-Object { $_.PackageFullName -match 'EdgeHTMLReborn.Harness' }
 if (-not $pkgs) { Write-Host "⚠ 安装后未查到 Harness 包" -ForegroundColor Yellow; exit 3 }
-$FN = ($pkgs | Sort-Object { [version]$_.Version.Major + '.' + $_.Version.Minor + '.' + $_.Version.Build + '.' + $_.Version.Revision } -Descending | Select-Object -First 1).PackageFullName
+$target = $pkgs | Sort-Object { [version]("$($_.Version.Major).$($_.Version.Minor).$($_.Version.Build).$($_.Version.Revision)") } -Descending | Select-Object -First 1
+$FN = $target.PackageFullName
 Write-Host "已装: $FN" -ForegroundColor Green
 $req2 = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$base/api/debug/dump/usermode/crashcontrol?packageFullName=$([uri]::EscapeDataString($FN))")
 if ($csrf) { $req2.Headers.Add('X-CSRF-Token', $csrf) }
 Write-Host "崩溃收集: $([int]$cli.SendAsync($req2).GetAwaiter().GetResult().StatusCode)"
+
+# 启动 App(PRAID 由 FullName 推导:<Name>_<PublisherHash>!App)
+$praid = $target.PackageRelativeId
+if (-not $praid) { $praid = "$($FN.Split('_')[0])_$($FN.Split('__')[-1])!App" }
+$aid = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($praid))
+$pkg = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($FN))
+$lreq = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$base/api/taskmanager/app?appid=$([uri]::EscapeDataString($aid))&package=$([uri]::EscapeDataString($pkg))")
+if ($csrf) { $lreq.Headers.Add('X-CSRF-Token', $csrf) }
+Write-Host "启动: $([int]$cli.SendAsync($lreq).GetAwaiter().GetResult().StatusCode) ($praid)"
 Write-Host "=== 部署成功 ==="
 exit 0
