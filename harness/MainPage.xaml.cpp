@@ -639,8 +639,12 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 int netRc = WebCoreSessionLoad(surl.c_str(), kW, kH, rgba->data());   // 常驻会话加载
                 char t[512] = ""; WebCoreGetTitle(t, sizeof t);
                 char diag[4096] = ""; WebCoreGetDiag(diag, sizeof diag);
+                char err[512] = ""; WebCoreGetLastError(err, sizeof err);   // curl 错误码+描述(失败时)
                 int comp = 0; try { comp = WebCoreEnableCompositing(); } catch (...) {}   // M1 验证:合成是否在跑(根图层已附)
-                WriteStage(("after-load rc=" + std::to_string(netRc) + " compositing=" + std::to_string(comp) + "\n" + diag).c_str());
+                // 失败原因也写进 stage.txt(原来只进错误页,拉不到)→ 远程诊断"加载失败"必看。
+                WriteStage(("after-load url=" + surl + " rc=" + std::to_string(netRc)
+                            + " compositing=" + std::to_string(comp)
+                            + "\nERR: " + err + "\ndiag: " + diag).c_str());
                 if (netRc == 0) {
                     rc = 0;
                     loadOk = true;
@@ -648,7 +652,6 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     title = ToWide(t);
                     if (title.empty()) title = Utf8ToWide(surl);
                 } else {
-                    char err[512] = ""; WebCoreGetLastError(err, sizeof err);
                     std::string eh = MakeErrorHtml(surl, err);
                     rc = WebCoreRenderHtml(eh.c_str(), kW, kH, rgba->data());   // 渲染错误页(会话已被引擎清理)
                     loadOk = false;

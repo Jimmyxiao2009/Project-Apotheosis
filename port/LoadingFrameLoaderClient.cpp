@@ -145,9 +145,16 @@ void LoadingFrameLoaderClient::dispatchDidFailLoad(const ResourceError& error)
     signalLoadComplete(true);
 }
 
-void LoadingFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceError& error, WillContinueLoading, WillInternallyHandleFailure)
+void LoadingFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceError& error, WillContinueLoading willContinue, WillInternallyHandleFailure)
 {
     recordNetError(error);
+    // Apotheosis: 服务器重定向(尤其 http→https 301,跨 scheme=换源)会以"取消"(Type::Cancellation)
+    //   失败掉当前 provisional load,但紧接着续起新的 provisional load(WillContinueLoading::Yes)。
+    //   原来一律 signalLoadComplete(true) → 把这种"将继续"的中间取消误判成加载失败,导致 gov.cn 等
+    //   301→https 站点白报 -10。故:将继续 / 取消 类一律不终结,等真正 didFinishLoad 或真实网络错误
+    //   (curl 非取消错误仍立即终结显示错误页);真卡住由 pumpLoop 的看门狗兜底。
+    if (willContinue == WillContinueLoading::Yes || error.isCancellation())
+        return;
     signalLoadComplete(true);
 }
 
