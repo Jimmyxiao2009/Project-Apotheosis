@@ -60,9 +60,13 @@ for ($i = 0; $i -lt 60; $i++) {
     if ($b -match '"Success"\s*:\s*false' -and $b -notmatch 'InProgress|Installing') { Write-Host "安装失败: $b" -ForegroundColor Red; exit 3 }
 }
 
-# 查实际 FullName + 开崩溃收集
-$pkgs = (GET '/api/app/packagemanager/packages' | ConvertFrom-Json).InstalledPackages | Where-Object { $_.PackageFullName -match 'EdgeHTMLReborn.Harness' }
-if (-not $pkgs) { Write-Host "⚠ 安装后未查到 Harness 包" -ForegroundColor Yellow; exit 3 }
+# 查实际 FullName + 开崩溃收集。非破坏式更新时,装好后包列表查询会与"包替换"竞态(瞬时查不到)→ 重试几次。
+$pkgs = $null
+for ($q = 0; $q -lt 6 -and -not $pkgs; $q++) {
+    try { $pkgs = (GET '/api/app/packagemanager/packages' | ConvertFrom-Json).InstalledPackages | Where-Object { $_.PackageFullName -match 'EdgeHTMLReborn.Harness' } } catch {}
+    if (-not $pkgs) { Start-Sleep -Seconds 3 }
+}
+if (-not $pkgs) { Write-Host "⚠ 安装后未查到 Harness 包(查询多次仍空;安装请求已 202,实际可能已装)" -ForegroundColor Yellow; exit 3 }
 $target = $pkgs | Sort-Object { [version]("$($_.Version.Major).$($_.Version.Minor).$($_.Version.Build).$($_.Version.Revision)") } -Descending | Select-Object -First 1
 $FN = $target.PackageFullName
 Write-Host "已装: $FN" -ForegroundColor Green
