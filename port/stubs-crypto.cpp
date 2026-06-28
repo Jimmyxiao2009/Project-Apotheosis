@@ -49,16 +49,20 @@
 #include <wtf/Vector.h>
 
 // =====================================================================================
-// PAL::CryptoDigest — runnable no-op / zero implementation (may be hit by hashing paths)
+// PAL::CryptoDigest — 真实 SHA(走已为 TLS 链接的 OpenSSL libcrypto)。
+// Apotheosis: 原先 computeHash() 返回全 0 假摘要 → Subresource Integrity(integrity=...)
+// 等校验恒失败、资源被拦。改用 OpenSSL EVP 一次性摘要算真 SHA。
+// 只声明所需 C 函数(不引 openssl 头,避免与 WebKit 自带 crypto 头/config 冲突)。
 // =====================================================================================
+
+#include <openssl/evp.h>   // libcrypto(已为 TLS 链接)的 EVP 摘要;头已在 vcpkg include 路径上
 
 namespace PAL {
 
-// Opaque per-digest context; we only need to remember the algorithm so computeHash() can
-// return a correctly-sized all-zero digest. Matches the forward-declared
-// PAL::CryptoDigestContext referenced by CryptoDigest::m_context.
+// 累积 addBytes 的输入,computeHash() 时一次性算摘要。
 struct CryptoDigestContext {
     CryptoDigestHashFunction algorithm { CryptoDigestHashFunction::SHA_256 };
+    Vector<uint8_t> data;
 };
 
 CryptoDigest::CryptoDigest()
@@ -75,37 +79,30 @@ std::unique_ptr<CryptoDigest> CryptoDigest::create(CryptoDigestHashFunction algo
     return digest;
 }
 
-void CryptoDigest::addBytes(std::span<const uint8_t>)
+void CryptoDigest::addBytes(std::span<const uint8_t> bytes)
 {
-    // No-op: this port has no real digest backend.
+    if (m_context)
+        m_context->data.append(bytes);
 }
 
 Vector<uint8_t> CryptoDigest::computeHash()
 {
-    // Return a fixed-length all-zero digest sized for the requested hash function so callers
-    // that only need a stable, correctly-sized buffer keep working.
-    size_t length = 32; // SHA-256 default
+    const EVP_MD* md = EVP_sha256();
     if (m_context) {
         switch (m_context->algorithm) {
-        case CryptoDigestHashFunction::SHA_1:
-            length = 20;
-            break;
-        case CryptoDigestHashFunction::DEPRECATED_SHA_224:
-            length = 28;
-            break;
-        case CryptoDigestHashFunction::SHA_256:
-            length = 32;
-            break;
-        case CryptoDigestHashFunction::SHA_384:
-            length = 48;
-            break;
-        case CryptoDigestHashFunction::SHA_512:
-            length = 64;
-            break;
+        case CryptoDigestHashFunction::SHA_1:              md = EVP_sha1();   break;
+        case CryptoDigestHashFunction::DEPRECATED_SHA_224: md = EVP_sha224(); break;
+        case CryptoDigestHashFunction::SHA_256:            md = EVP_sha256(); break;
+        case CryptoDigestHashFunction::SHA_384:            md = EVP_sha384(); break;
+        case CryptoDigestHashFunction::SHA_512:            md = EVP_sha512(); break;
         }
     }
-    Vector<uint8_t> result(length);
-    result.fill(0, length);
+    auto in = m_context ? m_context->data.span() : std::span<const uint8_t>();
+    unsigned char hash[64]; // EVP_MAX_MD_SIZE
+    unsigned int len = 0;
+    Vector<uint8_t> result;
+    if (EVP_Digest(in.data(), in.size(), hash, &len, md, nullptr) == 1)
+        result.append(std::span<const uint8_t>(hash, len));
     return result;
 }
 
