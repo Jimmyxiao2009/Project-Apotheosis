@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 Project Apotheosis / EdgeHTML Reborn contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTE ON UPSTREAM CODE / 上游代码说明
+
+The MIT license above covers the original code authored for this repository:
+the port layer (port/), the UWP harness (harness/), and the tooling (tools/).
+
+This project builds against upstream WebKit / WebCore / JavaScriptCore / WTF
+(webkitgtk-2.52.4), which is NOT included in this repository and remains under
+its own licenses (primarily LGPL-2.1 and BSD-2-Clause). Bundled third-party
+runtime dependencies (Cairo, ICU, libcurl, FreeType, HarfBuzz, ANGLE, etc.)
+likewise retain their respective upstream licenses.
+
+本仓库自有代码(port/、harness/、tools/)以 MIT 授权。其所链接的上游
+WebKit/WebCore/JSC/WTF 及第三方运行库不包含在本仓库内,各自保留其原始授权
+(主要为 LGPL-2.1 / BSD)。
