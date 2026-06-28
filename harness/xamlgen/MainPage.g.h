@@ -59,6 +59,7 @@ namespace Harness
     
         private: ::Windows::UI::Xaml::Controls::Grid^ RootGrid;
         private: ::Windows::UI::Xaml::Media::TranslateTransform^ RootShift;
+        private: ::Windows::UI::Xaml::Controls::Grid^ OobePanel;
         private: ::Windows::UI::Xaml::Controls::Grid^ ActionMenu;
         private: ::Windows::UI::Xaml::Controls::Grid^ Drawer;
         private: ::Windows::UI::Xaml::Controls::Grid^ SettingsPage;

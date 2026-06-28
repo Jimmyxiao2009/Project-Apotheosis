@@ -156,6 +156,12 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
 // 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
 static std::wstring g_searchPrefix = L"https://cn.bing.com/search?q=";
 static std::wstring g_homeUrl = L"about:home";
+static std::wstring g_lang = L"zh";   // 界面语言:zh(默认)/ en;首启 OOBE 选定,存 settings.ini
+// 代码里动态设置的中/英文案(按当前语言返回)。静态 XAML 串由 TranslateNode 树遍历翻译;
+// 这个给"运行期才赋值、会盖掉翻译"的标签/toast 用(收藏状态、UA 状态等)。
+static Platform::String^ L8(const wchar_t* zh, const wchar_t* en) {
+    return ref new Platform::String(g_lang == L"en" ? en : zh);
+}
 static std::wstring SearchPrefixFor(int idx)
 {
     switch (idx) {
@@ -381,6 +387,9 @@ MainPage::MainPage()
     } catch (...) {}
     LoadData();
     LoadSettings();   // 搜索引擎/主页/默认UA/缩放/标签模式(在首次导航前应用)
+    // OOBE:从没存过 lang(全新安装)→ 弹首启选语言浮层;否则按已选语言应用(英文则翻译整个界面)。
+    if (!m_langSet) { if (OobePanel) OobePanel->Visibility = Windows::UI::Xaml::Visibility::Visible; }
+    else { ApplyLanguage(); }
     // 初始化标签集合:活动标签的实时状态用全局成员表示,此处占位 1 个(首次导航填充其全局状态)。
     { Tab t0; t0.currentUrl = g_homeUrl; m_tabs.push_back(t0); m_activeTab = 0; }
     UpdateTabCount();
@@ -399,6 +408,11 @@ MainPage::MainPage()
             m_appForeground = e->Visible;
             if (e->Visible) StartLiveMode(); else StopLiveMode();
         });
+    // 实体返回键(Win10M 硬件 Back):接管系统返回事件 → 先关浮层/再浏览器后退/否则交系统。
+    try {
+        Windows::UI::Core::SystemNavigationManager::GetForCurrentView()->BackRequested +=
+            ref new Windows::Foundation::EventHandler<Windows::UI::Core::BackRequestedEventArgs^>(this, &MainPage::OnHardwareBack);
+    } catch (...) {}
     // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
     //   (地址胶囊+建议浮到键盘上方);网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
     try {
@@ -602,7 +616,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     m_urlSyncing = true;
     UrlBox->Text = isHome ? ref new String(L"") : url;
     m_urlSyncing = false;
-    TitleText->Text = isHome ? ref new String(L"主页") : ref new String((L"加载中  " + wurl).c_str());
+    TitleText->Text = isHome ? L8(L"主页", L"Home") : ref new String(((g_lang == L"en" ? L"Loading  " : L"加载中  ") + wurl).c_str());
     SetLoading(true);
 
     // 加载看门狗:即使完成回调因 dispatcher 断开/低内存而丢失,40s 后也强制复位 m_loading,
@@ -745,7 +759,7 @@ void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
         // 没有则返回 -12/-14,已处理。避免停在"以为有会话"却点不动的状态。
         m_sessionActive = false;
         ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
-        TitleText->Text = ref new String(L"加载超时");
+        TitleText->Text = L8(L"加载超时", L"Load timed out");
         SetLoading(false);
         UpdateNavButtons();
     }
@@ -810,7 +824,7 @@ void MainPage::ForwardClickToEngine(int px, int py)
     m_interacting = true;
     SetLoading(true);
     if (m_loadWatchdog) m_loadWatchdog->Start();   // 兜底:若引擎/回调卡死,40s 强制复位
-    TitleText->Text = ref new String(L"处理中…");
+    TitleText->Text = L8(L"处理中…", L"Working…");
 
     // 链接表命中(供引擎点击失败时退回经典导航)
     auto linkHit = std::make_shared<std::wstring>();
@@ -1362,6 +1376,20 @@ void MainPage::OnForward(Platform::Object^, RoutedEventArgs^)
     ++m_navIndex;
     NavigateTo(ref new String(m_navStack[m_navIndex].c_str()), false);
 }
+
+// 实体返回键:层级优先关浮层 → 浏览器后退 → 否则交系统(e->Handled 保持 false → 最小化/退出)。
+void MainPage::OnHardwareBack(Platform::Object^, Windows::UI::Core::BackRequestedEventArgs^ e)
+{
+    using V = Windows::UI::Xaml::Visibility;
+    if (OobePanel && OobePanel->Visibility == V::Visible) { e->Handled = true; return; }   // 选语言前拦住,别退出
+    if (SuggestPanel && SuggestPanel->Visibility == V::Visible) { HideSuggestions(); e->Handled = true; return; }
+    if (FindBar && FindBar->Visibility == V::Visible) { OnFindClose(nullptr, nullptr); e->Handled = true; return; }
+    if (ActionMenu && ActionMenu->Visibility == V::Visible) { HideActionMenu(); e->Handled = true; return; }
+    if (TabSwitcher && TabSwitcher->Visibility == V::Visible) { HideTabSwitcher(); e->Handled = true; return; }
+    if (Drawer && Drawer->Visibility == V::Visible) { HideDrawer(); e->Handled = true; return; }
+    if (SettingsPage && SettingsPage->Visibility == V::Visible) { HideSettings(); e->Handled = true; return; }
+    if (m_navIndex > 0 && !m_loading) { OnBack(nullptr, nullptr); e->Handled = true; return; }
+}
 void MainPage::OnMenu(Platform::Object^, RoutedEventArgs^) { ShowActionMenu(); }
 
 // UA 切换:手机/桌面。切引擎 UA 后重载当前页生效。(抽屉头部按钮)
@@ -1427,7 +1455,7 @@ void MainPage::OnPrimaryAction(Platform::Object^, RoutedEventArgs^)
 {
     if (m_tab == DrawerTab::Favorites) {
         ToggleBookmark();   // 收藏/取消(内部含保存 + 抽屉可见时刷新列表)
-        ActionBtn->Content = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? ref new String(L"★ 取消收藏") : ref new String(L"★ 收藏此页");
+        ActionBtn->Content = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"★ 取消收藏", L"★ Remove bookmark") : L8(L"★ 收藏此页", L"★ Bookmark this");
     } else if (m_tab == DrawerTab::History) {
         m_historyList.clear(); SaveHistory(); RebuildDrawerList();
     } else {
@@ -1444,11 +1472,11 @@ void MainPage::ShowDrawer(DrawerTab tab)
     Drawer->Visibility = Windows::UI::Xaml::Visibility::Visible;
     // 主操作按钮文案随标签变化
     if (tab == DrawerTab::Favorites)
-        ActionBtn->Content = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? ref new String(L"★ 取消收藏") : ref new String(L"★ 收藏此页");
+        ActionBtn->Content = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"★ 取消收藏", L"★ Remove bookmark") : L8(L"★ 收藏此页", L"★ Bookmark this");
     else if (tab == DrawerTab::History)
-        ActionBtn->Content = ref new String(L"\U0001F5D1 清空");
+        ActionBtn->Content = L8(L"\U0001F5D1 清空", L"\U0001F5D1 Clear");
     else
-        ActionBtn->Content = ref new String(L"↓ 下载此页");
+        ActionBtn->Content = L8(L"↓ 下载此页", L"↓ Download page");
     RebuildDrawerList();
     StopLiveMode();   // 抽屉盖住网页,暂停实时渲染省电
 }
@@ -1488,7 +1516,7 @@ void MainPage::RebuildDrawerList()
 
     if (list->empty()) {
         auto empty = ref new TextBlock();
-        empty->Text = (m_tab == DrawerTab::Favorites) ? L"暂无收藏" : (m_tab == DrawerTab::History ? L"暂无历史记录" : L"暂无下载");
+        empty->Text = (m_tab == DrawerTab::Favorites) ? L8(L"暂无收藏", L"No bookmarks yet") : (m_tab == DrawerTab::History ? L8(L"暂无历史记录", L"No history yet") : L8(L"暂无下载", L"No downloads yet"));
         empty->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x80, 0x86, 0x8b));
         empty->FontSize = 18; empty->Margin = Thickness(14, 20, 0, 0);
         DrawerList->Children->Append(empty);
@@ -1527,7 +1555,7 @@ void MainPage::RebuildDrawerList()
         // 删除按钮(收藏/历史)
         if (isFav) {
             auto del = ref new Button();
-            del->Content = L"✕ 删除收藏";
+            del->Content = L8(L"✕ 删除收藏", L"✕ Remove");
             del->FontSize = 15;
             del->Background = ref new SolidColorBrush(Colors::Transparent);
             del->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0xD9, 0x30, 0x25));
@@ -1570,7 +1598,7 @@ void MainPage::StartDownload(Platform::String^ url)
         }
     }
 
-    TitleText->Text = ref new String((L"下载中  " + fn).c_str());
+    TitleText->Text = ref new String(((g_lang == L"en" ? L"Downloading  " : L"下载中  ") + fn).c_str());
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     std::string u8url = ToUtf8(url);
@@ -1632,7 +1660,7 @@ void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
         m_sessionActive = false;
         ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
         SetLoading(false);
-        TitleText->Text = ref new String(L"已停止");
+        TitleText->Text = L8(L"已停止", L"Stopped");
         return;
     }
     std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
@@ -1746,9 +1774,9 @@ void MainPage::ShowActionMenu()
 {
     HideSuggestions();
     if (ActFavLabel)
-        ActFavLabel->Text = ref new String((!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L"已收藏" : L"收藏");
+        ActFavLabel->Text = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"已收藏", L"Saved") : L8(L"收藏", L"Bookmark");
     if (ActUaLabel)
-        ActUaLabel->Text = ref new String(m_uaMobile ? L"桌面版网站" : L"移动版网站");
+        ActUaLabel->Text = m_uaMobile ? L8(L"桌面版网站", L"Desktop site") : L8(L"移动版网站", L"Mobile site");
     ActionMenu->Visibility = Windows::UI::Xaml::Visibility::Visible;
     StopLiveMode();   // 面板盖住网页,暂停实时渲染省电
 }
@@ -1797,11 +1825,11 @@ void MainPage::ToggleBookmark()
     if (IsBookmarked(m_currentUrl)) {
         m_bookmarks.erase(std::remove_if(m_bookmarks.begin(), m_bookmarks.end(),
             [&](const Entry& e) { return e.url == m_currentUrl; }), m_bookmarks.end());
-        TitleText->Text = ref new String(L"已取消收藏");
+        TitleText->Text = L8(L"已取消收藏", L"Bookmark removed");
     } else {
         Entry e; e.url = m_currentUrl; e.title = m_currentTitle.empty() ? m_currentUrl : m_currentTitle;
         m_bookmarks.insert(m_bookmarks.begin(), e);
-        TitleText->Text = ref new String(L"已收藏");
+        TitleText->Text = L8(L"已收藏", L"Bookmarked");
     }
     SaveBookmarks();
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible && m_tab == DrawerTab::Favorites)
@@ -1810,7 +1838,7 @@ void MainPage::ToggleBookmark()
 
 void MainPage::DoShare()
 {
-    if (m_currentUrl.empty() || m_currentUrl == L"about:home") { TitleText->Text = ref new String(L"无可分享内容"); return; }
+    if (m_currentUrl.empty() || m_currentUrl == L"about:home") { TitleText->Text = L8(L"无可分享内容", L"Nothing to share"); return; }
     try { Windows::ApplicationModel::DataTransfer::DataTransferManager::ShowShareUI(); } catch (...) {}
 }
 
@@ -1821,14 +1849,14 @@ void MainPage::DoCopyLink()
         auto dp = ref new Windows::ApplicationModel::DataTransfer::DataPackage();
         dp->SetText(ref new String(m_currentUrl.c_str()));
         Windows::ApplicationModel::DataTransfer::Clipboard::SetContent(dp);
-        TitleText->Text = ref new String(L"已复制链接");
+        TitleText->Text = L8(L"已复制链接", L"Link copied");
     } catch (...) {}
 }
 
 void MainPage::DoToggleUA()
 {
     m_uaMobile = !m_uaMobile;
-    if (UaBtn) UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
+    if (UaBtn) UaBtn->Content = L8(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA", m_uaMobile ? L"\U0001F4F1 Mobile UA" : L"\U0001F5A5 Desktop UA");
     int mobile = m_uaMobile ? 1 : 0;
     WebEngine::instance().post([mobile]() { try { WebCoreSetUserAgentMobile(mobile); } catch (...) {} });
     if (!m_currentUrl.empty() && m_currentUrl != L"about:home")
@@ -1851,7 +1879,11 @@ void MainPage::ApplySettings()
         try { WebCoreSetUserAgentMobile(mobile); } catch (...) {}
         try { WebCoreSetUserAgentString(ua.empty() ? nullptr : ua.c_str()); } catch (...) {}   // 自定义 UA(空=清除回退开关)
     });
-    if (UaBtn) UaBtn->Content = ref new String(m_uaMobile ? L"\U0001F4F1 手机UA" : L"\U0001F5A5 桌面UA");
+    if (UaBtn) {
+        bool en = (g_lang == L"en");
+        UaBtn->Content = ref new String(m_uaMobile ? (en ? L"\U0001F4F1 Mobile UA" : L"\U0001F4F1 手机UA")
+                                                   : (en ? L"\U0001F5A5 Desktop UA" : L"\U0001F5A5 桌面UA"));
+    }
 }
 
 void MainPage::LoadSettings()
@@ -1873,9 +1905,11 @@ void MainPage::LoadSettings()
             else if (k == "tabmode") m_tabMode = atoi(v.c_str());
             else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
+            else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
     if (m_setSearch < 0 || m_setSearch > 3) m_setSearch = 0;
+    if (g_lang != L"en" && g_lang != L"zh") g_lang = L"zh";
     ApplySettings();
 }
 
@@ -1891,6 +1925,7 @@ void MainPage::SaveSettings()
     s += "tabmode=" + std::to_string(m_tabMode) + "\n";
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
+    s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
 }
@@ -1908,7 +1943,7 @@ void MainPage::ShowSettings()
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     if (VersionText) {
         auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
-        std::wstring v = L"版本 " + std::to_wstring(pv.Major) + L"." + std::to_wstring(pv.Minor)
+        std::wstring v = (g_lang == L"en" ? L"Version " : L"版本 ") + std::to_wstring(pv.Major) + L"." + std::to_wstring(pv.Minor)
                        + L"." + std::to_wstring(pv.Build) + L"." + std::to_wstring(pv.Revision);
         VersionText->Text = ref new String(v.c_str());
     }
@@ -1944,6 +1979,77 @@ void MainPage::HideSettings()
 
 void MainPage::OnSettingsBack(Platform::Object^, RoutedEventArgs^) { HideSettings(); }
 
+// ============================== OOBE / 多语言 ==============================
+// 中→英串表。选 English 时遍历已加载 XAML 树就地替换(键含 emoji/glyph 前缀的须全字匹配)。
+static const wchar_t* const kI18n[][2] = {
+    { L"页内查找", L"Find in page" }, { L"搜索或输入网址", L"Search or enter URL" },
+    { L"后退", L"Back" }, { L"前进", L"Forward" }, { L"刷新", L"Reload" }, { L"收藏", L"Bookmark" },
+    { L"新标签页", L"New tab" }, { L"主页", L"Home" }, { L"桌面版网站", L"Desktop site" },
+    { L"分享", L"Share" }, { L"复制链接", L"Copy link" }, { L"下载此页", L"Download page" },
+    { L"书签", L"Bookmarks" }, { L"历史记录", L"History" }, { L"下载内容", L"Downloads" }, { L"设置", L"Settings" },
+    { L"菜单", L"Menu" },
+    { L"\U0001F4F1 手机UA", L"\U0001F4F1 Mobile UA" }, { L"\U0001F5A5 桌面UA", L"\U0001F5A5 Desktop UA" },
+    { L"★ 收藏", L"★ Favorites" }, { L"\U0001F551 历史", L"\U0001F551 History" },
+    { L"↓ 下载", L"↓ Downloads" }, { L"★ 收藏此页", L"★ Bookmark this" },
+    { L"默认搜索引擎", L"Default search engine" }, { L"百度", L"Baidu" },
+    { L"主页(URL,留空用内置主页)", L"Home (URL; blank = built-in)" },
+    { L"自定义 User-Agent(留空=用上面的开关;改后刷新网页生效)", L"Custom User-Agent (blank = use the switch above; reload to apply)" },
+    { L"默认缩放", L"Default zoom" },
+    { L"启动请求桌面版网站", L"Request desktop site on launch" },
+    { L"并发多引擎标签(暂搁置,后续实现)", L"Concurrent multi-engine tabs (planned)" },
+    { L"默认启用 GPU 渲染(加载首个网页后自动开)", L"Enable GPU rendering by default (auto after first page)" },
+    { L"立即开启 GPU 合成(重启回软件)", L"Enable GPU compositing now (restart reverts)" },
+    { L"清除数据", L"Clear data" }, { L"清除历史记录", L"Clear history" },
+    { L"清除全部收藏", L"Clear all bookmarks" }, { L"清除下载记录", L"Clear downloads" },
+    { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
+    { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
+    { L"检查更新(GitHub Releases)", L"Check for updates (GitHub Releases)" },
+    { L"标签", L"Tabs" }, { L"完成", L"Done" }, { L"新建标签页", L"New tab" },
+};
+static Platform::String^ I18n(Platform::String^ s, bool toEn) {
+    if (s == nullptr) return s;
+    std::wstring w(s->Data());
+    for (auto& m : kI18n) {
+        if (toEn) { if (w == m[0]) return ref new Platform::String(m[1]); }
+        else      { if (w == m[1]) return ref new Platform::String(m[0]); }
+    }
+    return s;
+}
+
+void MainPage::TranslateNode(Platform::Object^ node, bool toEn) {
+    using namespace Windows::UI::Xaml;
+    using namespace Windows::UI::Xaml::Controls;
+    if (node == nullptr) return;
+    if (auto tb = dynamic_cast<TextBlock^>(node)) { tb->Text = I18n(tb->Text, toEn); return; }
+    if (auto tx = dynamic_cast<TextBox^>(node)) { tx->PlaceholderText = I18n(tx->PlaceholderText, toEn); return; }
+    if (auto sw = dynamic_cast<ToggleSwitch^>(node)) { if (auto h = dynamic_cast<Platform::String^>(sw->Header)) sw->Header = I18n(h, toEn); return; }
+    if (auto cbx = dynamic_cast<ComboBox^>(node)) { for (unsigned i = 0; i < cbx->Items->Size; ++i) { if (auto ci = dynamic_cast<ComboBoxItem^>(cbx->Items->GetAt(i))) if (auto s = dynamic_cast<Platform::String^>(ci->Content)) ci->Content = I18n(s, toEn); } return; }
+    if (auto p = dynamic_cast<Panel^>(node)) { for (auto c : p->Children) TranslateNode(c, toEn); return; }
+    if (auto bd = dynamic_cast<Border^>(node)) { TranslateNode(bd->Child, toEn); return; }
+    if (auto sv = dynamic_cast<ScrollViewer^>(node)) { TranslateNode(sv->Content, toEn); return; }
+    if (auto cc = dynamic_cast<ContentControl^>(node)) {   // Button 等
+        if (auto s = dynamic_cast<Platform::String^>(cc->Content)) cc->Content = I18n(s, toEn);
+        else TranslateNode(cc->Content, toEn);
+        return;
+    }
+}
+
+void MainPage::ApplyLanguage() {
+    if (g_lang != L"en") return;   // 默认中文,XAML 原文即中文,无需翻译
+    TranslateNode(this->Content, true);
+}
+
+void MainPage::OnOobeLang(Platform::Object^ sender, RoutedEventArgs^) {
+    std::wstring tag = L"zh";
+    if (auto b = dynamic_cast<Windows::UI::Xaml::Controls::Button^>(sender))
+        if (auto t = dynamic_cast<Platform::String^>(b->Tag)) tag = std::wstring(t->Data());
+    g_lang = (tag == L"en") ? L"en" : L"zh";
+    m_langSet = true;
+    if (g_lang == L"en") ApplyLanguage();   // 立即把整个界面翻成英文
+    SaveSettings();
+    if (OobePanel) OobePanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+}
+
 void MainPage::OnZoomChanged(Platform::Object^, Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs^ e)
 {
     if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring((int)(e->NewValue + 0.5)) + L"%").c_str());
@@ -1954,9 +2060,9 @@ void MainPage::OnSettingsBtn(Platform::Object^ sender, RoutedEventArgs^)
     std::wstring t;
     auto b = dynamic_cast<Button^>(sender);
     if (b) { auto tag = dynamic_cast<Platform::String^>(b->Tag); if (tag) t = std::wstring(tag->Data()); }
-    if (t == L"clearhist") { m_historyList.clear(); SaveHistory(); TitleText->Text = ref new String(L"历史记录已清除"); }
-    else if (t == L"clearfav") { m_bookmarks.clear(); SaveBookmarks(); TitleText->Text = ref new String(L"收藏已清除"); }
-    else if (t == L"cleardl") { m_downloads.clear(); SaveDownloads(); TitleText->Text = ref new String(L"下载记录已清除"); }
+    if (t == L"clearhist") { m_historyList.clear(); SaveHistory(); TitleText->Text = L8(L"历史记录已清除", L"History cleared"); }
+    else if (t == L"clearfav") { m_bookmarks.clear(); SaveBookmarks(); TitleText->Text = L8(L"收藏已清除", L"Bookmarks cleared"); }
+    else if (t == L"cleardl") { m_downloads.clear(); SaveDownloads(); TitleText->Text = L8(L"下载记录已清除", L"Downloads cleared"); }
     else if (t == L"export") ExportDebug();
     else if (t == L"gpu") { HideSettings(); OnToggleGpu(nullptr, nullptr); }
     else if (t == L"checkupdate") CheckForUpdate(true);
@@ -1982,7 +2088,7 @@ void MainPage::CheckForUpdate(bool manual)
 {
     if (m_updateChecking) return;
     m_updateChecking = true;
-    if (manual) TitleText->Text = ref new String(L"正在检查更新…");
+    if (manual) TitleText->Text = L8(L"正在检查更新…", L"Checking for updates…");
 
     // 当前版本(从 appx 清单读,不写死)
     auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
@@ -2029,10 +2135,10 @@ void MainPage::CheckForUpdate(bool manual)
                 [self, manual, ok, newer, tagW, pageW]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     s->m_updateChecking = false;
-                    if (!ok) { if (manual) s->TitleText->Text = ref new String(L"检查更新失败(网络?)"); return; }
-                    if (!newer) { if (manual) s->TitleText->Text = ref new String((L"已是最新版 " + tagW).c_str()); return; }
+                    if (!ok) { if (manual) s->TitleText->Text = L8(L"检查更新失败(网络?)", L"Update check failed (network?)"); return; }
+                    if (!newer) { if (manual) s->TitleText->Text = ref new String(((g_lang == L"en" ? L"Up to date " : L"已是最新版 ") + tagW).c_str()); return; }
                     // 有新版:提示 + 可直接在本浏览器打开发布页下载
-                    s->TitleText->Text = ref new String((L"发现新版本 " + tagW).c_str());
+                    s->TitleText->Text = ref new String(((g_lang == L"en" ? L"New version " : L"发现新版本 ") + tagW).c_str());
                     std::wstring target = pageW.empty()
                         ? std::wstring(L"https://github.com/Jimmyxiao2009/Project-Apotheosis/releases/latest")
                         : pageW;
@@ -2090,9 +2196,9 @@ void MainPage::ExportDebug()
         concurrency::create_task(picker->PickSaveFileAsync()).then([reportW](Windows::Storage::StorageFile^ file) {
             if (file) concurrency::create_task(Windows::Storage::FileIO::WriteTextAsync(file, reportW));
         });
-        TitleText->Text = ref new String(L"选择保存位置以导出…");
+        TitleText->Text = L8(L"选择保存位置以导出…", L"Pick a location to export…");
     } catch (...) {
-        TitleText->Text = ref new String(L"导出失败");
+        TitleText->Text = L8(L"导出失败", L"Export failed");
     }
 }
 
@@ -2102,7 +2208,7 @@ void MainPage::ExportDebug()
 
 void MainPage::ShowFindBar()
 {
-    if (!m_sessionActive) { TitleText->Text = ref new String(L"当前页不可查找"); return; }
+    if (!m_sessionActive) { TitleText->Text = L8(L"当前页不可查找", L"Find not available here"); return; }
     HideActionMenu();
     HideSuggestions();
     FindBar->Visibility = Windows::UI::Xaml::Visibility::Visible;
@@ -2176,8 +2282,8 @@ void MainPage::DoFind(int mode)
                     }
                     s->m_lastFrameHash = 0;
                     if (clearCopy) s->FindCount->Text = ref new String(L"");
-                    else if (modeCopy == 0) s->FindCount->Text = ref new String(rcCopy > 0 ? (std::to_wstring(rcCopy) + L" 处").c_str() : L"无结果");
-                    else s->FindCount->Text = ref new String(rcCopy ? L"" : L"无更多");
+                    else if (modeCopy == 0) s->FindCount->Text = ref new String(rcCopy > 0 ? (std::to_wstring(rcCopy) + (g_lang == L"en" ? L" found" : L" 处")).c_str() : (g_lang == L"en" ? L"No results" : L"无结果"));
+                    else s->FindCount->Text = ref new String(rcCopy ? L"" : (g_lang == L"en" ? L"No more" : L"无更多"));
                 }));
         } catch (...) {}
     });
@@ -2295,7 +2401,7 @@ void MainPage::HideTabSwitcher()
 void MainPage::RebuildTabSwitcher()
 {
     UpdateTabCount();
-    if (TabSwitcherTitle) TabSwitcherTitle->Text = ref new String((L"标签 (" + std::to_wstring(m_tabs.size()) + L")").c_str());
+    if (TabSwitcherTitle) TabSwitcherTitle->Text = ref new String(((g_lang == L"en" ? L"Tabs (" : L"标签 (") + std::to_wstring(m_tabs.size()) + L")").c_str());
     TabList->Children->Clear();
     Platform::Agile<MainPage^> self(this);
     Color blue = ColorHelper::FromArgb(255, 0x3A, 0xA0, 0xFF);

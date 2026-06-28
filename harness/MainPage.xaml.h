@@ -37,6 +37,8 @@ namespace Harness {
         // ---- 工具栏 ----
         void OnBack(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnForward(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // 实体返回键(Win10M 硬件 Back):先关浮层,否则浏览器后退,否则交系统(最小化/退出)。
+        void OnHardwareBack(Platform::Object^ sender, Windows::UI::Core::BackRequestedEventArgs^ e);
         void OnHome(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnGo(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
@@ -76,6 +78,11 @@ namespace Harness {
         void ExportDebug();
         // 检测更新:后台线程拉 GitHub Releases API,比对版本;manual=true 时无更新/失败也提示。
         void CheckForUpdate(bool manual);
+
+        // ---- OOBE / 多语言(首启选语言;英文=遍历已加载 XAML 树把中文串翻成英文)----
+        void OnOobeLang(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void ApplyLanguage();
+        void TranslateNode(Platform::Object^ node, bool toEn);
 
         // ---- 页内查找 ----
         void ShowFindBar();
@@ -198,6 +205,7 @@ namespace Harness {
         bool m_updateChecking { false };  // 检测更新进行中(防并发重复点)
         bool m_updateAutoChecked { false };  // 启动后已静默自检过一次(首个网络页加载完触发,CA 此时已就绪)
         // 设置(持久化到 LocalState\settings.ini;搜索前缀/主页是全局,见 .cpp)
+        bool m_langSet { false };     // settings.ini 里是否已存过 lang(否=首次启动→弹 OOBE)
         int  m_setSearch { 0 };       // 搜索引擎索引(0 Bing/1 Google/2 DuckDuckGo/3 百度)
         bool m_setUaDesktop { false };// 启动默认请求桌面版网站
         int  m_defaultZoom { 100 };   // 默认缩放百分比(50–200)

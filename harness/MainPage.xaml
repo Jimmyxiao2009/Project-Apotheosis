@@ -479,5 +479,23 @@
                 </StackPanel>
             </Button>
         </Grid>
+
+        <!-- ===== 首启 OOBE:欢迎 + 选语言(English / 中文)。仅全新安装(settings.ini 无 lang)弹出。 ===== -->
+        <Grid x:Name="OobePanel" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="36,0" MaxWidth="380">
+                <TextBlock Text="EdgeHTML Reborn" Foreground="{StaticResource TxtHi}" FontSize="30" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                <TextBlock Text="Modern web, reborn on Windows Phone" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0"/>
+                <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18"/>
+                <Border Background="{StaticResource Accent}" Margin="0,0,0,12">
+                    <Button Tag="en" Click="OnOobeLang" Background="Transparent" Foreground="#FFFFFFFF" BorderThickness="0"
+                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English"/>
+                </Border>
+                <Border Background="{StaticResource Surface}">
+                    <Button Tag="zh" Click="OnOobeLang" Background="Transparent" Foreground="{StaticResource TxtHi}" BorderThickness="0"
+                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="中文"/>
+                </Border>
+            </StackPanel>
+        </Grid>
     </Grid>
 </Page>
