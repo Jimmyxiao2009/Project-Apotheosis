@@ -1,0 +1,26 @@
+Project Apotheosis / EdgeHTML Reborn — third-party notices
+==========================================================
+
+The MIT license in LICENSE covers the original code authored for this
+repository: the port layer (port/), the UWP harness (harness/), and the
+tooling (tools/).
+
+This project builds against, and is intended to be linked with, upstream
+software that is NOT included in this repository and that remains under its
+own licenses:
+
+  - WebKit / WebCore / JavaScriptCore / WTF  (webkitgtk-2.52.4)
+        primarily LGPL-2.1 and BSD-2-Clause
+  - Cairo .................. LGPL-2.1 / MPL-1.1
+  - ICU .................... Unicode License
+  - libcurl ................ curl license (MIT-like)
+  - FreeType ............... FTL / GPL-2.0
+  - HarfBuzz ............... MIT (Old)
+  - ANGLE .................. BSD-3-Clause
+
+Each of these retains its respective upstream license. Refer to the upstream
+projects for the authoritative license texts.
+
+中文:本仓库自有代码(port/、harness/、tools/)以 MIT 授权(见 LICENSE)。
+其所链接的上游 WebKit/WebCore/JSC/WTF 及上述第三方运行库不包含在本仓库内,
+各自保留原始授权(主要为 LGPL-2.1 / BSD)。
