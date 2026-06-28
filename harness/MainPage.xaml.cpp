@@ -413,6 +413,19 @@ MainPage::MainPage()
         Windows::UI::Core::SystemNavigationManager::GetForCurrentView()->BackRequested +=
             ref new Windows::Foundation::EventHandler<Windows::UI::Core::BackRequestedEventArgs^>(this, &MainPage::OnHardwareBack);
     } catch (...) {}
+    // 内存压力(防 OOM):UWP 报应用内存到高水位/超限 → 让引擎一把放缓存(后退页面缓存已默认关)。
+    // 走引擎线程异步,绝不在 UI 线程同步 wait 引擎(线程铁律)。
+    try {
+        Windows::System::MemoryManager::AppMemoryUsageIncreased +=
+            ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                [](Platform::Object^, Platform::Object^) {
+                    auto lvl = Windows::System::MemoryManager::AppMemoryUsageLevel;
+                    if (lvl == Windows::System::AppMemoryUsageLevel::High || lvl == Windows::System::AppMemoryUsageLevel::OverLimit) {
+                        int crit = (lvl == Windows::System::AppMemoryUsageLevel::OverLimit) ? 1 : 0;
+                        WebEngine::instance().post([crit]() { try { WebCoreReleaseMemory(crit); } catch (...) {} });
+                    }
+                });
+    } catch (...) {}
     // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
     //   (地址胶囊+建议浮到键盘上方);网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
     try {

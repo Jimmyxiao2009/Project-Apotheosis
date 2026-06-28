@@ -79,6 +79,10 @@
 #include <WebCore/WebCoreJITOperations.h>// WebCore::populateJITOperations (no-op w/ C_LOOP)
 #include <WebCore/EmptyClients.h>        // pageConfigurationWithEmptyClients
 #include <WebCore/PageConfiguration.h>   // WebCore::PageConfiguration
+#include <WebCore/BackForwardCache.h>    // Apotheosis: 关后退页面缓存防 OOM
+#include <WebCore/MemoryCache.h>         // Apotheosis: 资源缓存上限
+#include <WebCore/MemoryRelease.h>       // Apotheosis: WebCore::releaseMemory(内存压力时一把清)
+#include <wtf/MemoryPressureHandler.h>   // Apotheosis: WTF::Critical / Synchronous
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
@@ -212,6 +216,11 @@ bool ensureWebCoreInitialized()
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
         installPortPlatformStrategies();         // PlatformStrategies (loader strategy) — required before any load
         WebCore::populateJITOperations();        // no-op under ENABLE(C_LOOP) (header has inline {} fallback)
+        // Apotheosis: 32 位低内存(Lumia)防 OOM —— 关后退页面缓存(整页 DOM+render 树极耗内存,
+        // 是 32 位地址空间最大的隐性占用),资源缓存收紧上限。系统内存压力来时由 harness 经
+        // WebCoreReleaseMemory() 主动放(WebCore::releaseMemory 一把清缓存 + JSC GC + 字体缓存)。
+        WebCore::BackForwardCache::singleton().setMaxSize(0);
+        WebCore::MemoryCache::singleton().setCapacities(0, 8u * 1024 * 1024, 16u * 1024 * 1024);
         return true;
     }();
     return initialized;
@@ -944,6 +953,18 @@ extern "C" void WebCorePortRecordNetError(int code, const char* domain, const ch
     std::snprintf(g_lastNetError, sizeof g_lastNetError,
         "curlcode=%d domain=%s desc=%s url=%s",
         code, domain ? domain : "", desc ? desc : "", url ? url : "");
+}
+
+// Apotheosis: 内存压力释放。harness 监听 UWP MemoryManager.AppMemoryUsageIncreased,
+// 到 High/OverLimit 时经引擎线程调本函数 → 一把清资源缓存 + 后退页面缓存 + JSC GC + 字体缓存。
+// critical: 1=严重(连活资源解码数据也丢);0=温和。须在引擎线程调(C ABI 已串行化)。
+extern "C" void WebCoreReleaseMemory(int critical)
+{
+    if (!ensureWebCoreInitialized()) return;
+    WebCore::releaseMemory(critical ? WTF::Critical::Yes : WTF::Critical::No,
+                           WTF::Synchronous::Yes,
+                           WebCore::MaintainBackForwardCache::No,
+                           WebCore::MaintainMemoryCache::No);
 }
 
 extern "C" {

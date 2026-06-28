@@ -21,6 +21,10 @@ int WebCoreLoadUrl(const char* url, int width, int height, uint8_t* outBuf);
 // 须在首个 WebCoreLoadUrl() 之前调用一次;path 是 cacert.pem 的 UTF-8 路径。
 void WebCoreSetCACertPath(const char* path);
 
+// Apotheosis: 内存压力释放(防 OOM)。监听 UWP MemoryManager 内存事件,到高水位时经引擎线程调。
+// critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
+void WebCoreReleaseMemory(int critical);
+
 // 用内存 PEM blob 注入 CA 根证书(CURLOPT_CAINFO_BLOB)。App Container 沙箱挡 OpenSSL
 // 的文件式 CA 加载(即便文件可读也 curl 77),故设备上必须用 blob 绕开文件 I/O。
 // data 是 cacert.pem 原始字节,须在首个 WebCoreLoadUrl 之前调用。

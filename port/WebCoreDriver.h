@@ -35,6 +35,10 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA);
 // WebCoreLoadUrl(); `path` is a UTF-8 filesystem path to a cacert.pem.
 void WebCoreSetCACertPath(const char* path);
 
+// Apotheosis: 内存压力释放(防 OOM)。harness 监听 UWP 内存事件,到高水位时经引擎线程调。
+// critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
+void WebCoreReleaseMemory(int critical);
+
 // ---- live interactive session (persistent Page + event forwarding) ----
 // Load a URL into a persistent session, then forward clicks/scroll to the live
 // document so buttons/forms/links work via real events and lazy images load on
