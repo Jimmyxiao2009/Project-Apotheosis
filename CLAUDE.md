@@ -92,9 +92,12 @@ pwsh -File E:\Apotheosis\port\compile-driver-gpu.ps1 E:\Apotheosis\port\WebCoreD
 pwsh -File E:\Apotheosis\port\link-driver-gpu.ps1
 ```
 
-构建 harness appx（MSBuild v143 ARM；脚本内部两段式：先 `MarkupCompilePass1;MarkupCompilePass2` 生成 XAML `.g.hpp` 再全量编）：
+构建 harness appx（MSBuild v143 ARM）。**改了 XAML（`MainPage.xaml`/`App.xaml`）必须先跑手搓代码生成器**（见下『手搓 XAML 工具链』）：
 
 ```powershell
+# 只在改了 XAML 后需要：重生成 xamlgen\MainPage.g.hpp（内嵌 XAML + 绑字段 + 挂 53 事件）
+pwsh -File E:\Apotheosis\port\gen-xaml-codebehind.ps1
+# 总是这步出 appx（脚本里的 MarkupCompilePass1/2 现在是空操作，工程已无 Page 项）
 pwsh -File E:\Apotheosis\port\build-harness.ps1
 # 看 harness-build.log；appx 在 harness\AppPackages\Harness\Harness_<ver>_ARM_Test\
 ```
@@ -115,6 +118,25 @@ pwsh -File E:\Apotheosis\tools\auto-diag2.ps1
 - 升版本号改 `harness\Package.appxmanifest`，deploy 脚本 `-Ver` 要对上。
 - 量 appx 大小用 PowerShell `.Length`（**别用 `ls -la`**，Windows 属主名带空格会把列读偏）。
 - 这是 **x64 构建机，ARM32 appx 跑不了**——引擎验证唯一靠真机。设备常因省电掉 WiFi，部署易传一半断，用 `tools\Deploy-Robust.ps1` 容错重试；远程时只产出 appx 交用户部署。
+- 发 release（让 app 内『检查更新』识别要**升版本号**）：改 `Package.appxmanifest` Version → 重编 → `gh release create v<x> --target gpu-path1 <appx> <cer>`。覆盖同版资产用 `gh release upload v<x> <appx> --clobber`。
+
+## 手搓 XAML 工具链（2026-06 起必读，否则会以为构建坏了）
+
+近期系统更新打挂了已弃用的 **C++/CX XamlCompiler**：生成 XamlTypeInfo 时空引用崩（`WMC9999`），**所有装着的 SDK（15063/17763/22621）+ VS2017/VS18 两套 MSBuild 都崩，连空白页都崩**（环境级,非版本问题）。原构建一直靠 `harness\Generated Files` 里旧工具链产的过时文件苟活，任何 clean/改 XAML 都会触发。
+
+**解法：整个绕开 markup compiler。** harness 的 XAML 不再编译：
+
+- **`port\gen-xaml-codebehind.ps1`** —— 解析 `MainPage.xaml` → 生成 `harness\xamlgen\MainPage.g.hpp`：运行期 `XamlReader::Load` 加载**内嵌 XAML 字符串** + 手动 `FindName` 绑全部 `x:Name` 字段 + 手动挂全部事件（无名事件元素自动补名），`Connect()` 留空。
+- **`Harness.vcxproj` 已删 `Page`/`ApplicationDefinition` 项** → `MarkupCompilePass1/2` 永不跑（`build-harness.ps1` 里那两段成了空操作）。
+- **`harness\xamlgen\`（已跟踪）** = Pass1 能产的 `.g.h` 声明快照（Pass1 不崩）+ 生成器产物。`App` 去掉了 `IXamlMetadataProvider`（否则 `XamlReader::Load` 解析框架类型拿 null 会 AV）；`App::OnLaunched` 直接 `ref new MainPage()`（不走 `Frame::Navigate(TypeName)`）。
+- **`XamlReader::Load` 已知坑**：根元素自身属性引用自己 `Grid.Resources` 的 `{StaticResource}`（如 `Background`）→ 解析顺序属性先于资源 → 空引用崩；生成器把根上的 `{StaticResource}` 替成字面色值。
+
+**改 UI 的铁律**：
+
+- 改 `MainPage.xaml` → 跑 `gen-xaml-codebehind.ps1` → `build-harness.ps1`。
+- **新增带 `x:Name` 的控件**：Pass1 不跑了不会自动补字段 → **手动去 `harness\xamlgen\MainPage.g.h` 加一行 `private: <类型>^ <名字>;`**（无名事件元素生成器自管）。
+- 多语言：静态 XAML 串走 `TranslateNode` 遍历已加载树翻译（中→英表 `kI18n`）；运行期赋值的标签/toast 走 `L8(zh,en)`（按 `g_lang`）。首启 `OobePanel` 选语言。实体返回键 = `SystemNavigationManager::BackRequested` → 关浮层/浏览器后退/交系统。
+- 引擎侧近期补的真功能：`CryptoDigest` 改用 OpenSSL 算真 SHA（原返回全 0，断 SRI）；`WebCoreReleaseMemory()` + 关 BackForwardCache + 收紧 MemoryCache 防 OOM（harness 接 UWP `MemoryManager` 内存事件触发）。
 
 ## 真机部署前置
 
