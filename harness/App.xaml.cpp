@@ -15,13 +15,12 @@ App::App()
 
 void App::OnLaunched(LaunchActivatedEventArgs^ e)
 {
-    auto rootFrame = dynamic_cast<Frame^>(Window::Current->Content);
-    if (rootFrame == nullptr) {
-        rootFrame = ref new Frame();
-        Window::Current->Content = rootFrame;
+    (void)e;
+    // 手搓:不走 Frame::Navigate(按 TypeName 实例化页面依赖 LoadComponent(App.xaml) 初始化的
+    // XAML 类型/元数据系统;本方案绕开了 markup compile,没那步 → Navigate 空指针崩)。
+    // 直接 ref new MainPage() 走 C++ 构造,设为窗口内容(本 app 单页,不需要 Frame 导航)。
+    if (Window::Current->Content == nullptr) {
+        Window::Current->Content = ref new MainPage();
     }
-    if (rootFrame->Content == nullptr)
-        rootFrame->Navigate(Windows::UI::Xaml::Interop::TypeName(MainPage::typeid), e->Arguments);
-
     Window::Current->Activate();
 }
