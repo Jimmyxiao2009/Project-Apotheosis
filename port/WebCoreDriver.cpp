@@ -59,6 +59,7 @@
 #include <wtf/StdLibExtras.h>        // (also pulled by config.h) WTF::move lives in <wtf/StdLibExtras.h>/<wtf/MainThread.h> chain
 #include <wtf/text/WTFString.h>      // WTF::String, _s literal
 #include <wtf/text/CString.h>        // String::utf8() for render diagnostics
+#include <wtf/text/MakeString.h>     // makeString(): WTF::String 不可变,拼接走 makeString(IME 直接置值)
 #include <wtf/URL.h>                 // WTF::URL
 
 // ---- JavaScriptCore ----
@@ -134,7 +135,7 @@
 #include <WebCore/Editor.h>                  // editor().canEdit()/insertText()/command(输入法文本插入)
 #include <WebCore/FindOptions.h>             // WebCore::FindOption / FindOptions(页内查找)
 #include <WebCore/SimpleRange.h>             // Page::FindStringData 内含 std::optional<SimpleRange>
-#include <WebCore/HTMLInputElement.h>        // 聚焦 input 置选区(setSelectionRange)→ 让 canEdit 成立
+#include <WebCore/HTMLInputElement.h>        // IME 直接改 input.value()/dispatchInputEvent()(绕开 editor 选区)
 #include <WebCore/HTMLTextAreaElement.h>     // 同上,textarea
 #include <WebCore/HTMLElement.h>             // isContentEditable()(contenteditable 检测)
 #include <WebCore/Document.h>                // elementFromPoint / focusedElement(命中点显式聚焦可编辑元素)
@@ -427,6 +428,22 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RunLoop::run();
     settle.stop();
     watchdog.stop();
+}
+
+// ★ 打字/退格专用轻量 settle:pumpLoop 的"加载器连续静默 16 tick(≈0.8s)才停"是为导航场景设计
+//   (等模块脚本求值/重定向后样式表落地),按键场景没有导航却也套用这个门槛 → 每敲一下键最少卡
+//   ~0.8s(真机实测:打字"能进框了但更新巨慢",越打越积压)。这里只推进 1~2 轮微任务/渲染更新
+//   (够把 input 事件里的同步 JS 落地),不等"静默"。异步跟随效果(防抖搜索等 setTimeout 回调)
+//   交给随后 200ms 一次的实时 tick(StartLiveMode/WebCoreLiveTick)在后续帧自然补上。
+static void pumpQuick(WebCore::LocalFrame& frame, WebCore::Page* pageForRendering)
+{
+    using namespace WebCore;
+    for (int i = 0; i < 2; ++i)
+        RunLoop::cycle();
+    if (pageForRendering)
+        pageForRendering->isolatedUpdateRendering();
+    if (RefPtr<Document> doc = frame.document())
+        doc->eventLoop().performMicrotaskCheckpoint();
 }
 
 // ============================ M2 GPU 合成 recipe ============================
@@ -1986,47 +2003,49 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     String text = String::fromUTF8(utf8);
 
-    // ★ "打字不进框"根因:headless 下合成点击给了元素 DOM focus,但常没在其内建立选区/插入点 →
-    //   editor().canEdit() 假阴 → 无论 insertText 还是 Char 默认动作都静默丢字(rc 仍 0,故诊断看不出)。
-    //   修复:把聚焦的 input/textarea 选区移到末尾(setSelectionRange)→ canEdit 成立 → 直接插入。
-    //   无可识别可编辑元素时退回合成键事件路径(原行为)。
+    // ★ "字进了 DOM 却 value 恒空"根因(真机 imedebug 实证:fe=input canEditAfter=1 inserted=1 但 valueLen 恒=0):
+    //   App Container/headless 下 editor().canEdit() 虽真,FrameSelection 却不在该 input 的内嵌编辑器里 →
+    //   insertTextWithoutSendingTextEvent 把字插到别处,目标框 value 一直空、屏幕也没变化。
+    //   修复:聚焦元素是文本 input / textarea 时,绕开 editor 与选区,直接改元素 value(确定性,经 input 内建
+    //   净化/maxlength)+ 派发 input 事件(让搜索建议/受控组件响应;不发 change,免每键误触发表单提交)。
+    //   仅 contenteditable / 未知可编辑元素才退回 editor / 合成键路径(原行为)。
     int canEditBefore = lf->editor().canEdit() ? 1 : 0;
     const char* feTag = "none";
-    if (doc) {
-        if (RefPtr<Element> fe = doc->focusedElement()) {
-            if (is<HTMLInputElement>(*fe)) {
-                feTag = "input";
-                auto& input = downcast<HTMLInputElement>(*fe);
-                input.focus();
-                input.setSelectionRange(0x3FFFFFFF, 0x3FFFFFFF);   // 钳到末尾,置入插入点
-            } else if (is<HTMLTextAreaElement>(*fe)) {
-                feTag = "textarea";
-                auto& ta = downcast<HTMLTextAreaElement>(*fe);
-                ta.focus();
-                ta.setSelectionRange(0x3FFFFFFF, 0x3FFFFFFF);
-            } else {
-                feTag = "other";   // contenteditable / 自定义编辑器:靠 keyEvent 兜底
-            }
+    const char* pathTag = "none";
+    int inserted = 0;
+    RefPtr<Element> fe = doc ? doc->focusedElement() : nullptr;
+    if (fe && is<HTMLInputElement>(*fe) && downcast<HTMLInputElement>(*fe).isTextField()) {
+        feTag = "input"; pathTag = "direct";
+        auto& input = downcast<HTMLInputElement>(*fe);
+        String cur = input.value();                                   // ValueOrReference<String> → const String&
+        (void)input.setValue(makeString(cur, text), DispatchNoEvent); // 末尾追加(默认 SetSelectionToEnd 置光标)
+        input.dispatchInputEvent();
+        inserted = 1;
+    } else if (fe && is<HTMLTextAreaElement>(*fe)) {
+        feTag = "textarea"; pathTag = "direct";
+        auto& ta = downcast<HTMLTextAreaElement>(*fe);
+        String cur = ta.value();
+        (void)ta.setValue(makeString(cur, text), DispatchNoEvent);
+        ta.dispatchInputEvent();
+        inserted = 1;
+    } else {
+        feTag = fe ? "other" : "none"; pathTag = "editor";   // contenteditable / 自定义编辑器
+        if (lf->editor().canEdit()) {
+            lf->editor().insertTextWithoutSendingTextEvent(text, false, nullptr);
+            inserted = 1;
+        } else {
+            // 兜底:合成键事件(Char 默认动作)。
+            OptionSet<PlatformEvent::Modifier> mods;
+            MonotonicTime t = MonotonicTime::now();
+            PlatformKeyboardEvent raw(PlatformEvent::Type::RawKeyDown, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+            lf->eventHandler().keyEvent(raw);
+            PlatformKeyboardEvent ch(PlatformEvent::Type::Char, text, text, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
+            lf->eventHandler().keyEvent(ch);
+            PlatformKeyboardEvent up(PlatformEvent::Type::KeyUp, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, MonotonicTime::now());
+            lf->eventHandler().keyEvent(up);
         }
     }
     int canEditAfter = lf->editor().canEdit() ? 1 : 0;
-    int inserted = 0;
-    if (canEditAfter) {
-        // ★ 不走 editor().insertText(它经 handleTextInputEvent 派发 textInput 事件,headless 下事件目标
-        //   解析不到 → 不插入,实测 val 仍空)。直接走 insertTextWithoutSendingTextEvent → TypingCommand 直插 DOM。
-        lf->editor().insertTextWithoutSendingTextEvent(text, false, nullptr);
-        inserted = 1;
-    } else {
-        // 兜底:合成键事件(Char 默认动作)。contenteditable 等非 form 控件走这里。
-        OptionSet<PlatformEvent::Modifier> mods;
-        MonotonicTime t = MonotonicTime::now();
-        PlatformKeyboardEvent raw(PlatformEvent::Type::RawKeyDown, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
-        lf->eventHandler().keyEvent(raw);
-        PlatformKeyboardEvent ch(PlatformEvent::Type::Char, text, text, ""_s, ""_s, ""_s, 0, false, false, false, mods, t);
-        lf->eventHandler().keyEvent(ch);
-        PlatformKeyboardEvent up(PlatformEvent::Type::KeyUp, ""_s, ""_s, ""_s, ""_s, ""_s, 0, false, false, false, mods, MonotonicTime::now());
-        lf->eventHandler().keyEvent(up);
-    }
     // 诊断:回读聚焦元素的 value 长度,确认文本是否真进了 DOM,但不把用户输入内容写入 LocalState 日志。
     unsigned feValLen = 0;
     if (doc) {
@@ -2038,9 +2057,9 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA)
         }
     }
     g_imeDiag = std::string("canEditBefore=") + std::to_string(canEditBefore)
-              + " fe=" + feTag + " canEditAfter=" + std::to_string(canEditAfter)
+              + " fe=" + feTag + " path=" + pathTag + " canEditAfter=" + std::to_string(canEditAfter)
               + " inserted=" + std::to_string(inserted) + " valueLen=" + std::to_string(feValLen);
-    pumpLoop(*lf, nullptr, true, 0, 4.0, g_session->page.get());
+    pumpQuick(*lf, g_session->page.get());
     return finishInteractionPaint(outRGBA);
 }
 
@@ -2080,7 +2099,30 @@ int WebCoreKeyAction(int action, uint8_t* outRGBA)
     }
 
     if (action == 0) {
-        lf->editor().command("DeleteBackward"_s).execute();
+        // 退格:与 WebCoreTypeText 同理——聚焦的是文本 input/textarea 时直接删末字符改 value(确定性),
+        //   否则才走 editor 的 DeleteBackward(contenteditable)。harness 的退格模型恒作用于末尾。
+        RefPtr<Document> kdoc = lf->document();
+        RefPtr<Element> kfe = kdoc ? kdoc->focusedElement() : nullptr;
+        if (kfe && is<HTMLInputElement>(*kfe) && downcast<HTMLInputElement>(*kfe).isTextField()) {
+            auto& input = downcast<HTMLInputElement>(*kfe);
+            String cur = input.value();
+            if (!cur.isEmpty()) {
+                (void)input.setValue(cur.left(cur.length() - 1), DispatchNoEvent);
+                input.dispatchInputEvent();
+            }
+        } else if (kfe && is<HTMLTextAreaElement>(*kfe)) {
+            auto& ta = downcast<HTMLTextAreaElement>(*kfe);
+            String cur = ta.value();
+            if (!cur.isEmpty()) {
+                (void)ta.setValue(cur.left(cur.length() - 1), DispatchNoEvent);
+                ta.dispatchInputEvent();
+            }
+        } else {
+            lf->editor().command("DeleteBackward"_s).execute();
+        }
+        // 退格不导航:同 WebCoreTypeText,用轻量 pump 而非"静默 0.8s"的 pumpLoop(防连续退格积压卡顿)。
+        pumpQuick(*lf, g_session->page.get());
+        return finishInteractionPaint(outRGBA);
     } else if (action == 1) {
         OptionSet<PlatformEvent::Modifier> mods;
         MonotonicTime t = MonotonicTime::now();

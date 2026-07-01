@@ -98,27 +98,75 @@ This repo tracks **only the port layer and the host** — not the gigabytes of u
 
 > **Not in repo:** upstream `WebKit/` (sparse webkitgtk-2.52.4, GB-scale), all `build-*/` outputs, fonts, `*.pfx`, `*.log`.
 
-## 🔧 Build (summary) / 构建概要
+## 🔧 Build / 构建
 
-ARM32 UWP toolchain — **clang-cl** (`--target=thumbv7-unknown-windows-msvc`) + **lld-link** for the engine/driver, **MSVC v143 (ARM)** for the harness. Dependencies (Cairo / ICU / libcurl / FreeType / HarfBuzz / ANGLE …) are pre-built as ARM `.lib`s, then:
+This is a **Windows-only, x64-build-machine** project — the produced binary is ARM32 and can only actually *run* on a real Windows 10 Mobile device ("Verify on device" below). Everything up to packaging the appx builds fine on an x64 dev box; nothing ARM32 runs locally.
+
+### Prerequisites / 前置环境
+
+- **Repo path must be pure ASCII** — the Ruby/meson code generators choke on non-ASCII paths. This repo assumes `E:\Apotheosis` and vcpkg at `C:\vcpkg`.
+- **Three toolchains, don't mix them up:**
+  - WTF/JSC/WebCore + `port/*.cpp` → **clang-cl**, `--target=thumbv7-unknown-windows-msvc`, linked with **lld-link** (WebKit has dropped pure-MSVC ARM32 support).
+  - `harness/` (C++/CX UWP) → **MSVC v143 (toolset 14.44.35207) ARM**. Newer Visual Studio removed ARM32 `vcvars` and SDK 26100 dropped the ARM32 libs, so this repo hand-rolls the ARM32 environment (`INCLUDE`/`LIB`/`PATH`) from the **Windows SDK 22621** ARM libs via `port\arm32-uwp-env.ps1`, instead of relying on a (now-missing) vcvars script.
+- Prebuilt ARM `.lib`s for the engine's dependencies (Cairo, ICU, libcurl, FreeType, HarfBuzz, ANGLE.WindowsStore …).
+- A full checkout of **webkitgtk-2.52.4** with this project's ARM32/App-Container patches applied at `WebKit/` (not in this repo — GB-scale upstream source; the patch list lives in the project's own notes, not tracked here). All patch sites are guarded with `#if defined(WK_WINUWP)` + an `Apotheosis:` comment so they never change upstream semantics when the flag is off.
+
+### Engine + driver / 引擎与驱动
 
 ```powershell
-# 1. compile + link the WebCore driver  →  WebCoreDriver-gpu.lib
+# First time only: configure the GPU engine build (CMake, out-of-tree)
+pwsh -File port\configure-gpu.ps1
+
+# After changing upstream WebCore sources (WK_WINUWP-guarded patches):
+# incrementally rebuild the engine, then relink the driver
+. port\arm32-uwp-env.ps1
+& "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" -C build-clang-gpu WebCore
 pwsh -File port\link-driver-gpu.ps1
 
-# 2. build the host appx  (MSBuild v143 ARM, two-pass XAML markup compile)
-pwsh -File port\build-harness.ps1
+# After changing only port/*.cpp (driver layer): just relink
+pwsh -File port\link-driver-gpu.ps1
+# → produces WebCoreDriver-gpu.lib
 
-# 3. deploy to a real device over Device Portal and launch
-pwsh -File tools\deploy-launch.ps1 -Ip <device-ip> -Ver <version>
+# Fast single-file syntax check while iterating (see port\driver-compile-gpu.log)
+pwsh -File port\compile-driver-gpu.ps1 port\WebCoreDriver.cpp port\WebCoreDriver.gpu.obj
 ```
+
+There's a parallel non-GPU **JIT-only** line (`master` branch, `build-clang-jit`) using `port\configure-jit.ps1` / `link-driver-jit.ps1` / `compile-driver-jit.ps1` — same idea, no TextureMapper/ANGLE.
+
+### Host app (harness) / 宿主 App
+
+```powershell
+# Only needed after editing XAML (MainPage.xaml / App.xaml) — see note below
+pwsh -File port\gen-xaml-codebehind.ps1
+
+# Full build + package (MSBuild v143 ARM) → appx under harness\AppPackages\Harness\
+pwsh -File port\build-harness.ps1
+# see harness-build.log for details
+```
+
+> **XAML is not markup-compiled.** A system update broke the deprecated C++/CX `XamlCompiler` (null-ref crash on *every* installed SDK). Instead, `port\gen-xaml-codebehind.ps1` parses `MainPage.xaml` and generates `harness\xamlgen\MainPage.g.hpp`: at runtime it loads the XAML as an embedded string via `XamlReader::Load`, binds every `x:Name` field via `FindName`, and wires every event handler — all by hand, no compiler involved. If you add a control with a new `x:Name`, the generator won't auto-declare its field; add one line yourself to `harness\xamlgen\MainPage.g.h` (`private: <Type>^ <Name>;`).
+
+### Verify on device / 真机验证
+
+There is no ARM32 emulator here — the **only** way to confirm a change actually works is a real device (Lumia 950 or similar) over **Device Portal** (Settings → Update & security → For developers → enable Device Portal, same Wi-Fi as the build machine).
+
+```powershell
+# Install + launch on the device
+pwsh -File tools\deploy-launch.ps1 -Ip <device-ip> -Ver <version>
+
+# Flaky Wi-Fi (phones sleep and drop the connection) → retry-hardened variant
+pwsh -File tools\Deploy-Robust.ps1 -Ip <device-ip> -Ver <version>
+```
+
+Bump `Version` in `harness\Package.appxmanifest` before each release build so the app's in-app "check for update" can tell versions apart (`-Ver` in the deploy scripts must match).
 
 ### Key constraints / 关键约束 (踩坑前必读)
 
-- **ASCII-only paths** — the Ruby/meson code generators choke on non-ASCII paths; the repo lives at `E:\Apotheosis`, vcpkg at `C:\vcpkg`.
 - **C++ exceptions OFF** — clang's `thumbv7-windows-msvc` backend can't lower `cleanupret`; build with `_HAS_EXCEPTIONS=0` + `/EHs-c-`.
 - **All upstream edits are guarded** with `#if defined(WK_WINUWP)` + an `Apotheosis:` comment, so the port never pollutes upstream semantics.
 - **Software rendering is the universal base; GPU is a runtime switch** gated strictly on `g_gpuActive` (defaults to Cairo + EmptyChromeClient → zero regression when GPU isn't up).
+- **Threading rule:** *present* only ever happens on the engine thread; the UI thread never synchronously waits on the engine (mutual wait = deadlock, and a timed-out `RunOnUIThread` calls `std::terminate`). All C ABI calls are serialized on one engine thread.
+- **The C ABI has two copies** — `port\WebCoreDriver.h` and `harness\WebCoreDriver.h`. Adding or changing an exported function means editing both, or the two sides silently disagree.
 
 See **[`CLAUDE.md`](CLAUDE.md)**, **[`HANDOFF.md`](HANDOFF.md)** and **[`M2-HANDOFF.md`](M2-HANDOFF.md)** for the deep details.
 
