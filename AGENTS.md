@@ -92,10 +92,12 @@ pwsh -File E:\Apotheosis\port\compile-driver-gpu.ps1 E:\Apotheosis\port\WebCoreD
 pwsh -File E:\Apotheosis\port\link-driver-gpu.ps1
 ```
 
-构建 harness appx（MSBuild v143 ARM；脚本内部两段式：先 `MarkupCompilePass1;MarkupCompilePass2` 生成 XAML `.g.hpp` 再全量编）：
+构建 harness appx（默认 VS2017 官方 C++/CX XAML codegen，再由 VS18/v143 ARM 全量编译、链接和打包）：
 
 ```powershell
 pwsh -File E:\Apotheosis\port\build-harness.ps1
+# 完整干净验证：pwsh -File E:\Apotheosis\port\build-harness.ps1 -Clean
+# 应急 fallback：pwsh -File E:\Apotheosis\port\build-harness.ps1 -XamlMode Fallback
 # 看 harness-build.log；appx 在 harness\AppPackages\Harness\Harness_<ver>_ARM_Test\
 ```
 
@@ -122,4 +124,4 @@ pwsh -File E:\Apotheosis\tools\auto-diag2.ps1
 
 ## 项目记忆（深层背景在这）
 
-每个里程碑的**根因 / 试错 / 真机数据点**、以及**上游 WebKit 补丁清单**都在 Codex 项目记忆（`MEMORY.md` 索引 + 各 `.md`），不在仓库里。动手前先扫 `MEMORY.md`。仓库内还有 `HANDOFF.md`（Phase 0，偏早）、`M2-HANDOFF.md`（GPU 呈现细节）、`README.md`。
+每个里程碑的**根因 / 试错 / 真机数据点**、以及**上游 WebKit 补丁清单**都在 Codex 项目记忆（`MEMORY.md` 索引 + 各 `.md`），不在仓库里。动手前先扫 `MEMORY.md`。仓库现状与架构概述见 `PROJECT-OVERVIEW.md`。

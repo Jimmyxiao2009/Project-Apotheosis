@@ -25,10 +25,27 @@ void WebCoreSetCACertPath(const char* path);
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
 
+// 清除全部 cookie(含持久 SQLite 库里的)。设置页"清除数据"用;引擎线程调。
+void WebCoreClearCookies();
+
 // 用内存 PEM blob 注入 CA 根证书(CURLOPT_CAINFO_BLOB)。App Container 沙箱挡 OpenSSL
 // 的文件式 CA 加载(即便文件可读也 curl 77),故设备上必须用 blob 绕开文件 I/O。
 // data 是 cacert.pem 原始字节,须在首个 WebCoreLoadUrl 之前调用。
 void WebCoreSetCACertBlob(const uint8_t* data, int len);
+
+// ⚠ 设 cookie jar 落盘 SQLite 路径。2026-07-03 真机验证会崩(这个 ARM32 UWP App Container 构建
+// 的 SQLite Win32 VFS 打开真实文件时空指针,详见项目记忆 cookie-persistence)。harness 不要调用
+// 这个 —— 保留仅为坑修好后备用。cookie 持久化改用下面两个(JSON Lines 旁路快照)。
+void WebCoreSetCookieJarPath(const char* path);
+
+// cookie 的 JSON Lines 持久化文件路径(每行一个 cookie 对象;jar 本身固定 ":memory:",不碰
+// SQLite 真实文件 open())。须在首个引擎调用之前调(SetupRuntimeEnv 里);
+// 空/未调用则不持久化(不崩)。path 是 UTF-8 文件系统路径。
+void WebCoreSetCookieJsonPath(const char* path);
+
+// 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。app 切后台(即将被
+// UWP 挂起/可能被系统直接终止)时调,引擎线程串行。
+void WebCoreFlushCookiesToDisk();
 
 // 取回上次 WebCoreLoadUrl 失败时记录的网络错误(curl 错误码 + 描述 + URL)。
 // 写入 buf(最多 len 字节,含 NUL),返回写入字节数(不含 NUL)。无错误则为空串。

@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "MainPage.xaml.h"
+#if !defined(APOTHEOSIS_XAML_CODEGEN)
 #include "MainPage.g.hpp"
+#endif
 #include "WebCoreDriver.h"
 #include "JitProbe.h"
 #include "GpuProbe.h"
@@ -100,6 +102,12 @@ static void SetupRuntimeEnv()
             _putenv_s("FONTCONFIG_FILE", confPath.c_str());
         }
 
+        // cookie 持久化:SQLite 真实文件 open() 在这个 ARM32 UWP App Container 构建里会崩(2026-07-03
+        // 真机验证,VFS 层空函数指针,见项目记忆 cookie-persistence),故不用 WebCoreSetCookieJarPath。
+        // 改走引擎自己的 JSON Lines 旁路快照:jar 仍是稳定的 ":memory:",这个文件只是启动时读回 /
+        // 切后台时写出的持久化数据,不经过 SQLite 的真实文件 I/O。
+        WebCoreSetCookieJsonPath((localDir + "\\cookies.jsonl").c_str());
+
         // CA 根证书:内存 blob 注入(绕 App Container 文件式加载限制)。
         std::string srcCa = installDir + "\\cacert.pem";
         std::vector<uint8_t> caBytes;
@@ -125,6 +133,18 @@ static void WriteStage(const char* stage)
         std::ofstream f(WideToUtf8(d) + "\\stage.txt", std::ios::binary | std::ios::trunc);
         if (f) f << stage << "\n";
     } catch (...) {}
+}
+
+// IME 诊断日志开关:仅当 LocalState\imedebug.txt 已存在(测试者经 WDP 放置,重启生效)才追加记录 ——
+// 对齐 autodiag.txt 的"设备侧显式开启"模式。此前每敲一键 UI/引擎线程各开写一次文件,是打字延迟的
+// 固定开销,且日志跨会话无限增长。
+static bool ImeDebugEnabled()
+{
+    static bool enabled = [] {
+        std::wstring d = LocalStateDir();
+        return !d.empty() && GetFileAttributesW((d + L"\\imedebug.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+    }();
+    return enabled;
 }
 
 // 本地起始页(主页),WebCoreRenderHtml 渲染。CJK 已可用(SimHei)。
@@ -295,6 +315,18 @@ private:
     std::deque<std::function<void()>> m_q;
 };
 
+// App::OnSuspending 的落地点(见 App.xaml.cpp):cookie JSON 落盘转给引擎线程串行执行,写完才
+// Complete deferral——UWP 挂起到进程被冻结/可能被系统直接终止之间只给系统定的几秒钟,这是唯一
+// 有时间保证的落盘时机(Window::VisibilityChanged 触发的是不等结果的 fire-and-forget,曾实测
+// 切后台重开后 cookie 没保住,应是没跑完就被冻结)。
+void MainPage::FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDeferral^ deferral)
+{
+    WebEngine::instance().post([deferral]() {
+        try { WebCoreFlushCookiesToDisk(); } catch (...) {}
+        deferral->Complete();
+    });
+}
+
 // GPU 直呈现模式:引擎已 swapBuffers 到可见 GpuPanel,无需把 rgba blit 进 WriteableBitmap(RenderImage 已隐藏)。
 //   置位后 BlitToBitmap 直接返回,省掉每帧 3MB 的 RGBA→BGRA 拷贝(冲 60fps)。引擎线程与 UI 线程都可能读,用 atomic。
 static std::atomic<bool> g_directPresent { false };
@@ -307,13 +339,15 @@ static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, 
     reinterpret_cast<IInspectable*>(wb->PixelBuffer)->QueryInterface(IID_PPV_ARGS(&bba));
     byte* dst = nullptr;
     bba->Buffer(&dst);
+    // 按 32 位字交换 R/B:比逐字节拷贝少 ~4 倍内存访问(每帧 3MB 的热路径,ARM32 上可观)。
+    // 两侧缓冲均 4 字节对齐(vector 堆块 / XAML 像素缓冲)。LE 下 RGBA 内存序 = A<<24|B<<16|G<<8|R,
+    // BGRA 需 A<<24|R<<16|G<<8|B → 保留 G/A 字节,交换 R/B 字节。
     const size_t n = (size_t)W * H;
-    const uint8_t* src = rgba.data();
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(rgba.data());
+    uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
     for (size_t i = 0; i < n; ++i) {
-        dst[i * 4 + 0] = src[i * 4 + 2];
-        dst[i * 4 + 1] = src[i * 4 + 1];
-        dst[i * 4 + 2] = src[i * 4 + 0];
-        dst[i * 4 + 3] = src[i * 4 + 3];
+        const uint32_t v = src[i];
+        d32[i] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
     }
 }
 
@@ -346,6 +380,19 @@ static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int 
 }
 
 static const int kW = 720, kH = 1080;
+
+// 取一块引擎渲染输出缓冲(kW*kH*4)。直呈现模式:UI 从不读这块 RGBA(BlitToBitmap 空转、各回调按
+// m_gpuPresent 跳过贴图),且引擎线程严格串行 → 全程复用同一块,免去热路径(实时 tick/拖拽滚动/
+// 逐键重绘)每帧 3MB 的分配+清零。软件模式必须每次新分配:UI 线程可能还拿着上一帧在读。
+static std::shared_ptr<std::vector<uint8_t>> AcquireEngineBuffer(bool present)
+{
+    if (present) {
+        static std::shared_ptr<std::vector<uint8_t>> s_buf =
+            std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4);
+        return s_buf;
+    }
+    return std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+}
 
 // ============================================================================
 MainPage::MainPage()
@@ -406,7 +453,14 @@ MainPage::MainPage()
     Window::Current->VisibilityChanged += ref new Windows::UI::Xaml::WindowVisibilityChangedEventHandler(
         [this](Platform::Object^, Windows::UI::Core::VisibilityChangedEventArgs^ e) {
             m_appForeground = e->Visible;
-            if (e->Visible) StartLiveMode(); else StopLiveMode();
+            if (e->Visible) StartLiveMode();
+            else {
+                StopLiveMode();
+                // cookie 落盘(JSON Lines 快照):UWP 挂起的应用可能被系统直接终止、不会再回调任何
+                // 生命周期事件,切后台这一刻是最后的安全落盘时机。引擎线程异步(线程铁律:UI 线程
+                // 绝不同步 wait 引擎),不等它做完就返回——反正马上要挂起,没有下一步依赖它的操作。
+                WebEngine::instance().post([]() { try { WebCoreFlushCookiesToDisk(); } catch (...) {} });
+            }
         });
     // 实体返回键(Win10M 硬件 Back):接管系统返回事件 → 先关浮层/再浏览器后退/否则交系统。
     try {
@@ -503,10 +557,17 @@ MainPage::MainPage()
                 try { WebCoreGpuLayerInfo(li.data(), (int)li.size()); } catch (...) {}
                 dump += std::string(li.data());
                 dump += "\n\n";
+                // cookie 持久化调试:document.cookie 快照(诊断 jar 是否收到/带上了 Set-Cookie)。
+                std::vector<char> ck(2048, 0);
+                try { WebCoreEvalJS("document.cookie", ck.data(), (int)ck.size()); } catch (...) {}
+                dump += "document.cookie: [" + std::string(ck.data()) + "]\n\n";
                 // 落盘这页 GPU readback 的实际帧(BMP),供 WDP 拉回当截图看
                 try { if (!dd.empty()) WriteBmp32(WideToUtf8(dd) + "\\shot_" + std::to_string(idx) + ".bmp", rgba.data(), kW, kH); } catch (...) {}
                 ++idx;
             }
+            // cookie 持久化调试:主动落盘(平时靠切后台 VisibilityChanged 触发;autodiag 不经 UI 生命周期,
+            // 这里显式补一次,让"设 cookie→跑 autodiag→杀进程→重跑另一份 autodiag 验证读回"这套测试闭环成立)。
+            try { WebCoreFlushCookiesToDisk(); dump += "WebCoreFlushCookiesToDisk() done.\n"; } catch (...) {}
             try {
                 std::wstring d2 = LocalStateDir();
                 if (!d2.empty()) {
@@ -709,10 +770,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被更新操作/看门狗取代,丢弃此迟到回调
                     if (ok) {
-                        auto wb = ref new WriteableBitmap(kW, kH);
-                        BlitToBitmap(wb, *rgba, kW, kH);
-                        wb->Invalidate();
-                        s->RenderImage->Source = wb;
+                        s->PresentSoftwareFrame(rgba);
                         s->m_pageLinks = *links;   // 存当前页链接表供点击命中
                     }
                     s->m_sessionActive = sessionActive;
@@ -778,12 +836,12 @@ void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
     }
 }
 
-// 网页点击:RenderImage 局部坐标 = 位图像素(Stretch=None)= 视口像素。
+// 网页点击:软件帧与 GPU surface 都会铺满 ContentArea，故统一由显示坐标映回固定引擎视口。
 //  有会话(网络页):转发到引擎 WebCoreClickAt,经真实命中测试 + 默认动作(链接/表单/按钮 onclick/SPA)。
 //  无会话(主页/错误页):退回链接命中表导航。
 // 把内容区显示坐标(DIP)映回引擎像素空间(kW×kH)。直呈现模式下 GpuPanel 把 720×1080 表面拉伸填满内容区
-//   (并叠加设备分辨率缩放),故点击/焦点坐标需按 (kW/ActualWidth, kH/ActualHeight) 缩放回引擎像素;
-//   软件模式 RenderImage Stretch=None 为 1:1,直接取整。★ 这是"直呈现下点击固定/渐增偏移"的根因修复。
+//   (并叠加设备分辨率缩放);软件模式同样以 Stretch=Fill 适配横竖屏，故两条路径均须按
+//   (kW/ActualWidth, kH/ActualHeight) 缩放回引擎像素。
 void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
 {
     if (dipX < 0.0 || dipY < 0.0) {
@@ -792,7 +850,7 @@ void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
         return;
     }
     double aw = ContentArea->ActualWidth, ah = ContentArea->ActualHeight;
-    if (m_gpuPresent && aw > 1.0 && ah > 1.0) {
+    if (aw > 1.0 && ah > 1.0) {
         outPx = static_cast<int>(dipX * static_cast<double>(kW) / aw + 0.5);
         outPy = static_cast<int>(dipY * static_cast<double>(kH) / ah + 0.5);
     } else {
@@ -921,18 +979,29 @@ void MainPage::ForwardClickToEngine(int px, int py)
     });
 }
 
+// 软件模式:把引擎 RGBA 帧贴上 RenderImage。WriteableBitmap 双缓冲复用 —— 原来每帧 ref new 一块
+// 3MB XAML 位图(实时 5fps + 拖拽滚动 + 逐键重绘)是 UI 线程分配大头;交替写 A/B 两块,避免 XAML
+// 还在上传上一帧纹理时就地改写同一块。直呈现模式(GpuPanel 已由引擎 swapBuffers)无事可做。
+void MainPage::PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba)
+{
+    if (m_gpuPresent) return;
+    WriteableBitmap^ wb = m_frameBmpFlip ? m_frameBmpB : m_frameBmpA;
+    if (!wb) {
+        wb = ref new WriteableBitmap(kW, kH);
+        if (m_frameBmpFlip) m_frameBmpB = wb; else m_frameBmpA = wb;
+    }
+    m_frameBmpFlip = !m_frameBmpFlip;
+    BlitToBitmap(wb, *rgba, kW, kH);
+    wb->Invalidate();
+    RenderImage->Source = wb;
+}
+
 // 把一帧引擎渲染结果贴到位图 + 同步标题/链接表;navUrl 非空 = 会话内发生导航(同步地址栏/栈/历史)。
 void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                                Platform::String^ title, Platform::String^ navUrl,
                                const std::shared_ptr<std::vector<PageLink>>& links)
 {
-    // present 模式:引擎点击已 swapBuffers 到 GpuPanel,无需建位图(BlitToBitmap 本就空转,RenderImage 已隐藏)。
-    if (!m_gpuPresent) {
-        auto wb = ref new WriteableBitmap(kW, kH);
-        BlitToBitmap(wb, *rgba, kW, kH);
-        wb->Invalidate();
-        RenderImage->Source = wb;
-    }
+    PresentSoftwareFrame(rgba);   // present 模式内部自跳过(引擎已 swapBuffers 到 GpuPanel)
     m_pageLinks = *links;
     m_lastFrameHash = 0;        // 强制下一实时帧重贴(交互改了画面)
     StartLiveMode();            // 交互后重启实时(可能触发了动画/SPA 更新)
@@ -997,12 +1066,7 @@ void MainPage::EngineScroll(int dy)
                     if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
                     s->SetLoading(false);
                     if (rcCopy == 0) {
-                        if (!s->m_gpuPresent) {
-                            auto wb = ref new WriteableBitmap(kW, kH);
-                            BlitToBitmap(wb, *rgba, kW, kH);
-                            wb->Invalidate();
-                            s->RenderImage->Source = wb;
-                        }
+                        s->PresentSoftwareFrame(rgba);
                         s->m_pageLinks = *links;
                         s->m_lastFrameHash = 0;
                         s->StartLiveMode();   // 滚动后重启实时(新视口的懒加载/动画)
@@ -1035,20 +1099,20 @@ void MainPage::PumpScroll()
     // ★ 提速:滚动期间不再每帧跨 FFI 拷贝链接表(引擎侧也跳过了 extractLinks),present 模式连 WriteableBitmap
     //   都不建(引擎已直呈现到 GpuPanel,BlitToBitmap 本就空转)。链接表在滚动停止后由 SyncLinksAfterScroll 一次性补。
     WebEngine::instance().post([disp, self, dx, dy, mySeq, present]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
         int rcCopy = rc;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present]() {
                 MainPage^ s = self.Get(); if (!s) return;
-                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; return; }   // 被导航/点击取代,丢弃迟到帧
+                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; s->m_scrollAccumX = 0; return; }   // 被导航/点击取代,丢弃迟到帧+全部残留位移
                 if (rcCopy == 0) {
-                    if (!present) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
+                    if (!present) s->PresentSoftwareFrame(rgba);
                     s->m_lastFrameHash = 0;
                 }
                 s->m_scrollBusy = false;
-                if (s->m_scrollAccum != 0) s->PumpScroll();   // 拖拽期间又攒了位移,继续冲刷
+                if (s->m_scrollAccum != 0 || s->m_scrollAccumX != 0) s->PumpScroll();   // 拖拽期间又攒了位移(含纯横向),继续冲刷
                 else { s->SyncLinksAfterScroll(); s->StartLiveMode(); }  // 滚动停了 → 补链接表 + 重启实时(新视口懒加载/动画)
             }));
         } catch (...) {}
@@ -1151,8 +1215,7 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
                 if (rcCopy == 0) {
                     s->m_pageScale = newScale;
-                    if (!present) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
-                    // present 模式:引擎已 swapBuffers 到 GpuPanel,新清晰帧已在面板上。
+                    s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
                 }
                 // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
                 s->GpuPanel->RenderTransform = nullptr;
@@ -1184,23 +1247,25 @@ void MainPage::OpenKeyboard()
 }
 void MainPage::CloseKeyboard()
 {
-    if (!m_imeOpen) return;
     m_imeOpen = false;
+    // 地址栏键盘并不经过 ImeBox，不能因 m_imeOpen=false 而漏掉 TryHide；否则菜单关闭后会重新露出。
     try { Windows::UI::ViewManagement::InputPane::GetForCurrentView()->TryHide(); } catch (...) {}
 }
 void MainPage::OnImeTextChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^)
 {
-    // 诊断埋点:记录本回调是否触发 + 门控状态 + ImeBox 文本长度(写 LocalState\imedebug.txt,真机测后拉取)。
-    // 若打字后此文件为空 → OnImeTextChanged 没触发 → 隐藏 ImeBox 收不到 IME 文本(UI 层问题);
+    // 诊断埋点(imedebug.txt 存在才记,见 ImeDebugEnabled):记录本回调是否触发 + 门控状态 + 文本长度。
+    // 若打字后此文件无新记录 → OnImeTextChanged 没触发 → 隐藏 ImeBox 收不到 IME 文本(UI 层问题);
     // 若有记录但输入框没字 → 引擎层(看 SendKeyToEngine 写的 rc:kErrNoDocument=canEdit 丢焦点)。
-    try {
-        std::wstring d = LocalStateDir();
-        if (!d.empty()) {
-            std::ofstream f(WideToUtf8(d) + "\\imedebug.txt", std::ios::app | std::ios::binary);
-            if (f) { std::string s = "TC open=" + std::to_string(m_imeOpen) + " sess=" + std::to_string(m_sessionActive)
-                + " sync=" + std::to_string(m_imeSyncing) + " textLen=" + std::to_string(ImeBox->Text ? ImeBox->Text->Length() : 0) + "\n"; f.write(s.data(), s.size()); }
-        }
-    } catch (...) {}
+    if (ImeDebugEnabled()) {
+        try {
+            std::wstring d = LocalStateDir();
+            if (!d.empty()) {
+                std::ofstream f(WideToUtf8(d) + "\\imedebug.txt", std::ios::app | std::ios::binary);
+                if (f) { std::string s = "TC open=" + std::to_string(m_imeOpen) + " sess=" + std::to_string(m_sessionActive)
+                    + " sync=" + std::to_string(m_imeSyncing) + " textLen=" + std::to_string(ImeBox->Text ? ImeBox->Text->Length() : 0) + "\n"; f.write(s.data(), s.size()); }
+            }
+        } catch (...) {}
+    }
     if (m_imeSyncing || !m_imeOpen || !m_sessionActive) return;
     std::wstring cur = ImeBox->Text ? std::wstring(ImeBox->Text->Data()) : L"";
     std::wstring prev = m_lastImeText;
@@ -1234,17 +1299,23 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     std::string utf8 = (kind == 0 && text) ? ToUtf8(text) : std::string();
-    WebEngine::instance().post([disp, self, kind, utf8]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+    // 回车可能触发表单提交导航 → 像点击一样领新操作令牌(作废在途实时/滚动帧);普通键只读令牌。
+    // 回调检查令牌:期间发生导航/切标签/看门狗复位后,迟到的按键帧被丢弃,不再盖掉新页面(此前无防护)。
+    unsigned long long mySeq = (kind == 1) ? ++m_opSeq : m_opSeq;
+    bool present = m_gpuPresent;
+    WebEngine::instance().post([disp, self, kind, utf8, mySeq, present]() {
+        auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try {
             if (kind == 0) rc = WebCoreTypeText(utf8.c_str(), rgba->data());
             else if (kind == 1) rc = WebCoreKeyAction(1, rgba->data());
             else rc = WebCoreKeyAction(0, rgba->data());
         } catch (...) { rc = -1000; }
-        // 诊断:记引擎返回(rc=-6/kErrNoDocument → 打字时 canEdit 为 false=丢了可编辑焦点;rc=0 → 引擎接受了)。
-        char edbg[256] = ""; try { WebCoreEditDebug(edbg, sizeof edbg); } catch (...) {}
-        try { std::wstring dd = LocalStateDir(); if (!dd.empty()) { std::ofstream f(WideToUtf8(dd) + "\\imedebug.txt", std::ios::app | std::ios::binary); if (f) { std::string s = "  SK kind=" + std::to_string(kind) + " rc=" + std::to_string(rc) + " [" + edbg + "]\n"; f.write(s.data(), s.size()); } } } catch (...) {}
+        // 诊断(imedebug.txt 存在才记):rc=-6/kErrNoDocument → 打字时 canEdit 为 false=丢了可编辑焦点。
+        if (ImeDebugEnabled()) {
+            char edbg[256] = ""; try { WebCoreEditDebug(edbg, sizeof edbg); } catch (...) {}
+            try { std::wstring dd = LocalStateDir(); if (!dd.empty()) { std::ofstream f(WideToUtf8(dd) + "\\imedebug.txt", std::ios::app | std::ios::binary); if (f) { std::string s = "  SK kind=" + std::to_string(kind) + " rc=" + std::to_string(rc) + " [" + edbg + "]\n"; f.write(s.data(), s.size()); } } } catch (...) {}
+        }
         std::wstring navUrl, title;
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0 && kind == 1) {   // 回车可能导航 → 取新 url/title/链接
@@ -1256,14 +1327,15 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
         auto navW = std::make_shared<std::wstring>(navUrl); auto titleW = std::make_shared<std::wstring>(title);
         int rcCopy = rc; int kindCopy = kind;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, kindCopy, navW, titleW, links]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, kindCopy, navW, titleW, links, mySeq]() {
                 MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) return;   // 被导航/点击/看门狗取代,丢弃迟到按键帧
                 if (rcCopy != 0) return;
                 if (kindCopy == 1 && !navW->empty() && std::wstring(navW->c_str()) != s->m_currentUrl) {
                     s->ApplyEngineFrame(rgba, ref new String(titleW->c_str()), ref new String(navW->c_str()), links);   // 回车导航:同步地址栏/历史
                     s->CloseKeyboard();
                 } else {
-                    if (!s->m_gpuPresent) { auto wb = ref new WriteableBitmap(kW, kH); BlitToBitmap(wb, *rgba, kW, kH); wb->Invalidate(); s->RenderImage->Source = wb; }
+                    s->PresentSoftwareFrame(rgba);
                     s->m_lastFrameHash = 0;
                     s->StartLiveMode();   // 打字后重启实时循环 → 后续帧把输入内容再合成/呈现一次(防单帧合成漏掉新文字)
                 }
@@ -1317,7 +1389,7 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
     WebEngine::instance().post([disp, self, mySeq, present]() {
         MainPage^ s0 = self.Get();
         if (!s0 || !s0->m_appForeground) return;   // 已切后台:别在 PLM 冻结风险下跑 JS+绘制(m_liveBusy 由恢复时 StartLiveMode 清)
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = AcquireEngineBuffer(present);
         int rc = -999; unsigned hash = 0; int pending = 0;
         try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
         int rcCopy = rc; unsigned hashCopy = hash; int pendingCopy = pending;
@@ -1353,12 +1425,7 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                     }
                     s->m_liveStaticTicks = 0;
                     s->m_lastFrameHash = hashCopy;
-                    if (!present) {
-                        auto wb = ref new WriteableBitmap(kW, kH);
-                        BlitToBitmap(wb, *rgba, kW, kH);
-                        wb->Invalidate();
-                        s->RenderImage->Source = wb;
-                    }
+                    s->PresentSoftwareFrame(rgba);
                     // 永久动画防失控:连续动画超 ~150 帧(30s)无交互 → 降到 ~1fps(不硬停,免得动画卡死);
                     // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复 200ms。
                     if (++s->m_liveTotalTicks == 150 && s->m_liveTimer) {
@@ -1503,16 +1570,18 @@ void MainPage::HideDrawer()
 static Border^ MakeRow(Platform::String^ title, Platform::String^ sub, Color titleColor)
 {
     auto sp = ref new StackPanel();
-    sp->Margin = Thickness(14, 10, 14, 10);
+    sp->Margin = Thickness(15, 12, 15, 12);
     auto t = ref new TextBlock();
     t->Text = title; t->FontSize = 20; t->Foreground = ref new SolidColorBrush(titleColor);
     t->TextTrimming = TextTrimming::CharacterEllipsis; t->MaxLines = 1;
     auto u = ref new TextBlock();
-    u->Text = sub; u->FontSize = 15; u->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x80, 0x86, 0x8b));
+    u->Text = sub; u->FontSize = 14; u->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x91, 0xA2, 0xAD));
     u->TextTrimming = TextTrimming::CharacterEllipsis; u->MaxLines = 1; u->Margin = Thickness(0, 2, 0, 0);
     sp->Children->Append(t); sp->Children->Append(u);
     auto b = ref new Border();
-    b->Background = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x2B, 0x2D, 0x31));
+    b->Background = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x17, 0x21, 0x29));
+    b->BorderBrush = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x26, 0x36, 0x40));
+    b->BorderThickness = Thickness(1);
     b->CornerRadius = CornerRadius(10);
     b->Margin = Thickness(0, 0, 0, 8);
     b->Child = sp;
@@ -1530,7 +1599,7 @@ void MainPage::RebuildDrawerList()
     if (list->empty()) {
         auto empty = ref new TextBlock();
         empty->Text = (m_tab == DrawerTab::Favorites) ? L8(L"暂无收藏", L"No bookmarks yet") : (m_tab == DrawerTab::History ? L8(L"暂无历史记录", L"No history yet") : L8(L"暂无下载", L"No downloads yet"));
-        empty->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x80, 0x86, 0x8b));
+        empty->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x91, 0xA2, 0xAD));
         empty->FontSize = 18; empty->Margin = Thickness(14, 20, 0, 0);
         DrawerList->Children->Append(empty);
         return;
@@ -1543,7 +1612,7 @@ void MainPage::RebuildDrawerList()
         const Entry& e = (*list)[i];
         Platform::String^ titleS = ref new String(e.title.empty() ? e.url.c_str() : e.title.c_str());
         Platform::String^ subS = ref new String((isDownloads ? (e.extra + L"  ·  " + e.url) : e.url).c_str());
-        auto row = MakeRow(titleS, subS, ColorHelper::FromArgb(255, 0xF0, 0xF0, 0xF0));
+        auto row = MakeRow(titleS, subS, ColorHelper::FromArgb(255, 0xF4, 0xF7, 0xF8));
 
         if (isDownloads) {
             DrawerList->Children->Append(row);
@@ -1786,6 +1855,10 @@ void MainPage::HideSuggestions()
 void MainPage::ShowActionMenu()
 {
     HideSuggestions();
+    // 收起网页/地址栏输入法并撤销地址栏的“编辑中”状态。硬件 Back 只会关闭当前 sheet，
+    // 不应因此把此前保留焦点的键盘重新唤起。
+    m_urlFocused = false;
+    CloseKeyboard();
     if (ActFavLabel)
         ActFavLabel->Text = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"已收藏", L"Saved") : L8(L"收藏", L"Bookmark");
     if (ActUaLabel)
@@ -2014,6 +2087,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"立即开启 GPU 合成(重启回软件)", L"Enable GPU compositing now (restart reverts)" },
     { L"清除数据", L"Clear data" }, { L"清除历史记录", L"Clear history" },
     { L"清除全部收藏", L"Clear all bookmarks" }, { L"清除下载记录", L"Clear downloads" },
+    { L"清除 Cookie(退出全部登录)", L"Clear cookies (sign out everywhere)" },
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
     { L"检查更新(GitHub Releases)", L"Check for updates (GitHub Releases)" },
@@ -2076,6 +2150,10 @@ void MainPage::OnSettingsBtn(Platform::Object^ sender, RoutedEventArgs^)
     if (t == L"clearhist") { m_historyList.clear(); SaveHistory(); TitleText->Text = L8(L"历史记录已清除", L"History cleared"); }
     else if (t == L"clearfav") { m_bookmarks.clear(); SaveBookmarks(); TitleText->Text = L8(L"收藏已清除", L"Bookmarks cleared"); }
     else if (t == L"cleardl") { m_downloads.clear(); SaveDownloads(); TitleText->Text = L8(L"下载记录已清除", L"Downloads cleared"); }
+    else if (t == L"clearcookies") {
+        WebEngine::instance().post([]() { try { WebCoreClearCookies(); } catch (...) {} });   // 引擎线程串行,不与加载互踩
+        TitleText->Text = L8(L"Cookie 已清除", L"Cookies cleared");
+    }
     else if (t == L"export") ExportDebug();
     else if (t == L"gpu") { HideSettings(); OnToggleGpu(nullptr, nullptr); }
     else if (t == L"checkupdate") CheckForUpdate(true);
@@ -2287,12 +2365,7 @@ void MainPage::DoFind(int mode)
                         s->FindCount->Text = ref new String(L"");
                         return;
                     }
-                    if (!present) {
-                        auto wb = ref new WriteableBitmap(kW, kH);
-                        BlitToBitmap(wb, *rgba, kW, kH);
-                        wb->Invalidate();
-                        s->RenderImage->Source = wb;
-                    }
+                    s->PresentSoftwareFrame(rgba);
                     s->m_lastFrameHash = 0;
                     if (clearCopy) s->FindCount->Text = ref new String(L"");
                     else if (modeCopy == 0) s->FindCount->Text = ref new String(rcCopy > 0 ? (std::to_wstring(rcCopy) + (g_lang == L"en" ? L" found" : L" 处")).c_str() : (g_lang == L"en" ? L"No results" : L"无结果"));
@@ -2417,8 +2490,8 @@ void MainPage::RebuildTabSwitcher()
     if (TabSwitcherTitle) TabSwitcherTitle->Text = ref new String(((g_lang == L"en" ? L"Tabs (" : L"标签 (") + std::to_wstring(m_tabs.size()) + L")").c_str());
     TabList->Children->Clear();
     Platform::Agile<MainPage^> self(this);
-    Color blue = ColorHelper::FromArgb(255, 0x3A, 0xA0, 0xFF);
-    Color white = ColorHelper::FromArgb(255, 0xF0, 0xF0, 0xF0);
+    Color accent = ColorHelper::FromArgb(255, 0x45, 0xD6, 0xC5);
+    Color white = ColorHelper::FromArgb(255, 0xF4, 0xF7, 0xF8);
     for (size_t i = 0; i < m_tabs.size(); ++i) {
         int idx = (int)i;
         const Tab& t = m_tabs[i];
@@ -2432,13 +2505,13 @@ void MainPage::RebuildTabSwitcher()
         cell->Margin = Thickness(0, 0, 0, 8);
 
         auto sw = ref new Button();
-        sw->Background = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x2B, 0x2D, 0x31));
-        sw->BorderThickness = active ? Thickness(2) : Thickness(0);
-        sw->BorderBrush = ref new SolidColorBrush(blue);
+        sw->Background = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x10, 0x17, 0x1D));
+        sw->BorderThickness = Thickness(1);
+        sw->BorderBrush = ref new SolidColorBrush(active ? accent : ColorHelper::FromArgb(255, 0x26, 0x36, 0x40));
         sw->Padding = Thickness(0, 0, 40, 0);   // 右留位给关闭键
         sw->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
         sw->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
-        sw->Content = MakeRow(ref new String(title.c_str()), ref new String(sub.c_str()), active ? blue : white);
+        sw->Content = MakeRow(ref new String(title.c_str()), ref new String(sub.c_str()), active ? accent : white);
         sw->Click += ref new RoutedEventHandler([self, idx](Platform::Object^, RoutedEventArgs^) {
             MainPage^ s = self.Get(); if (!s) return;
             s->HideTabSwitcher();
@@ -2449,7 +2522,7 @@ void MainPage::RebuildTabSwitcher()
         auto cb = ref new Button();
         cb->Content = ref new String(L"\x2715");
         cb->Background = ref new SolidColorBrush(Colors::Transparent);
-        cb->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x9A, 0xA0, 0xA6));
+        cb->Foreground = ref new SolidColorBrush(ColorHelper::FromArgb(255, 0x91, 0xA2, 0xAD));
         cb->BorderThickness = Thickness(0);
         cb->Width = 44; cb->Height = 44;
         cb->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Right;

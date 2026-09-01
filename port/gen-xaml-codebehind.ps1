@@ -6,9 +6,10 @@
 # 用法:pwsh -File E:\Apotheosis\port\gen-xaml-codebehind.ps1
 
 $ErrorActionPreference = 'Stop'
-$xamlPath = 'E:\Apotheosis\harness\MainPage.xaml'
-$ghPath   = 'E:\Apotheosis\harness\xamlgen\MainPage.g.h'
-$outDir   = 'E:\Apotheosis\harness\xamlgen'
+$root = Split-Path -Parent $PSScriptRoot
+$xamlPath = Join-Path $root 'harness\MainPage.xaml'
+$ghPath   = Join-Path $root 'harness\xamlgen\MainPage.g.h'
+$outDir   = Join-Path $root 'harness\xamlgen'
 [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
 
 $nsP = 'http://schemas.microsoft.com/winfx/2006/xaml/presentation'
@@ -24,6 +25,7 @@ $EVMAP = @{
   'KeyDown'               = @('::Windows::UI::Xaml::UIElement',              '::Windows::UI::Xaml::Input::KeyEventHandler')
   'GotFocus'              = @('::Windows::UI::Xaml::UIElement',              '::Windows::UI::Xaml::RoutedEventHandler')
   'LostFocus'             = @('::Windows::UI::Xaml::UIElement',              '::Windows::UI::Xaml::RoutedEventHandler')
+  'Loaded'                = @('::Windows::UI::Xaml::FrameworkElement',       '::Windows::UI::Xaml::RoutedEventHandler')
   'ValueChanged'          = @('::Windows::UI::Xaml::Controls::Slider',       '::Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventHandler')
 }
 $EVENTS = $EVMAP.Keys

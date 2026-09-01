@@ -85,6 +85,7 @@
 #include <WebCore/MemoryRelease.h>       // Apotheosis: WebCore::releaseMemory(内存压力时一把清)
 #include <wtf/MemoryPressureHandler.h>   // Apotheosis: WTF::Critical / Synchronous
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
+#include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
 #include "PortChromeClient.h"            // WebCorePort::PortChromeClient(开合成,捕获根图层)
@@ -206,6 +207,20 @@ enum : int {
     kErrFrameGone    = -14,   // 交互后主帧消失(会话已坏)
 };
 
+// Apotheosis: public render surfaces are backed by ARM32 allocations or GPU
+// textures. Bound dimensions before any area/byte multiplication so malformed
+// C ABI input cannot wrap size_t or provoke an avoidable OOM.
+static constexpr int kMaxSurfaceDimension = 4096;
+static constexpr uint64_t kMaxSurfacePixels =
+    static_cast<uint64_t>(kMaxSurfaceDimension) * static_cast<uint64_t>(kMaxSurfaceDimension);
+
+static bool isValidSurfaceSize(int w, int h)
+{
+    if (w <= 0 || h <= 0 || w > kMaxSurfaceDimension || h > kMaxSurfaceDimension)
+        return false;
+    return static_cast<uint64_t>(w) * static_cast<uint64_t>(h) <= kMaxSurfacePixels;
+}
+
 // Run the WebCore one-time process initialization exactly once.
 // Sequence taken from Source/WebKit/Shared/WebKit2Initialize.cpp
 // (the !PLATFORM(COCOA) branch — our case).
@@ -216,6 +231,11 @@ bool ensureWebCoreInitialized()
         WTF::initializeMainThread();             // pins this thread as the WebKit main thread + RunLoop::main
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
         installPortPlatformStrategies();         // PlatformStrategies (loader strategy) — required before any load
+        // Apotheosis: 预开进程级 cookie jar(持久 SQLite;路径由 harness 在引擎线程更早的 SetupRuntimeEnv
+        // 里经 WebCoreSetCookieJarPath 显式注入,见 PortNetworkStorageSession.cpp)+ 设接受策略
+        // OnlyFromMainDocumentDomain(各端口惯例,挡第三方子资源 Set-Cookie)。打不开由 CookieJarDB::open()
+        // 的 WK_WINUWP 补丁回退 :memory:,不崩。
+        WebCorePort::ensureDefaultPortStorageSession();
         WebCore::populateJITOperations();        // no-op under ENABLE(C_LOOP) (header has inline {} fallback)
         // Apotheosis: 32 位低内存(Lumia)防 OOM —— 关后退页面缓存(整页 DOM+render 树极耗内存,
         // 是 32 位地址空间最大的隐性占用),资源缓存收紧上限。系统内存压力来时由 harness 经
@@ -260,6 +280,7 @@ static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFli
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
+static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
 // 子资源加载诊断计数(主文档 + CSS/JS/图片全经 ResourceHandle 桥)。由 ResourceHandle.cpp
 // 的 WebCorePortBumpLoad 累加;在 WebCoreLoadUrl 开头清零,结束并入 g_lastDiag,真机定位"子资源不加载"。
@@ -490,7 +511,7 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
     g_gpuScrollFast = false;
     glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
-    glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻
+    g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
 }
 
 // 离屏合成 + 读回:把图层树合成进 w*h 的 BitmapTexture(FBO),glReadPixels 出 RGBA 到 outRGBA。
@@ -518,7 +539,9 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     g_textureMapper->clearColor(docBg);
     glRoot.layer().paint(*g_textureMapper);
     // texture 的 FBO 此刻仍绑定 → 直接读回(endPainting 会还原帧缓冲绑定,故必须读在前)。
-    std::vector<uint8_t> tmp(static_cast<size_t>(w) * h * 4);
+    // 读回缓冲静态复用:仅引擎线程用,免每帧 3MB 分配+释放(readback 模式滚动/实时 tick 是热路径)。
+    static std::vector<uint8_t> tmp;
+    tmp.resize(static_cast<size_t>(w) * h * 4);
     glFinish();
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
     g_textureMapper->endPainting();
@@ -589,12 +612,23 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
             // 直呈现模式(GpuInit 收到窗口表面):合成直接 swapBuffers 到可见 SwapChainPanel,省掉 readback+blit
             //   两次 3MB 拷贝(冲 60fps)。outRGBA 不填(调用方据 g_directPresent 跳过 BlitToBitmap)。
             if (g_gpuPresentMode) {
-                if (gpuPresent(view, w, h, *root) == kOK)
+                if (gpuPresent(view, w, h, *root) == kOK) {
+                    // 直呈现没有像素可算哈希 → 用"引擎请求过重绘(triggerRenderingUpdate)/合成动画在跑"当帧
+                    // 变化信号混进哈希。否则 g_lastFrameHash 恒不变:实时循环 ~8s 误判静止停帧(GPU 模式下
+                    // 动画冻结),ForwardClickToEngine 的 changed 检测也恒 false(模态关闭被误判成死点击 →
+                    // 链接表兜底误导航)。takeNeedsPresent 此前无人消费,在此消费正好。
+                    if (g_session->chrome->takeNeedsPresent() || g_gpuAnimating)
+                        ++g_lastFrameHash;
                     return kOK;
+                }
             } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK)
                 return kOK;
         }
     }
+
+    // 走到这=本帧不经 GPU 合成(GPU 未起/无图层树/合成失败)。滚动快路径标志只对"紧接着的那次 GPU 合成"
+    // 有意义,这里必须清掉,否则残留到下一次真 GPU 合成(如点击后)会错误跳过 forceDirtyTree → 停留旧内容。
+    g_gpuScrollFast = false;
 
     const IntSize size(w, h);
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
@@ -984,6 +1018,15 @@ extern "C" void WebCoreReleaseMemory(int critical)
                            WebCore::MaintainMemoryCache::No);
 }
 
+// Apotheosis: 清除全部 cookie。设置页"清除数据"用。引擎线程调。清完立即落盘(空文件),否则
+// JSON 快照还留着旧的,下次启动 ensureDefaultPortStorageSession 会把清掉的 cookie 又灌回来。
+extern "C" void WebCoreClearCookies()
+{
+    if (!ensureWebCoreInitialized()) return;
+    WebCorePort::defaultPortStorageSession().deleteAllCookies([] { });
+    WebCorePort::flushCookiesToDisk();
+}
+
 extern "C" {
 
 // Point curl/OpenSSL at a CA-certificate bundle (PEM) for TLS verification.
@@ -999,6 +1042,35 @@ void WebCoreSetCACertPath(const char* path)
     // CurlContext::singleton() also boots libcurl + OpenSSL the same way
     // ResourceHandle::start() does, so this is safe to call standalone.
     WebCore::CurlContext::singleton().sslHandle().setCACertPath(String::fromUTF8(path));
+}
+
+// Apotheosis: 显式设 cookie jar 落盘路径(镜像本函数的模式:显式注入,不靠环境变量跨 clang-cl 引擎
+// 与 MSVC v143 harness 两套独立 CRT 传递)。
+// ⚠ 2026-07-03 真机验证:调了这个会崩(SQLite 真实文件 open() 在此平台的 VFS 层空指针,见项目记忆
+//   cookie-persistence)。当前 harness 不调用它,保留只是留着接口;真正持久化见下面两个函数。
+void WebCoreSetCookieJarPath(const char* path)
+{
+    if (!path || !*path)
+        return;
+    WebCorePort::setPortCookieJarPath(String::fromUTF8(path));
+}
+
+// cookie 的 JSON Lines 持久化文件路径(jar 本身固定 ":memory:",这只是引擎自己旁路读写的快照,
+// 不碰 SQLite 真实文件 open())。须在首个引擎调用(ensureWebCoreInitialized)之前调 —— harness 的
+// SetupRuntimeEnv 在引擎线程最早处调用。空/未调用则 cookie 不持久(等同旧版临时会话,不崩)。
+void WebCoreSetCookieJsonPath(const char* path)
+{
+    if (!path || !*path)
+        return;
+    WebCorePort::setPortCookieJsonPath(String::fromUTF8(path));
+}
+
+// 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。harness 在应用切后台
+// (即将被 UWP 挂起/可能被系统直接终止)时调,引擎线程串行。
+void WebCoreFlushCookiesToDisk()
+{
+    if (!ensureWebCoreInitialized()) return;
+    WebCorePort::flushCookiesToDisk();
 }
 
 // Inject the CA-certificate bundle as an in-memory PEM blob (CURLOPT_CAINFO_BLOB).
@@ -1154,7 +1226,7 @@ int WebCoreDownload(const char* url, const char* outPath)
 // outRGBA must point to at least w*h*4 bytes. Returns 0 on success.
 int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
 {
-    if (!utf8Html || !outRGBA || w <= 0 || h <= 0)
+    if (!utf8Html || !outRGBA || !isValidSurfaceSize(w, h))
         return kErrBadArgs;
 
     ensureWebCoreInitialized();
@@ -1296,7 +1368,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
 {
     using namespace WebCore;
 
-    if (!url || !outRGBA || w <= 0 || h <= 0)
+    if (!url || !outRGBA || !isValidSurfaceSize(w, h))
         return kErrBadArgs;
 
     g_lastNetError[0] = '\0';   // clear any stale diagnostic from a prior call
@@ -1465,7 +1537,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
 // 在同一活文档上交互。返回 0 成功(语义同 WebCoreLoadUrl),失败已自动清理会话。
 int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
 {
-    if (!url || !outRGBA || w <= 0 || h <= 0)
+    if (!url || !outRGBA || !isValidSurfaceSize(w, h))
         return kErrBadArgs;
     ensureWebCoreInitialized();
     if (g_inPump)
@@ -1771,11 +1843,13 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     float oldScale = g_session->page->pageScaleFactor();
     if (oldScale <= 0.0f) oldScale = 1.0f;
     ScrollPosition scroll = view->scrollPosition();
-    // 焦点下的内容点(未缩放 CSS 像素)= (scroll + focal)/oldScale;新滚动 = 内容点*newScale - focal(焦点锚定)。
-    double cx = (static_cast<double>(scroll.x()) + focalX) / oldScale;
-    double cy = (static_cast<double>(scroll.y()) + focalY) / oldScale;
-    int nsx = static_cast<int>(cx * scale - focalX + 0.5);
-    int nsy = static_cast<int>(cy * scale - focalY + 0.5);
+    // FrameView 的 scrollPosition 已是 CSS 内容坐标，pageScale 改变的是视口中每个设备像素
+    // 对应的 CSS 距离。因此焦点内容点 = scroll + focal / oldScale；新 scroll = 内容点 - focal / newScale。
+    // 旧公式把 scroll 也除以 oldScale、又把结果乘 scale，缩回 1x 时常被钳到 (0,0)。
+    double cx = static_cast<double>(scroll.x()) + static_cast<double>(focalX) / oldScale;
+    double cy = static_cast<double>(scroll.y()) + static_cast<double>(focalY) / oldScale;
+    int nsx = static_cast<int>(cx - static_cast<double>(focalX) / scale + 0.5);
+    int nsy = static_cast<int>(cy - static_cast<double>(focalY) / scale + 0.5);
     if (nsx < 0) nsx = 0;
     if (nsy < 0) nsy = 0;
 
@@ -1836,7 +1910,7 @@ int WebCoreEnableCompositing()
 int WebCoreGpuInit(void* nativeWindow, int w, int h)
 {
     using namespace WebCore;
-    if (w <= 0 || h <= 0)
+    if (!isValidSurfaceSize(w, h))
         return kErrBadArgs;
     if (g_gpuActive)
         return kOK;   // 幂等
@@ -2223,7 +2297,7 @@ unsigned WebCoreGetFrameHash()
 int WebCoreRenderHtmlStub(const char* utf8Html, int w, int h, uint8_t* outRGBA)
 {
     (void)utf8Html;
-    if (!outRGBA || w <= 0 || h <= 0)
+    if (!outRGBA || !isValidSurfaceSize(w, h))
         return kErrBadArgs;
     ensureWebCoreInitialized();
     auto cfg = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());

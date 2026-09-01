@@ -119,73 +119,73 @@ void Pasteboard::read(PasteboardFileReader&, std::optional<size_t>)
 // ----------------------------------------------------------------------------
 void Pasteboard::clear()
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: Clipboard is not wired to the UWP host yet; keep this a no-op.
 }
 
 void Pasteboard::clear(const String&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writeString(const String&, const String&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::write(const Color&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::write(const PasteboardURL&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writeTrustworthyWebURLsPboardType(const PasteboardURL&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::write(const PasteboardImage&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::write(const PasteboardBuffer&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::write(const PasteboardWebContent&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writeCustomData(const Vector<PasteboardCustomData>&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writeMarkup(const String&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writePlainText(const String&, SmartReplaceOption)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 // PLATFORM(WIN)-only layering-violation writers (FIXME in header).
 void Pasteboard::writeImage(Element&, const URL&, const String&)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 void Pasteboard::writeSelection(const std::optional<SimpleRange>&, bool, LocalFrame&, ShouldSerializeSelectedTextForDataTransfer)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: graceful no-op until the UWP Clipboard backend is added.
 }
 
 // ----------------------------------------------------------------------------
@@ -195,7 +195,8 @@ void Pasteboard::writeSelection(const std::optional<SimpleRange>&, bool, LocalFr
 // ----------------------------------------------------------------------------
 ULONG STDMETHODCALLTYPE WCDataObject::Release()
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: this Win32 OLE object is never exposed by the UWP host. Do
+    // not turn an unexpected teardown into a process-killing assertion.
     return 0;
 }
 
@@ -206,7 +207,8 @@ ULONG STDMETHODCALLTYPE WCDataObject::Release()
 // ----------------------------------------------------------------------------
 void Editor::pasteWithPasteboard(Pasteboard*, OptionSet<PasteOption>)
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis: paste is unavailable until the UWP Clipboard backend is
+    // connected; leave the document unchanged instead of crashing.
 }
 
 void Editor::platformCopyFont()

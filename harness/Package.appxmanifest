@@ -7,7 +7,7 @@
 
   <Identity Name="EdgeHTMLReborn.Harness"
             Publisher="CN=EdgeHTMLReborn"
-            Version="0.1.8.6"
+            Version="0.1.8.11"
             ProcessorArchitecture="arm" />
 
   <mp:PhoneIdentity PhoneProductId="b3a9e5c2-1d4f-4a7b-9c8e-0f1a2b3c4d5e" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
@@ -20,6 +20,7 @@
 
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.14393.0" MaxVersionTested="10.0.22621.0" />
+    <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.24215.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
   </Dependencies>
 
   <Resources>

@@ -144,4 +144,4 @@ pwsh -File E:\Apotheosis\tools\auto-diag2.ps1
 
 ## 项目记忆（深层背景在这）
 
-每个里程碑的**根因 / 试错 / 真机数据点**、以及**上游 WebKit 补丁清单**都在 Claude Code 项目记忆（`MEMORY.md` 索引 + 各 `.md`），不在仓库里。动手前先扫 `MEMORY.md`。仓库内还有 `HANDOFF.md`（Phase 0，偏早）、`M2-HANDOFF.md`（GPU 呈现细节）、`README.md`。
+每个里程碑的**根因 / 试错 / 真机数据点**、以及**上游 WebKit 补丁清单**都在 Claude Code 项目记忆（`MEMORY.md` 索引 + 各 `.md`），不在仓库里。动手前先扫 `MEMORY.md`。仓库现状与架构概述见 `PROJECT-OVERVIEW.md`。

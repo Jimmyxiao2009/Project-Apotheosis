@@ -15,12 +15,20 @@
     <AppContainerApplication>true</AppContainerApplication>
     <ApplicationType>Windows Store</ApplicationType>
     <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
-    <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+    <ApotheosisWindowsSdkVersion Condition="'$(ApotheosisWindowsSdkVersion)' == ''">10.0.22621.0</ApotheosisWindowsSdkVersion>
+    <WindowsTargetPlatformVersion>$(ApotheosisWindowsSdkVersion)</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformMinVersion>10.0.15063.0</WindowsTargetPlatformMinVersion>
-    <!-- Apotheosis: 用 15063 SDK 编译,但不让 MSBuild 用它覆盖清单的 TargetDeviceFamily MinVersion;
+    <!-- Apotheosis: use a selectable installed SDK, but do not let MSBuild replace the manifest MinVersion;
          保留 Package.appxmanifest 里手写的 10.0.14393.0 → 包可装到 1607/14393 设备。 -->
     <AppxOSMinVersionReplaceManifestVersion>false</AppxOSMinVersionReplaceManifestVersion>
     <ProjectName>Harness</ProjectName>
+    <ApotheosisRoot>$(MSBuildThisFileDirectory)..\</ApotheosisRoot>
+    <ApotheosisVcpkgRoot Condition="'$(ApotheosisVcpkgRoot)' == ''">C:\vcpkg</ApotheosisVcpkgRoot>
+    <ApotheosisIcuRoot Condition="'$(ApotheosisIcuRoot)' == ''">C:\icu-arm-uwp</ApotheosisIcuRoot>
+    <ApotheosisUseOfficialXaml Condition="'$(ApotheosisUseOfficialXaml)' == ''">false</ApotheosisUseOfficialXaml>
+    <ApotheosisConsumeOfficialXaml Condition="'$(ApotheosisConsumeOfficialXaml)' == ''">false</ApotheosisConsumeOfficialXaml>
+    <ApotheosisXamlIncludeDir Condition="'$(ApotheosisUseOfficialXaml)' == 'true' Or '$(ApotheosisConsumeOfficialXaml)' == 'true'">$(ProjectDir)Generated Files\</ApotheosisXamlIncludeDir>
+    <ApotheosisXamlIncludeDir Condition="'$(ApotheosisUseOfficialXaml)' != 'true' And '$(ApotheosisConsumeOfficialXaml)' != 'true'">$(ProjectDir)xamlgen\</ApotheosisXamlIncludeDir>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -48,7 +56,9 @@
     <ClCompile>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)xamlgen\;E:\Apotheosis\angle\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ApotheosisXamlIncludeDir);$(ApotheosisRoot)angle\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions Condition="'$(ApotheosisUseOfficialXaml)' == 'true' Or '$(ApotheosisConsumeOfficialXaml)' == 'true'">APOTHEOSIS_OFFICIAL_XAML;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(ApotheosisXamlCodegen)' == 'true'">APOTHEOSIS_XAML_CODEGEN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
       <Optimization>MaxSpeed</Optimization>
     </ClCompile>
@@ -56,7 +66,7 @@
       <!-- Phase 1b: 链接 build-clang-webcore 的 4 个引擎库 + 驱动/stub 库 + 全部软渲染依赖。
            顺序 WebCore->JSC->PAL->WTF(被依赖者在后);MS link.exe 多遍解析,顺序容错。 -->
       <AdditionalDependencies>libEGL.lib;libGLESv2.lib;WebCoreDriver-gpu.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>E:\Apotheosis\angle\arm;E:\Apotheosis\port;E:\Apotheosis\build-clang-gpu\lib;C:\vcpkg\installed\arm-uwp\lib;C:\icu-arm-uwp\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ApotheosisRoot)angle\arm;$(ApotheosisRoot)port;$(ApotheosisRoot)build-clang-gpu\lib;$(ApotheosisVcpkgRoot)\installed\arm-uwp\lib;$(ApotheosisIcuRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- 与 lld-link 验证一致:/OPT:REF 死剥未引用代码,只保留渲染路径闭包(146 stub 覆盖之)。 -->
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>false</EnableCOMDATFolding>
@@ -82,9 +92,8 @@
     </ClCompile>
     <ClCompile Include="App.xaml.cpp" />
     <ClCompile Include="MainPage.xaml.cpp" />
-    <!-- Apotheosis: 手搓 XAML codegen(绕开崩掉的 XamlCompiler)。
-         metadata provider(XamlTypeInfo.Impl/CreateXamlType)是 Pass2 产物且会崩,且本方案不需要
-         (运行期只 XamlReader::Load 纯框架类型),故不编译;App::GetXamlType 直接返回 nullptr。 -->
+    <!-- Apotheosis: official XAML codegen is produced by VS2017 and consumed by the v143 final build.
+         xamlgen remains available only for the explicit fallback mode. -->
     <ClCompile Include="JitProbe.cpp">
       <CompileAsWinRT>false</CompileAsWinRT>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
@@ -92,14 +101,29 @@
     <ClCompile Include="GpuProbe.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Condition="'$(ApotheosisConsumeOfficialXaml)' == 'true'" Include="Generated Files\XamlTypeInfo.Impl.g.cpp" />
+    <ClCompile Condition="'$(ApotheosisConsumeOfficialXaml)' == 'true'" Include="Generated Files\XamlTypeInfo.g.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
 
-  <!-- Apotheosis: 不再把 XAML 交给 MarkupCompile(SDK XamlCompiler 在本机环境必崩 WMC9999)。
-       XAML 在运行期由 xamlgen\MainPage.g.hpp 里 XamlReader::Load 内嵌字符串加载。
-       保留为 None 仅供工程可见,不编译/不打包。 -->
-  <ItemGroup>
+  <ItemGroup Condition="'$(ApotheosisUseOfficialXaml)' != 'true' And '$(ApotheosisConsumeOfficialXaml)' != 'true'">
     <None Include="App.xaml" />
     <None Include="MainPage.xaml" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ApotheosisUseOfficialXaml)' == 'true'">
+    <ApplicationDefinition Include="App.xaml">
+      <SubType>Designer</SubType>
+    </ApplicationDefinition>
+    <Page Include="MainPage.xaml">
+      <SubType>Designer</SubType>
+    </Page>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ApotheosisConsumeOfficialXaml)' == 'true'">
+    <None Include="Generated Files\App.xbf"><DeploymentContent>true</DeploymentContent><Link>App.xbf</Link></None>
+    <None Include="Generated Files\MainPage.xbf"><DeploymentContent>true</DeploymentContent><Link>MainPage.xbf</Link></None>
   </ItemGroup>
 
   <ItemGroup>
@@ -110,32 +134,34 @@
 
   <!-- 运行期动态依赖 DLL:全部随 appx 打包(设备无对应版本)。软渲染栈 + ICU。 -->
   <ItemGroup>
-    <None Include="C:\icu-arm-uwp\bin\icuuc78.dll"><DeploymentContent>true</DeploymentContent><Link>icuuc78.dll</Link></None>
-    <None Include="C:\icu-arm-uwp\bin\icuin78.dll"><DeploymentContent>true</DeploymentContent><Link>icuin78.dll</Link></None>
-    <None Include="C:\icu-arm-uwp\bin\icudt78.dll"><DeploymentContent>true</DeploymentContent><Link>icudt78.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\cairo-2.dll"><DeploymentContent>true</DeploymentContent><Link>cairo-2.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\pixman-1-0.dll"><DeploymentContent>true</DeploymentContent><Link>pixman-1-0.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\freetype.dll"><DeploymentContent>true</DeploymentContent><Link>freetype.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\fontconfig-1.dll"><DeploymentContent>true</DeploymentContent><Link>fontconfig-1.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libexpat.dll"><DeploymentContent>true</DeploymentContent><Link>libexpat.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\harfbuzz.dll"><DeploymentContent>true</DeploymentContent><Link>harfbuzz.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\jpeg62.dll"><DeploymentContent>true</DeploymentContent><Link>jpeg62.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libpng16.dll"><DeploymentContent>true</DeploymentContent><Link>libpng16.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libwebp.dll"><DeploymentContent>true</DeploymentContent><Link>libwebp.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libwebpdemux.dll"><DeploymentContent>true</DeploymentContent><Link>libwebpdemux.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libsharpyuv.dll"><DeploymentContent>true</DeploymentContent><Link>libsharpyuv.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libxml2.dll"><DeploymentContent>true</DeploymentContent><Link>libxml2.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\z.dll"><DeploymentContent>true</DeploymentContent><Link>z.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\bz2.dll"><DeploymentContent>true</DeploymentContent><Link>bz2.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\brotlidec.dll"><DeploymentContent>true</DeploymentContent><Link>brotlidec.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\brotlicommon.dll"><DeploymentContent>true</DeploymentContent><Link>brotlicommon.dll</Link></None>
+    <None Include="$(ApotheosisIcuRoot)\bin\icuuc78.dll"><DeploymentContent>true</DeploymentContent><Link>icuuc78.dll</Link></None>
+    <None Include="$(ApotheosisIcuRoot)\bin\icuin78.dll"><DeploymentContent>true</DeploymentContent><Link>icuin78.dll</Link></None>
+    <None Include="$(ApotheosisIcuRoot)\bin\icudt78.dll"><DeploymentContent>true</DeploymentContent><Link>icudt78.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\cairo-2.dll"><DeploymentContent>true</DeploymentContent><Link>cairo-2.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\pixman-1-0.dll"><DeploymentContent>true</DeploymentContent><Link>pixman-1-0.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\freetype.dll"><DeploymentContent>true</DeploymentContent><Link>freetype.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\fontconfig-1.dll"><DeploymentContent>true</DeploymentContent><Link>fontconfig-1.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libexpat.dll"><DeploymentContent>true</DeploymentContent><Link>libexpat.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\harfbuzz.dll"><DeploymentContent>true</DeploymentContent><Link>harfbuzz.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\jpeg62.dll"><DeploymentContent>true</DeploymentContent><Link>jpeg62.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libpng16.dll"><DeploymentContent>true</DeploymentContent><Link>libpng16.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libwebp.dll"><DeploymentContent>true</DeploymentContent><Link>libwebp.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libwebpdemux.dll"><DeploymentContent>true</DeploymentContent><Link>libwebpdemux.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libsharpyuv.dll"><DeploymentContent>true</DeploymentContent><Link>libsharpyuv.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libxml2.dll"><DeploymentContent>true</DeploymentContent><Link>libxml2.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\z.dll"><DeploymentContent>true</DeploymentContent><Link>z.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\bz2.dll"><DeploymentContent>true</DeploymentContent><Link>bz2.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\brotlidec.dll"><DeploymentContent>true</DeploymentContent><Link>brotlidec.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\brotlicommon.dll"><DeploymentContent>true</DeploymentContent><Link>brotlicommon.dll</Link></None>
     <!-- 网络栈(Phase 1b):curl + OpenSSL 3.6.3(TLS 1.3)。 -->
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libcurl.dll"><DeploymentContent>true</DeploymentContent><Link>libcurl.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libssl-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libssl-3-arm.dll</Link></None>
-    <None Include="C:\vcpkg\installed\arm-uwp\bin\libcrypto-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libcrypto-3-arm.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libcurl.dll"><DeploymentContent>true</DeploymentContent><Link>libcurl.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libssl-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libssl-3-arm.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libcrypto-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libcrypto-3-arm.dll</Link></None>
     <!-- GPU 路径1:ANGLE(老 ms-master ANGLE.WindowsStore)ARM UWP 运行时,随 appx 打包。 -->
-    <None Include="E:\Apotheosis\angle\arm\libEGL.dll"><DeploymentContent>true</DeploymentContent><Link>libEGL.dll</Link></None>
-    <None Include="E:\Apotheosis\angle\arm\libGLESv2.dll"><DeploymentContent>true</DeploymentContent><Link>libGLESv2.dll</Link></None>
+    <None Include="$(ApotheosisRoot)angle\arm\libEGL.dll"><DeploymentContent>true</DeploymentContent><Link>libEGL.dll</Link></None>
+    <None Include="$(ApotheosisRoot)angle\arm\libGLESv2.dll"><DeploymentContent>true</DeploymentContent><Link>libGLESv2.dll</Link></None>
+    <!-- WebCore 驱动 DLL(port/*.cpp 编成的 clang-cl ARM32 引擎桥接层,含全部 C ABI 导出)。 -->
+    <None Include="$(ApotheosisRoot)port\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
     <!-- CA 根证书包(App Container 无系统证书库,curl 用 CURLOPT_CAINFO 指向它做 TLS 校验)。 -->
     <None Include="Assets\cacert.pem"><DeploymentContent>true</DeploymentContent><Link>cacert.pem</Link></None>
     <!-- 字体(App Container 拿不到设备系统字体,必须打包;fontconfig 在运行期经 LocalFolder\fonts.conf 指向这里)。 -->

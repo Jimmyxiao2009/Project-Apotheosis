@@ -32,6 +32,10 @@ namespace Harness {
     public ref class MainPage sealed {
     public:
         MainPage();
+        // App::OnSuspending 调用:把 cookie JSON 落盘转给引擎线程串行执行,完成后 Complete 传入的
+        // deferral(见 App.xaml.cpp 注释——这是真正可靠的挂起前落盘点,取代 VisibilityChanged 那种
+        // fire-and-forget)。
+        void FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDeferral^ deferral);
 
     private:
         // ---- 工具栏 ----
@@ -162,6 +166,8 @@ namespace Harness {
         void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                               Platform::String^ title, Platform::String^ navUrl,
                               const std::shared_ptr<std::vector<PageLink>>& links);
+        // 软件模式:把引擎 RGBA 帧贴上 RenderImage(WriteableBitmap 双缓冲复用);直呈现模式内部自跳过。
+        void PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba);
 
         // ---- 抽屉 UI ----
         void ShowDrawer(DrawerTab tab);
@@ -237,6 +243,11 @@ namespace Harness {
         // 加载看门狗:保证 m_loading 总能被复位(即使完成回调因 dispatcher 断开/低内存丢失,
         // 避免导航永久锁死)。
         Windows::UI::Xaml::DispatcherTimer^ m_loadWatchdog;
+
+        // 软件呈现双缓冲(PresentSoftwareFrame 交替写,免每帧新建 3MB WriteableBitmap)
+        Windows::UI::Xaml::Media::Imaging::WriteableBitmap^ m_frameBmpA;
+        Windows::UI::Xaml::Media::Imaging::WriteableBitmap^ m_frameBmpB;
+        bool m_frameBmpFlip { false };
 
         // 实时渲染循环状态
         Windows::UI::Xaml::DispatcherTimer^ m_liveTimer;

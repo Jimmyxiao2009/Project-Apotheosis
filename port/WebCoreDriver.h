@@ -35,9 +35,51 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA);
 // WebCoreLoadUrl(); `path` is a UTF-8 filesystem path to a cacert.pem.
 void WebCoreSetCACertPath(const char* path);
 
+// In-memory CA blob variant (CURLOPT_CAINFO_BLOB). App Container blocks OpenSSL's
+// file-based CA loading (curl 77 even on a readable file), so on device this is
+// the one that works. `data` = raw cacert.pem bytes; call before the first load.
+void WebCoreSetCACertBlob(const uint8_t* data, int len);
+
+// Explicit cookie-jar SQLite path. UNSAFE on device as of 2026-07-03 (crashes —
+// SQLite's Win32 VFS null-derefs opening a real file in this ARM32 UWP App
+// Container build; see project memory cookie-persistence). Do not call; kept
+// only so the entry point exists once the underlying bug is fixed.
+void WebCoreSetCookieJarPath(const char* path);
+
+// Cookie persistence path (JSON Lines, one cookie per line). The in-memory jar
+// itself stays ":memory:" (proven stable); this is a side-channel snapshot the
+// engine reads/writes itself, bypassing SQLite's real-file open() entirely.
+// Must be called before the first engine call; unset/empty = not persisted
+// (never crashes). `path` is a UTF-8 filesystem path.
+void WebCoreSetCookieJsonPath(const char* path);
+
+// Write current persistent (non-session, has an expiry) cookies to the JSON
+// Lines path. Call when the app is about to background/suspend (UWP can kill
+// a suspended app without notice). Engine-thread call.
+void WebCoreFlushCookiesToDisk();
+
+// ---- diagnostics / page metadata (written by the render/load paths) ----
+// Each copies a NUL-terminated UTF-8 string into buf (<= len bytes) and returns
+// the number of bytes written (excluding NUL); empty string if nothing recorded.
+int WebCoreGetLastError(char* buf, int len);  // last failed load: curl code + desc + URL
+int WebCoreGetDiag(char* buf, int len);       // last render diag (url/title/sizes/loads/res list)
+int WebCoreGetTitle(char* buf, int len);      // last loaded page title
+
+// Download `url` to `outPath` via a standalone curl handle (no render; reuses the
+// CA blob). Returns the HTTP status code (e.g. 200) or negative on failure.
+int WebCoreDownload(const char* url, const char* outPath);
+
+// Link hit-table extracted at render time: count + rect (bitmap coords) and URL
+// of entry i. Returns 1 on success, 0 if i is out of range.
+int WebCoreGetLinkCount();
+int WebCoreGetLink(int i, int* x, int* y, int* w, int* h, char* url, int len);
+
 // Apotheosis: 内存压力释放(防 OOM)。harness 监听 UWP 内存事件,到高水位时经引擎线程调。
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
+
+// 清除全部 cookie(含持久 SQLite 库里的)。设置页"清除数据"用;引擎线程调。
+void WebCoreClearCookies();
 
 // ---- live interactive session (persistent Page + event forwarding) ----
 // Load a URL into a persistent session, then forward clicks/scroll to the live
