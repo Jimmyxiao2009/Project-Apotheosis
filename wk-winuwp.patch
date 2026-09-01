@@ -1,0 +1,2076 @@
+diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
+index 614318abbd..71b1de91a8 100644
+--- a/Source/CMakeLists.txt
++++ b/Source/CMakeLists.txt
+@@ -19,7 +19,8 @@ endif ()
+ 
+ add_subdirectory(JavaScriptCore)
+ 
+-if (ENABLE_WEBGL OR USE_ANGLE_EGL)
++if ((ENABLE_WEBGL OR USE_ANGLE_EGL) AND NOT APOTHEOSIS_GPU)
++    # APOTHEOSIS_GPU:复用预编译 NuGet ANGLE(ANGLE::GLES/EGL 在 OptionsWinUWP 做成 IMPORTED),不编 in-tree ANGLE
+     add_subdirectory(ThirdParty/ANGLE)
+ endif ()
+ 
+diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
+index a2a6d72460..ea9ea17802 100644
+--- a/Source/JavaScriptCore/CMakeLists.txt
++++ b/Source/JavaScriptCore/CMakeLists.txt
+@@ -412,8 +412,10 @@ set(LLIntSettingsExtractor_DEPENDENCIES
+     JavaScriptCore_CopyHeaders
+     JavaScriptCore_CopyPrivateHeaders
+     WTF_CopyHeaders
+-    bmalloc_CopyHeaders
+ )
++if (NOT USE_SYSTEM_MALLOC)
++    list(APPEND LLIntSettingsExtractor_DEPENDENCIES bmalloc_CopyHeaders)
++endif ()
+ WEBKIT_EXECUTABLE(LLIntSettingsExtractor)
+ 
+ # LLIntSettingsExtractor target needs to have a direct or indirect
+@@ -439,8 +441,10 @@ set(LLIntOffsetsExtractor_DEPENDENCIES
+     JavaScriptCore_CopyHeaders
+     JavaScriptCore_CopyPrivateHeaders
+     WTF_CopyHeaders
+-    bmalloc_CopyHeaders
+ )
++if (NOT USE_SYSTEM_MALLOC)
++    list(APPEND LLIntOffsetsExtractor_DEPENDENCIES bmalloc_CopyHeaders)
++endif ()
+ WEBKIT_EXECUTABLE(LLIntOffsetsExtractor)
+ 
+ # The build system will execute asm.rb every time LLIntOffsetsExtractor's mtime is newer than
+diff --git a/Source/JavaScriptCore/assembler/ARMv7Assembler.h b/Source/JavaScriptCore/assembler/ARMv7Assembler.h
+index 2695af3ec3..1484b1b0d5 100644
+--- a/Source/JavaScriptCore/assembler/ARMv7Assembler.h
++++ b/Source/JavaScriptCore/assembler/ARMv7Assembler.h
+@@ -2886,6 +2886,9 @@ public:
+             linuxPageFlush(current, current + page);
+ 
+         linuxPageFlush(current, end);
++#elif OS(WINDOWS)
++        // Windows(含 UWP App Container):写入 JIT 代码后刷新指令缓存,确保 CPU 看到新指令。
++        FlushInstructionCache(GetCurrentProcess(), code, size);
+ #else
+ #error "The cacheFlush support is missing on this platform."
+ #endif
+diff --git a/Source/JavaScriptCore/assembler/AbstractMacroAssembler.h b/Source/JavaScriptCore/assembler/AbstractMacroAssembler.h
+index 0911bd48c7..1c40610f65 100644
+--- a/Source/JavaScriptCore/assembler/AbstractMacroAssembler.h
++++ b/Source/JavaScriptCore/assembler/AbstractMacroAssembler.h
+@@ -305,7 +305,9 @@ public:
+         {
+         }
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && CPU(X86_64)
++        // 仅 x86_64:SYSV_ABI 是与默认不同的调用约定,这是个独立重载。ARM 上 SYSV_ABI 为空,
++        // 此签名与上面的 TrustedImmPtr(ReturnType(*)(Arguments...)) 完全相同 → 构造函数撞重。
+         template<typename ReturnType, typename... Arguments>
+         explicit TrustedImmPtr(ReturnType(SYSV_ABI *value)(Arguments...))
+             : m_value(reinterpret_cast<void*>(value))
+diff --git a/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.cpp b/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.cpp
+index 5726fd1968..9044961c69 100644
+--- a/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.cpp
++++ b/Source/JavaScriptCore/assembler/MacroAssemblerARMv7.cpp
+@@ -366,7 +366,11 @@ __asm__(
+     // Restore the sp and pc.
+     "ldr       sp, [sp, #" STRINGIZE_VALUE_OF(PROBE_CPU_SP_OFFSET) "]" "\n"
+     "pop       { pc }" "\n"
++#if !OS(WINDOWS)
++    // .previous(返回上一 section)是 GNU-as 指令,clang 的 COFF 汇编器不支持;
++    // 此独立 asm 块无需恢复 section,Windows 下省略即可。
+     ".previous" "\n"
++#endif
+ );
+ 
+ void MacroAssembler::probe(Probe::Function function, void* arg)
+diff --git a/Source/JavaScriptCore/inspector/scripts/codegen/preprocess.pl b/Source/JavaScriptCore/inspector/scripts/codegen/preprocess.pl
+index d8c6022644..e46f4a992c 100644
+--- a/Source/JavaScriptCore/inspector/scripts/codegen/preprocess.pl
++++ b/Source/JavaScriptCore/inspector/scripts/codegen/preprocess.pl
+@@ -39,7 +39,7 @@ GetOptions('input=s' => \$inputPath,
+ 
+ my @args = ();
+ if (!$preprocessor) {
+-    if ($Config::Config{"osname"} eq "MSWin32") {
++    if ($Config::Config{"osname"} eq "MSWin32" or $Config::Config{"osname"} eq "msys") {
+         $preprocessor = $ENV{CC} || "cl";
+         push(@args, qw(/nologo /EP /TP /C));
+     } else {
+@@ -85,7 +85,7 @@ if ($Config{osname} eq "cygwin") {
+             sleep 1;
+         }
+     }
+-} elsif ($Config::Config{"osname"} eq "MSWin32") {
++} elsif ($Config::Config{"osname"} eq "MSWin32" or $Config::Config{"osname"} eq "msys") {
+     # Suppress STDERR so that if we're using cl.exe, the output
+     # name isn't needlessly echoed.
+     use Symbol 'gensym'; my $err = gensym;
+diff --git a/Source/JavaScriptCore/offlineasm/arm.rb b/Source/JavaScriptCore/offlineasm/arm.rb
+index adc2cba6aa..bf65485b64 100644
+--- a/Source/JavaScriptCore/offlineasm/arm.rb
++++ b/Source/JavaScriptCore/offlineasm/arm.rb
+@@ -980,6 +980,12 @@ class Instruction
+             $asm.puts "add #{dest.armOperand}, pc, #{dest.armOperand}"
+             $asm.puts "ldr #{dest.armOperand}, [#{dest.armOperand}, #{temp.armOperand}]"
+ 
++            # Windows (COFF, non-PIC): movw/movt 取符号绝对地址,linker 用 IMAGE_REL_ARM_MOV32T 重定位、
++            # 加载器按 ASLR 基址修正。无需 GOT / non_lazy_ptr 表(故下方 deferNextLabelAction 不需 Windows 分支)。
++            $asm.putStr("#elif OS(WINDOWS)")
++            $asm.puts "movw #{dest.armOperand}, :lower16:#{operands[0].asmLabel}"
++            $asm.puts "movt #{dest.armOperand}, :upper16:#{operands[0].asmLabel}"
++
+             # Throw a compiler error everywhere else.
+             $asm.putStr("#else")
+             $asm.putStr("#error Missing globaladdr implementation")
+diff --git a/Source/JavaScriptCore/runtime/MachineContext.h b/Source/JavaScriptCore/runtime/MachineContext.h
+index 50353c75e4..b66b9f60da 100644
+--- a/Source/JavaScriptCore/runtime/MachineContext.h
++++ b/Source/JavaScriptCore/runtime/MachineContext.h
+@@ -748,8 +748,9 @@ inline void*& llintInstructionPointer(PlatformRegisters& regs)
+ #elif OS(WINDOWS)
+ 
+ #if CPU(ARM)
+-    static_assert(LLInt::LLIntPC == ARMRegisters::r8, "Wrong LLInt PC.");
+-    return reinterpret_cast<void*&>((uintptr_t&) regs.R8);
++    // LLIntPC = GPRInfo::regT4,在 ARM 上是 r4(原 r8/R8 是未测过的错误推测)。
++    static_assert(LLInt::LLIntPC == ARMRegisters::r4, "Wrong LLInt PC.");
++    return reinterpret_cast<void*&>((uintptr_t&) regs.R4);
+ #elif CPU(X86)
+     static_assert(LLInt::LLIntPC == X86Registers::esi, "Wrong LLInt PC.");
+     return reinterpret_cast<void*&>((uintptr_t&) regs.Esi);
+diff --git a/Source/JavaScriptCore/runtime/MathCommon.cpp b/Source/JavaScriptCore/runtime/MathCommon.cpp
+index 24429b75b6..174c05239e 100644
+--- a/Source/JavaScriptCore/runtime/MathCommon.cpp
++++ b/Source/JavaScriptCore/runtime/MathCommon.cpp
+@@ -604,7 +604,8 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(f64_nearest, double, (double operand))
+     return std::nearbyint(operand);
+ }
+ 
+-#if (OS(LINUX) && !defined(__GLIBC__)) || OS(HAIKU)
++#if (OS(LINUX) && !defined(__GLIBC__)) || OS(HAIKU) || OS(WINDOWS)
++// MSVC UCRT 不提供 C23 的 roundeven/roundevenf, Windows 也用 WebKit 自带 fallback。
+ static inline float roundevenf(float operand)
+ {
+     float rounded = roundf(operand);
+diff --git a/Source/WTF/wtf/CodePtr.h b/Source/WTF/wtf/CodePtr.h
+index efa00c8f4a..0a6a5c65a4 100644
+--- a/Source/WTF/wtf/CodePtr.h
++++ b/Source/WTF/wtf/CodePtr.h
+@@ -91,7 +91,7 @@ public:
+         : m_value(encodeFunc(ptr))
+     { }
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && CPU(X86_64)
+     template<typename Out, typename... In>
+     constexpr CodePtr(Out(SYSV_ABI *ptr)(In...))
+         : m_value(encodeFunc(ptr))
+diff --git a/Source/WTF/wtf/CurrentTime.cpp b/Source/WTF/wtf/CurrentTime.cpp
+index 681aeffc2d..8631aac7a0 100644
+--- a/Source/WTF/wtf/CurrentTime.cpp
++++ b/Source/WTF/wtf/CurrentTime.cpp
+@@ -170,9 +170,13 @@ static inline double currentTime()
+     double highResTime = highResUpTime();
+ 
+     if (!syncedTime) {
+-        timeBeginPeriod(1); // increase time resolution around low-res time getter
++#if !defined(WK_WINUWP)
++        timeBeginPeriod(1); // increase time resolution around low-res time getter (winmm, desktop-only)
++#endif
+         syncLowResUTCTime = lowResTime = lowResUTCTime();
++#if !defined(WK_WINUWP)
+         timeEndPeriod(1); // restore time resolution
++#endif
+         syncHighResUpTime = highResTime;
+         syncedTime = true;
+     }
+diff --git a/Source/WTF/wtf/FastMalloc.cpp b/Source/WTF/wtf/FastMalloc.cpp
+index b8a269c620..a0cc635248 100644
+--- a/Source/WTF/wtf/FastMalloc.cpp
++++ b/Source/WTF/wtf/FastMalloc.cpp
+@@ -208,18 +208,37 @@ void fastAlignedFree(void* p)
+ 
+ #endif // OS(WINDOWS)
+ 
+-TryMallocReturnValue tryFastMalloc(size_t n) 
++#if defined(WK_WINUWP)
++// Apotheosis: ARM32 上 clang 对 alignof>=16 的类型(如 WebCore::EventHandler)会生成 NEON
++// vst1.64 {dN,dM},[rX:128] 这类要求目标 16 字节对齐的指令来批量初始化成员。但
++// WTF_MAKE_FAST_ALLOCATED 只提供非对齐的 operator new(size_t)→fastMalloc;按 C++17 规则,过对齐
++// 类型在找不到接受 align_val_t 的分配函数时会"静默退回"非对齐版,于是 malloc 只给 8 字节对齐
++// → vst1.64 触发 EXCEPTION_DATATYPE_MISALIGNMENT(0x80000002)真机闪退(EventHandler 构造)。
++// 这里把整套 fast* 提升为 16 字节对齐(_aligned_malloc 的内存必须用 _aligned_free/_aligned_realloc/
++// _aligned_msize 配套处理,故整组一起改,保持自洽)。
++static constexpr size_t kWinUWPFastMallocAlignment = 16;
++#endif
++
++TryMallocReturnValue tryFastMalloc(size_t n)
+ {
+     FAIL_IF_EXCEEDS_LIMIT(n);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    return _aligned_malloc(n, kWinUWPFastMallocAlignment);
++#else
+     return malloc(n);
++#endif
+ }
+ 
+-void* fastMalloc(size_t n) 
++void* fastMalloc(size_t n)
+ {
+     ASSERT_IS_WITHIN_LIMIT(n);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    void* result = _aligned_malloc(n, kWinUWPFastMallocAlignment);
++#else
+     void* result = malloc(n);
++#endif
+     if (!result)
+         CRASH();
+ 
+@@ -246,14 +265,29 @@ TryMallocReturnValue tryFastCalloc(size_t n_elements, size_t element_size)
+ {
+     FAIL_IF_EXCEEDS_LIMIT(n_elements * element_size);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    size_t total = n_elements * element_size;
++    void* result = _aligned_malloc(total, kWinUWPFastMallocAlignment);
++    if (result)
++        memset(result, 0, total);
++    return result;
++#else
+     return calloc(n_elements, element_size);
++#endif
+ }
+ 
+ void* fastCalloc(size_t n_elements, size_t element_size)
+ {
+     ASSERT_IS_WITHIN_LIMIT(n_elements * element_size);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    size_t total = n_elements * element_size;
++    void* result = _aligned_malloc(total, kWinUWPFastMallocAlignment);
++    if (result)
++        memset(result, 0, total);
++#else
+     void* result = calloc(n_elements, element_size);
++#endif
+     if (!result)
+         CRASH();
+ 
+@@ -262,14 +296,22 @@ void* fastCalloc(size_t n_elements, size_t element_size)
+ 
+ void fastFree(void* p)
+ {
++#if defined(WK_WINUWP)
++    _aligned_free(p);
++#else
+     free(p);
++#endif
+ }
+ 
+ void* fastRealloc(void* p, size_t n)
+ {
+     ASSERT_IS_WITHIN_LIMIT(n);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    void* result = _aligned_realloc(p, n, kWinUWPFastMallocAlignment);
++#else
+     void* result = realloc(p, n);
++#endif
+     if (!result)
+         CRASH();
+     return result;
+@@ -279,7 +321,11 @@ TryMallocReturnValue tryFastRealloc(void* p, size_t n)
+ {
+     FAIL_IF_EXCEEDS_LIMIT(n);
+     assertMallocRestrictionForCurrentThreadScope();
++#if defined(WK_WINUWP)
++    return _aligned_realloc(p, n, kWinUWPFastMallocAlignment);
++#else
+     return realloc(p, n);
++#endif
+ }
+ 
+ void releaseFastMallocFreeMemory() { }
+@@ -296,7 +342,11 @@ size_t fastMallocSize(const void* p)
+ #if OS(DARWIN)
+     return malloc_size(p);
+ #elif OS(WINDOWS)
++#if defined(WK_WINUWP)
++    return _aligned_msize(const_cast<void*>(p), kWinUWPFastMallocAlignment, 0);
++#else
+     return _msize(const_cast<void*>(p));
++#endif
+ #else
+     UNUSED_PARAM(p);
+     return 1;
+diff --git a/Source/WTF/wtf/FunctionPtr.h b/Source/WTF/wtf/FunctionPtr.h
+index c78c59733c..198bc88761 100644
+--- a/Source/WTF/wtf/FunctionPtr.h
++++ b/Source/WTF/wtf/FunctionPtr.h
+@@ -88,7 +88,7 @@ public:
+         : m_ptr(encode(ptr))
+     { }
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && CPU(X86_64)
+     constexpr FunctionPtr(Out(SYSV_ABI *ptr)(In...))
+         : m_ptr(encode(ptr))
+     { }
+diff --git a/Source/WTF/wtf/FunctionTraits.h b/Source/WTF/wtf/FunctionTraits.h
+index 90e9142621..ac54804e8d 100644
+--- a/Source/WTF/wtf/FunctionTraits.h
++++ b/Source/WTF/wtf/FunctionTraits.h
+@@ -80,7 +80,7 @@ struct FunctionTraits<Result(Args...)> {
+ 
+ };
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && CPU(X86_64)
+ template<typename Result, typename... Args>
+ struct FunctionTraits<Result SYSV_ABI(Args...)> : public FunctionTraits<Result(Args...)> {
+ };
+@@ -90,7 +90,7 @@ template<typename Result, typename... Args>
+ struct FunctionTraits<Result(*)(Args...)> : public FunctionTraits<Result(Args...)> {
+ };
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && CPU(X86_64)
+ template<typename Result, typename... Args>
+ struct FunctionTraits<Result SYSV_ABI (*)(Args...)> : public FunctionTraits<Result(Args...)> {
+ };
+diff --git a/Source/WTF/wtf/PlatformCallingConventions.h b/Source/WTF/wtf/PlatformCallingConventions.h
+index eea6f6f70e..266dca7682 100644
+--- a/Source/WTF/wtf/PlatformCallingConventions.h
++++ b/Source/WTF/wtf/PlatformCallingConventions.h
+@@ -33,7 +33,10 @@
+ 
+ /* Macros for specifing specific calling conventions. */
+ 
+-#if OS(WINDOWS)
++// sysv_abi 仅在 x86_64 上区分 Win64 与 System V AMD64 调用约定;ARM/ARM64 只有 AAPCS 一种,
++// 该属性被编译器忽略(并产生大量 -Wignored-attributes 警告 + 触发 TrustedImmPtr 构造函数撞重)。
++// 故仅在 x86_64 Windows 启用。
++#if OS(WINDOWS) && CPU(X86_64)
+ #define SYSV_ABI __attribute__((sysv_abi))
+ #else
+ #define SYSV_ABI
+diff --git a/Source/WTF/wtf/RandomDevice.cpp b/Source/WTF/wtf/RandomDevice.cpp
+index 95921fd376..2719111e42 100644
+--- a/Source/WTF/wtf/RandomDevice.cpp
++++ b/Source/WTF/wtf/RandomDevice.cpp
+@@ -37,8 +37,12 @@
+ 
+ #if OS(WINDOWS)
+ #include <windows.h>
++#if defined(WK_WINUWP)
++#include <bcrypt.h> // App Container: 用 BCrypt 代替不可用的旧版 CryptoAPI(wincrypt)
++#else
+ #include <wincrypt.h> // windows.h must be included before wincrypt.h.
+ #endif
++#endif
+ 
+ #if OS(DARWIN)
+ #include <CommonCrypto/CommonCryptor.h>
+@@ -105,6 +109,10 @@ void RandomDevice::cryptographicallyRandomValues(std::span<uint8_t> buffer)
+         } else
+             amountRead += currentRead;
+     }
++#elif OS(WINDOWS) && defined(WK_WINUWP)
++    // App Container: 旧版 CryptoAPI 不可用, 用 BCrypt 的系统首选 RNG(无需打开算法句柄)。
++    if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(buffer.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG))
++        CRASH(); // 返回非 0 (NTSTATUS != STATUS_SUCCESS) 即失败
+ #elif OS(WINDOWS)
+     // FIXME: We cannot ensure that Cryptographic Service Provider context and CryptGenRandom are safe across threads.
+     // If it is safe, we can acquire context per RandomDevice.
+diff --git a/Source/WTF/wtf/StackTrace.h b/Source/WTF/wtf/StackTrace.h
+index 60d2eb043f..52b374e5f7 100644
+--- a/Source/WTF/wtf/StackTrace.h
++++ b/Source/WTF/wtf/StackTrace.h
+@@ -126,7 +126,7 @@ public:
+         char** symbols = backtrace_symbols(m_stack.data(), m_stack.size());
+         if (!symbols)
+             return;
+-#elif OS(WINDOWS)
++#elif OS(WINDOWS) && !defined(WK_WINUWP)
+         HANDLE hProc = GetCurrentProcess();
+         uint8_t symbolData[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)] = { 0 };
+         auto symbolInfo = reinterpret_cast<SYMBOL_INFO*>(symbolData);
+@@ -142,7 +142,7 @@ public:
+ #if HAVE(BACKTRACE_SYMBOLS)
+             if (!name || !strcmp(name, "<redacted>"))
+                 name = symbols[i];
+-#elif OS(WINDOWS)
++#elif OS(WINDOWS) && !defined(WK_WINUWP)
+             if (!name && DbgHelper::SymFromAddress(hProc, reinterpret_cast<DWORD64>(m_stack[i]), nullptr, symbolInfo))
+                 name = symbolInfo->Name;
+ #endif
+diff --git a/Source/WTF/wtf/StdLibExtras.h b/Source/WTF/wtf/StdLibExtras.h
+index ec0194903f..25eb5d82a9 100644
+--- a/Source/WTF/wtf/StdLibExtras.h
++++ b/Source/WTF/wtf/StdLibExtras.h
+@@ -423,7 +423,15 @@ template<class A> struct Visitor<A> : A {
+     using A::operator();
+ };
+  
+-template<class... F> ALWAYS_INLINE Visitor<F...> makeVisitor(F... f)
++// Apotheosis(WK_WINUWP): clang thumbv7-windows-msvc 的 MS-ABI 修饰器对包展开"未实现"(MicrosoftMangle.cpp
++// 2012 年的桩,任何 LLVM 版本/main/23 都没修)。makeVisitor/switchOn 用变参 lambda 包构造 Visitor,其闭包类
++// 落入需导出 MS 修饰名的模板实参 → "cannot mangle this pack expansion yet"。给这些 helper 内部链接(static)
++// + 强制内联,CodeGen 就不再为它们请求导出修饰名。内部链接/内联改动不改 ABI,不影响已建的 Phase0 WTF/JSC.lib。
++// Apotheosis: 早期为绕 mpark 修饰墙试过 static/gnu_inline 内部链接,均无效(已改为换 std::variant)。
++// 此宏现等价于 ALWAYS_INLINE,保留仅为不改动下方各 switchOn/makeVisitor 的引用点。
++#define WTF_VISITOR_INTERNAL ALWAYS_INLINE
++
++template<class... F> WTF_VISITOR_INTERNAL Visitor<F...> makeVisitor(F... f)
+ {
+     return Visitor<F...>(f...);
+ }
+@@ -534,6 +542,16 @@ template<typename T> concept HasSwitchOn = requires(T t) {
+     t.switchOn([](const auto&) {});
+ };
+ 
++#if defined(WK_WINUWP)
++// Apotheosis: clang thumbv7-windows-msvc 的 MS-ABI 修饰器在修饰"带 C++20 requires 约束的变参函数模板
++// switchOn 实例"时,必须把关联约束(HasSwitchOn 概念表达式,内含未展开包 / 概念内泛型 lambda)编进修饰名,
++// 落入 MicrosoftMangle.cpp 的 pack-expansion 未实现桩(任何 LLVM 版本未修)→ "cannot mangle this pack expansion yet"。
++// 消融实验(port\repro_variant_return_15/16)证明:把约束从 requires 换成 enable_if SFINAE,墙即消失
++// (SFINAE 条件不进修饰名)。下方用等价的 void_t trait 替代概念,仅用于 WK_WINUWP 的 switchOn 重载约束。
++template<class T, class = void> struct HasSwitchOnMember : std::false_type { };
++template<class T> struct HasSwitchOnMember<T, std::void_t<decltype(std::declval<T&>().switchOn([](const auto&) { }))>> : std::true_type { };
++#endif
++
+ template<typename Derived, typename Base>
+ concept DerivedFromOrConvertibleTo = std::is_base_of_v<Base, Derived> || std::is_convertible_v<Derived, Base>;
+ 
+@@ -557,24 +575,42 @@ template<size_t Minimum = 0, class F, class V> ALWAYS_INLINE decltype(auto) visi
+ #undef WTF_INDEX_VISIT_CASE
+ }
+ 
+-template<class V, class... F> requires (!HasSwitchOn<V>) ALWAYS_INLINE auto switchOn(V&& v, F&&... f) -> decltype(visitOneVariant(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v))))
++template<class V, class... F> requires (!HasSwitchOn<V>) ALWAYS_INLINE auto switchOn(V&& v, F&&... f) // Apotheosis: 去尾置 decltype,用 auto 推导避免 MS ABI decltype 修饰
+ {
+     return visitOneVariant(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
+ }
+ 
+ #else
+ 
+-template<class V, class... F> requires (!HasSwitchOn<V>) ALWAYS_INLINE constexpr auto switchOn(V&& v, F&&... f) -> decltype(WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v))))
++// Apotheosis: 原为 `-> decltype(WTF::visit(...))` 尾置返回类型。clang 的 thumbv7-windows-msvc
++// (MS ABI)名字修饰器对某些复杂 variant 的 decltype 报 "cannot mangle this decltype() yet"。
++// 改用 auto 返回推导(修饰的是推导出的具体类型,而非 decltype),requires 子句仍保证只对
++// 非 HasSwitchOn 的 variant 参与重载。
++#if defined(WK_WINUWP)
++template<class V, class... F, std::enable_if_t<!HasSwitchOnMember<std::remove_cvref_t<V>>::value, int> = 0> WTF_VISITOR_INTERNAL decltype(auto) switchOn(V&& v, F&&... f) // Apotheosis: requires→enable_if(避 pack 墙);decltype(auto) 保留引用返回(避 Render* 等引用被 decay 成抽象/不可拷贝值)
+ {
+     return WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
+ }
++#else
++template<class V, class... F> requires (!HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f)
++{
++    return WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
++}
++#endif
+ 
+ #endif
+ 
+-template<class V, class... F> requires (HasSwitchOn<V>) ALWAYS_INLINE auto switchOn(V&& v, F&&... f) -> decltype(v.switchOn(std::forward<F>(f)...))
++#if defined(WK_WINUWP)
++template<class V, class... F, std::enable_if_t<HasSwitchOnMember<std::remove_cvref_t<V>>::value, int> = 0> WTF_VISITOR_INTERNAL decltype(auto) switchOn(V&& v, F&&... f) // Apotheosis: requires→enable_if + decltype(auto) 返回(原尾置 decltype 撞次要墙,decltype(auto) 推导出具体类型可修饰且保留引用)
+ {
+     return v.switchOn(std::forward<F>(f)...);
+ }
++#else
++template<class V, class... F> requires (HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f) -> decltype(v.switchOn(std::forward<F>(f)...))
++{
++    return v.switchOn(std::forward<F>(f)...);
++}
++#endif
+ 
+ // Implementation of std::variant_alternative_index from https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2024/p2527r3.html.
+ 
+diff --git a/Source/WTF/wtf/Variant.h b/Source/WTF/wtf/Variant.h
+index fc43f039d8..83b9b18be6 100644
+--- a/Source/WTF/wtf/Variant.h
++++ b/Source/WTF/wtf/Variant.h
+@@ -2907,7 +2907,34 @@ template<class T, class... Types> constexpr add_pointer_t<const T> get_if(const
+ 
+ }
+ 
++#if defined(WK_WINUWP)
++#include <variant> // Apotheosis: std::variant 替换 mpark 所需的标准头(mpark 单头不含 <variant>)
++#endif
++
+ namespace WTF {
++#if defined(WK_WINUWP)
++// Apotheosis(WK_WINUWP): 用 std::variant 替换 mpark::variant。clang thumbv7-windows-msvc 的 MS-ABI
++// 名字修饰器对 mpark::variant 在 switchOn/visit 里的实例化报 "cannot mangle this pack expansion yet"
++// (最小复现证明 std::variant + std::visit 同样的递归 Visitor / 变参 switchOn 模式可正常修饰)。
++// std::variant 与 mpark API 兼容;build-clang-webcore 整体重编 WTF+JSC+WebCore,ABI 自洽。
++template<typename... Ts> using Variant = std::variant<Ts...>;
++template<size_t I, class T> using variant_alternative_t = std::variant_alternative_t<I, T>;
++template<typename T> constexpr std::in_place_type_t<T> InPlaceType { };
++template<typename T> using InPlaceTypeT = std::in_place_type_t<T>;
++template<size_t I> constexpr std::in_place_index_t<I> InPlaceIndex { };
++template<size_t I> using InPlaceIndexT = std::in_place_index_t<I>;
++template <size_t I, class T> struct VariantAlternative;
++template<size_t I, typename... Types> struct VariantAlternative<I, Variant<Types...>> : std::variant_alternative<I, Variant<Types...>> { };
++template<size_t I, typename T> using VariantAlternativeT = typename VariantAlternative<I, T>::type;
++template<typename T> struct VariantSize;
++template<typename... Types> struct VariantSize<Variant<Types...>> : std::integral_constant<std::size_t, sizeof...(Types)> { };
++template<typename T> struct VariantSize<const T> : VariantSize<T> { };
++template<typename T> constexpr size_t VariantSizeV = VariantSize<T>::value;
++template<typename Visitor, typename... Variants> constexpr decltype(auto) visit(Visitor&& v, Variants&&... values) // Apotheosis: decltype(auto) 而非 auto,保留 visitor 分支的引用返回(否则抽象类 RenderObject/不可拷贝 RenderBlockFlow 被 decay 成值 → 拷贝/实例化抽象类报错)
++{
++    return std::visit(std::forward<Visitor>(v), std::forward<Variants>(values)...);
++}
++#else
+ template<typename... Ts> using Variant = mpark::variant<Ts...>;
+ template<size_t I, class T> using variant_alternative_t = typename mpark::variant_alternative<I, T>::type;
+ template<typename T> constexpr mpark::in_place_type_t<T> InPlaceType { };
+@@ -2921,12 +2948,11 @@ template<typename T> struct VariantSize;
+ template<typename... Types> struct VariantSize<Variant<Types...>> : std::integral_constant<std::size_t, sizeof...(Types)> { };
+ template<typename T> struct VariantSize<const T> : VariantSize<T> { };
+ template<typename T> constexpr size_t VariantSizeV = VariantSize<T>::value;
+-
+ template<typename Visitor, typename... Variants> constexpr auto visit(Visitor&& v, Variants&&... values)
+-    -> decltype(mpark::visit<Visitor, Variants...>(std::forward<Visitor>(v), std::forward<Variants>(values)...))
+ {
+-    return mpark::visit<Visitor, Variants...>(std::forward<Visitor>(v), std::forward<Variants>(values)...);
++    return mpark::visit(std::forward<Visitor>(v), std::forward<Variants>(values)...);
+ }
++#endif
+ 
+ }
+ 
+diff --git a/Source/WTF/wtf/WindowsExtras.h b/Source/WTF/wtf/WindowsExtras.h
+index 00cb2b14e0..6b86207053 100644
+--- a/Source/WTF/wtf/WindowsExtras.h
++++ b/Source/WTF/wtf/WindowsExtras.h
+@@ -41,17 +41,31 @@ namespace WTF {
+ 
+ inline HRESULT getRegistryValue(HKEY hkey, LPCWSTR pszSubKey, LPCWSTR pszValue, LPDWORD pdwType, LPVOID pvData, LPDWORD pcbData)
+ {
++#if defined(WK_WINUWP)
++    UNUSED_PARAM(hkey); UNUSED_PARAM(pszSubKey); UNUSED_PARAM(pszValue);
++    UNUSED_PARAM(pdwType); UNUSED_PARAM(pvData); UNUSED_PARAM(pcbData);
++    return E_NOTIMPL; // App Container: 无 shlwapi SHGetValueW
++#else
+     return ::SHGetValueW(hkey, pszSubKey, pszValue, pdwType, pvData, pcbData);
++#endif
+ }
+ 
+ inline void* getWindowPointer(HWND hWnd, int index)
+ {
++#if defined(WK_WINUWP)
++    UNUSED_PARAM(hWnd); UNUSED_PARAM(index); return nullptr; // App Container: 无 HWND/user32
++#else
+     return reinterpret_cast<void*>(::GetWindowLongPtr(hWnd, index));
++#endif
+ }
+ 
+ inline void* setWindowPointer(HWND hWnd, int index, void* value)
+ {
++#if defined(WK_WINUWP)
++    UNUSED_PARAM(hWnd); UNUSED_PARAM(index); UNUSED_PARAM(value); return nullptr;
++#else
+     return reinterpret_cast<void*>(::SetWindowLongPtr(hWnd, index, reinterpret_cast<LONG_PTR>(value)));
++#endif
+ }
+ 
+ } // namespace WTF
+diff --git a/Source/WTF/wtf/generic/MainThreadGeneric.cpp b/Source/WTF/wtf/generic/MainThreadGeneric.cpp
+index 6f873d0771..834ba12f3c 100644
+--- a/Source/WTF/wtf/generic/MainThreadGeneric.cpp
++++ b/Source/WTF/wtf/generic/MainThreadGeneric.cpp
+@@ -31,12 +31,32 @@
+  */
+ 
+ #include "config.h"
++#if OS(WINDOWS)
++#include <windows.h>
++#else
+ #include <pthread.h>
++#endif
+ 
+ #include <wtf/RunLoop.h>
+ 
+ namespace WTF {
+ 
++#if OS(WINDOWS)
++
++static DWORD s_mainThread;
++
++void initializeMainThreadPlatform()
++{
++    s_mainThread = GetCurrentThreadId();
++}
++
++bool isMainThread()
++{
++    return GetCurrentThreadId() == s_mainThread;
++}
++
++#else
++
+ static pthread_t s_mainThread;
+ 
+ void initializeMainThreadPlatform()
+@@ -54,4 +74,6 @@ bool isMainThread()
+     return pthread_equal(pthread_self(), s_mainThread);
+ }
+ 
++#endif
++
+ } // namespace WTF
+diff --git a/Source/WTF/wtf/simde/arm/neon.h b/Source/WTF/wtf/simde/arm/neon.h
+index 28dc5821f3..561de48401 100644
+--- a/Source/WTF/wtf/simde/arm/neon.h
++++ b/Source/WTF/wtf/simde/arm/neon.h
+@@ -105333,7 +105333,11 @@ simde_mm_pause (void) {
+     #endif
+   #elif defined(SIMDE_ARCH_ARM_NEON)
+     #if defined(_MSC_VER)
+-      __isb(SIMDE_ARM64_BARRIER_SY);
++      #if defined(_M_ARM64)
++        __isb(SIMDE_ARM64_BARRIER_SY);
++      #else
++        __isb(SIMDE_ARM_BARRIER_SY);
++      #endif
+     #else
+       __asm__ __volatile__("isb\n");
+     #endif
+diff --git a/Source/WTF/wtf/win/DbgHelperWin.h b/Source/WTF/wtf/win/DbgHelperWin.h
+index d951a0b07f..efd603af12 100644
+--- a/Source/WTF/wtf/win/DbgHelperWin.h
++++ b/Source/WTF/wtf/win/DbgHelperWin.h
+@@ -28,6 +28,8 @@
+ #include <wtf/Lock.h>
+ #include <wtf/Noncopyable.h>
+ 
++// dbghelp 是桌面专用(App Container 无 SYMBOL_INFO 等), UWP 下整块排除。
++#if !defined(WK_WINUWP)
+ #include <dbghelp.h>
+ 
+ namespace WTF {
+@@ -39,3 +41,4 @@ WTF_EXPORT_PRIVATE bool SymFromAddress(HANDLE hProc, DWORD64 address, DWORD64* d
+ };
+ 
+ } // namespace WTF
++#endif
+diff --git a/Source/WTF/wtf/win/FileSystemWin.cpp b/Source/WTF/wtf/win/FileSystemWin.cpp
+index 5c1332dbb0..acfe2ef424 100644
+--- a/Source/WTF/wtf/win/FileSystemWin.cpp
++++ b/Source/WTF/wtf/win/FileSystemWin.cpp
+@@ -100,8 +100,30 @@ CString fileSystemRepresentation(const String& path)
+     return string;
+ }
+ 
++#if defined(WK_WINUWP)
++// App Container: 旧版 CreateFileW 不可用(fileapi.h 仅暴露 CreateFile2)。包一层兼容旧 7 参签名。
++static inline HANDLE wkCreateFile(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flagsAndAttributes, HANDLE)
++{
++    CREATEFILE2_EXTENDED_PARAMETERS p { };
++    p.dwSize = sizeof(p);
++    p.dwFileAttributes   = flagsAndAttributes & 0x0000FFFF;
++    p.dwFileFlags        = flagsAndAttributes & 0xFFF00000;
++    p.dwSecurityQosFlags = flagsAndAttributes & 0x000F0000;
++    p.lpSecurityAttributes = sa;
++    return CreateFile2(name, access, share, disposition, &p);
++}
++#define WK_CREATE_FILE wkCreateFile
++#else
++#define WK_CREATE_FILE ::CreateFileW
++#endif
++
+ static String storageDirectory(DWORD pathIdentifier)
+ {
++#if defined(WK_WINUWP)
++    // App Container: 无 SHGetFolderPath/CSIDL。Phase 0 不需要 appdata 缓存目录。
++    UNUSED_PARAM(pathIdentifier);
++    return String();
++#else
+     Vector<char16_t> buffer(MAX_PATH);
+     if (FAILED(SHGetFolderPathW(nullptr, pathIdentifier | CSIDL_FLAG_CREATE, nullptr, 0, wcharFrom(buffer.mutableSpan().data()))))
+         return String();
+@@ -114,6 +136,7 @@ static String storageDirectory(DWORD pathIdentifier)
+         return String();
+ 
+     return directory;
++#endif
+ }
+ 
+ static String cachedStorageDirectory(DWORD pathIdentifier)
+@@ -168,7 +191,7 @@ std::pair<String, FileHandle> openTemporaryFile(StringView, StringView suffix, c
+ 
+     String proposedPath = generateTemporaryPath([&handle](const String& proposedPath) {
+         // use CREATE_NEW to avoid overwriting an existing file with the same name
+-        handle = FileHandle::adopt(::CreateFileW(proposedPath.wideCharacters().span().data(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
++        handle = FileHandle::adopt(WK_CREATE_FILE(proposedPath.wideCharacters().span().data(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+ 
+         return handle || GetLastError() == ERROR_ALREADY_EXISTS;
+     });
+@@ -204,17 +227,25 @@ FileHandle openFile(const String& path, FileOpenMode mode, FileAccessPermission,
+         creationDisposition = CREATE_NEW;
+ 
+     String destination = path;
+-    return FileHandle::adopt(CreateFile(destination.wideCharacters().span().data(), desiredAccess, shareMode, nullptr, creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr), lockMode);
++    return FileHandle::adopt(WK_CREATE_FILE(destination.wideCharacters().span().data(), desiredAccess, shareMode, nullptr, creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr), lockMode);
+ }
+ 
+ String localUserSpecificStorageDirectory()
+ {
++#if defined(WK_WINUWP)
++    return String(); // App Container: 无 CSIDL_LOCAL_APPDATA(Phase 0 不需要)
++#else
+     return cachedStorageDirectory(CSIDL_LOCAL_APPDATA);
++#endif
+ }
+ 
+ String roamingUserSpecificStorageDirectory()
+ {
++#if defined(WK_WINUWP)
++    return String(); // App Container: 无 CSIDL_APPDATA
++#else
+     return cachedStorageDirectory(CSIDL_APPDATA);
++#endif
+ }
+ 
+ std::optional<int32_t> getFileDeviceId(const String& fsFile)
+diff --git a/Source/WTF/wtf/win/GDIObject.h b/Source/WTF/wtf/win/GDIObject.h
+index 772aab73a6..903c1469c0 100644
+--- a/Source/WTF/wtf/win/GDIObject.h
++++ b/Source/WTF/wtf/win/GDIObject.h
+@@ -113,16 +113,26 @@ template<typename T> inline void swap(GDIObject<T>& a, GDIObject<T>& b)
+ }
+ 
+ // Nearly all GDI types use the same DeleteObject call.
++// Apotheosis(App Container): DeleteObject/DeleteDC 是 GDI 桌面 API,WINAPI_FAMILY_APP 下
++// 不可用。沙箱里 GDI 对象也无法创建,故 GDIObject 永不持真实句柄 → 删除器 no-op 安全。
+ template<typename T> inline void deleteObject(T object)
+ {
++#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+     if (object)
+         ::DeleteObject(object);
++#else
++    (void)object;
++#endif
+ }
+ 
+ template<> inline void deleteObject<HDC>(HDC hdc)
+ {
++#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+     if (hdc)
+         ::DeleteDC(hdc);
++#else
++    (void)hdc;
++#endif
+ }
+ 
+ } // namespace WTF
+diff --git a/Source/WTF/wtf/win/MemoryPressureHandlerWin.cpp b/Source/WTF/wtf/win/MemoryPressureHandlerWin.cpp
+index 372f8f74a0..2cddf617fd 100644
+--- a/Source/WTF/wtf/win/MemoryPressureHandlerWin.cpp
++++ b/Source/WTF/wtf/win/MemoryPressureHandlerWin.cpp
+@@ -26,20 +26,26 @@
+ #include "config.h"
+ #include <wtf/MemoryPressureHandler.h>
+ 
++#if !defined(WK_WINUWP)
+ #include <psapi.h>
++#endif
+ #include <wtf/NeverDestroyed.h>
+ 
+ namespace WTF {
+ 
+ void MemoryPressureHandler::platformInitialize()
+ {
++#if !defined(WK_WINUWP)
++    // App Container 无 CreateMemoryResourceNotification(桌面内存通知 API)。
+     m_lowMemoryHandle = Win32Handle::adopt(::CreateMemoryResourceNotification(LowMemoryResourceNotification));
++#endif
+ }
+ 
+ void MemoryPressureHandler::windowsMeasurementTimerFired()
+ {
+     setMemoryPressureStatus(SystemMemoryPressureStatus::Normal);
+ 
++#if !defined(WK_WINUWP)
+     BOOL memoryLow;
+ 
+     if (QueryMemoryResourceNotification(m_lowMemoryHandle.get(), &memoryLow) && memoryLow) {
+@@ -47,6 +53,7 @@ void MemoryPressureHandler::windowsMeasurementTimerFired()
+         releaseMemory(Critical::Yes);
+         return;
+     }
++#endif
+ 
+ #if CPU(X86)
+     PROCESS_MEMORY_COUNTERS_EX counters;
+diff --git a/Source/WTF/wtf/win/OSAllocatorWin.cpp b/Source/WTF/wtf/win/OSAllocatorWin.cpp
+index 5664e2d839..53c1bf5081 100644
+--- a/Source/WTF/wtf/win/OSAllocatorWin.cpp
++++ b/Source/WTF/wtf/win/OSAllocatorWin.cpp
+@@ -34,7 +34,23 @@
+ #include <wtf/SoftLinking.h>
+ 
+ SOFT_LINK_LIBRARY(kernelbase)
++
++#if defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_APP
++// App Container(UWP): 普通 VirtualAlloc/VirtualAlloc2/VirtualProtect 不在允许的 API set, 必须用 *FromApp 变体。
++// JIT(ENABLE_JIT=1):真机实测 VirtualAllocFromApp 直接带 PAGE_EXECUTE_* 会 err=87 失败,但「RW 分配 + 写码 +
++// VirtualProtectFromApp 翻成 PAGE_EXECUTE_*」可行(W^X),前提是清单声明 codeGeneration 能力。
++#define WK_VirtualAlloc VirtualAllocFromApp
++#define WK_VirtualProtect VirtualProtectFromApp
++SOFT_LINK_OPTIONAL(kernelbase, VirtualAlloc2FromApp, void*, WINAPI, (HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG))
++#define WK_VirtualAlloc2Ptr VirtualAlloc2FromAppPtr
++#define WK_APP_CONTAINER 1
++#else
++#define WK_VirtualAlloc VirtualAlloc
++#define WK_VirtualProtect VirtualProtect
+ SOFT_LINK_OPTIONAL(kernelbase, VirtualAlloc2, void*, WINAPI, (HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG))
++#define WK_VirtualAlloc2Ptr VirtualAlloc2Ptr
++#define WK_APP_CONTAINER 0
++#endif
+ 
+ namespace WTF {
+ 
+@@ -45,9 +61,34 @@ static inline DWORD protection(bool writable, bool executable)
+         (writable ? PAGE_READWRITE : PAGE_READONLY);
+ }
+ 
++// App Container 下分配时用的保护:executable 一律先按可写非执行分配(*FromApp 不接受 PAGE_EXECUTE_*),
++// 可执行靠提交后的 applyExecutableProtection 翻转(W^X)。非 App 容器与原行为一致。
++static inline DWORD allocProtection(bool writable, bool executable)
++{
++#if WK_APP_CONTAINER
++    if (executable)
++        return writable ? PAGE_READWRITE : PAGE_READONLY;
++#endif
++    return protection(writable, executable);
++}
++
++// 提交后,App Container 下若需可执行,用 VirtualProtectFromApp 翻成可执行保护(需 codeGeneration 能力)。
++static inline void applyExecutableProtection(void* address, size_t bytes, bool writable, bool executable)
++{
++#if WK_APP_CONTAINER
++    if (address && executable) {
++        DWORD oldProtect = 0;
++        WK_VirtualProtect(address, bytes, protection(writable, executable), &oldProtect);
++    }
++#else
++    UNUSED_PARAM(address); UNUSED_PARAM(bytes); UNUSED_PARAM(writable); UNUSED_PARAM(executable);
++#endif
++}
++
+ void* OSAllocator::tryReserveUncommitted(size_t bytes, Usage, void* address, bool writable, bool executable, bool, unsigned)
+ {
+-    return VirtualAlloc(address, bytes, MEM_RESERVE, protection(writable, executable));
++    // 仅预留(不提交):无已提交页,故只按 allocProtection 预留;可执行保护在 commit 时再翻。
++    return WK_VirtualAlloc(address, bytes, MEM_RESERVE, allocProtection(writable, executable));
+ }
+ 
+ void* OSAllocator::reserveUncommitted(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool jitCageEnabled, unsigned numGuardPagesToAddOnEachEnd)
+@@ -61,13 +102,13 @@ void* OSAllocator::tryReserveUncommittedAligned(size_t bytes, size_t alignment,
+ {
+     ASSERT(hasOneBitSet(alignment) && alignment >= pageSize());
+ 
+-    if (VirtualAlloc2Ptr()) {
++    if (WK_VirtualAlloc2Ptr()) {
+         MEM_ADDRESS_REQUIREMENTS addressReqs = { };
+         MEM_EXTENDED_PARAMETER param = { };
+         addressReqs.Alignment = alignment;
+         param.Type = MemExtendedParameterAddressRequirements;
+         param.Pointer = &addressReqs;
+-        void* result = VirtualAlloc2Ptr()(nullptr, address, bytes, MEM_RESERVE, protection(writable, executable), &param, 1);
++        void* result = WK_VirtualAlloc2Ptr()(nullptr, address, bytes, MEM_RESERVE, allocProtection(writable, executable), &param, 1);
+         return result;
+     }
+ 
+@@ -79,7 +120,9 @@ void* OSAllocator::tryReserveUncommittedAligned(size_t bytes, size_t alignment,
+ 
+ void* OSAllocator::tryReserveAndCommit(size_t bytes, Usage, void* address, bool writable, bool executable, bool, unsigned)
+ {
+-    return VirtualAlloc(address, bytes, MEM_RESERVE | MEM_COMMIT, protection(writable, executable));
++    void* result = WK_VirtualAlloc(address, bytes, MEM_RESERVE | MEM_COMMIT, allocProtection(writable, executable));
++    applyExecutableProtection(result, bytes, writable, executable);   // App Container:提交后翻可执行
++    return result;
+ }
+ 
+ void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool jitCageEnabled, unsigned numGuardPagesToAddOnEachEnd)
+@@ -91,9 +134,10 @@ void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, void* address, bo
+ 
+ void OSAllocator::commit(void* address, size_t bytes, bool writable, bool executable)
+ {
+-    void* result = VirtualAlloc(address, bytes, MEM_COMMIT, protection(writable, executable));
++    void* result = WK_VirtualAlloc(address, bytes, MEM_COMMIT, allocProtection(writable, executable));
+     if (!result)
+         CRASH();
++    applyExecutableProtection(address, bytes, writable, executable);   // App Container:提交后翻可执行
+ }
+ 
+ void OSAllocator::decommit(void* address, size_t bytes)
+@@ -108,13 +152,15 @@ void OSAllocator::decommit(void* address, size_t bytes)
+     // So, we need VirtualUnlock call.
+     if (!bytes)
+         return;
+-    void* result = VirtualAlloc(address, bytes, MEM_RESET, PAGE_READWRITE);
++    void* result = WK_VirtualAlloc(address, bytes, MEM_RESET, PAGE_READWRITE);
+     if (!result)
+         CRASH();
+     // Calling VirtualUnlock on a range of memory that is not locked releases the pages from the
+     // process's working set.
+     // https://devblogs.microsoft.com/oldnewthing/20170317-00/?p=95755
+-    VirtualUnlock(address, bytes);
++#if !defined(WK_WINUWP)
++    VirtualUnlock(address, bytes); // 桌面专用; App Container 无此 API(MEM_RESET 已 decommit)
++#endif
+ }
+ 
+ void OSAllocator::releaseDecommitted(void* address, size_t bytes, unsigned)
+@@ -148,7 +194,7 @@ bool OSAllocator::tryProtect(void* address, size_t bytes, bool readable, bool wr
+         ASSERT(!readable && !writable);
+         protection = PAGE_NOACCESS;
+     }
+-    return VirtualAlloc(address, bytes, MEM_COMMIT, protection);
++    return WK_VirtualAlloc(address, bytes, MEM_COMMIT, protection);
+ }
+ 
+ void OSAllocator::protect(void* address, size_t bytes, bool readable, bool writable)
+diff --git a/Source/WTF/wtf/win/SignalsWin.cpp b/Source/WTF/wtf/win/SignalsWin.cpp
+index 28be55d821..c8c034a412 100644
+--- a/Source/WTF/wtf/win/SignalsWin.cpp
++++ b/Source/WTF/wtf/win/SignalsWin.cpp
+@@ -152,7 +152,11 @@ void SignalHandlers::finalize()
+ 
+     for (unsigned i = 0; i < numberOfSignals; ++i) {
+         if (handlers.numberOfHandlers[i]) {
+-            AddVectoredExceptionHandler(1, vectoredHandler);
++#if !defined(WK_WINUWP)
++            AddVectoredExceptionHandler(1, vectoredHandler); // App Container 无 VEH; 无 JIT/Wasm 故无需信号
++#else
++            UNUSED_VARIABLE(vectoredHandler);
++#endif
+             break;
+         }
+     }
+diff --git a/Source/WTF/wtf/win/ThreadingWin.cpp b/Source/WTF/wtf/win/ThreadingWin.cpp
+index 9c944ea631..9559f15dfa 100644
+--- a/Source/WTF/wtf/win/ThreadingWin.cpp
++++ b/Source/WTF/wtf/win/ThreadingWin.cpp
+@@ -130,9 +130,14 @@ void Thread::initializeCurrentThreadInternal(const char* szThreadName)
+     info.dwThreadID = GetCurrentThreadId();
+     info.dwFlags = 0;
+ 
++#if !defined(WK_WINUWP)
++    // SEH 的 __try clang ARM32 不支持; 这只是给调试器命名线程的旧把戏, UWP 跳过。
+     __try {
+         RaiseException(MS_VC_EXCEPTION, 0, sizeof(info) / sizeof(ULONG_PTR), reinterpret_cast<ULONG_PTR*>(&info));
+     } __except(EXCEPTION_CONTINUE_EXECUTION) { }
++#else
++    (void)info;
++#endif
+ 
+     initializeCurrentThreadEvenIfNonWTFCreated();
+ }
+diff --git a/Source/WebCore/accessibility/AccessibilityObject.cpp b/Source/WebCore/accessibility/AccessibilityObject.cpp
+index e16097e52e..9d379aca7c 100644
+--- a/Source/WebCore/accessibility/AccessibilityObject.cpp
++++ b/Source/WebCore/accessibility/AccessibilityObject.cpp
+@@ -2709,7 +2709,7 @@ struct RoleEntry {
+     AccessibilityRole webcoreRole;
+ };
+ 
+-static void initializeRoleMap()
++static void initializeAriaRoleMaps()
+ {
+     if (gAriaRoleMap)
+         return;
+@@ -2875,13 +2875,13 @@ static void initializeRoleMap()
+ 
+ static ARIARoleMap& ariaRoleMap()
+ {
+-    initializeRoleMap();
++    initializeAriaRoleMaps();
+     return *gAriaRoleMap;
+ }
+ 
+ static ARIAReverseRoleMap& reverseAriaRoleMap()
+ {
+-    initializeRoleMap();
++    initializeAriaRoleMaps();
+     return *gAriaReverseRoleMap;
+ }
+ 
+diff --git a/Source/WebCore/bindings/scripts/CodeGenerator.pm b/Source/WebCore/bindings/scripts/CodeGenerator.pm
+index bebd2fc3f0..230c6773de 100644
+--- a/Source/WebCore/bindings/scripts/CodeGenerator.pm
++++ b/Source/WebCore/bindings/scripts/CodeGenerator.pm
+@@ -574,6 +574,9 @@ sub IDLFileForInterface
+         $idlFiles = { };
+         while (<$fh>) {
+             chomp $_;
++            $_ =~ s/\r$//; # Apotheosis: idlFileNamesList 在 Windows 上是 CRLF,chomp 只去 \n,
++                           # 残留的 \r 会让 fileparse 提出 "Name.idl\r"(.idl 后缀匹配失败),
++                           # 导致 IDLFileForInterface 找不到 EventTarget/EventInit 等依赖接口。
+             my $name = fileparse($_, ".idl");
+             $idlFiles->{$name} = $_;
+         }
+diff --git a/Source/WebCore/crypto/keys/CryptoKeyEC.h b/Source/WebCore/crypto/keys/CryptoKeyEC.h
+index 2c948738ae..a801ab46b7 100644
+--- a/Source/WebCore/crypto/keys/CryptoKeyEC.h
++++ b/Source/WebCore/crypto/keys/CryptoKeyEC.h
+@@ -60,6 +60,19 @@ using PlatformECKeyContainer = WebCore::EvpPKeyPtr;
+ }
+ #endif
+ 
++#if defined(WK_WINUWP) && !OS(DARWIN) && !USE(GCRYPT) && !USE(OPENSSL)
++// WinUWP port: no WebCrypto backend is selected (crypto is non-functional, compile-only).
++// Mirrors the upstream Darwin CLANG_WEBKIT_BRANCH stub so the CryptoKeyEC class body stays
++// well-formed and the CryptoKey inheritance is preserved. Backend platform* methods remain
++// unresolved externals, which is fine for the static WebCore.lib archive.
++#include <memory>
++#include <variant>
++namespace WebCore {
++using PlatformECKey = std::monostate*;
++using PlatformECKeyContainer = std::unique_ptr<std::monostate>;
++}
++#endif
++
+ namespace WebCore {
+ 
+ struct JsonWebKey;
+diff --git a/Source/WebCore/crypto/keys/CryptoKeyRSA.h b/Source/WebCore/crypto/keys/CryptoKeyRSA.h
+index aa6287821c..bfd9ea9415 100644
+--- a/Source/WebCore/crypto/keys/CryptoKeyRSA.h
++++ b/Source/WebCore/crypto/keys/CryptoKeyRSA.h
+@@ -53,6 +53,17 @@ typedef EVP_PKEY* PlatformRSAKey;
+ typedef WebCore::EvpPKeyPtr PlatformRSAKeyContainer;
+ #endif
+ 
++#if defined(WK_WINUWP) && !OS(DARWIN) && !USE(GCRYPT) && !USE(OPENSSL)
++// WinUWP port: no WebCrypto backend is selected (crypto is non-functional, compile-only).
++// Provide opaque stub key types so the CryptoKeyRSA class body stays well-formed and the
++// CryptoKey inheritance is preserved. The backend platform* methods remain unresolved
++// externals, which is fine for the static WebCore.lib archive.
++#include <memory>
++#include <variant>
++typedef std::monostate* PlatformRSAKey;
++typedef std::unique_ptr<std::monostate> PlatformRSAKeyContainer;
++#endif
++
+ namespace WebCore {
+ 
+ class CryptoKeyRSAComponents;
+diff --git a/Source/WebCore/css/CSSFontFaceSet.cpp b/Source/WebCore/css/CSSFontFaceSet.cpp
+index 410893229d..4c2eda6544 100644
+--- a/Source/WebCore/css/CSSFontFaceSet.cpp
++++ b/Source/WebCore/css/CSSFontFaceSet.cpp
+@@ -467,6 +467,10 @@ ExceptionOr<bool> CSSFontFaceSet::check(ScriptExecutionContext& context, const S
+ 
+ CSSSegmentedFontFace* CSSFontFaceSet::fontFace(FontSelectionRequest request, const AtomString& family)
+ {
++    // Apotheosis: m_facesLookupTable 用 ASCIICaseInsensitiveHash,它对 null StringImpl 会解引用空指针
++    // 崩溃(标准 AtomStringHash 能处理 null,这个不能)。空族名(百度等的字体声明会触发)直接返回。
++    if (family.isNull())
++        return nullptr;
+     auto iterator = m_facesLookupTable.find(family);
+     if (iterator == m_facesLookupTable.end())
+         return nullptr;
+diff --git a/Source/WebCore/css/DOMCSSRegisterCustomProperty.cpp b/Source/WebCore/css/DOMCSSRegisterCustomProperty.cpp
+index 8aaf29b5ed..0f6d2af29c 100644
+--- a/Source/WebCore/css/DOMCSSRegisterCustomProperty.cpp
++++ b/Source/WebCore/css/DOMCSSRegisterCustomProperty.cpp
+@@ -43,10 +43,19 @@
+ namespace WebCore {
+ DEFINE_ALLOCATOR_WITH_HEAP_IDENTIFIER(DOMCSSRegisterCustomProperty);
+ 
++#if !defined(WK_WINUWP)
+ using namespace Style;
++#endif
+ 
+ ExceptionOr<void> DOMCSSRegisterCustomProperty::registerProperty(Document& document, const DOMCSSCustomPropertyDescriptor& descriptor)
+ {
++#if defined(WK_WINUWP)
++    // In unified builds a namespace-scope `using namespace Style;` accumulates onto namespace
++    // WebCore for the whole TU and makes Style::{Color,Cursor,ScrollbarWidth,ScrollbarColor,
++    // FontFeatureSettings,FontSizeAdjust,...} visible to unqualified lookup in later files'
++    // headers, producing ambiguity under clang-cl/thumbv7. Scope the directive to this function.
++    using namespace Style;
++#endif
+     if (!isCustomPropertyName(descriptor.name))
+         return Exception { ExceptionCode::SyntaxError, "The name of this property is not a custom property name."_s };
+ 
+diff --git a/Source/WebCore/css/values/CSSValueAggregates.h b/Source/WebCore/css/values/CSSValueAggregates.h
+index a21a05c719..31283f6732 100644
+--- a/Source/WebCore/css/values/CSSValueAggregates.h
++++ b/Source/WebCore/css/values/CSSValueAggregates.h
+@@ -1419,12 +1419,12 @@ template<typename T> struct MinimallySerializingSpaceSeparatedPoint {
+     using Array = SpaceSeparatedPair<T>;
+     using value_type = T;
+ 
+-    template<typename U> constexpr MinimallySerializingSpaceSeparatedPoint(U p1)
++    template<typename U> requires (std::convertible_to<U, T>) constexpr MinimallySerializingSpaceSeparatedPoint(U p1) // Apotheosis: 约束转换构造,否则 std::variant(WK_WINUWP)探测备选可构造性时实例化函数体 → 不可转类型硬错误(mpark 不触发此探测)
+         : value { p1, p1 }
+     {
+     }
+ 
+-    template<typename U> constexpr MinimallySerializingSpaceSeparatedPoint(U p1, U p2)
++    template<typename U> requires (std::convertible_to<U, T>) constexpr MinimallySerializingSpaceSeparatedPoint(U p1, U p2) // Apotheosis: 同上,约束转换构造
+         : value { WTF::move(p1), WTF::move(p2) }
+     {
+     }
+@@ -1456,12 +1456,12 @@ template<typename T> struct MinimallySerializingSpaceSeparatedSize {
+     using Array = SpaceSeparatedPair<T>;
+     using value_type = T;
+ 
+-    template<typename U> constexpr MinimallySerializingSpaceSeparatedSize(U p1)
++    template<typename U> requires (std::convertible_to<U, T>) constexpr MinimallySerializingSpaceSeparatedSize(U p1) // Apotheosis: 约束转换构造,否则 std::variant(WK_WINUWP)探测备选可构造性时实例化函数体 → 不可转类型硬错误(mpark 不触发此探测)
+         : value { p1, p1 }
+     {
+     }
+ 
+-    template<typename U> constexpr MinimallySerializingSpaceSeparatedSize(U p1, U p2)
++    template<typename U> requires (std::convertible_to<U, T>) constexpr MinimallySerializingSpaceSeparatedSize(U p1, U p2) // Apotheosis: 同上,约束转换构造
+         : value { WTF::move(p1), WTF::move(p2) }
+     {
+     }
+diff --git a/Source/WebCore/loader/DocumentLoader.cpp b/Source/WebCore/loader/DocumentLoader.cpp
+index 2c9b359bdf..8ec2cfe70c 100644
+--- a/Source/WebCore/loader/DocumentLoader.cpp
++++ b/Source/WebCore/loader/DocumentLoader.cpp
+@@ -53,6 +53,9 @@
+ #include "DocumentWriter.h"
+ #include "ElementChildIteratorInlines.h"
+ #include "Event.h"
++#if defined(WK_WINUWP)
++#include "EventLoop.h" // Apotheosis: 显式引入 EventLoopTaskGroup 完整定义(WinUWP unified build 下未经其它头传递,eventLoop().queueTask 需完整类型)
++#endif
+ #include "EventNames.h"
+ #include "ExtensionStyleSheets.h"
+ #include "FormSubmission.h"
+diff --git a/Source/WebCore/loader/cache/CachedResourceLoader.cpp b/Source/WebCore/loader/cache/CachedResourceLoader.cpp
+index 202ddbd27f..291206f755 100644
+--- a/Source/WebCore/loader/cache/CachedResourceLoader.cpp
++++ b/Source/WebCore/loader/cache/CachedResourceLoader.cpp
+@@ -612,8 +612,15 @@ bool CachedResourceLoader::canRequest(CachedResource::Type type, const URL& url,
+         }
+ 
+         bool shouldReportViolationAsConsoleMessage = forPreload == ForPreload::No || isLinkPreload;
++#if !defined(WK_WINUWP)
++        // Apotheosis: 跳过 CSP 强制。我们是单页渲染 demo,CSP 是多源浏览安全特性、不影响渲染正确性;
++        // 而在本 headless 配置下 github 等的严格 CSP 会统一拦掉全部子资源(CSS/JS/图片),导致 loads=S1、
++        // 页面无样式。诊断(workflow)定位此处为最强嫌疑。跳过后子资源才能发起。
+         if (!allowedByContentSecurityPolicy(type, url, options, ContentSecurityPolicy::RedirectResponseReceived::No, { }, shouldReportViolationAsConsoleMessage))
+             return false;
++#else
++        (void)shouldReportViolationAsConsoleMessage;
++#endif
+ 
+         if (shouldRequestBeBlockedByIntegrityPolicy(*document, options, url))
+             return false;
+@@ -657,10 +664,16 @@ bool CachedResourceLoader::canRequestAfterRedirection(CachedResource::Type type,
+             return false;
+         }
+ 
++#if !defined(WK_WINUWP)
++        // Apotheosis: 同 canRequest 的 ::No 检查一致地跳过 CSP——否则走 301/302 重定向到 CDN 的
++        // 子资源(github 大量如此)仍会被这里的 CSP 拦掉,half-applied 的跳过等于没修。
+         if (!allowedByContentSecurityPolicy(type, url, options, ContentSecurityPolicy::RedirectResponseReceived::Yes, preRedirectURL)) {
+             CACHEDRESOURCELOADER_RELEASE_LOG("canRequestAfterRedirection: URL was not allowed by content policy");
+             return false;
+         }
++#else
++        (void)preRedirectURL;
++#endif
+     }
+ 
+     // Last of all, check for insecure content. We do this last so that when folks block insecure content with a CSP policy, they don't get a warning.
+diff --git a/Source/WebCore/page/EventHandler.cpp b/Source/WebCore/page/EventHandler.cpp
+index d418cec7d5..2206a95d47 100644
+--- a/Source/WebCore/page/EventHandler.cpp
++++ b/Source/WebCore/page/EventHandler.cpp
+@@ -3877,9 +3877,11 @@ bool EventHandler::sendContextMenuEventForKey()
+ 
+     static const int kContextMenuMargin = 1;
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && !defined(WK_WINUWP)
+     int rightAligned = ::GetSystemMetrics(SM_MENUDROPALIGNMENT);
+ #else
++    // Apotheosis(WK_WINUWP): GetSystemMetrics 在 App Container(WINAPI_FAMILY_APP)下被
++    // WINAPI_PARTITION_DESKTOP 守掉,不可用。菜单方向默认按 LTR(rightAligned=0)。
+     int rightAligned = 0;
+ #endif
+     IntPoint location { rightAligned ? view->contentsWidth() - kContextMenuMargin : kContextMenuMargin, kContextMenuMargin };
+diff --git a/Source/WebCore/platform/FreeType.cmake b/Source/WebCore/platform/FreeType.cmake
+index 0d7cc9156b..3aa5d7e3e7 100644
+--- a/Source/WebCore/platform/FreeType.cmake
++++ b/Source/WebCore/platform/FreeType.cmake
+@@ -35,5 +35,7 @@ list(APPEND WebCore_LIBRARIES
+     Fontconfig::Fontconfig
+     Freetype::Freetype
+     HarfBuzz::HarfBuzz
+-    HarfBuzz::ICU
++    # Apotheosis: 去掉 HarfBuzz::ICU —— 我们的 harfbuzz 未编 hb-icu。WebCore 只用过
++    # 一处 hb_icu_script_to_script(ComplexTextControllerHarfBuzz.cpp:377),改用 ICU
++    # 的 uscript_getShortName + hb_script_from_string,无需链 libharfbuzz-icu。
+ )
+diff --git a/Source/WebCore/platform/MainThreadSharedTimer.cpp b/Source/WebCore/platform/MainThreadSharedTimer.cpp
+index 89ea63bd1d..b55fd22957 100644
+--- a/Source/WebCore/platform/MainThreadSharedTimer.cpp
++++ b/Source/WebCore/platform/MainThreadSharedTimer.cpp
+@@ -46,7 +46,7 @@ MainThreadSharedTimer& MainThreadSharedTimer::singleton()
+     return instance;
+ }
+ 
+-#if USE(CF) || OS(WINDOWS)
++#if USE(CF) || (OS(WINDOWS) && !USE(FREETYPE))
+ MainThreadSharedTimer::MainThreadSharedTimer() = default;
+ #else
+ MainThreadSharedTimer::MainThreadSharedTimer()
+diff --git a/Source/WebCore/platform/MainThreadSharedTimer.h b/Source/WebCore/platform/MainThreadSharedTimer.h
+index 4dca975c12..4b8ad16429 100644
+--- a/Source/WebCore/platform/MainThreadSharedTimer.h
++++ b/Source/WebCore/platform/MainThreadSharedTimer.h
+@@ -30,7 +30,7 @@
+ #include <wtf/Forward.h>
+ #include <wtf/TZoneMalloc.h>
+ 
+-#if !USE(CF) && !OS(WINDOWS)
++#if !USE(CF) && (!OS(WINDOWS) || USE(FREETYPE))
+ #include <wtf/CanMakeWeakPtr.h>
+ #include <wtf/RunLoop.h>
+ #endif
+@@ -38,7 +38,7 @@
+ namespace WebCore {
+ 
+ class MainThreadSharedTimer final : public SharedTimer
+-#if !USE(CF) && !OS(WINDOWS)
++#if !USE(CF) && (!OS(WINDOWS) || USE(FREETYPE))
+     , public CanMakeWeakPtr<MainThreadSharedTimer>
+ #endif
+ {
+@@ -68,7 +68,7 @@ private:
+     MainThreadSharedTimer();
+ 
+     Function<void()> m_firedFunction;
+-#if !USE(CF) && !OS(WINDOWS)
++#if !USE(CF) && (!OS(WINDOWS) || USE(FREETYPE))
+     RunLoop::Timer m_timer;
+ #endif
+ };
+diff --git a/Source/WebCore/platform/Timer.cpp b/Source/WebCore/platform/Timer.cpp
+index 2291ee845b..6838438ebc 100644
+--- a/Source/WebCore/platform/Timer.cpp
++++ b/Source/WebCore/platform/Timer.cpp
+@@ -276,6 +276,14 @@ struct SameSizeAsTimer {
+     uint8_t bitfields;
+ #endif
+     void* pointer;
++#if defined(WK_WINUWP)
++    // On thumbv7/MSVC-ABI the real WebCore::Timer is 8 bytes larger than this size-tripwire
++    // placeholder models (sizeof(Timer)==56 vs 48 here), due to MSVC-ABI alignment/padding
++    // differing from the Itanium model. Pad by one pointer-pair (8 bytes on ARM32) so the size
++    // assertions below hold. Purely a compile-time size guard with no runtime semantics;
++    // DeferrableOneShotTimer's assert follows since its placeholder derives from this struct.
++    void* winuwpSizePadding[2];
++#endif
+ };
+ 
+ static_assert(sizeof(Timer) == sizeof(SameSizeAsTimer), "Timer should stay small");
+diff --git a/Source/WebCore/platform/graphics/Font.h b/Source/WebCore/platform/graphics/Font.h
+index a6370aef15..d0eedca70a 100644
+--- a/Source/WebCore/platform/graphics/Font.h
++++ b/Source/WebCore/platform/graphics/Font.h
+@@ -49,8 +49,8 @@
+ #include "OpenTypeVerticalData.h"
+ #endif
+ 
+-#if PLATFORM(WIN)
+-#include <usp10.h>
++#if PLATFORM(WIN) && !USE(FREETYPE)
++#include <usp10.h>   // Apotheosis: Uniscribe(usp10) 是 App Container 禁用桌面 API;FreeType 路用 HarfBuzz
+ #endif
+ 
+ #if USE(SKIA)
+@@ -267,7 +267,7 @@ public:
+     WEBCORE_EXPORT IPCFontData toSerializableFont() const;
+     WEBCORE_EXPORT std::optional<InstalledFont> toSerializableInstalledFont() const;
+ #endif
+-#if PLATFORM(WIN)
++#if PLATFORM(WIN) && !USE(FREETYPE)
+     SCRIPT_CACHE* scriptCache() const { return &m_scriptCache; }
+ #endif
+ 
+@@ -406,7 +406,7 @@ private:
+     mutable SupportsFeature m_supportsOpenTypeAlternateHalfWidths { SupportsFeature::Unknown };
+ #endif
+ 
+-#if PLATFORM(WIN)
++#if PLATFORM(WIN) && !USE(FREETYPE)
+     mutable SCRIPT_CACHE m_scriptCache { 0 };
+ #endif
+ 
+diff --git a/Source/WebCore/platform/graphics/FontCustomPlatformData.h b/Source/WebCore/platform/graphics/FontCustomPlatformData.h
+index 8ebb91aa2b..fed37d41e4 100644
+--- a/Source/WebCore/platform/graphics/FontCustomPlatformData.h
++++ b/Source/WebCore/platform/graphics/FontCustomPlatformData.h
+@@ -32,7 +32,7 @@
+ #include <wtf/Platform.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+-#if PLATFORM(WIN)
++#if PLATFORM(WIN) && !USE(FREETYPE)
+ #include <wtf/text/WTFString.h>
+ #elif USE(CORE_TEXT)
+ #include <CoreFoundation/CFBase.h>
+@@ -71,7 +71,7 @@ public:
+     WEBCORE_EXPORT static RefPtr<FontCustomPlatformData> create(SharedBuffer&, const String&);
+     WEBCORE_EXPORT static RefPtr<FontCustomPlatformData> createMemorySafe(SharedBuffer&, const String&);
+ 
+-#if PLATFORM(WIN) && USE(CAIRO)
++#if PLATFORM(WIN) && USE(CAIRO) && !USE(FREETYPE)
+     FontCustomPlatformData(const String& name, FontPlatformData::CreationData&&);
+ #elif USE(CORE_TEXT)
+     FontCustomPlatformData(CTFontDescriptorRef fontDescriptor, FontPlatformData::CreationData&& creationData)
+@@ -95,7 +95,7 @@ public:
+     static bool supportsFormat(const String&);
+     static bool supportsTechnology(const FontTechnology&);
+ 
+-#if PLATFORM(WIN) && USE(CAIRO)
++#if PLATFORM(WIN) && USE(CAIRO) && !USE(FREETYPE)
+     String name;
+ #elif USE(CORE_TEXT)
+     RetainPtr<CTFontDescriptorRef> fontDescriptor;
+diff --git a/Source/WebCore/platform/graphics/FontPlatformData.h b/Source/WebCore/platform/graphics/FontPlatformData.h
+index e63d521cc0..6df689843c 100644
+--- a/Source/WebCore/platform/graphics/FontPlatformData.h
++++ b/Source/WebCore/platform/graphics/FontPlatformData.h
+@@ -463,8 +463,8 @@ public:
+     struct CreationData {
+         const Ref<SharedBuffer> fontFaceData;
+         String itemInCollection;
+-#if PLATFORM(WIN) && USE(CAIRO)
+-        Ref<FontMemoryResource> m_fontResource;
++#if PLATFORM(WIN) && USE(CAIRO) && !USE(FREETYPE)
++        Ref<FontMemoryResource> m_fontResource;   // Apotheosis: GDI 字体资源仅 DirectWrite 路用;FreeType 路用 fontFaceData+FT_New_Memory_Face
+ #endif
+     };
+ 
+diff --git a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp b/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
+index 6f664b78ff..125a65e0f1 100644
+--- a/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
++++ b/Source/WebCore/platform/graphics/cairo/CairoUtilities.cpp
+@@ -43,8 +43,8 @@
+ #include <wtf/UniqueArray.h>
+ #include <wtf/Vector.h>
+ 
+-#if OS(WINDOWS)
+-#include <cairo-win32.h>
++#if OS(WINDOWS) && !defined(WK_WINUWP)
++#include <cairo-win32.h>   // Apotheosis: image-only cairo 无 win32 后端,App Container 不需要
+ #endif
+ 
+ namespace WebCore {
+@@ -335,7 +335,7 @@ IntSize cairoSurfaceSize(cairo_surface_t* surface)
+     switch (cairo_surface_get_type(surface)) {
+     case CAIRO_SURFACE_TYPE_IMAGE:
+         return IntSize(cairo_image_surface_get_width(surface), cairo_image_surface_get_height(surface));
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && !defined(WK_WINUWP)
+     case CAIRO_SURFACE_TYPE_WIN32:
+         surface = cairo_win32_surface_get_image(surface);
+         ASSERT(surface);
+diff --git a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp b/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
+index 4fb36500a8..fc2125a764 100644
+--- a/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
++++ b/Source/WebCore/platform/graphics/cairo/GraphicsContextCairo.cpp
+@@ -46,7 +46,8 @@
+ #include "NotImplemented.h"
+ #include "RefPtrCairo.h"
+ 
+-#if PLATFORM(WIN)
++#if PLATFORM(WIN) && !defined(WK_WINUWP)
++// Apotheosis(WK_WINUWP): arm-uwp Cairo 无 win32/GDI 后端,且本文件未用任何 cairo_win32_* 符号。
+ #include <cairo-win32.h>
+ #endif
+ 
+diff --git a/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp b/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
+index 4de74ae199..2c630a3751 100644
+--- a/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
++++ b/Source/WebCore/platform/graphics/harfbuzz/ComplexTextControllerHarfBuzz.cpp
+@@ -34,8 +34,8 @@
+ #include "SurrogatePairAwareTextIterator.h"
+ #include "text/TextFlags.h"
+ #include <hb-ft.h>
+-#include <hb-icu.h>
+ #include <hb-ot.h>
++#include <unicode/uscript.h>   // Apotheosis: 用 ICU 直转 script,替代 hb-icu
+ 
+ #if ENABLE(VARIATION_FONTS)
+ #include FT_MULTIPLE_MASTERS_H
+@@ -374,7 +374,7 @@ void ComplexTextController::collectComplexTextRunsForCharacters(std::span<const
+         auto& run = runList[m_run->rtl() ? runCount - i - 1 : i];
+ 
+         if (fontPlatformData.orientation() != FontOrientation::Vertical)
+-            hb_buffer_set_script(buffer.get(), hb_icu_script_to_script(run.script));
++            { const char* scriptTag = uscript_getShortName(run.script); hb_buffer_set_script(buffer.get(), scriptTag ? hb_script_from_string(scriptTag, -1) : HB_SCRIPT_INVALID); }
+         if (!m_mayUseNaturalWritingDirection || m_run->directionalOverride())
+             hb_buffer_set_direction(buffer.get(), m_run->rtl() ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+         else {
+diff --git a/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h b/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h
+index 6071b1d72c..3a77b378e0 100644
+--- a/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h
++++ b/Source/WebCore/platform/graphics/opentype/FontMemoryResource.h
+@@ -43,7 +43,12 @@ public:
+ 
+     ~FontMemoryResource()
+     {
++#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+         RemoveFontMemResourceEx(m_fontResourceHandle);
++#endif
++        // Apotheosis(App Container): RemoveFontMemResourceEx 是 GDI 桌面 API。我们走
++        // FreeType 渲染,不经 AddFontMemResourceEx 创建此资源(创建处在已排除的 Win 字体
++        // 文件里),析构 no-op 安全。
+     }
+     
+ private:
+diff --git a/Source/WebCore/platform/graphics/opentype/OpenTypeUtilities.cpp b/Source/WebCore/platform/graphics/opentype/OpenTypeUtilities.cpp
+index a74b717fa2..90acedc242 100644
+--- a/Source/WebCore/platform/graphics/opentype/OpenTypeUtilities.cpp
++++ b/Source/WebCore/platform/graphics/opentype/OpenTypeUtilities.cpp
+@@ -269,6 +269,7 @@ RefPtr<FontMemoryResource> renameAndActivateFont(const SharedBuffer& fontData, c
+     if (!renameFont(fontData, fontName, rewrittenFontData))
+         return { };
+ 
++#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+     DWORD numFonts = 0;
+     HANDLE fontHandle = AddFontMemResourceEx(rewrittenFontData.mutableSpan().data(), rewrittenFontData.size(), 0, &numFonts);
+     if (!fontHandle)
+@@ -279,6 +280,11 @@ RefPtr<FontMemoryResource> renameAndActivateFont(const SharedBuffer& fontData, c
+     }
+ 
+     return FontMemoryResource::create(fontHandle);
++#else
++    // Apotheosis(App Container): GDI 字体安装(AddFontMemResourceEx)不可用;FreeType 路用
++    // FT_New_Memory_Face 直接从字节建 face,不经此函数。
++    return { };
++#endif
+ }
+ 
+ }
+diff --git a/Source/WebCore/platform/network/DNSResolveQueue.cpp b/Source/WebCore/platform/network/DNSResolveQueue.cpp
+index e7cbc7bd4c..99560c8de6 100644
+--- a/Source/WebCore/platform/network/DNSResolveQueue.cpp
++++ b/Source/WebCore/platform/network/DNSResolveQueue.cpp
+@@ -61,6 +61,20 @@ static const int gMaxRequestsToQueue = 64;
+ // If there were queued names that couldn't be sent simultaneously, check the state of resolvers after this delay.
+ static const Seconds resolvingRetryDelay { 100_ms };
+ 
++#if defined(WK_WINUWP) && !USE(CURL)
++// Apotheosis(WK_WINUWP): USE_CURL=OFF 时无网络后端,DNSResolveQueuePlatform 不存在 → 提供 no-op
++// 具体子类使抽象基类可实例化。USE_CURL=ON(Phase 1b)时 curl 端口经头提供 using DNSResolveQueuePlatform
++// = DNSResolveQueueCurl,本 stub 多余且与该 type alias 冲突 → 守掉。
++class DNSResolveQueuePlatform final : public DNSResolveQueue {
++public:
++    void resolve(const String&, uint64_t, DNSCompletionHandler&&) final { }
++    void stopResolve(uint64_t) final { }
++private:
++    void updateIsUsingProxy() final { }
++    void platformResolve(const String&) final { }
++};
++#endif
++
+ DNSResolveQueue& DNSResolveQueue::singleton()
+ {
+     static NeverDestroyed<DNSResolveQueuePlatform> queue;
+diff --git a/Source/WebCore/platform/network/ResourceHandle.cpp b/Source/WebCore/platform/network/ResourceHandle.cpp
+index 1bc5f7b40e..89f7e91146 100644
+--- a/Source/WebCore/platform/network/ResourceHandle.cpp
++++ b/Source/WebCore/platform/network/ResourceHandle.cpp
+@@ -43,6 +43,21 @@
+ #include <wtf/text/CString.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if USE(CURL) && defined(WK_WINUWP)
++#include "CertificateInfo.h"
++#include "CurlContext.h"
++#include "CurlRequest.h"
++#include "CurlRequestClient.h"
++#include "CurlResponse.h"
++#include "HTTPHeaderNames.h"
++#include "NetworkLoadMetrics.h"
++#include "ProtectionSpace.h"
++#include "ResourceError.h"
++#include "ResourceResponse.h"
++#include "SharedBuffer.h"
++#include <wtf/text/StringCommon.h>
++#endif
++
+ namespace WebCore {
+ 
+ static bool shouldForceContentSniffing;
+@@ -309,7 +324,302 @@ void ResourceHandle::setDefersLoading(bool defers)
+     platformSetDefersLoading(defers);
+ }
+ 
+-#if USE(SOUP) || USE(CURL)
++#if USE(CURL) && defined(WK_WINUWP)
++// ============================================================================
++// In-process curl network bridge (EdgeHTML Reborn — WinUWP ARM32).
++// Drives ResourceHandle -> CurlRequest directly inside WebCore.lib (these
++// symbols are compiled into WebCore.lib; a separate TU would LNK2005).
++// ============================================================================
++
++// --- ref-counted forwarder: curl callbacks -> ResourceHandleClient ----------
++// CurlRequest holds a Ref<> to its client (CurlRequestClient : AbstractRefCounted).
++// ResourceHandleInternal is not refcounted, so this thin object IS the
++// CurlRequestClient and forwards into the handle. invalidate() severs the
++// back-pointer on cancel/destruction so late curl callbacks are dropped safely.
++class CurlResourceHandleDelegate final : public CurlRequestClient {
++public:
++    static Ref<CurlResourceHandleDelegate> create(ResourceHandle& handle)
++    {
++        return adoptRef(*new CurlResourceHandleDelegate(handle));
++    }
++
++    void ref() const final { ++m_refCount; }
++    void deref() const final { if (!--m_refCount) delete this; }
++
++    void invalidate() { m_handle = nullptr; }
++
++    // CurlRequestClient
++    void curlDidSendData(CurlRequest&, unsigned long long bytesSent, unsigned long long totalToSend) final
++    {
++        if (RefPtr handle = m_handle)
++            handle->curlDidSendData(bytesSent, totalToSend);
++    }
++    void curlDidReceiveResponse(CurlRequest& request, CurlResponse&& response) final
++    {
++        if (RefPtr handle = m_handle)
++            handle->curlDidReceiveResponse(request, WTF::move(response));
++    }
++    void curlDidReceiveData(CurlRequest&, Ref<SharedBuffer>&& buffer) final
++    {
++        if (RefPtr handle = m_handle)
++            handle->curlDidReceiveData(WTF::move(buffer));
++    }
++    void curlDidComplete(CurlRequest&, NetworkLoadMetrics&& metrics) final
++    {
++        if (RefPtr handle = m_handle)
++            handle->curlDidComplete(WTF::move(metrics));
++    }
++    void curlDidFailWithError(CurlRequest&, ResourceError&& error, CertificateInfo&&) final
++    {
++        if (RefPtr handle = m_handle)
++            handle->curlDidFailWithError(WTF::move(error));
++    }
++
++private:
++    explicit CurlResourceHandleDelegate(ResourceHandle& handle)
++        : m_handle(&handle) { }
++
++    mutable uint32_t m_refCount { 1 };
++    RefPtr<ResourceHandle> m_handle;
++};
++
++ResourceHandleInternal::~ResourceHandleInternal() = default;
++
++ResourceHandle::~ResourceHandle()
++{
++    // Make sure no in-flight curl callback can touch a destroyed handle.
++    if (d->m_curlDelegate)
++        d->m_curlDelegate->invalidate();
++    if (d->m_curlRequest)
++        d->m_curlRequest->invalidateClient();
++}
++
++// Apotheosis: 子资源加载诊断计数。每个网络请求(主文档 + 全部子资源:CSS/JS/图片)都经此桥,
++// 在 start/response/complete/fail 四处打点,计数由驱动 WebCorePortBumpLoad 累加并并入 WebCoreGetDiag。
++// kind: 0=started 1=response 2=complete 3=fail。驱动未链接时为弱符号无操作。
++extern "C" void WebCorePortBumpLoad(int kind);
++
++bool ResourceHandle::start()
++{
++    ASSERT(isMainThread());
++
++    WebCorePortBumpLoad(0);
++
++    // Ensure libcurl + scheduler thread are up. Idempotent.
++    CurlContext::singleton();
++
++    ResourceRequest request = d->m_firstRequest;
++
++    // Credentials embedded in the URL were stripped into m_user/m_password by
++    // ResourceHandleInternal's ctor; re-apply them onto the CurlRequest below.
++    d->m_curlDelegate = CurlResourceHandleDelegate::create(*this);
++    d->m_curlRequest = CurlRequest::create(request, *d->m_curlDelegate,
++        CurlRequest::CaptureNetworkLoadMetrics::Basic);
++
++    if (!d->m_user.isEmpty() || !d->m_password.isEmpty()) {
++        d->m_curlRequest->setUserPass(d->m_user, d->m_password);
++        d->m_curlRequest->setAuthenticationScheme(ProtectionSpace::AuthenticationScheme::HTTPBasic);
++    }
++
++    // CurlRequest is created suspended; resume() hands it to the scheduler thread.
++    if (!d->m_defersLoading)
++        d->m_curlRequest->resume();
++
++    return true;
++}
++
++void ResourceHandle::cancel()
++{
++    if (d->m_curlDelegate)
++        d->m_curlDelegate->invalidate();
++    if (d->m_curlRequest) {
++        d->m_curlRequest->cancel();
++        d->m_curlRequest->invalidateClient();
++    }
++}
++
++void ResourceHandle::platformSetDefersLoading(bool defers)
++{
++    if (!d->m_curlRequest)
++        return;
++    if (defers)
++        d->m_curlRequest->cancel();   // CurlRequest has no pause(); cancel+recreate on resume (TODO: real suspend)
++    else
++        d->m_curlRequest->resume();
++}
++
++// --- curl -> client translation (mirrors NetworkDataTaskCurl) ---------------
++
++void ResourceHandle::curlDidSendData(unsigned long long bytesSent, unsigned long long totalToSend)
++{
++    if (!client())
++        return;
++    client()->didSendData(this, bytesSent, totalToSend);
++}
++
++void ResourceHandle::curlDidReceiveResponse(CurlRequest& request, CurlResponse&& receivedResponse)
++{
++    WebCorePortBumpLoad(1);
++
++    if (!client())
++        return;
++
++    d->m_curlResponse = ResourceResponse(receivedResponse);
++
++    // Redirect: a 3xx status carrying a Location header. Follow it ourselves by
++    // driving willSendRequestAsync() and rebuilding the CurlRequest, instead of
++    // forwarding the (empty) redirect body up to the client. Mirrors
++    // NetworkDataTaskCurl::willPerformHTTPRedirection().
++    // TODO(auth): 401/407 handling. Omitted for v1 (treat as normal response).
++    if (d->m_curlResponse.isRedirection() && !d->m_curlResponse.httpHeaderField(HTTPHeaderName::Location).isEmpty()) {
++        willPerformHTTPRedirection();
++        return;
++    }
++
++    // didReceiveResponse() forwards to client()->didReceiveResponseAsync with a
++    // completion handler that must call completeDidReceiveResponse() to unblock
++    // the body. This is the critical async hop.
++    ResourceResponse responseCopy = d->m_curlResponse;
++    didReceiveResponse(WTF::move(responseCopy), [this, protectedThis = Ref { *this }] {
++        if (d->m_curlRequest)
++            d->m_curlRequest->completeDidReceiveResponse();
++    });
++}
++
++void ResourceHandle::willPerformHTTPRedirection()
++{
++    static const unsigned maxRedirects = 20;
++
++    if (!client())
++        return;
++
++    // m_redirectCount is pre-incremented and compared so the 21st hop fails.
++    if (d->m_redirectCount++ > maxRedirects) {
++        client()->didFail(this, ResourceError("WebKitInternal"_s, 0, d->m_curlResponse.url(), "Too many redirects"_s));
++        return;
++    }
++
++    // Resolve Location relative to the response URL (handles absolute + relative).
++    URL redirectedURL { d->m_curlResponse.url(), d->m_curlResponse.httpHeaderField(HTTPHeaderName::Location) };
++    if (!redirectedURL.isValid() || redirectedURL.protocolIsFile()) {
++        client()->didFail(this, ResourceError("WebKitInternal"_s, 0, d->m_curlResponse.url(), "Invalid redirect location"_s));
++        return;
++    }
++
++    // Build the redirected request from the original first request (preserving
++    // method/headers), then point it at the new URL. Carry over a fragment from
++    // the previous URL if the Location didn't supply one.
++    ResourceRequest newRequest = d->m_firstRequest;
++    if (!redirectedURL.hasFragmentIdentifier() && newRequest.url().hasFragmentIdentifier())
++        redirectedURL.setFragmentIdentifier(newRequest.url().fragmentIdentifier());
++    newRequest.setURL(WTF::move(redirectedURL));
++
++    bool isCrossOrigin = !protocolHostAndPortAreEqual(d->m_firstRequest.url(), newRequest.url());
++
++    // 301/302/303 to a non-GET request become GET per fetch semantics; 307/308
++    // preserve the method and body. (303 always switches to GET.)
++    int statusCode = d->m_curlResponse.httpStatusCode();
++    if (!equalLettersIgnoringASCIICase(newRequest.httpMethod(), "get"_s)) {
++        if (statusCode == 301 || statusCode == 302 || statusCode == 303) {
++            newRequest.setHTTPMethod("GET"_s);
++            newRequest.setHTTPBody(nullptr);
++            newRequest.clearHTTPContentType();
++        }
++    }
++
++    // Do not leak credentials / Authorization / Origin across an origin boundary,
++    // and never resend a Referer when downgrading https -> http.
++    if (isCrossOrigin) {
++        newRequest.clearHTTPAuthorization();
++        newRequest.clearHTTPOrigin();
++    }
++    if (!newRequest.url().protocolIs("https"_s) && WTF::protocolIs(newRequest.httpReferrer(), "https"_s))
++        newRequest.clearHTTPReferrer();
++
++    d->m_lastHTTPMethod = newRequest.httpMethod();
++
++    // Hand the redirect to the client. willSendRequestAsync() runs the loader's
++    // redirect bookkeeping (server-redirect notification, cross-origin checks)
++    // and calls our completion handler back with the request to actually issue
++    // — which the client may modify, or null out to abort the load.
++    ResourceResponse redirectResponse = d->m_curlResponse;
++    client()->willSendRequestAsync(this, WTF::move(newRequest), WTF::move(redirectResponse),
++        [this, protectedThis = Ref { *this }](ResourceRequest&& continueRequest) {
++            if (!client())
++                return;
++
++            // Client aborted the redirect (e.g. blocked, or load cancelled).
++            if (continueRequest.isNull())
++                return;
++
++            // Tear down the request that delivered the 3xx; its body is the
++            // redirect page we are intentionally discarding.
++            if (d->m_curlRequest) {
++                d->m_curlRequest->cancel();
++                d->m_curlRequest->invalidateClient();
++                d->m_curlRequest = nullptr;
++            }
++            if (d->m_curlDelegate)
++                d->m_curlDelegate->invalidate();
++
++            // Fresh delegate + CurlRequest for the new URL, then resume.
++            d->m_curlDelegate = CurlResourceHandleDelegate::create(*this);
++            d->m_curlRequest = CurlRequest::create(continueRequest, *d->m_curlDelegate,
++                CurlRequest::CaptureNetworkLoadMetrics::Basic);
++
++            if (!d->m_user.isEmpty() || !d->m_password.isEmpty()) {
++                d->m_curlRequest->setUserPass(d->m_user, d->m_password);
++                d->m_curlRequest->setAuthenticationScheme(ProtectionSpace::AuthenticationScheme::HTTPBasic);
++            }
++
++            if (!d->m_defersLoading)
++                d->m_curlRequest->resume();
++        });
++}
++
++void ResourceHandle::curlDidReceiveData(Ref<SharedBuffer>&& buffer)
++{
++    if (!client())
++        return;
++    // ResourceHandleClient consumes FragmentedSharedBuffer; SharedBuffer is one.
++    auto size = buffer->size();
++    client()->didReceiveBuffer(this, WTF::move(buffer), size);
++}
++
++void ResourceHandle::curlDidComplete(NetworkLoadMetrics&& metrics)
++{
++    WebCorePortBumpLoad(2);
++    if (!client())
++        return;
++    client()->didFinishLoading(this, metrics);
++}
++
++void ResourceHandle::curlDidFailWithError(ResourceError&& error)
++{
++    WebCorePortBumpLoad(3);
++    if (!client())
++        return;
++    client()->didFail(this, error);
++}
++
++// --- remaining stubs kept loud until implemented ----------------------------
++
++void ResourceHandle::platformLoadResourceSynchronously(NetworkingContext*, const ResourceRequest&, StoredCredentialsPolicy, SecurityOrigin*, ResourceError& error, ResourceResponse&, Vector<uint8_t>&)
++{
++    // TODO: drive a CurlRequest with a nested run loop / MessageQueue and block.
++    // Not on the render critical path; fail loudly for now.
++    error = ResourceError("WebKitInternal"_s, 0, URL { }, "sync load not implemented (WinUWP curl)"_s);
++}
++
++bool ResourceHandle::shouldUseCredentialStorage() { return false; }
++void ResourceHandle::didReceiveAuthenticationChallenge(const AuthenticationChallenge&) { }
++void ResourceHandle::receivedCredential(const AuthenticationChallenge&, const Credential&) { }
++void ResourceHandle::receivedRequestToContinueWithoutCredential(const AuthenticationChallenge&) { }
++void ResourceHandle::receivedCancellation(const AuthenticationChallenge&) { if (client()) client()->receivedCancellation(this, { }); }
++void ResourceHandle::receivedRequestToPerformDefaultHandling(const AuthenticationChallenge&) { }
++void ResourceHandle::receivedChallengeRejection(const AuthenticationChallenge&) { }
++
++#elif USE(SOUP) || USE(CURL)
+ ResourceHandleInternal::~ResourceHandleInternal() = default;
+ 
+ ResourceHandle::~ResourceHandle()
+diff --git a/Source/WebCore/platform/network/ResourceHandle.h b/Source/WebCore/platform/network/ResourceHandle.h
+index 392f55b50f..54317f74e4 100644
+--- a/Source/WebCore/platform/network/ResourceHandle.h
++++ b/Source/WebCore/platform/network/ResourceHandle.h
+@@ -79,6 +79,12 @@ class SecurityOrigin;
+ class FragmentedSharedBuffer;
+ class SynchronousLoaderMessageQueue;
+ class Timer;
++#if USE(CURL) && defined(WK_WINUWP)
++class CurlRequest;
++class CurlResponse;
++class CurlResourceHandleDelegate;
++class SharedBuffer;
++#endif
+ 
+ class ResourceHandle : public RefCounted<ResourceHandle>, public AuthenticationClient {
+ public:
+@@ -100,6 +106,24 @@ public:
+     void receivedRequestToPerformDefaultHandling(const AuthenticationChallenge&) override;
+     void receivedChallengeRejection(const AuthenticationChallenge&) override;
+ 
++#if USE(CURL) && defined(WK_WINUWP)
++    // Curl -> client translation. Called from CurlResourceHandleDelegate (same TU).
++    void curlDidSendData(unsigned long long, unsigned long long);
++    void curlDidReceiveResponse(CurlRequest&, CurlResponse&&);
++    void curlDidReceiveData(Ref<SharedBuffer>&&);
++    void curlDidComplete(NetworkLoadMetrics&&);
++    void curlDidFailWithError(ResourceError&&);
++#endif
++
++#if USE(CURL) && defined(WK_WINUWP)
++private:
++    // 3xx + Location handling: builds the redirected request, drives it through
++    // ResourceHandleClient::willSendRequestAsync(), and on the client's callback
++    // tears down the current CurlRequest and starts a fresh one for the new URL.
++    void willPerformHTTPRedirection();
++public:
++#endif
++
+     virtual bool isBlobResourceHandle() const { return false; }
+ 
+ #if PLATFORM(COCOA)
+diff --git a/Source/WebCore/platform/network/ResourceHandleInternal.h b/Source/WebCore/platform/network/ResourceHandleInternal.h
+index b2c44ad962..20ca132e1c 100644
+--- a/Source/WebCore/platform/network/ResourceHandleInternal.h
++++ b/Source/WebCore/platform/network/ResourceHandleInternal.h
+@@ -33,6 +33,11 @@
+ #include "Timer.h"
+ #include <wtf/MonotonicTime.h>
+ 
++#if USE(CURL) && defined(WK_WINUWP)
++#include "ResourceResponse.h"
++#include <wtf/RefPtr.h>
++#endif
++
+ #if PLATFORM(COCOA)
+ #include <wtf/WeakObjCPtr.h>
+ 
+@@ -109,6 +114,12 @@ public:
+ 
+     uint16_t m_redirectCount { 0 };
+ 
++#if USE(CURL) && defined(WK_WINUWP)
++    RefPtr<CurlResourceHandleDelegate> m_curlDelegate;
++    RefPtr<CurlRequest> m_curlRequest;
++    ResourceResponse m_curlResponse;
++#endif
++
+     ResourceHandle::FailureType m_scheduledFailureType { ResourceHandle::NoFailure };
+     ContentEncodingSniffingPolicy m_contentEncodingSniffingPolicy;
+ 
+diff --git a/Source/WebCore/platform/network/curl/CookieJarDB.cpp b/Source/WebCore/platform/network/curl/CookieJarDB.cpp
+index dfd5de50a3..0a9b1c588f 100644
+--- a/Source/WebCore/platform/network/curl/CookieJarDB.cpp
++++ b/Source/WebCore/platform/network/curl/CookieJarDB.cpp
+@@ -108,7 +108,18 @@ void CookieJarDB::open()
+ {
+     if (!m_database.isOpen()) {
+         checkDatabaseCorruptionAndRemoveIfNeeded();
++#if defined(WK_WINUWP)
++        // Apotheosis: App Container 里文件库打不开(路径不可写/损坏/磁盘满)时,原实现静默失败,
++        // jar 停在"半初始化"态 —— m_statements 为空,而 setCookie(const Cookie&)/hasHttpOnlyCookie
++        // 等入口不判 isOpen() 直接 preparedStatement() → 空指针崩(0.1.6.0 访问任何网页闪退的根因族)。
++        // 这里回退纯内存库重开:cookie 退化为不持久,但绝不崩。
++        if (!openDatabase() && !isOnMemory()) {
++            m_databasePath = ":memory:"_s;
++            openDatabase();
++        }
++#else
+         openDatabase();
++#endif
+     }
+ }
+ 
+diff --git a/Source/WebCore/platform/network/curl/CurlContext.cpp b/Source/WebCore/platform/network/curl/CurlContext.cpp
+index 145c3e2b04..92b8e19866 100644
+--- a/Source/WebCore/platform/network/curl/CurlContext.cpp
++++ b/Source/WebCore/platform/network/curl/CurlContext.cpp
+@@ -343,9 +343,12 @@ void CurlHandle::enableSSL()
+ 
+     setSslCtxCallbackFunction(willSetupSslCtxCallback, this);
+ 
+-#if OS(WINDOWS)
++#if OS(WINDOWS) && !defined(WK_WINUWP)
+     curl_easy_setopt(m_handle, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+ #else
++    // Apotheosis(WK_WINUWP):App Container 沙箱拿不到 Windows 系统证书库,CURLSSLOPT_NATIVE_CA
++    // 会让 OpenSSL 没有任何可信根 → 所有 HTTPS 证书校验失败(curl 60 CURLE_PEER_FAILED_VERIFICATION)。
++    // 改走和 POSIX 同样的路径:用 WebCoreSetCACertPath() 注入的打包 cacert.pem(CURLOPT_CAINFO)。
+     if (auto* path = std::get_if<String>(&sslHandle.getCACertInfo()))
+         setCACertPath(path->utf8().data());
+     else if (auto data = std::get_if<CertificateInfo::Certificate>(&sslHandle.getCACertInfo()))
+diff --git a/Source/WebCore/platform/text/LocaleICU.cpp b/Source/WebCore/platform/text/LocaleICU.cpp
+index b4c4960896..5f65d30b34 100644
+--- a/Source/WebCore/platform/text/LocaleICU.cpp
++++ b/Source/WebCore/platform/text/LocaleICU.cpp
+@@ -43,8 +43,8 @@
+ #include <wtf/unicode/icu/ICUHelpers.h>
+ 
+ #if USE(HARFBUZZ)
+-#include <hb-icu.h>
+ #include <hb.h>
++#include <unicode/uscript.h>   // Apotheosis: 用 ICU 直转 script,替代未编的 hb-icu
+ #endif
+ 
+ 
+@@ -75,7 +75,8 @@ Locale::WritingDirection LocaleICU::defaultWritingDirection() const
+ {
+ #if USE(HARFBUZZ)
+     UScriptCode icuScript = localeToScriptCode(m_locale.span());
+-    hb_script_t script = hb_icu_script_to_script(icuScript);
++    const char* scriptTag = uscript_getShortName(icuScript);
++    hb_script_t script = scriptTag ? hb_script_from_string(scriptTag, -1) : HB_SCRIPT_INVALID;
+ 
+     switch (hb_script_get_horizontal_direction(script)) {
+     case HB_DIRECTION_LTR:
+diff --git a/Source/WebCore/platform/win/BString.cpp b/Source/WebCore/platform/win/BString.cpp
+index 6c0fa6a4af..5172ff4409 100644
+--- a/Source/WebCore/platform/win/BString.cpp
++++ b/Source/WebCore/platform/win/BString.cpp
+@@ -27,6 +27,7 @@
+ #include "BString.h"
+ 
+ #include <windows.h>
++#include <oleauto.h>   // Apotheosis: SysAllocString/SysFreeString(WIN32_LEAN_AND_MEAN 不带)。OleAut32 在 App Container 可用。
+ #include <wtf/URL.h>
+ #include <wtf/text/AtomString.h>
+ #include <wtf/text/StringView.h>
+diff --git a/Source/WebCore/platform/win/WCDataObject.h b/Source/WebCore/platform/win/WCDataObject.h
+index 3d8b2b6d4e..3615a3432c 100644
+--- a/Source/WebCore/platform/win/WCDataObject.h
++++ b/Source/WebCore/platform/win/WCDataObject.h
+@@ -37,7 +37,16 @@ namespace WebCore {
+ struct StgMediumDeleter {
+     void operator()(STGMEDIUM* medium)
+     {
++#if defined(WK_WINUWP)
++        // App Container (WINAPI_FAMILY_APP): ole2.h guards ReleaseStgMedium behind
++        // WINAPI_PARTITION_DESKTOP, so it is unavailable. WCDataObject (drag-and-drop) is
++        // non-functional under WinUWP and every consuming .cpp is dropped from PlatformWinUWP.cmake,
++        // so this deleter is never actually invoked; keep it as a no-op stub purely so the
++        // unique_ptr type stays complete for Pasteboard.h's member declarations.
++        (void)medium;
++#else
+         ::ReleaseStgMedium(medium);
++#endif
+     }
+ };
+ 
+diff --git a/Source/WebCore/rendering/RenderLayerBacking.cpp b/Source/WebCore/rendering/RenderLayerBacking.cpp
+index 7d20685770..ec9121167d 100644
+--- a/Source/WebCore/rendering/RenderLayerBacking.cpp
++++ b/Source/WebCore/rendering/RenderLayerBacking.cpp
+@@ -3674,7 +3674,10 @@ LayoutSize RenderLayerBacking::offsetRelativeToRendererOriginForDescendantLayers
+ 
+ bool RenderLayerBacking::paintsIntoWindow() const
+ {
+-#if USE(COORDINATED_GRAPHICS)
++#if USE(COORDINATED_GRAPHICS) || USE(TEXTURE_MAPPER)
++        // TextureMapper/Coordinated 端没有可供"画进去"的原生窗口——整棵图层树由 embedder 经 TextureMapper
++        // 合成呈现。若这里对主帧根层返回 true,RenderLayerBacking::paintIntoLayer 会直接 return,根内容(正常流
++        // 文本/图片)根本不画进自己的 backing → GPU 合成只剩背景填充(真机实测 contentPx≈0)。故恒为 false。
+         return false;
+ #endif
+ 
+diff --git a/Source/WebCore/rendering/RenderMenuList.h b/Source/WebCore/rendering/RenderMenuList.h
+index 432eed57b2..5c102091bd 100644
+--- a/Source/WebCore/rendering/RenderMenuList.h
++++ b/Source/WebCore/rendering/RenderMenuList.h
+@@ -27,6 +27,13 @@
+ #include "PopupMenu.h"
+ #include "PopupMenuClient.h"
+ #include "RenderFlexibleBox.h"
++#if defined(WK_WINUWP)
++// The WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR destroying-delete operator forces this final class's
++// vtable (and thus odr-use of RenderBoxModelObject's virtual inline members) to be emitted in any
++// TU that sees the full definition. clang-cl's -Wundefined-inline then requires those inline
++// definitions to be visible here.
++#include "RenderBoxModelObjectInlines.h"
++#endif
+ 
+ namespace WebCore {
+ 
+diff --git a/Source/WebKitLegacy/WebCoreSupport/WebResourceLoadScheduler.cpp b/Source/WebKitLegacy/WebCoreSupport/WebResourceLoadScheduler.cpp
+index ac073d1c93..0335ee4533 100644
+--- a/Source/WebKitLegacy/WebCoreSupport/WebResourceLoadScheduler.cpp
++++ b/Source/WebKitLegacy/WebCoreSupport/WebResourceLoadScheduler.cpp
+@@ -22,6 +22,7 @@
+     Boston, MA 02110-1301, USA.
+  */
+ 
++#include "config.h"
+ #include "WebResourceLoadScheduler.h"
+ 
+ #include "PingHandle.h"
+diff --git a/Source/cmake/WebKitCommon.cmake b/Source/cmake/WebKitCommon.cmake
+index 639b7e5d1e..a3c4ec1774 100644
+--- a/Source/cmake/WebKitCommon.cmake
++++ b/Source/cmake/WebKitCommon.cmake
+@@ -49,6 +49,7 @@ if (NOT HAS_RUN_WEBKIT_COMMON)
+         PlayStation
+         WPE
+         Win
++        WinUWP
+     )
+     set(PORT "NOPORT" CACHE STRING "choose which WebKit port to build (one of ${ALL_PORTS})")
+ 
+diff --git a/Source/cmake/WebKitCompilerFlags.cmake b/Source/cmake/WebKitCompilerFlags.cmake
+index efdf8d4dd0..bc61ecfd91 100644
+--- a/Source/cmake/WebKitCompilerFlags.cmake
++++ b/Source/cmake/WebKitCompilerFlags.cmake
+@@ -360,6 +360,10 @@ if (UNIX AND NOT APPLE AND NOT ENABLED_COMPILER_SANITIZERS)
+ endif ()
+ 
+ if (MSVC)
++    # Apotheosis: clang-cl 也走这里。/EP 输出到 stdout 且无 #line(bindings 要的干净形式;
++    # clang-cl 的 -P 会被当 cl 的 /P 写到文件 -> stdout 空)。/nologo /EP /TP 这三个 '/' flag
++    # 会被 Git 的 MSYS Perl 误当 POSIX 路径转换 -> 用 MSYS2_ARG_CONV_EXCL 精准排除这三个(见
++    # arm32-uwp-env.ps1),fileName 仍正常 POSIX↔Windows 往返。
+     set(CODE_GENERATOR_PREPROCESSOR "\"${CMAKE_CXX_COMPILER}\" /nologo /EP /TP")
+ elseif (COMPILER_IS_QCC)
+     set(CODE_GENERATOR_PREPROCESSOR "\"${CMAKE_CXX_COMPILER}\" -E -Wp,-P -x c++")
+@@ -489,7 +493,12 @@ int main() {
+ }
+     ]=])
+     cmake_push_check_state(RESET)
+-    set(CMAKE_REQUIRED_FLAGS "--std=c++17")
++    if (MSVC)
++        # clang-cl 不认 GCC 形式的 --std=c++17(会忽略 → 退回默认 C++14 → 无 std::optional)
++        set(CMAKE_REQUIRED_FLAGS "/std:c++17")
++    else ()
++        set(CMAKE_REQUIRED_FLAGS "--std=c++17")
++    endif ()
+     check_cxx_source_compiles("${ATOMIC_TEST_SOURCE}" ATOMICS_ARE_BUILTIN)
+     if (NOT ATOMICS_ARE_BUILTIN)
+         set(CMAKE_REQUIRED_LIBRARIES atomic)
