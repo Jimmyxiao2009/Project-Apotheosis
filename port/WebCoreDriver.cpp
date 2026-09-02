@@ -559,6 +559,21 @@ static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
         rec->NumberParameters > 0 ? static_cast<unsigned long>(rec->ExceptionInformation[0]) : 99ul,
         rec->NumberParameters > 1 ? static_cast<unsigned long long>(rec->ExceptionInformation[1]) : 0ull);
     crashLogWrite(reason, info->ContextRecord);
+    // For an execute fault (access=8) the decisive question is what protection the page
+    // at the faulting address actually has: VirtualQuery is App-Container-safe and the
+    // JIT pool is the prime suspect (W^X commit path in OSAllocatorWin.cpp).
+    if (rec->NumberParameters > 1) {
+        MEMORY_BASIC_INFORMATION mbi = { };
+        if (VirtualQuery(reinterpret_cast<const void*>(rec->ExceptionInformation[1]), &mbi, sizeof(mbi))) {
+            char extra[200];
+            std::snprintf(extra, sizeof(extra), "fault page: base=0x%08llx size=0x%08llx state=0x%lx protect=0x%lx allocProtect=0x%lx type=0x%lx",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+                static_cast<unsigned long long>(mbi.RegionSize),
+                static_cast<unsigned long>(mbi.State), static_cast<unsigned long>(mbi.Protect),
+                static_cast<unsigned long>(mbi.AllocationProtect), static_cast<unsigned long>(mbi.Type));
+            crashLogWrite(extra, nullptr);
+        }
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
