@@ -612,7 +612,7 @@ static bool g_perfHeaderDone = false;
 static const char* const kPerfHeader =
     "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
     "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
-    "subres_fail,gpu,dfg,w,h\n";
+    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -625,6 +625,9 @@ struct PerfRow {
     double domReady = -1;     // no column of its own; ms_net_load falls back to it
     int frames = -1, subStarted = -1, subOk = -1, subFail = -1;
     int gpu = 0, dfg = 0, w = 0, h = 0;
+    // Apotheosis (M4): TextureMapper layers repainted in full vs. by dirty rect in this operation
+    // (wkWinUWPTexmapDirtyStats, WebKit winuwp f14d05ff1f); -1 = no composite happened.
+    int dirtyFull = -1, dirtyPartial = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -719,10 +722,13 @@ static void perfFlush()
         char n[4][12];
         for (int k = 0; k < 4; ++k)
             perfFmtI(n[k], sizeof n[k], ints[k]);
-        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d\n",
+        char df[12], dp[12];
+        perfFmtI(df, sizeof df, r.dirtyFull);
+        perfFmtI(dp, sizeof dp, r.dirtyPartial);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
-            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h);
+            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -970,6 +976,16 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
             forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
         g_gpuScrollFast = false;
         glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
+        {
+            // Apotheosis (M4): how many layers were repainted in full vs. by dirty rect (accumulates per op).
+            unsigned full = 0, partial = 0;
+            WebCore::wkWinUWPTexmapDirtyStats(full, partial);
+            if (g_perfOn) {
+                if (g_perfCur.dirtyFull < 0) { g_perfCur.dirtyFull = 0; g_perfCur.dirtyPartial = 0; }
+                g_perfCur.dirtyFull += static_cast<int>(full);
+                g_perfCur.dirtyPartial += static_cast<int>(partial);
+            }
+        }
         g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
     }
 }
