@@ -170,7 +170,8 @@
     <None Include="Assets\fonts\times.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\times.ttf</Link></None>
     <None Include="Assets\fonts\cour.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\cour.ttf</Link></None>
     <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
-    <None Include="Assets\fonts\simhei.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
+    <!-- Apotheosis: fonts are gitignored; skip SimHei on machines that do not have it instead of failing the package step. -->
+    <None Include="Assets\fonts\simhei.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\simhei.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
   </ItemGroup>
 
   <ItemGroup>
