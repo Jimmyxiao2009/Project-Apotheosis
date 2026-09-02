@@ -46,7 +46,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
-#include <csignal>       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
+#include <csignal>
+#include <JavaScriptCore/ExecutableAllocator.h>   // Apotheosis: JIT pool range / isJITPC for crash.txt       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
 #include <vector>
 #include <curl/curl.h>   // 下载用独立 curl_easy 句柄(WebCoreDownload)
 
@@ -573,6 +574,13 @@ static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
                 static_cast<unsigned long>(mbi.AllocationProtect), static_cast<unsigned long>(mbi.Type));
             crashLogWrite(extra, nullptr);
         }
+        // Is the fault inside JSC's fixed executable pool? (W^X commit gap vs. stray jump)
+        char pool[120];
+        std::snprintf(pool, sizeof(pool), "jit pool: [0x%08llx, 0x%08llx) isJITPC(fault)=%d",
+            static_cast<unsigned long long>(JSC::startOfFixedExecutableMemoryPool<uintptr_t>()),
+            static_cast<unsigned long long>(JSC::endOfFixedExecutableMemoryPool<uintptr_t>()),
+            JSC::isJITPC(reinterpret_cast<void*>(rec->ExceptionInformation[1])) ? 1 : 0);
+        crashLogWrite(pool, nullptr);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
