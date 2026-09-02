@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <csignal>       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
 #include <vector>
 #include <curl/curl.h>   // 下载用独立 curl_easy 句柄(WebCoreDownload)
 
@@ -382,6 +383,192 @@ static bool g_inPump = false;              // settle 轮询 / 事件派发的重
 
 // 复位 g_inPump 的作用域守卫(无异常环境下,析构在正常返回路径也会执行)。
 struct PumpGuard { ~PumpGuard() { g_inPump = false; } };
+
+// ==================== crash.txt: last-resort crash reporting =================
+// Apotheosis: on Windows 10 Mobile WER writes no dump for the way this engine
+// dies (WTF's CRASH() is std::abort(), whose UWP CRT tail is __fastfail, and
+// WTFBreakpointTrap() is a `bkpt #0` trap) — the app just vanishes, which is
+// exactly what ntv.de does on a Lumia 950. So the driver writes the crashing
+// stack itself, appended to LocalState\crash.txt, from three independent
+// sources that all funnel into crashLogWrite():
+//   (a) the WTF crash hook (Source/WTF/wtf/Assertions.cpp, WK_WINUWP) — fires
+//       *before* the trap, so the captured stack is the crashing stack and the
+//       reason carries file/line/assertion;
+//   (b) a vectored exception handler (first in the chain) for the fatal codes —
+//       catches AVs and traps that never reach WTF at all;
+//   (c) signal(SIGABRT) — the tail of abort() before the CRT fast-fails.
+// Constraints on the crash path: no heap allocation beyond fopen's, no C++
+// exceptions (_HAS_EXCEPTIONS=0), no DbgHelp and no SetUnhandledExceptionFilter
+// (neither exists in the App Container partition), re-entrancy guarded, and a
+// hard cap on entries so a repeating first-chance AV cannot fill LocalState.
+// The engine and driver are statically linked into Harness.exe, so nearly every
+// frame is an RVA into Harness.exe — resolve them offline against its map/pdb.
+
+// AddVectoredExceptionHandler is declared DESKTOP-only in the 10.0.22621 SDK
+// headers, but the import is present in WindowsApp.lib and the API works inside
+// the App Container, so declare it here instead of widening WINAPI_FAMILY.
+extern "C" WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
+
+// Installed into WTF by WebCoreSetCrashLogPath(). Defined in
+// Source/WTF/wtf/Assertions.cpp under WK_WINUWP; declared here on purpose so no
+// WTF header changes (a header edit would rebuild the whole engine). Plain C++
+// linkage at global scope — the definition must match this exactly.
+extern void WTFWinUWPSetCrashHook(void (*hook)(const char* reason));
+
+static char g_crashLogPath[512] = { 0 };
+static bool g_crashLogInstalled = false;
+static bool g_crashLogInProgress = false;   // re-entrancy guard (crash while logging)
+static int  g_crashLogEntries = 0;          // hard cap, see kMaxCrashLogEntries
+static const int kMaxCrashLogEntries = 16;
+
+// Basename of a module path, ASCII-folded into `out` (module names are ASCII).
+static void crashLogModuleName(HMODULE module, char* out, size_t outSize)
+{
+    out[0] = 0;
+    if (!module || outSize < 2)
+        return;
+    wchar_t wide[MAX_PATH];
+    DWORD n = GetModuleFileNameW(module, wide, MAX_PATH);
+    if (!n)
+        return;
+    wide[MAX_PATH - 1] = 0;
+    const wchar_t* base = wide;
+    for (const wchar_t* p = wide; *p; ++p) {
+        if (*p == L'\\' || *p == L'/')
+            base = p + 1;
+    }
+    size_t i = 0;
+    for (; base[i] && i + 1 < outSize; ++i)
+        out[i] = (base[i] < 128) ? static_cast<char>(base[i]) : '?';
+    out[i] = 0;
+}
+
+// SizeOfImage straight out of the mapped PE headers (no DbgHelp in App Container).
+static DWORD crashLogModuleSize(HMODULE module)
+{
+    if (!module)
+        return 0;
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(module) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+// The one writer. `ctxOrNull` is the vectored handler's CONTEXT when we have one.
+static void crashLogWrite(const char* reason, const CONTEXT* ctxOrNull)
+{
+    if (!g_crashLogPath[0] || g_crashLogInProgress || g_crashLogEntries >= kMaxCrashLogEntries)
+        return;
+    g_crashLogInProgress = true;
+    ++g_crashLogEntries;
+
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp) {
+        g_crashLogInProgress = false;
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "\n==== crash %04u-%02u-%02u %02u:%02u:%02u.%03u tid=%lu ====\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    std::fprintf(fp, "reason: %s\n", reason ? reason : "(none)");
+
+    // Image base/size of the host exe first, so every RVA below can be matched
+    // offline against the exact Harness.exe that produced this file.
+    HMODULE exe = GetModuleHandleW(nullptr);
+    char exeName[64];
+    crashLogModuleName(exe, exeName, sizeof(exeName));
+    std::fprintf(fp, "module %s base=0x%08llx size=0x%08lx\n",
+        exeName[0] ? exeName : "?",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(exe)),
+        static_cast<unsigned long>(crashLogModuleSize(exe)));
+
+#if defined(_M_ARM) || defined(_ARM_)
+    if (ctxOrNull) {
+        std::fprintf(fp, "context: pc=0x%08lx lr=0x%08lx sp=0x%08lx r0=0x%08lx r1=0x%08lx\n",
+            static_cast<unsigned long>(ctxOrNull->Pc), static_cast<unsigned long>(ctxOrNull->Lr),
+            static_cast<unsigned long>(ctxOrNull->Sp), static_cast<unsigned long>(ctxOrNull->R0),
+            static_cast<unsigned long>(ctxOrNull->R1));
+    }
+#else
+    (void)ctxOrNull;
+#endif
+
+    void* frames[48] = { nullptr };
+    USHORT captured = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < captured; ++i) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(frames[i]);
+        HMODULE mod = nullptr;
+        char name[64] = { 0 };
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(frames[i]), &mod) && mod) {
+            crashLogModuleName(mod, name, sizeof(name));
+            std::fprintf(fp, "frame %2u: %s +0x%08llx\n", static_cast<unsigned>(i),
+                name[0] ? name : "?",
+                static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(mod)));
+        } else
+            std::fprintf(fp, "frame %2u: ? 0x%08llx\n", static_cast<unsigned>(i),
+                static_cast<unsigned long long>(addr));
+    }
+
+    std::fflush(fp);
+    std::fclose(fp);
+    g_crashLogInProgress = false;
+}
+
+// (a) WTF hook: reason already carries file/line/assertion or reason/misc values.
+static void crashLogWtfHook(const char* reason)
+{
+    char buffer[832];
+    std::snprintf(buffer, sizeof(buffer), "WTF %s", reason ? reason : "(none)");
+    crashLogWrite(buffer, nullptr);
+}
+
+// (b) Vectored handler, first in the chain. Logs only the terminal codes and
+// always returns EXCEPTION_CONTINUE_SEARCH — we observe, we never swallow.
+static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
+{
+    if (!info || !info->ExceptionRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_BREAKPOINT:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case 0xC00000FDu:   // STATUS_STACK_OVERFLOW
+    case 0xC0000409u:   // STATUS_STACK_BUFFER_OVERRUN — what __fastfail raises
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char reason[200];
+    // For access violations ExceptionInformation[0] is 0 = read, 1 = write, 8 = execute
+    // (DEP/no-execute page) and [1] the faulting address - tells a non-executable JIT
+    // pool apart from a bad pointer inside JIT code.
+    const auto* rec = info->ExceptionRecord;
+    std::snprintf(reason, sizeof(reason), "SEH code=0x%08lx address=0x%08llx access=%lu fault=0x%08llx",
+        static_cast<unsigned long>(code),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rec->ExceptionAddress)),
+        rec->NumberParameters > 0 ? static_cast<unsigned long>(rec->ExceptionInformation[0]) : 99ul,
+        rec->NumberParameters > 1 ? static_cast<unsigned long long>(rec->ExceptionInformation[1]) : 0ull);
+    crashLogWrite(reason, info->ContextRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// (c) abort() tail. Returns; the CRT then fast-fails as usual.
+static void __cdecl crashLogSignalHandler(int sig)
+{
+    char reason[64];
+    std::snprintf(reason, sizeof(reason), "signal %d (SIGABRT)", sig);
+    crashLogWrite(reason, nullptr);
+}
 
 // ==================== M4 step 1: per-phase timing (PerfLog) ==================
 // Apotheosis: opt-in per-phase timing for the performance milestone. Off unless
@@ -1338,6 +1525,31 @@ void WebCoreSetCookieJsonPath(const char* path)
     if (!path || !*path)
         return;
     WebCorePort::setPortCookieJsonPath(String::fromUTF8(path));
+}
+
+// Apotheosis: arm crash.txt logging and point it at a file inside LocalState
+// (the App Container's only writable place, and the driver cannot discover it —
+// the harness passes it in from SetupRuntimeEnv on the engine thread). Unlike
+// the perf log this is NOT opt-in: a crash with no dump is exactly the case we
+// can never reproduce on the build machine. Installs all three legs once; later
+// calls only update the path. See the block near the top of this file.
+void WebCoreSetCrashLogPath(const char* path)
+{
+    if (!path || !*path)
+        return;
+    // Copy into a fixed buffer — the crash path must not touch the heap and the
+    // caller's string may be gone by the time we crash.
+    size_t i = 0;
+    for (; path[i] && i + 1 < sizeof(g_crashLogPath); ++i)
+        g_crashLogPath[i] = path[i];
+    g_crashLogPath[i] = 0;
+
+    if (g_crashLogInstalled)
+        return;
+    g_crashLogInstalled = true;
+    WTFWinUWPSetCrashHook(&crashLogWtfHook);
+    AddVectoredExceptionHandler(1, &crashLogVectoredHandler);
+    std::signal(SIGABRT, &crashLogSignalHandler);
 }
 
 // Apotheosis (M4 step 1): switch per-phase timing on and point it at a CSV file.

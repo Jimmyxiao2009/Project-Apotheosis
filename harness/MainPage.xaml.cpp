@@ -113,6 +113,12 @@ static void SetupRuntimeEnv()
         // 切后台时写出的持久化数据,不经过 SQLite 的真实文件 I/O。
         WebCoreSetCookieJsonPath((localDir + "\\cookies.jsonl").c_str());
 
+        // Apotheosis: crash log. Always on (not opt-in like perf.txt): a crash with no
+        // WER dump — which is every fast-fail/trap termination on Windows 10 Mobile — is
+        // exactly the case we cannot reproduce on the build machine. The engine appends
+        // reason + stack frames to LocalState\crash.txt; pull it with WDP after a crash.
+        WebCoreSetCrashLogPath((localDir + "\\crash.txt").c_str());
+
         // Apotheosis (M4): per-phase timing. Device-side opt-in exactly like imedebug.txt —
         // only when the tester dropped LocalState\perf.txt (via WDP, effective after restart)
         // does the engine time the load/paint phases and append them to LocalState\perf.csv.

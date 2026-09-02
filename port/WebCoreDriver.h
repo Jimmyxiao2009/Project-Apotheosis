@@ -72,6 +72,17 @@ void WebCoreSetPerfLogPath(const char* path);
 // (UWP can terminate a suspended app without notice). No-op when off.
 void WebCorePerfFlush(void);
 
+// ---- crash reporting (always on) ----
+// Point the engine at a crash log file (LocalState\crash.txt) and arm all three
+// crash legs: the WTF crash hook (fires before the trap, carries the failing
+// assertion's file/line), a vectored exception handler for the fatal SEH codes,
+// and signal(SIGABRT) for abort(). Each crash appends a timestamped entry with
+// the reason, the host module base/size and up to 48 stack frames as
+// "module +0xRVA". Needed because Windows 10 Mobile's WER writes no dump for
+// fast-fail / breakpoint-trap terminations. Not opt-in. Engine-thread call;
+// call it as early as possible (SetupRuntimeEnv).
+void WebCoreSetCrashLogPath(const char* path);
+
 // ---- diagnostics / page metadata (written by the render/load paths) ----
 // Each copies a NUL-terminated UTF-8 string into buf (<= len bytes) and returns
 // the number of bytes written (excluding NUL); empty string if nothing recorded.
