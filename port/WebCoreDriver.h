@@ -58,6 +58,20 @@ void WebCoreSetCookieJsonPath(const char* path);
 // a suspended app without notice). Engine-thread call.
 void WebCoreFlushCookiesToDisk();
 
+// ---- M4 step 1: per-phase timing (opt-in) ----
+// Switch per-phase timing on and point it at a CSV file (one row per completed
+// nav/scroll/tick/click operation). The App Container only lets us write inside
+// LocalState and the engine cannot discover that path itself, so the harness
+// passes it in — and only when LocalState\perf.txt exists, mirroring the
+// imedebug.txt opt-in. Unset/"" = off (shipping default, one branch per probe).
+// Engine-thread call; call before the first navigation.
+void WebCoreSetPerfLogPath(const char* path);
+
+// Drain the in-memory perf ring to that CSV. Rows otherwise reach disk only on
+// navigation completion or when the ring fills, so call this before suspend
+// (UWP can terminate a suspended app without notice). No-op when off.
+void WebCorePerfFlush(void);
+
 // ---- diagnostics / page metadata (written by the render/load paths) ----
 // Each copies a NUL-terminated UTF-8 string into buf (<= len bytes) and returns
 // the number of bytes written (excluding NUL); empty string if nothing recorded.

@@ -41,6 +41,7 @@
 #include "config.h"
 
 #include "WebCoreDriver.h"
+#include "PortPerf.h"    // Apotheosis: M4 perf probes called from the port-layer clients
 
 #include <cstdint>
 #include <cstring>
@@ -382,6 +383,238 @@ static bool g_inPump = false;              // settle 轮询 / 事件派发的重
 // 复位 g_inPump 的作用域守卫(无异常环境下,析构在正常返回路径也会执行)。
 struct PumpGuard { ~PumpGuard() { g_inPump = false; } };
 
+// ==================== M4 step 1: per-phase timing (PerfLog) ==================
+// Apotheosis: opt-in per-phase timing for the performance milestone. Off unless
+// the harness calls WebCoreSetPerfLogPath() — which it only does when the tester
+// dropped LocalState\perf.txt (same device-side opt-in as imedebug.txt) — so a
+// shipping build pays one predictable branch per probe and nothing else.
+// One CSV row per completed top-level operation (nav/scroll/tick/click); rows
+// buffer in a fixed ring and reach disk with a single fopen_s("ab")+fprintf+
+// fclose at nav completion / ring-full / explicit flush. Never one file open per
+// frame — that would dominate the numbers on a Lumia 950. Timestamps are taken
+// only at phase boundaries, never inside the per-pixel loops.
+// Engine thread only, like the g_last* diagnostics above (deliberately lock-free).
+static std::string g_perfPath;
+static bool g_perfOn = false;
+static bool g_perfHeaderDone = false;
+
+// One physical line; the column order must stay in sync with perfFlush()'s fprintf.
+static const char* const kPerfHeader =
+    "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
+    "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
+    "subres_fail,gpu,dfg,w,h\n";
+
+struct PerfRow {
+    unsigned seq = 0;
+    char kind[12] = { 0 };    // nav | scroll | tick | click
+    char url[192] = { 0 };
+    // Phase durations in ms; < 0 means "phase does not apply" → empty CSV cell.
+    double total = -1, netCommit = -1, netLoad = -1, settle = -1, styleLayout = -1,
+           renderUpdate = -1, flush = -1, backing = -1, paint = -1, readback = -1,
+           swap = -1, blit = -1;
+    double domReady = -1;     // no column of its own; ms_net_load falls back to it
+    int frames = -1, subStarted = -1, subOk = -1, subFail = -1;
+    int gpu = 0, dfg = 0, w = 0, h = 0;
+};
+
+static constexpr int kPerfRingSize = 256;
+static PerfRow g_perfRing[kPerfRingSize];
+static int g_perfRows = 0;
+static unsigned g_perfSeq = 0;
+
+static PerfRow g_perfCur;                 // operation currently being measured
+static bool g_perfInOp = false;
+static bool g_perfOpIsNav = false;
+static MonotonicTime g_perfOpStart;       // C ABI entry of the current operation
+static MonotonicTime g_perfNavT0;         // first provisional load start of the operation
+static bool g_perfNavT0Set = false;
+static int g_perfPumpTicks = 0;           // pumpLoop settle ticks of the current operation
+
+// Scoped phase timer: adds its own lifetime to one PerfRow field (accumulating,
+// so repeated phases inside one operation sum up). Reads no clock at all when
+// logging is off. Never place one inside a pixel loop.
+struct PerfPhase {
+    double* slot;
+    MonotonicTime t;
+    explicit PerfPhase(double* s)
+        : slot(g_perfOn ? s : nullptr)
+        , t(g_perfOn ? MonotonicTime::now() : MonotonicTime())
+    {
+    }
+    ~PerfPhase()
+    {
+        if (!slot)
+            return;
+        const double ms = (MonotonicTime::now() - t).milliseconds();
+        *slot = (*slot < 0) ? ms : (*slot + ms);
+    }
+};
+
+// CSV-safe copy: URLs carry commas/quotes and a row must stay one physical line.
+static void perfSetUrl(const char* url)
+{
+    g_perfCur.url[0] = '\0';
+    if (!url)
+        return;
+    size_t n = 0;
+    for (; url[n] && n + 1 < sizeof g_perfCur.url; ++n) {
+        const char c = url[n];
+        g_perfCur.url[n] = (c == ',' || c == '"' || c == '\r' || c == '\n') ? '_' : c;
+    }
+    g_perfCur.url[n] = '\0';
+}
+
+static void perfFmtD(char* buf, size_t cap, double v)
+{
+    if (v < 0) {
+        buf[0] = '\0';
+        return;
+    }
+    std::snprintf(buf, cap, "%.2f", v);
+}
+
+static void perfFmtI(char* buf, size_t cap, int v)
+{
+    if (v < 0) {
+        buf[0] = '\0';
+        return;
+    }
+    std::snprintf(buf, cap, "%d", v);
+}
+
+// Drain the ring to disk. Single open/append/close (App-Container-safe, the same
+// shape PortNetworkStorageSession uses for its cookie diag).
+static void perfFlush()
+{
+    if (!g_perfOn || g_perfPath.empty() || !g_perfRows)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_perfPath.c_str(), "ab") != 0 || !fp) {
+        g_perfRows = 0;   // an unwritable path must not make the ring grow forever
+        return;
+    }
+    if (!g_perfHeaderDone) {
+        std::fputs(kPerfHeader, fp);
+        g_perfHeaderDone = true;
+    }
+    for (int i = 0; i < g_perfRows; ++i) {
+        const PerfRow& r = g_perfRing[i];
+        const double vals[12] = { r.total, r.netCommit, r.netLoad, r.settle, r.styleLayout,
+                                  r.renderUpdate, r.flush, r.backing, r.paint, r.readback,
+                                  r.swap, r.blit };
+        char d[12][16];
+        for (int k = 0; k < 12; ++k)
+            perfFmtD(d[k], sizeof d[k], vals[k]);
+        const int ints[4] = { r.frames, r.subStarted, r.subOk, r.subFail };
+        char n[4][12];
+        for (int k = 0; k < 4; ++k)
+            perfFmtI(n[k], sizeof n[k], ints[k]);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d\n",
+            r.seq, r.kind, r.url,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
+            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h);
+    }
+    std::fclose(fp);
+    g_perfRows = 0;
+}
+
+static void perfBegin(const char* kind, const char* url, int w, int h)
+{
+    if (!g_perfOn)
+        return;
+    g_perfCur = PerfRow{};
+    std::snprintf(g_perfCur.kind, sizeof g_perfCur.kind, "%s", kind ? kind : "?");
+    perfSetUrl(url);
+    g_perfCur.w = w;
+    g_perfCur.h = h;
+    g_perfOpIsNav = kind && !std::strcmp(kind, "nav");
+    g_perfPumpTicks = 0;
+    g_perfNavT0Set = false;
+    g_perfInOp = true;
+    g_perfOpStart = MonotonicTime::now();
+}
+
+static void perfEnd()
+{
+    if (!g_perfOn || !g_perfInOp)
+        return;
+    g_perfInOp = false;
+    g_perfCur.total = (MonotonicTime::now() - g_perfOpStart).milliseconds();
+    g_perfCur.seq = ++g_perfSeq;
+    if (!g_perfCur.url[0])
+        perfSetUrl(g_lastUrl);
+    // ms_net_load: the load event when it fired, else DOM ready — redirect chains
+    // and in-page (SPA) navigations may never reach a second load event.
+    if (g_perfCur.netLoad < 0)
+        g_perfCur.netLoad = g_perfCur.domReady;
+    if (g_perfOpIsNav) {
+        g_perfCur.frames = g_perfPumpTicks;         // rendering updates driven while settling
+        g_perfCur.subStarted = g_loadStarted;
+        g_perfCur.subOk = g_loadComplete;
+        g_perfCur.subFail = g_loadFail;
+    } else
+        g_perfCur.frames = 1;
+    g_perfCur.gpu = g_gpuActive ? 1 : 0;
+    g_perfCur.dfg = 0;   // hardcoded: becomes a build flag once ENABLE_DFG_JIT=ON is measured (M4 §4)
+    if (g_perfCur.w <= 0 && g_session) {            // viewport of the live session
+        g_perfCur.w = g_session->w;
+        g_perfCur.h = g_session->h;
+    }
+    if (g_perfRows < kPerfRingSize)
+        g_perfRing[g_perfRows++] = g_perfCur;
+    if (g_perfOpIsNav || g_perfRows >= kPerfRingSize)
+        perfFlush();
+}
+
+// Scope guard so every early return of an entry point still emits its row.
+struct PerfOpGuard {
+    PerfOpGuard(const char* kind, const char* url, int w, int h) { perfBegin(kind, url, w, h); }
+    ~PerfOpGuard() { perfEnd(); }
+};
+
+// Network phases are measured from the first provisional load start, so page
+// setup/teardown before the load does not leak into the network columns.
+static double perfSinceNavStart()
+{
+    return (MonotonicTime::now() - (g_perfNavT0Set ? g_perfNavT0 : g_perfOpStart)).milliseconds();
+}
+
+// Navigation phase marks — LoadingFrameLoaderClient is the only observer of these
+// boundaries. Declared in PortPerf.h; first mark of an operation wins (a redirect
+// chain keeps the timestamps of the load the user actually asked for).
+namespace WebCorePort {
+
+void perfNavStart()
+{
+    if (!g_perfOn || !g_perfInOp || g_perfNavT0Set)
+        return;
+    g_perfNavT0 = MonotonicTime::now();
+    g_perfNavT0Set = true;
+}
+
+void perfNavCommit()
+{
+    if (!g_perfOn || !g_perfInOp || g_perfCur.netCommit >= 0)
+        return;
+    g_perfCur.netCommit = perfSinceNavStart();
+}
+
+void perfNavDocumentReady()
+{
+    if (!g_perfOn || !g_perfInOp || g_perfCur.domReady >= 0)
+        return;
+    g_perfCur.domReady = perfSinceNavStart();
+}
+
+void perfNavLoadEvent()
+{
+    if (!g_perfOn || !g_perfInOp || g_perfCur.netLoad >= 0)
+        return;
+    g_perfCur.netLoad = perfSinceNavStart();
+}
+
+} // namespace WebCorePort
+
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
 //  allowEarlyStopWithoutNav: 若未发生导航完成,连续 ~0.5s 无加载活动即停(点击/滚动用)。
@@ -403,10 +636,15 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RefPtr<LocalFrame> frameRef = &frame;
     RunLoop::Timer settle(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.settle"_s,
         WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+            if (g_perfOn)
+                ++g_perfPumpTicks;   // Apotheosis: settle ticks of the current operation (M4)
             // EmptyChromeClient 下自动 RenderingUpdateScheduler 是 no-op;不显式调它则 rAF /
             // IntersectionObserver / 懒加载图片永不触发(滚动加载与 SPA 渲染必需)。
             if (pageForRendering) {
-                pageForRendering->isolatedUpdateRendering();   // 跑 rAF/IntersectionObserver(可能跑 JS 改 DOM 甚至导航)
+                {
+                    PerfPhase perfRender(&g_perfCur.renderUpdate);
+                    pageForRendering->isolatedUpdateRendering();   // 跑 rAF/IntersectionObserver(可能跑 JS 改 DOM 甚至导航)
+                }
                 // isolatedUpdateRendering 可能因导航替换主帧;若已不是当初那帧,本轮停止(调用方随后重取帧),
                 // 避免在同一 tick 里对脱离的 frameRef->loader() 解引用半毁状态。
                 RefPtr<LocalFrame> mf = pageForRendering->localMainFrame();
@@ -490,7 +728,10 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
 {
     using namespace WebCore;
     // flushCompositingStateForThisFrame 在 needsLayout() 时直接返回不 flush → 先确保布局就绪。
-    view.updateLayoutAndStyleIfNeededRecursive();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        view.updateLayoutAndStyleIfNeededRecursive();
+    }
     // 文档/base 背景:合成路径下不会自动进图层(无 embedder 给根层设背景色)→ 离屏 FBO 透出底白,
     // 任何页面背景都丢。显式把文档背景色设到根层(TextureMapperLayer::paintSelf 会以纯色渲染有效
     // backgroundColor)。只解决纯色/base 背景;body 背景图仍靠各自元素图层的 backing(若仍缺另议)。
@@ -498,20 +739,26 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         Color docBg = view.documentBackgroundColor();
         glRoot.setBackgroundColor(docBg.isValid() ? docBg : Color::white);
     }
-    view.flushCompositingStateIncludingSubframes();        // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
-    // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
-    // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
-    // 当时状态重置滚动层位置,放在 flush 前会被它覆盖 → 画面不滚。这里在 flush 后、paint 前显式定位一次,
-    // 让 -scrollPosition 成为合成前对 scrolled-contents 层的最后一次定位。无滚动层时为 no-op。
-    if (auto* renderView = view.renderView())
-        renderView->compositor().frameViewDidScroll();
-    // 滚动帧跳过强制全树重绘:滚动不改内容,tile 早已画好,只需移动滚动层重新合成 → 避免每帧重画所有 tile
-    //   (长页尤其卡)。加载/点击/输入/动画帧仍全量重绘保正确。g_gpuScrollFast 由 WebCoreScrollBy 置位、此处消费。
-    if (!g_gpuScrollFast)
-        forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
-    g_gpuScrollFast = false;
-    glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
-    g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
+    {
+        PerfPhase perfFlushPhase(&g_perfCur.flush);        // M4: compositing flush (+ scroll-layer positioning)
+        view.flushCompositingStateIncludingSubframes();    // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
+        // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
+        // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
+        // 当时状态重置滚动层位置,放在 flush 前会被它覆盖 → 画面不滚。这里在 flush 后、paint 前显式定位一次,
+        // 让 -scrollPosition 成为合成前对 scrolled-contents 层的最后一次定位。无滚动层时为 no-op。
+        if (auto* renderView = view.renderView())
+            renderView->compositor().frameViewDidScroll();
+    }
+    {
+        PerfPhase perfBacking(&g_perfCur.backing);         // M4: dirty-tree + tile upload + animations
+        // 滚动帧跳过强制全树重绘:滚动不改内容,tile 早已画好,只需移动滚动层重新合成 → 避免每帧重画所有 tile
+        //   (长页尤其卡)。加载/点击/输入/动画帧仍全量重绘保正确。g_gpuScrollFast 由 WebCoreScrollBy 置位、此处消费。
+        if (!g_gpuScrollFast)
+            forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
+        g_gpuScrollFast = false;
+        glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
+        g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
+    }
 }
 
 // 离屏合成 + 读回:把图层树合成进 w*h 的 BitmapTexture(FBO),glReadPixels 出 RGBA 到 outRGBA。
@@ -537,11 +784,15 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     // 已是全表面)。documentBackgroundColor 已混合 base+html+body 纯色;背景图无法纳入(见 LocalFrameView
     // 注释),故纯色页背景就此修复,背景图仍待其元素图层自身绘制。
     g_textureMapper->clearColor(docBg);
-    glRoot.layer().paint(*g_textureMapper);
+    {
+        PerfPhase perfPaint(&g_perfCur.paint);   // M4: TextureMapper composite of the layer tree
+        glRoot.layer().paint(*g_textureMapper);
+    }
     // texture 的 FBO 此刻仍绑定 → 直接读回(endPainting 会还原帧缓冲绑定,故必须读在前)。
     // 读回缓冲静态复用:仅引擎线程用,免每帧 3MB 分配+释放(readback 模式滚动/实时 tick 是热路径)。
     static std::vector<uint8_t> tmp;
     tmp.resize(static_cast<size_t>(w) * h * 4);
+    PerfPhase perfReadback(&g_perfCur.readback);   // M4: glFinish + glReadPixels + the copy/hash pass below
     glFinish();
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
     g_textureMapper->endPainting();
@@ -590,9 +841,15 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         Color docBg = view.documentBackgroundColor();
         g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);   // 文档 base 背景(同 readback,见上)
     }
-    glRoot.layer().paint(*g_textureMapper);
-    g_textureMapper->endPainting();
-    g_glContext->swapBuffers();
+    {
+        PerfPhase perfPaint(&g_perfCur.paint);      // M4: TextureMapper composite into the default framebuffer
+        glRoot.layer().paint(*g_textureMapper);
+        g_textureMapper->endPainting();
+    }
+    {
+        PerfPhase perfSwap(&g_perfCur.swap);        // M4: eglSwapBuffers → SwapChainPanel
+        g_glContext->swapBuffers();
+    }
     return kOK;
 }
 
@@ -650,7 +907,10 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
         //   非合成路径(RenderHtml/LoadUrl)无合成层,此标志无害。
         auto oldBehavior = view.paintBehavior();
         view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
-        view.paint(context, IntRect(IntPoint(), size));
+        {
+            PerfPhase perfPaint(&g_perfCur.paint);   // M4: software raster (Cairo)
+            view.paint(context, IntRect(IntPoint(), size));
+        }
         view.setPaintBehavior(oldBehavior);
     }
     cairo_surface_flush(surface);
@@ -659,6 +919,8 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     const int stride = cairo_image_surface_get_stride(surface);
     int nonWhite = 0;
     uint32_t hash = 2166136261u;   // FNV-ish 滚动哈希,实时模式判断画面是否变化(顺带在同一遍像素循环里算)
+    {
+    PerfPhase perfBlit(&g_perfCur.blit);   // M4: ARGB32 → RGBA8888 convert/unpremultiply pass (one probe, not per pixel)
     for (int y = 0; y < h; ++y) {
         const unsigned char* srow = src + static_cast<size_t>(y) * stride;
         uint8_t* drow = outRGBA + static_cast<size_t>(y) * w * 4;
@@ -688,6 +950,7 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
                 hash = (hash ^ drow[x * 4 + 2]) * 16777619u;
             }
         }
+    }
     }
     cairo_surface_destroy(surface);
     nonWhiteOut = nonWhite;
@@ -920,8 +1183,11 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     // 初次加载:等主文档完成 + 空闲;每 tick isolatedUpdateRendering 让 SPA(claude.ai 等)的
     // rAF 驱动渲染推进(否则 JS 站点 settle 后仍空白)。
-    pumpLoop(*localMainFrame, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ false,
-             /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
+    {
+        PerfPhase perfSettle(&g_perfCur.settle);   // M4: network + settle wall time (tick count → `frames`)
+        pumpLoop(*localMainFrame, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ false,
+                 /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
+    }
 
     if (!g_session->load.mainDone)
         return kErrLoadTimeout;
@@ -939,7 +1205,10 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     RefPtr<Document> document = localMainFrame->protectedDocument();
     if (!document)
         return kErrNoDocument;
-    document->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4: forced style + layout
+        document->updateLayoutIgnorePendingStylesheets();
+    }
 
     // SPA 模块求值探针:动态 import 入口模块,触发/复用其求值(可能挂载 React)。之后重取帧/view/document,
     // 因挂载可能改了 DOM/布局。非模块站点(probeSpaModule 内判 no-mod)不跑、零开销。
@@ -957,7 +1226,10 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     document = localMainFrame->protectedDocument();
     if (!document)
         return kErrNoDocument;
-    document->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4: forced style + layout
+        document->updateLayoutIgnorePendingStylesheets();
+    }
     extractLinks(document.get(), h);
 
     int nonWhite = 0;
@@ -1063,6 +1335,41 @@ void WebCoreSetCookieJsonPath(const char* path)
     if (!path || !*path)
         return;
     WebCorePort::setPortCookieJsonPath(String::fromUTF8(path));
+}
+
+// Apotheosis (M4 step 1): switch per-phase timing on and point it at a CSV file.
+// The App Container only lets us write inside LocalState and the driver cannot
+// discover that path itself, so the harness passes it in — and only when the
+// tester dropped LocalState\perf.txt, mirroring the imedebug.txt opt-in. Unset or
+// "" = off, which is the shipping default and costs one branch per probe.
+// Engine-thread call; call it before the first navigation.
+void WebCoreSetPerfLogPath(const char* path)
+{
+    if (!path || !*path) {
+        g_perfOn = false;
+        g_perfPath.clear();
+        return;
+    }
+    g_perfPath = path;
+    g_perfOn = true;
+    // Write the CSV header only into a fresh file (the log is appended across runs).
+    g_perfHeaderDone = false;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_perfPath.c_str(), "rb") == 0 && fp) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) > 0)
+            g_perfHeaderDone = true;
+        std::fclose(fp);
+    }
+}
+
+// Apotheosis (M4 step 1): drain the in-memory perf ring to disk. Rows otherwise
+// reach the file only when a navigation completes or the ring fills, so an app
+// that UWP terminates while suspended would lose them — the harness calls this
+// from the suspend path and at the end of the autodiag loop. No-op when off.
+void WebCorePerfFlush()
+{
+    perfFlush();
 }
 
 // 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。harness 在应用切后台
@@ -1547,6 +1854,7 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
     g_spaProbe[0] = '\0';
     g_lastPendingResources = 0;
     g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
+    PerfOpGuard perfOp("nav", url, w, h);   // M4: one CSV row for this navigation (flushed on completion)
     g_session.emplace();
     g_session->w = w;
     g_session->h = h;
@@ -1578,6 +1886,7 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;   // 任何返回路径复位 g_inPump
+    PerfOpGuard perfOp("click", nullptr, 0, 0);   // M4
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
@@ -1586,7 +1895,10 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
+    }
 
     // 重新武装加载检测:点击触发的导航能被 pump 捕获。关键:signalLoadComplete 触发一次后会把完成回调
     // move 走(LoadingFrameLoaderClient.cpp:131),初次加载完成后回调已空 —— 故每次点击都必须重装,否则
@@ -1631,8 +1943,11 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     }
 
     // 同步处理器(JS onclick 等)已返回;导航(若有)异步 → settle。无导航则空闲早停。
-    pumpLoop(*lf, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ true,
-             /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ g_session->page.get());
+    {
+        PerfPhase perfSettle(&g_perfCur.settle);   // M4
+        pumpLoop(*lf, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ true,
+                 /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ g_session->page.get());
+    }
 
     // 导航会重建 view/frame,重新校验 + 重取。
     lf = g_session->page->localMainFrame();
@@ -1650,7 +1965,10 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();
+    }
     extractLinks(doc.get(), g_session->h);
 
     int nonWhite = 0;
@@ -1674,6 +1992,7 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;
+    PerfOpGuard perfOp("scroll", nullptr, 0, 0);   // M4
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
@@ -1682,7 +2001,10 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();   // contentsSize/最大滚动有效
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();   // contentsSize/最大滚动有效
+    }
 
     ScrollPosition cur = view->scrollPosition();
     ScrollPosition minP = view->minimumScrollPosition();
@@ -1699,7 +2021,10 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     //   —— 那是"很卡"的元凶。这里只一次 isolatedUpdateRendering(驱动 scroll steps/IntersectionObserver 注册,
     //   轻量)+ 刷新链接表 + 合成。懒加载图片/动画交给滚动停止后的 StartLiveMode(WebCoreLiveTick 逐帧补)。
     //   纯滚动不跑 JS 不会导航,故不重取帧(导航只发生在 click/输入/load)。
-    g_session->page->isolatedUpdateRendering();
+    {
+        PerfPhase perfRender(&g_perfCur.renderUpdate);   // M4
+        g_session->page->isolatedUpdateRendering();
+    }
     // ★ 提速:滚动期间不再每帧 extractLinks(其对每个锚点调 boundingClientRect,长页/链接多时是每帧大头)
     //   也不写诊断串。点击走引擎真实命中测试(权威,不依赖链接表);链接表由滚动停止后 WebCoreSyncLinks 一次性刷新。
     int nonWhite = 0;
@@ -2255,9 +2580,13 @@ int WebCoreLiveTick(uint8_t* outRGBA)
 
     // 网络 / 图片解码完成回调经 RunLoop 任务投递。仅 isolatedUpdateRendering 不会取这些任务,
     // 所以空白占位图会一直等到下一次点击/滚动的 pumpLoop 才刷新。实时 tick 先轻量转几轮队列。
+    PerfOpGuard perfOp("tick", nullptr, 0, 0);   // M4
     for (int i = 0; i < 3; ++i)
         RunLoop::cycle();
-    g_session->page->isolatedUpdateRendering();   // 推进一帧动画/rAF/IO(可能跑 JS,甚至导航/换帧)
+    {
+        PerfPhase perfRender(&g_perfCur.renderUpdate);   // M4
+        g_session->page->isolatedUpdateRendering();   // 推进一帧动画/rAF/IO(可能跑 JS,甚至导航/换帧)
+    }
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     if (!lf)
         return kErrFrameGone;
@@ -2269,7 +2598,10 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (!doc)
         return kErrNoDocument;
     doc->eventLoop().performMicrotaskCheckpoint();
-    doc->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4
+        doc->updateLayoutIgnorePendingStylesheets();
+    }
     g_lastPendingResources = countPendingResources(*doc);
     int nonWhite = 0;
     return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);

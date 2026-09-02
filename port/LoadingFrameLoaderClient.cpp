@@ -22,6 +22,7 @@
 #include <WebCore/LocalFrame.h>
 #include <WebCore/NetworkStorageSession.h>
 #include "PortNetworkStorageSession.h"   // cookie 持久化:真 storageSession
+#include "PortPerf.h"                    // Apotheosis: M4 per-phase timing (navigation marks)
 #include <WebCore/ResourceError.h>
 #include <WebCore/ResourceRequest.h>
 #include <WebCore/ResourceResponse.h>
@@ -136,6 +137,7 @@ void LoadingFrameLoaderClient::signalLoadComplete(bool failed)
 
 void LoadingFrameLoaderClient::dispatchDidFinishLoad()
 {
+    perfNavLoadEvent();   // Apotheosis (M4): ms_net_load — before the completion handler stops the pump
     signalLoadComplete(false);
 }
 
@@ -319,6 +321,10 @@ void LoadingFrameLoaderClient::dispatchWillClose()
 
 void LoadingFrameLoaderClient::dispatchDidStartProvisionalLoad()
 {
+    // Apotheosis (M4): start of the network clock — the driver measures the
+    // net_commit / net_load columns from here, so page setup before the load
+    // does not leak into them. No-op unless perf logging is on.
+    perfNavStart();
 }
 
 void LoadingFrameLoaderClient::dispatchDidReceiveTitle(const StringWithDirection&)
@@ -327,10 +333,12 @@ void LoadingFrameLoaderClient::dispatchDidReceiveTitle(const StringWithDirection
 
 void LoadingFrameLoaderClient::dispatchDidCommitLoad(std::optional<HasInsecureContent>, std::optional<UsedLegacyTLS>, std::optional<WasPrivateRelayed>)
 {
+    perfNavCommit();          // Apotheosis (M4): ms_net_commit
 }
 
 void LoadingFrameLoaderClient::dispatchDidFinishDocumentLoad()
 {
+    perfNavDocumentReady();   // Apotheosis (M4): DOM ready (ms_net_load fallback)
 }
 
 void LoadingFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone>)

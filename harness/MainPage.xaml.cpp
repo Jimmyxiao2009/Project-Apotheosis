@@ -108,6 +108,13 @@ static void SetupRuntimeEnv()
         // 切后台时写出的持久化数据,不经过 SQLite 的真实文件 I/O。
         WebCoreSetCookieJsonPath((localDir + "\\cookies.jsonl").c_str());
 
+        // Apotheosis (M4): per-phase timing. Device-side opt-in exactly like imedebug.txt —
+        // only when the tester dropped LocalState\perf.txt (via WDP, effective after restart)
+        // does the engine time the load/paint phases and append them to LocalState\perf.csv.
+        // 未放该文件时引擎侧零开销(每个探针只剩一个分支)。SetupRuntimeEnv 跑在引擎线程,符合 ABI 要求。
+        if (GetFileAttributesW((LocalStateDir() + L"\\perf.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+            WebCoreSetPerfLogPath((localDir + "\\perf.csv").c_str());
+
         // CA 根证书:内存 blob 注入(绕 App Container 文件式加载限制)。
         std::string srcCa = installDir + "\\cacert.pem";
         std::vector<uint8_t> caBytes;
@@ -323,6 +330,9 @@ void MainPage::FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDefer
 {
     WebEngine::instance().post([deferral]() {
         try { WebCoreFlushCookiesToDisk(); } catch (...) {}
+        // Apotheosis (M4): 同理落盘性能日志 —— 环形缓冲平时只在导航完成时写盘,挂起后进程可能被
+        // 系统直接终止,未落盘的行就丢了。关闭时为 no-op。
+        try { WebCorePerfFlush(); } catch (...) {}
         deferral->Complete();
     });
 }
@@ -568,6 +578,9 @@ MainPage::MainPage()
             // cookie 持久化调试:主动落盘(平时靠切后台 VisibilityChanged 触发;autodiag 不经 UI 生命周期,
             // 这里显式补一次,让"设 cookie→跑 autodiag→杀进程→重跑另一份 autodiag 验证读回"这套测试闭环成立)。
             try { WebCoreFlushCookiesToDisk(); dump += "WebCoreFlushCookiesToDisk() done.\n"; } catch (...) {}
+            // Apotheosis (M4): autodiag 不经 UI 生命周期,显式把性能日志环形缓冲落到 perf.csv,
+            // 供 WDP 一并拉回(仅当 LocalState\perf.txt 开了开关时才有内容)。
+            try { WebCorePerfFlush(); dump += "WebCorePerfFlush() done.\n"; } catch (...) {}
             try {
                 std::wstring d2 = LocalStateDir();
                 if (!d2.empty()) {

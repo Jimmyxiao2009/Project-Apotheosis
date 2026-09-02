@@ -9,9 +9,6 @@ extern "C" {
 // outBuf 必须 >= width*height*4 字节。返回 0 成功,负数失败(见 WebCoreDriver.cpp 错误码)。
 int WebCoreRenderHtml(const char* utf8Html, int width, int height, uint8_t* outBuf);
 
-// 验证版:只跑 init + Page::create + 纯色填充,验证 C ABI + 显示管线(引擎风险最小)。
-int WebCoreRenderHtmlStub(const char* utf8Html, int width, int height, uint8_t* outBuf);
-
 // Phase 1b 网络:加载真实 URL(curl + OpenSSL TLS 1.3)并渲染。返回 0 成功,负数失败
 // (-9 URL 非法 / -10 加载失败 / -11 30s 超时,其余同 WebCoreRenderHtml)。
 int WebCoreLoadUrl(const char* url, int width, int height, uint8_t* outBuf);
@@ -46,6 +43,20 @@ void WebCoreSetCookieJsonPath(const char* path);
 // 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。app 切后台(即将被
 // UWP 挂起/可能被系统直接终止)时调,引擎线程串行。
 void WebCoreFlushCookiesToDisk();
+
+// ---- M4 step 1: per-phase timing (opt-in) ----
+// Switch per-phase timing on and point it at a CSV file (one row per completed
+// nav/scroll/tick/click operation). The App Container only lets us write inside
+// LocalState and the engine cannot discover that path itself, so the harness
+// passes it in — and only when LocalState\perf.txt exists, mirroring the
+// imedebug.txt opt-in. Unset/"" = off (shipping default, one branch per probe).
+// Engine-thread call; call before the first navigation.
+void WebCoreSetPerfLogPath(const char* path);
+
+// Drain the in-memory perf ring to that CSV. Rows otherwise reach disk only on
+// navigation completion or when the ring fills, so call this before suspend
+// (UWP can terminate a suspended app without notice). No-op when off.
+void WebCorePerfFlush(void);
 
 // 取回上次 WebCoreLoadUrl 失败时记录的网络错误(curl 错误码 + 描述 + URL)。
 // 写入 buf(最多 len 字节,含 NUL),返回写入字节数(不含 NUL)。无错误则为空串。
