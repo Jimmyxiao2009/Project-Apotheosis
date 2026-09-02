@@ -34,6 +34,13 @@
 // (curl 错误码 + 域 + 描述 + 失败 URL)送给驱动,供真机网络失败定位。
 extern "C" void WebCorePortRecordNetError(int code, const char* domain, const char* desc, const char* url);
 
+// Apotheosis: DNS prefetch for <link rel="dns-prefetch">. Implemented in
+// WebKit\Source\WebKitLegacy\WebCoreSupport\WebResourceLoadScheduler.cpp, which is
+// compiled straight into the driver (local\link-driver-gpu.ps1), so this is a plain
+// cross-TU call. WebCore::prefetchDNS() itself is a no-op in the curl port - see the
+// comment on apotheosisPrefetchDNS() there.
+extern void apotheosisPrefetchDNS(const WTF::String& hostname);
+
 namespace WebCorePort {
 
 using namespace WebCore;
@@ -599,8 +606,12 @@ void LoadingFrameLoaderClient::willCacheResponse(DocumentLoader*, ResourceLoader
 
 #endif
 
-void LoadingFrameLoaderClient::prefetchDNS(const String&)
+void LoadingFrameLoaderClient::prefetchDNS(const String& hostname)
 {
+    // Apotheosis: real DNS prefetch (background getaddrinfo, warms the OS resolver
+    // cache that libcurl hits next). Preconnect beyond DNS is not possible with libcurl
+    // - see WebResourceLoadScheduler::preconnectTo().
+    ::apotheosisPrefetchDNS(hostname);
 }
 
 RefPtr<HistoryItem> LoadingFrameLoaderClient::createHistoryItemTree(bool, BackForwardItemIdentifier) const
