@@ -682,6 +682,7 @@ MainPage::MainPage()
         //   about:home 不走这条:它无会话/无合成,且直呈现下 PresentSoftwareFrame 会跳过贴图 → 保持原行为。
         if (m_gpuDefault && !firstUrl.empty() && firstUrl != L"about:home") {
             m_pendingFirstNav = firstUrl;
+            m_pendingFirstNavPush = true;
             // 真机实测(第一版):GpuPanel 的 Loaded 从未到达 → 启动落到兜底定时器 → 又变回两次加载。
             //   原因:Visibility=Collapsed 的元素不参与 measure/arrange,既不 Loaded 也不 SizeChanged。
             //   故这里就把面板设为可见(第一帧 GPU 内容前它是透明的,盖在 RenderImage 上不影响软件路径),
@@ -695,11 +696,7 @@ MainPage::MainPage()
             this->Loaded += ref new Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnPageLoadedForGpu);
             // 兜底:6 s 内一个触发源都没来 → 照原路发导航(软件首屏,GPU 仍由 OnNavDone 的自动开关
             // 接手 = 老的两次加载)——绝不让启动停在"没有任何页面"。
-            m_startupNavTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-            Windows::Foundation::TimeSpan sts; sts.Duration = 60000000LL;   // 6s(100ns 单位)
-            m_startupNavTimer->Interval = sts;
-            m_startupNavTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnStartupNavTimer);
-            m_startupNavTimer->Start();
+            ArmStartupNavTimer();
         } else {
             NavigateTo(ref new String(firstUrl.c_str()), true);
         }
@@ -789,6 +786,24 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
 
     std::wstring wurl = url ? std::wstring(url->Data()) : L"about:home";
     const bool isHome = wurl.empty() || wurl == L"about:home";
+
+    // Apotheosis (M4): GPU 优先 —— 本次会话的第一次网络导航,先起 GPU 再加载,首个会话就带合成
+    //   (引擎侧 setAcceleratedCompositingEnabled/setForceCompositingMode 只在 buildSession 里按
+    //   g_gpuActive 生效,见 port\WebCoreDriver.cpp:1357-1358 → 会话建好后无法追加合成,原流程只能
+    //   "软件加载一遍 + 开 GPU 后重载一遍",真机每次 ~14 s / ~300 MB 白工)。
+    //   这里拦截而不是只在启动时拦截:主页是 about:home 时,第一次网络导航来自用户输入/点击。
+    //   about:home 保持软件路径(无会话/无合成)。GpuInit 失败 → g_gpuActive 仍 false → 同一次导航
+    //   照旧走 Cairo(零回归)。EnableGpu 的回调(成功或失败)负责把这次导航发出去。
+    if (!isHome && m_gpuDefault && !m_gpuOn && !m_gpuAutoTried && !m_gpuStartupBegun) {
+        m_pendingFirstNav = wurl;
+        m_pendingFirstNavPush = pushHistory;
+        if (GpuPanel) GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        HideSuggestions();
+        SetLoading(true);      // GpuInit 期间(几百 ms)显示进度条,并挡住重复点/回车(m_loading 早退)
+        StartupGpuThenNav();   // 起 GPU;导航由 EnableGpu 的回调发出,那时 m_gpuAutoTried 已为 true → 正常加载
+        return;
+    }
+
     m_currentUrl = isHome ? L"about:home" : wurl;
 
     // M4:导航=新页面,引擎 pageScaleFactor 复位 1.0 → harness 缩放状态/显示变换同步复位(否则下次捏合基准错)。
@@ -833,6 +848,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         int rc = -999;
         bool loadOk = false;   // 网络加载是否真成功(区别于错误页渲染成功),决定是否进历史
         bool sessionActive = false;   // 是否建立了引擎常驻会话(决定点击转发/翻页按钮)
+        int comp = 0;                 // 本页合成是否在跑(根图层已附)→ UI 侧据此选 GPU 面/软件面
         std::wstring title;
         try {
             if (isHome) {
@@ -850,7 +866,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 char t[512] = ""; WebCoreGetTitle(t, sizeof t);
                 char diag[4096] = ""; WebCoreGetDiag(diag, sizeof diag);
                 char err[512] = ""; WebCoreGetLastError(err, sizeof err);   // curl 错误码+描述(失败时)
-                int comp = 0; try { comp = WebCoreEnableCompositing(); } catch (...) {}   // M1 验证:合成是否在跑(根图层已附)
+                try { comp = WebCoreEnableCompositing(); } catch (...) {}   // M1 验证:合成是否在跑(根图层已附)
                 // 失败原因也写进 stage.txt(原来只进错误页,拉不到)→ 远程诊断"加载失败"必看。
                 WriteStage(("after-load url=" + surl + " rc=" + std::to_string(netRc)
                             + " compositing=" + std::to_string(comp)
@@ -889,7 +905,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         bool ok = (rc == 0);   // 渲染是否成功(决定是否贴图)
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, titleCopy, ok, loadOk, sessionActive, links, mySeq]() {
+                ref new DispatchedHandler([self, rgba, titleCopy, ok, loadOk, sessionActive, comp, links, mySeq]() {
                     MainPage^ s = self.Get();
                     if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被更新操作/看门狗取代,丢弃此迟到回调
@@ -899,8 +915,10 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                         //   就会停在没有内容的 GpuPanel 上 —— GPU 优先启动后首屏本身就可能是错误页(离线
                         //   启动),故按本帧的会话状态切显示面:无会话→软件面(RenderImage),有会话→GPU 面。
                         //   引擎侧不受影响(g_directPresent 只 gate harness 的 BlitToBitmap)。
-                        if (s->m_gpuOn && sessionActive != s->m_gpuPresent) {
-                            bool present = sessionActive;
+                        //   判据用本页实际合成状态(comp=根图层已附),而不是"有会话":GpuInit 恰好在
+                        //   这次加载途中完成时,会话是无合成建起来的 → 引擎按 cairo 填了 rgba,必须走软件面。
+                        if (s->m_gpuOn && (sessionActive && comp != 0) != s->m_gpuPresent) {
+                            bool present = (sessionActive && comp != 0);
                             s->m_gpuPresent = present;
                             g_directPresent.store(present);
                             s->GpuPanel->Visibility = present
@@ -1303,8 +1321,13 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         ApplyLiveZoom();
         return;
     }
-    double dx = -e->Delta.Translation.X;             // 手指左移(ΔX<0)→ 内容右滚(dx>0)
-    double dy = -e->Delta.Translation.Y;             // 手指上移(ΔY<0)→ 内容下滚(dy>0)
+    // Apotheosis: ManipulationDelta 的位移是内容区显示坐标(DIP),而 FreeScrollBy/WebCoreScrollBy 要的是
+    //   固定引擎视口像素(kW×kH)。此前直接把 DIP 当引擎像素传 → 页面只跟手约一半。与 MapTapToEngine 同一换算。
+    //   不要再除 m_pageScale:表面无论缩放都铺满同一块屏幕矩形。
+    double sx = ContentArea->ActualWidth  > 1.0 ? (double)kW / ContentArea->ActualWidth  : 1.0;
+    double sy = ContentArea->ActualHeight > 1.0 ? (double)kH / ContentArea->ActualHeight : 1.0;
+    double dx = -e->Delta.Translation.X * sx;        // 手指左移(ΔX<0)→ 内容右滚(dx>0)
+    double dy = -e->Delta.Translation.Y * sy;        // 手指上移(ΔY<0)→ 内容下滚(dy>0)
     int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
     if (idx != 0 || idy != 0) FreeScrollBy(idx, idy);
@@ -2783,15 +2806,30 @@ std::string MainPage::GpuPanelSizeStr()
     return std::to_string(pw) + "x" + std::to_string(ph);
 }
 
+// 兜底定时器:待发导航必须在 6 s 内出去,不管 GPU 那边发生了什么。启动时构造函数先武装一次,
+// StartupGpuThenNav 再重新武装(用户输入触发的首次网络导航根本没经过构造函数那条路)。
+void MainPage::ArmStartupNavTimer()
+{
+    if (!m_startupNavTimer) {
+        m_startupNavTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        Windows::Foundation::TimeSpan sts; sts.Duration = 60000000LL;   // 6s(100ns 单位)
+        m_startupNavTimer->Interval = sts;
+        m_startupNavTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnStartupNavTimer);
+    }
+    m_startupNavTimer->Stop();
+    m_startupNavTimer->Start();
+}
+
 void MainPage::StartupGpuThenNav()
 {
     if (m_pendingFirstNav.empty()) return;
-    if (m_gpuStartupBegun) return;   // 去重:页面 Loaded / 面板 Loaded / 面板 SizeChanged 谁先到都行
+    if (m_gpuStartupBegun) return;   // 去重:页面 Loaded / 面板 Loaded / 面板 SizeChanged / 首次网络导航
     m_gpuStartupBegun = true;
-    if (m_startupNavTimer) m_startupNavTimer->Stop();
+    ArmStartupNavTimer();
     WriteMemLog("startup gpu-first (panel " + GpuPanelSizeStr() + ")"
                 + " pageLoaded=" + (m_pageLoadedSeen ? "1" : "0")
-                + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0"));
+                + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0")
+                + " url=" + WideToUtf8(m_pendingFirstNav));
     if (m_gpuOn || m_gpuAutoTried) { StartPendingFirstNav(); return; }   // 不该发生;绝不吞掉首次导航
     m_gpuAutoTried = true;   // 占住 OnNavDone 里的自动开 GPU 分支(否则加载完又开一次并重载)
     EnableGpu();             // 成功/失败的 UI 回调都会调 StartPendingFirstNav()
@@ -2803,23 +2841,24 @@ void MainPage::StartPendingFirstNav()
     if (m_startupNavTimer) m_startupNavTimer->Stop();
     if (m_pendingFirstNav.empty()) return;
     std::wstring u = m_pendingFirstNav;
+    bool push = m_pendingFirstNavPush;
     m_pendingFirstNav.clear();
-    NavigateTo(ref new String(u.c_str()), true);
+    SetLoading(false);   // 拦截时置的"等 GpuInit"状态;不清 NavigateTo 会在 m_loading 处早退
+    NavigateTo(ref new String(u.c_str()), push);
 }
 
-// 兜底:6 s 内没有任何触发源 → 回原流程(软件首屏;GPU 仍由 OnNavDone 的自动开关接手,即老的两次加载)。
-// GpuInit 已经在飞(m_gpuStartupBegun)时不抢跑:导航由 EnableGpu 的回调发,否则两边都发 = 又变两次加载。
+// 兜底:6 s 到点导航还没出去 → 无论如何发出去(GpuInit 卡住/触发源全没来)。
+// 迟到的 EnableGpu 回调此时看到 m_pendingFirstNav 为空,只会走它原来的"重载当前页"分支,而那条
+// 分支在加载中(m_loading)会自行早退 → 不会变成两次加载。
 void MainPage::OnStartupNavTimer(Platform::Object^, Platform::Object^)
 {
     if (m_startupNavTimer) m_startupNavTimer->Stop();
     if (m_pendingFirstNav.empty()) return;
-    if (m_gpuStartupBegun) {   // GpuInit 慢(引擎线程忙/ANGLE 初始化):等它的回调,别重复导航
-        WriteMemLog("startup gpu-init slow, waiting (panel " + GpuPanelSizeStr() + ")");
-        return;
-    }
-    WriteMemLog(std::string("startup fallback (timer) reason=no-trigger")
+    WriteMemLog(std::string("startup fallback (timer) reason=")
+                + (m_gpuStartupBegun ? "gpu-init-slow" : "no-trigger")
                 + " pageLoaded=" + (m_pageLoadedSeen ? "1" : "0")
                 + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0")
-                + " panel=" + GpuPanelSizeStr());
+                + " panel=" + GpuPanelSizeStr()
+                + " url=" + WideToUtf8(m_pendingFirstNav));
     StartPendingFirstNav();
 }

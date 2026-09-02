@@ -121,6 +121,7 @@ namespace Harness {
         void StartPendingFirstNav();   // 发出并清空 m_pendingFirstNav(GPU 成功/失败/兜底都走这里)
         void OnStartupNavTimer(Platform::Object^ sender, Platform::Object^ e);   // 兜底定时器:触发源都没来也要导航
         void OnPageLoadedForGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);  // 页面 Loaded:保底触发源
+        void ArmStartupNavTimer();      // (重新)武装 6s 兜底定时器:待发导航必须出去
         std::string GpuPanelSizeStr();  // 面板当前尺寸 "WxH"(启动诊断行用)
 
         // ---- 抽屉 ----
@@ -234,8 +235,9 @@ namespace Harness {
         bool m_gpuPresent { false };  // GPU 直呈现模式(合成直接画到 GpuPanel,省 readback+blit)
         bool m_gpuDefault { true };   // 默认启用 GPU(设置可关;启动后首个网络页加载完自动开)
         bool m_gpuAutoTried { false };// 本次会话已自动尝试过开 GPU(不重复)
-        // Apotheosis (M4): 启动首次导航被推迟到 GpuInit 之后时,URL 暂存在这里(空=没有待发导航)。
+        // Apotheosis (M4): 首次网络导航被推迟到 GpuInit 之后时,URL 暂存在这里(空=没有待发导航)。
         std::wstring m_pendingFirstNav;
+        bool m_pendingFirstNavPush { true };   // 那次导航的 pushHistory(后退/前进触发时必须是 false)
         // 兜底定时器:6 s 内没有任何触发源,到点也把待发导航发出去(软件首屏)。
         Windows::UI::Xaml::DispatcherTimer^ m_startupNavTimer;
         bool m_gpuStartupBegun { false };   // 已开始 GPU 优先启动(多触发源去重 + 兜底定时器不抢跑)
