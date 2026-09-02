@@ -115,6 +115,13 @@ namespace Harness {
         // GPU 合成开关(M2):一次性开启(引擎线程 WebCoreGpuInit 离屏成功→重载当前页走 TextureMapper 合成)。
         void OnToggleGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void EnableGpu();   // 开 GPU 直呈现(OnToggleGpu 首点 + 默认GPU自动触发 共用;含崩溃环路保护)
+        // Apotheosis (M4): GPU 优先启动 —— 面板就绪 → EnableGpu() → 回调里才发第一次导航,
+        //   使首个会话就带合成(引擎侧合成只在 buildSession 按 g_gpuActive 打开),省掉启动时的重复加载。
+        void StartupGpuThenNav();      // 触发源(页面/面板 Loaded、面板 SizeChanged)共用,自带去重
+        void StartPendingFirstNav();   // 发出并清空 m_pendingFirstNav(GPU 成功/失败/兜底都走这里)
+        void OnStartupNavTimer(Platform::Object^ sender, Platform::Object^ e);   // 兜底定时器:触发源都没来也要导航
+        void OnPageLoadedForGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);  // 页面 Loaded:保底触发源
+        std::string GpuPanelSizeStr();  // 面板当前尺寸 "WxH"(启动诊断行用)
 
         // ---- 抽屉 ----
         void OnDrawerClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -161,7 +168,10 @@ namespace Harness {
         // kind: 0=插入文本(text),1=回车,2=退格。转发到引擎并重绘。
         void SendKeyToEngine(int kind, Platform::String^ text);
         // GPU 路径1 探针:SwapChainPanel 就绪后启动 ANGLE 三角形探针(验 GPU 管线在 App Container 通)。
+        //   GPU 优先启动时改为在此起引擎 GPU(探针会占住同一面板的窗口表面,故那条路径下不跑探针)。
         void OnGpuPanelLoaded(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // 面板拿到非零尺寸(折叠元素尺寸恒 0)→ 可以建 ANGLE 窗口表面 → StartupGpuThenNav()。
+        void OnGpuPanelSizeChanged(Platform::Object^ sender, Windows::UI::Xaml::SizeChangedEventArgs^ e);
         // 把一帧引擎渲染结果(rgba)贴到位图 + 同步标题/地址/链接表;navUrl 非空表示会话内发生了导航。
         void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                               Platform::String^ title, Platform::String^ navUrl,
@@ -224,6 +234,13 @@ namespace Harness {
         bool m_gpuPresent { false };  // GPU 直呈现模式(合成直接画到 GpuPanel,省 readback+blit)
         bool m_gpuDefault { true };   // 默认启用 GPU(设置可关;启动后首个网络页加载完自动开)
         bool m_gpuAutoTried { false };// 本次会话已自动尝试过开 GPU(不重复)
+        // Apotheosis (M4): 启动首次导航被推迟到 GpuInit 之后时,URL 暂存在这里(空=没有待发导航)。
+        std::wstring m_pendingFirstNav;
+        // 兜底定时器:6 s 内没有任何触发源,到点也把待发导航发出去(软件首屏)。
+        Windows::UI::Xaml::DispatcherTimer^ m_startupNavTimer;
+        bool m_gpuStartupBegun { false };   // 已开始 GPU 优先启动(多触发源去重 + 兜底定时器不抢跑)
+        bool m_pageLoadedSeen { false };    // 诊断:页面 Loaded 到过
+        bool m_gpuPanelLoadedSeen { false };// 诊断:GpuPanel Loaded 到过(第一版真机上它没来)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
         int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态

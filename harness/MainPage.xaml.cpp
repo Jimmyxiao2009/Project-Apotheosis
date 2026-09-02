@@ -671,10 +671,39 @@ MainPage::MainPage()
                 }));
             } catch (...) {}
         });
-    } else if (!testUrl.empty())
-        NavigateTo(ref new String(testUrl.c_str()), true);
-    else
-        NavigateTo(ref new String(g_homeUrl.c_str()), true);   // 主页(设置可改)
+    } else {
+        std::wstring firstUrl = testUrl.empty() ? g_homeUrl : testUrl;   // 主页(设置可改)/ 测试钩子
+        // Apotheosis (M4): 启动只加载一次页面。原流程 = 软件加载首页 → OnNavDone 自动 EnableGpu →
+        //   EnableGpu 成功后重载同一页(引擎侧 setAcceleratedCompositingEnabled/setForceCompositingMode
+        //   只在 buildSession 里按 g_gpuActive 生效,见 port\WebCoreDriver.cpp:1357-1358,故会话建好后
+        //   无法追加合成),真机上每次启动白花 ~14 s / ~300 MB。
+        //   改为:面板就绪 → 先 WebCoreGpuInit → 再发第一次导航,首个会话就带合成。GpuInit 失败时
+        //   g_gpuActive 仍为 false → 同一次导航照旧走 Cairo 软件路径(零回归)。
+        //   about:home 不走这条:它无会话/无合成,且直呈现下 PresentSoftwareFrame 会跳过贴图 → 保持原行为。
+        if (m_gpuDefault && !firstUrl.empty() && firstUrl != L"about:home") {
+            m_pendingFirstNav = firstUrl;
+            // 真机实测(第一版):GpuPanel 的 Loaded 从未到达 → 启动落到兜底定时器 → 又变回两次加载。
+            //   原因:Visibility=Collapsed 的元素不参与 measure/arrange,既不 Loaded 也不 SizeChanged。
+            //   故这里就把面板设为可见(第一帧 GPU 内容前它是透明的,盖在 RenderImage 上不影响软件路径),
+            //   并在构造期就挂好事件——晚挂会错过已经发生的 Loaded。
+            if (GpuPanel) {
+                GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+                GpuPanel->SizeChanged += ref new Windows::UI::Xaml::SizeChangedEventHandler(this, &MainPage::OnGpuPanelSizeChanged);
+            }
+            // 触发源取先到者(StartupGpuThenNav 自带去重):页面 Loaded 一定会来(Page 是可见根),
+            //   面板首次非零 SizeChanged / 面板 Loaded 通常更早。
+            this->Loaded += ref new Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnPageLoadedForGpu);
+            // 兜底:6 s 内一个触发源都没来 → 照原路发导航(软件首屏,GPU 仍由 OnNavDone 的自动开关
+            // 接手 = 老的两次加载)——绝不让启动停在"没有任何页面"。
+            m_startupNavTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+            Windows::Foundation::TimeSpan sts; sts.Duration = 60000000LL;   // 6s(100ns 单位)
+            m_startupNavTimer->Interval = sts;
+            m_startupNavTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnStartupNavTimer);
+            m_startupNavTimer->Start();
+        } else {
+            NavigateTo(ref new String(firstUrl.c_str()), true);
+        }
+    }
 }
 
 // ---- 持久化 ----
@@ -865,6 +894,20 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被更新操作/看门狗取代,丢弃此迟到回调
                     if (ok) {
+                        // Apotheosis (M4): 主页/错误页是纯软件渲染(无会话 → 无合成图层树,paintToRGBA
+                        //   落回 cairo 并填满 rgba)。直呈现模式下 PresentSoftwareFrame 自跳过贴图,画面
+                        //   就会停在没有内容的 GpuPanel 上 —— GPU 优先启动后首屏本身就可能是错误页(离线
+                        //   启动),故按本帧的会话状态切显示面:无会话→软件面(RenderImage),有会话→GPU 面。
+                        //   引擎侧不受影响(g_directPresent 只 gate harness 的 BlitToBitmap)。
+                        if (s->m_gpuOn && sessionActive != s->m_gpuPresent) {
+                            bool present = sessionActive;
+                            s->m_gpuPresent = present;
+                            g_directPresent.store(present);
+                            s->GpuPanel->Visibility = present
+                                ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+                            s->RenderImage->Visibility = present
+                                ? Windows::UI::Xaml::Visibility::Collapsed : Windows::UI::Xaml::Visibility::Visible;
+                        }
                         s->PresentSoftwareFrame(rgba);
                         s->m_pageLinks = *links;   // 存当前页链接表供点击命中
                     }
@@ -1327,7 +1370,32 @@ void MainPage::OnGpuPanelLoaded(Platform::Object^, RoutedEventArgs^)
     static bool s_done = false;
     if (s_done) return;   // 只跑一次
     s_done = true;
-    try { RunGpuProbe(GpuPanel, ref new String(LocalStateDir().c_str())); } catch (...) {}
+    // Apotheosis (M4): 走"GPU 优先启动"(m_pendingFirstNav 非空)时不跑三角形探针 —— 探针在同一个
+    //   SwapChainPanel 上自建 EGL 窗口表面并常驻(GpuProbe.cpp 末尾故意不销毁),会和紧随其后的
+    //   WebCoreGpuInit 窗口表面抢 ISwapChainPanelNative;原流程两者相隔十几秒才不打架。
+    m_gpuPanelLoadedSeen = true;   // 诊断:真机上这个事件到底来不来(见 startup 日志行)
+    if (m_pendingFirstNav.empty()) {
+        try { RunGpuProbe(GpuPanel, ref new String(LocalStateDir().c_str())); } catch (...) {}
+        return;
+    }
+    StartupGpuThenNav();   // 事件已在构造期挂好,这里只是最早的触发源之一(去重在 StartupGpuThenNav)
+}
+
+// Apotheosis (M4): 页面 Loaded —— 可视树已建,GpuPanel 已进树,是"起 GPU"的保底触发源
+// (面板 Loaded/SizeChanged 万一不来也有它)。
+void MainPage::OnPageLoadedForGpu(Platform::Object^, RoutedEventArgs^)
+{
+    m_pageLoadedSeen = true;
+    if (m_pendingFirstNav.empty()) return;
+    StartupGpuThenNav();
+}
+
+// Apotheosis (M4): 面板拿到非零尺寸 = ANGLE 可以在它上面建窗口表面 → 起 GPU,再发第一次导航。
+void MainPage::OnGpuPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::SizeChangedEventArgs^ e)
+{
+    if (m_pendingFirstNav.empty()) return;   // 导航已发出(GPU 路径或兜底)
+    if (e->NewSize.Width <= 0.0f || e->NewSize.Height <= 0.0f) return;
+    StartupGpuThenNav();
 }
 
 // ---- 输入法/屏幕键盘 ----
@@ -2683,14 +2751,75 @@ void MainPage::EnableGpu()
                     s->RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
                     s->GpuBtn->Content = GpuOrientLabel(s->m_gpuOrient);
                     s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::LimeGreen);
-                    if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
+                    // Apotheosis (M4): 启动路径把第一次导航推迟到这里 → 首个会话直接带合成,不再"加载两遍"。
+                    if (!s->m_pendingFirstNav.empty())
+                        s->StartPendingFirstNav();
+                    else if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
                         s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
                 } else {
                     s->GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
                     s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU\x2717");
                     s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
+                    // Apotheosis (M4): GPU 起不来 → 待发的首次导航照常走软件路径(g_gpuActive 仍 false)。
+                    if (!s->m_pendingFirstNav.empty())
+                        s->StartPendingFirstNav();
                 }
             }));
         } catch (...) {}
     });
+}
+
+// ============================================================================
+// Apotheosis (M4):GPU 优先启动 —— 面板就绪后先起 GPU,再发第一次导航。
+// 省掉原来的"软件加载首页一遍 → EnableGpu → 重载同一页一遍"(真机 ~14 s / ~300 MB 白工)。
+// 引擎侧合成只在 buildSession 里按 g_gpuActive 打开(port\WebCoreDriver.cpp:1357-1358),
+// 所以必须在第一次 WebCoreSessionLoad 之前 WebCoreGpuInit;失败则该次导航自然落回软件路径。
+// ============================================================================
+// 面板当前尺寸(诊断用;取不到算 0)。
+std::string MainPage::GpuPanelSizeStr()
+{
+    int pw = 0, ph = 0;
+    try { if (GpuPanel) { pw = (int)GpuPanel->ActualWidth; ph = (int)GpuPanel->ActualHeight; } } catch (...) {}
+    return std::to_string(pw) + "x" + std::to_string(ph);
+}
+
+void MainPage::StartupGpuThenNav()
+{
+    if (m_pendingFirstNav.empty()) return;
+    if (m_gpuStartupBegun) return;   // 去重:页面 Loaded / 面板 Loaded / 面板 SizeChanged 谁先到都行
+    m_gpuStartupBegun = true;
+    if (m_startupNavTimer) m_startupNavTimer->Stop();
+    WriteMemLog("startup gpu-first (panel " + GpuPanelSizeStr() + ")"
+                + " pageLoaded=" + (m_pageLoadedSeen ? "1" : "0")
+                + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0"));
+    if (m_gpuOn || m_gpuAutoTried) { StartPendingFirstNav(); return; }   // 不该发生;绝不吞掉首次导航
+    m_gpuAutoTried = true;   // 占住 OnNavDone 里的自动开 GPU 分支(否则加载完又开一次并重载)
+    EnableGpu();             // 成功/失败的 UI 回调都会调 StartPendingFirstNav()
+}
+
+// 发出被推迟的第一次导航(此刻 GpuInit 已有结论:成功=合成+直呈现,失败=软件路径)。
+void MainPage::StartPendingFirstNav()
+{
+    if (m_startupNavTimer) m_startupNavTimer->Stop();
+    if (m_pendingFirstNav.empty()) return;
+    std::wstring u = m_pendingFirstNav;
+    m_pendingFirstNav.clear();
+    NavigateTo(ref new String(u.c_str()), true);
+}
+
+// 兜底:6 s 内没有任何触发源 → 回原流程(软件首屏;GPU 仍由 OnNavDone 的自动开关接手,即老的两次加载)。
+// GpuInit 已经在飞(m_gpuStartupBegun)时不抢跑:导航由 EnableGpu 的回调发,否则两边都发 = 又变两次加载。
+void MainPage::OnStartupNavTimer(Platform::Object^, Platform::Object^)
+{
+    if (m_startupNavTimer) m_startupNavTimer->Stop();
+    if (m_pendingFirstNav.empty()) return;
+    if (m_gpuStartupBegun) {   // GpuInit 慢(引擎线程忙/ANGLE 初始化):等它的回调,别重复导航
+        WriteMemLog("startup gpu-init slow, waiting (panel " + GpuPanelSizeStr() + ")");
+        return;
+    }
+    WriteMemLog(std::string("startup fallback (timer) reason=no-trigger")
+                + " pageLoaded=" + (m_pageLoadedSeen ? "1" : "0")
+                + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0")
+                + " panel=" + GpuPanelSizeStr());
+    StartPendingFirstNav();
 }
