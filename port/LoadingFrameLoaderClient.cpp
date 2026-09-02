@@ -535,9 +535,11 @@ bool LoadingFrameLoaderClient::supportsAsyncShouldGoToHistoryItem() const
     return false;
 }
 
-void LoadingFrameLoaderClient::shouldGoToHistoryItemAsync(HistoryItem&, CompletionHandler<void(ShouldGoToHistoryItem)>&&) const
+void LoadingFrameLoaderClient::shouldGoToHistoryItemAsync(HistoryItem&, CompletionHandler<void(ShouldGoToHistoryItem)>&& completionHandler) const
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis (M4): was RELEASE_ASSERT_NOT_REACHED() - i.e. std::abort() without a dump the
+    // moment a page triggers a history navigation (history.go/back, some SPA routers). Allow it.
+    completionHandler(ShouldGoToHistoryItem::Yes);
 }
 
 void LoadingFrameLoaderClient::saveViewStateToItem(HistoryItem&)
