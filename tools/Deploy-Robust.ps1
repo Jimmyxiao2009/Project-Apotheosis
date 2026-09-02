@@ -1,13 +1,14 @@
 #Requires -Version 7.0
 # Deploy-Robust.ps1 — 非破坏式部署最新 appx 到设备:不卸载(靠版本号递增做更新覆盖),
 # 失败也保留旧版。glob 最高版本 appx,HttpClient 多段上传,轮询安装状态,动态查 FullName 开崩溃收集。
-param([string]$Ip = '192.168.3.51', [int]$TimeoutMin = 8)
+# Apotheosis: $Root = repo root, defaults to the parent of tools\ so the script works from any checkout location.
+param([string]$Ip = '192.168.3.51', [int]$TimeoutMin = 8, [string]$Root = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 $base = "https://${Ip}:443"
 
 # 取最高版本的 appx + 同目录 cer
-$appx = Get-ChildItem 'E:\Apotheosis\harness\AppPackages\Harness' -Recurse -Filter 'Harness_*_ARM.appx' |
+$appx = Get-ChildItem (Join-Path $Root 'harness\AppPackages\Harness') -Recurse -Filter 'Harness_*_ARM.appx' |
     Sort-Object { [version]([regex]::Match($_.Name, '_(\d+\.\d+\.\d+\.\d+)_').Groups[1].Value) } -Descending |
     Select-Object -First 1
 if (-not $appx) { Write-Host "找不到 appx"; exit 1 }
