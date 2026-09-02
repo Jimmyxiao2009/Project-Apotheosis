@@ -574,6 +574,22 @@ static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
                 static_cast<unsigned long>(mbi.AllocationProtect), static_cast<unsigned long>(mbi.Type));
             crashLogWrite(extra, nullptr);
         }
+        // Which modules do pc and lr point into? (a pc outside Harness.exe with a DLL name
+        // beats a bare address - the ANGLE DLLs are the usual suspects for present/resize races)
+        {
+            const uintptr_t regs[2] = { static_cast<uintptr_t>(info->ContextRecord->Pc), static_cast<uintptr_t>(info->ContextRecord->Lr) };
+            char where[200]; int off = 0;
+            for (int k = 0; k < 2; ++k) {
+                HMODULE mod = nullptr; char name[64] = { 0 };
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(regs[k]), &mod) && mod) {
+                    crashLogModuleName(mod, name, sizeof(name));
+                    off += std::snprintf(where + off, sizeof(where) - off, "%s in %s +0x%08llx  ", k ? "lr" : "pc", name[0] ? name : "?", static_cast<unsigned long long>(regs[k] - reinterpret_cast<uintptr_t>(mod)));
+                } else
+                    off += std::snprintf(where + off, sizeof(where) - off, "%s in no module  ", k ? "lr" : "pc");
+                if (off >= static_cast<int>(sizeof(where)) - 1) break;
+            }
+            crashLogWrite(where, nullptr);
+        }
         // Is the fault inside JSC's fixed executable pool? (W^X commit gap vs. stray jump)
         char pool[120];
         std::snprintf(pool, sizeof(pool), "jit pool: [0x%08llx, 0x%08llx) isJITPC(fault)=%d",
@@ -949,7 +965,11 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
     // flushCompositingStateForThisFrame 在 needsLayout() 时直接返回不 flush → 先确保布局就绪。
     {
         PerfPhase perfLayout(&g_perfCur.styleLayout);
-        view.updateLayoutAndStyleIfNeededRecursive();
+        // Apotheosis (M4): run the pending compositing-geometry update in the same layout
+        // (as Page::updateRendering does). Without the option it is deferred to the next
+        // tick, whose RenderLayerBacking::updateGeometry then dirties whole layers ->
+        // heavy/light ping-pong between consecutive ticks on animated pages.
+        view.updateLayoutAndStyleIfNeededRecursive({ WebCore::LayoutOptions::UpdateCompositingLayers });
     }
     // 文档/base 背景:合成路径下不会自动进图层(无 embedder 给根层设背景色)→ 离屏 FBO 透出底白,
     // 任何页面背景都丢。显式把文档背景色设到根层(TextureMapperLayer::paintSelf 会以纯色渲染有效
@@ -2854,7 +2874,7 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     doc->eventLoop().performMicrotaskCheckpoint();
     {
         PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4
-        doc->updateLayoutIgnorePendingStylesheets();
+        doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });   // see gpuPrepare
     }
     g_lastPendingResources = countPendingResources(*doc);
     int nonWhite = 0;
