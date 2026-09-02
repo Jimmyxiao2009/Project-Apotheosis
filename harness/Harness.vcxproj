@@ -25,6 +25,11 @@
     <ApotheosisRoot>$(MSBuildThisFileDirectory)..\</ApotheosisRoot>
     <ApotheosisVcpkgRoot Condition="'$(ApotheosisVcpkgRoot)' == ''">C:\vcpkg</ApotheosisVcpkgRoot>
     <ApotheosisIcuRoot Condition="'$(ApotheosisIcuRoot)' == ''">C:\icu-arm-uwp</ApotheosisIcuRoot>
+    <!-- Apotheosis (M4): engine tree and driver directory are overridable so an A/B engine
+         (e.g. build-clang-gpu-jit with its own WebCoreDriver-gpu.lib/.dll) can be packaged
+         without touching the baseline. Defaults keep the original layout. -->
+    <ApotheosisEngineBuildDir Condition="'$(ApotheosisEngineBuildDir)' == ''">$(ApotheosisRoot)build-clang-gpu</ApotheosisEngineBuildDir>
+    <ApotheosisDriverDir Condition="'$(ApotheosisDriverDir)' == ''">$(ApotheosisRoot)port</ApotheosisDriverDir>
     <ApotheosisUseOfficialXaml Condition="'$(ApotheosisUseOfficialXaml)' == ''">false</ApotheosisUseOfficialXaml>
     <ApotheosisConsumeOfficialXaml Condition="'$(ApotheosisConsumeOfficialXaml)' == ''">false</ApotheosisConsumeOfficialXaml>
     <ApotheosisXamlIncludeDir Condition="'$(ApotheosisUseOfficialXaml)' == 'true' Or '$(ApotheosisConsumeOfficialXaml)' == 'true'">$(ProjectDir)Generated Files\</ApotheosisXamlIncludeDir>
@@ -66,7 +71,7 @@
       <!-- Phase 1b: 链接 build-clang-webcore 的 4 个引擎库 + 驱动/stub 库 + 全部软渲染依赖。
            顺序 WebCore->JSC->PAL->WTF(被依赖者在后);MS link.exe 多遍解析,顺序容错。 -->
       <AdditionalDependencies>libEGL.lib;libGLESv2.lib;WebCoreDriver-gpu.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ApotheosisRoot)angle\arm;$(ApotheosisRoot)port;$(ApotheosisRoot)build-clang-gpu\lib;$(ApotheosisVcpkgRoot)\installed\arm-uwp\lib;$(ApotheosisIcuRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ApotheosisRoot)angle\arm;$(ApotheosisDriverDir);$(ApotheosisEngineBuildDir)\lib;$(ApotheosisVcpkgRoot)\installed\arm-uwp\lib;$(ApotheosisIcuRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- 与 lld-link 验证一致:/OPT:REF 死剥未引用代码,只保留渲染路径闭包(146 stub 覆盖之)。 -->
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>false</EnableCOMDATFolding>
@@ -166,7 +171,7 @@
     <None Include="$(ApotheosisRoot)angle\arm\libEGL.dll"><DeploymentContent>true</DeploymentContent><Link>libEGL.dll</Link></None>
     <None Include="$(ApotheosisRoot)angle\arm\libGLESv2.dll"><DeploymentContent>true</DeploymentContent><Link>libGLESv2.dll</Link></None>
     <!-- WebCore 驱动 DLL(port/*.cpp 编成的 clang-cl ARM32 引擎桥接层,含全部 C ABI 导出)。 -->
-    <None Include="$(ApotheosisRoot)port\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
+    <None Include="$(ApotheosisDriverDir)\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
     <!-- CA 根证书包(App Container 无系统证书库,curl 用 CURLOPT_CAINFO 指向它做 TLS 校验)。 -->
     <None Include="Assets\cacert.pem"><DeploymentContent>true</DeploymentContent><Link>cacert.pem</Link></None>
     <!-- 字体(App Container 拿不到设备系统字体,必须打包;fontconfig 在运行期经 LocalFolder\fonts.conf 指向这里)。 -->

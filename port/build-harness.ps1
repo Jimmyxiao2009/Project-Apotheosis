@@ -8,6 +8,10 @@ param(
     [string]$IcuRoot = 'C:\icu-arm-uwp',
     [ValidateSet('Official', 'Fallback')]
     [string]$XamlMode = 'Official',
+    # Apotheosis (M4): package an A/B engine tree + its driver without touching the baseline
+    # (defaults: <root>\build-clang-gpu and <root>\port, see Harness.vcxproj).
+    [string]$EngineBuildDir = '',
+    [string]$DriverDir = '',
     [switch]$Clean
 )
 
@@ -43,6 +47,8 @@ $commonArgs = @(
     "/p:ApotheosisVcpkgRoot=$VcpkgRoot",
     "/p:ApotheosisIcuRoot=$IcuRoot"
 )
+if ($EngineBuildDir) { $commonArgs += "/p:ApotheosisEngineBuildDir=$EngineBuildDir" }
+if ($DriverDir) { $commonArgs += "/p:ApotheosisDriverDir=$DriverDir" }
 Write-Host "=== Harness: XAML=$XamlMode, SDK=$SdkVersion, MSVC=$VCToolsVersion ===" -ForegroundColor Cyan
 
 if ($Clean) {

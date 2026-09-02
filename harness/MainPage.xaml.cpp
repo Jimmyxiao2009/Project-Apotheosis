@@ -72,6 +72,11 @@ static std::wstring InstallDir()
     catch (...) { return {}; }
 }
 
+// Apotheosis (M4): same device-side opt-in as the engine perf log (LocalState\perf.txt). Set in
+// SetupRuntimeEnv so the live-tick path can read it without touching the file system per tick.
+static bool g_perfLogEnabled = false;
+static unsigned g_memTickCount = 0;
+
 // ===== 运行期配置:fontconfig(含 SimHei CJK 回退)+ CA blob =====
 static void SetupRuntimeEnv()
 {
@@ -112,8 +117,10 @@ static void SetupRuntimeEnv()
         // only when the tester dropped LocalState\perf.txt (via WDP, effective after restart)
         // does the engine time the load/paint phases and append them to LocalState\perf.csv.
         // 未放该文件时引擎侧零开销(每个探针只剩一个分支)。SetupRuntimeEnv 跑在引擎线程,符合 ABI 要求。
-        if (GetFileAttributesW((LocalStateDir() + L"\\perf.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesW((LocalStateDir() + L"\\perf.txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
             WebCoreSetPerfLogPath((localDir + "\\perf.csv").c_str());
+            g_perfLogEnabled = true;   // Apotheosis (M4): same switch also arms the memory tick log
+        }
 
         // CA 根证书:内存 blob 注入(绕 App Container 文件式加载限制)。
         std::string srcCa = installDir + "\\cacert.pem";
@@ -139,6 +146,51 @@ static void WriteStage(const char* stage)
         if (d.empty()) return;
         std::ofstream f(WideToUtf8(d) + "\\stage.txt", std::ios::binary | std::ios::trunc);
         if (f) f << stage << "\n";
+    } catch (...) {}
+}
+
+// Apotheosis (M4): UWP enforces a per-app memory cap; on a Lumia 950 the app is terminated with no
+// crash dump once it is exceeded (github.com ≈620 MB → ntv.de). One compact snapshot of the OS view
+// of our own working set, appended to the stage lines so WDP can pull the numbers back.
+// 这三个 API 在 15254 上都有;取不到就返回 "mem=n/a",绝不影响调用点。
+static std::string MemSnapshot()
+{
+    try {
+        unsigned long long used = Windows::System::MemoryManager::AppMemoryUsage;
+        unsigned long long limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
+        auto lvl = Windows::System::MemoryManager::AppMemoryUsageLevel;
+        const char* lvlName = "Unknown";
+        switch (lvl) {
+        case Windows::System::AppMemoryUsageLevel::Low:       lvlName = "Low"; break;
+        case Windows::System::AppMemoryUsageLevel::Medium:    lvlName = "Medium"; break;
+        case Windows::System::AppMemoryUsageLevel::High:      lvlName = "High"; break;
+        case Windows::System::AppMemoryUsageLevel::OverLimit: lvlName = "OverLimit"; break;
+        default: break;
+        }
+        const unsigned long long kMB = 1024ULL * 1024ULL;
+        int pct = (limit > 0) ? (int)((used * 100ULL) / limit) : 0;
+        return "mem=" + std::to_string(used / kMB) + "/" + std::to_string(limit / kMB)
+             + "MB(" + std::to_string(pct) + "%) lvl=" + std::string(lvlName);
+    } catch (...) { return std::string("mem=n/a"); }
+}
+
+// Apotheosis (M4): stage.txt is truncated on every write (it is the "where are we now" marker), so
+// the memory numbers get their own append-only log: LocalState\mem.txt, one line per event with a
+// local HH:mm:ss prefix. 这些行很稀疏(每次导航几行 / 事件级),每次开关文件的开销可以忽略。
+static void WriteMemLog(const std::string& line)
+{
+    try {
+        std::wstring d = LocalStateDir();
+        if (d.empty()) return;
+        SYSTEMTIME st = {};
+        GetLocalTime(&st);
+        char ts[16] = "";
+        ts[0] = (char)('0' + (st.wHour / 10) % 10);   ts[1] = (char)('0' + st.wHour % 10);   ts[2] = ':';
+        ts[3] = (char)('0' + (st.wMinute / 10) % 10); ts[4] = (char)('0' + st.wMinute % 10); ts[5] = ':';
+        ts[6] = (char)('0' + (st.wSecond / 10) % 10); ts[7] = (char)('0' + st.wSecond % 10); ts[8] = ' ';
+        ts[9] = '\0';
+        std::ofstream f(WideToUtf8(d) + "\\mem.txt", std::ios::binary | std::ios::app);
+        if (f) f << ts << line << "\n";
     } catch (...) {}
 }
 
@@ -484,10 +536,28 @@ MainPage::MainPage()
             ref new Windows::Foundation::EventHandler<Platform::Object^>(
                 [](Platform::Object^, Platform::Object^) {
                     auto lvl = Windows::System::MemoryManager::AppMemoryUsageLevel;
+                    // Apotheosis (M4): the OS only raises this when we cross a level boundary (rare),
+                    // so logging it is free and it is the last breadcrumb before a silent kill.
+                    WriteMemLog("mem-event increased " + MemSnapshot());
                     if (lvl == Windows::System::AppMemoryUsageLevel::High || lvl == Windows::System::AppMemoryUsageLevel::OverLimit) {
                         int crit = (lvl == Windows::System::AppMemoryUsageLevel::OverLimit) ? 1 : 0;
                         WebEngine::instance().post([crit]() { try { WebCoreReleaseMemory(crit); } catch (...) {} });
                     }
+                });
+        // Apotheosis (M4): the cap itself moves (another app in the foreground, PLM). The args carry
+        // the old/new limit — that is exactly the number we are missing when the app dies silently.
+        Windows::System::MemoryManager::AppMemoryUsageLimitChanging +=
+            ref new Windows::Foundation::EventHandler<Windows::System::AppMemoryUsageLimitChangingEventArgs^>(
+                [](Platform::Object^, Windows::System::AppMemoryUsageLimitChangingEventArgs^ e) {
+                    const unsigned long long kMB = 1024ULL * 1024ULL;
+                    unsigned long long oldLimit = 0, newLimit = 0;
+                    try { oldLimit = e->OldLimit; newLimit = e->NewLimit; } catch (...) {}
+                    WriteMemLog("mem-event limit-changing old=" + std::to_string(oldLimit / kMB)
+                                + "MB new=" + std::to_string(newLimit / kMB) + "MB "
+                                + MemSnapshot());
+                    // 新上限已低于当前用量 → 立刻按临界级别放缓存,别等 AppMemoryUsageIncreased。
+                    if (newLimit > 0 && Windows::System::MemoryManager::AppMemoryUsage >= newLimit)
+                        WebEngine::instance().post([]() { try { WebCoreReleaseMemory(1); } catch (...) {} });
                 });
     } catch (...) {}
     // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
@@ -737,7 +807,11 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 title = L"主页";
             } else {
                 WriteStage(("before-load " + surl).c_str());
+                WriteMemLog("before-load url=" + surl + " " + MemSnapshot());   // Apotheosis (M4)
                 int netRc = WebCoreSessionLoad(surl.c_str(), kW, kH, rgba->data());   // 常驻会话加载
+                // Apotheosis (M4): peak right after the load, still before title/diag/compositing
+                // queries — if the OS kills us in those, mem.txt already carries the number.
+                WriteMemLog("mem-loading url=" + surl + " " + MemSnapshot());
                 char t[512] = ""; WebCoreGetTitle(t, sizeof t);
                 char diag[4096] = ""; WebCoreGetDiag(diag, sizeof diag);
                 char err[512] = ""; WebCoreGetLastError(err, sizeof err);   // curl 错误码+描述(失败时)
@@ -746,6 +820,8 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 WriteStage(("after-load url=" + surl + " rc=" + std::to_string(netRc)
                             + " compositing=" + std::to_string(comp)
                             + "\nERR: " + err + "\ndiag: " + diag).c_str());
+                WriteMemLog("after-load url=" + surl + " rc=" + std::to_string(netRc)
+                            + " " + MemSnapshot());   // Apotheosis (M4)
                 if (netRc == 0) {
                     rc = 0;
                     loadOk = true;
@@ -1426,6 +1502,11 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                         }
                         return;
                     }
+                    // Apotheosis (M4): memory trend while a page just sits there (SPA/animation ticks
+                    // grow the heap). Ticks are the hot path → opt-in (LocalState\perf.txt) and only
+                    // every 50th completed tick, i.e. every ~10 s at 5 fps.
+                    if (g_perfLogEnabled && (++g_memTickCount % 50) == 0)
+                        WriteMemLog("mem-tick n=" + std::to_string(g_memTickCount) + " " + MemSnapshot());
                     if (hashCopy == s->m_lastFrameHash) {        // 画面没变:连续静止则停帧省电
                         if (pendingCopy > 0) {
                             s->m_liveStaticTicks = 0;            // 仍有图片/子资源在途:继续 tick,等待完成回调和解码
