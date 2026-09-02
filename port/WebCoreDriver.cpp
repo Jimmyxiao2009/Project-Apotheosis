@@ -628,7 +628,7 @@ static bool g_perfHeaderDone = false;
 static const char* const kPerfHeader =
     "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
     "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
-    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial\n";
+    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -644,6 +644,13 @@ struct PerfRow {
     // Apotheosis (M4): TextureMapper layers repainted in full vs. by dirty rect in this operation
     // (wkWinUWPTexmapDirtyStats, WebKit winuwp f14d05ff1f); -1 = no composite happened.
     int dirtyFull = -1, dirtyPartial = -1;
+    // Apotheosis (M4): curl's breakdown of the main resource of this navigation
+    // (WebCorePortNetTiming, WebKit CurlRequest::didReceiveHeader). Milliseconds since
+    // the transfer started; net_connect is the TCP handshake only, net_tls the TLS one,
+    // net_ttfb the whole wait until the first response byte. -1 = never reported.
+    // Chasing the sporadic 14-22 s "first contact" stalls seen on the Lumia over Wi-Fi.
+    double netDns = -1, netConnect = -1, netTls = -1, netTtfb = -1;
+    int httpVer = -1;         // 10 / 11 / 20 / 30; 0 = curl could not tell
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -741,10 +748,18 @@ static void perfFlush()
         char df[12], dp[12];
         perfFmtI(df, sizeof df, r.dirtyFull);
         perfFmtI(dp, sizeof dp, r.dirtyPartial);
-        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s\n",
+        // M4: network breakdown of the main resource (empty cells when never reported).
+        const double netVals[4] = { r.netDns, r.netConnect, r.netTls, r.netTtfb };
+        char nt[4][16];
+        for (int k = 0; k < 4; ++k)
+            perfFmtD(nt[k], sizeof nt[k], netVals[k]);
+        char hv[12];
+        perfFmtI(hv, sizeof hv, r.httpVer);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
-            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp);
+            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
+            nt[0], nt[1], nt[2], nt[3], hv);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -849,6 +864,27 @@ void perfNavLoadEvent()
 }
 
 } // namespace WebCorePort
+
+// Apotheosis (M4): curl's DNS/TCP/TLS/TTFB breakdown for the main resource of the
+// current navigation. Called from WebKit's CurlRequest::didReceiveHeader (WK_WINUWP)
+// on the main thread, once per response, for VeryHigh-priority requests only — that
+// is WebKit's priority for the main document, but subresources can be raised to it
+// too, so the FIRST report inside a nav operation wins (that is the main resource:
+// nothing else can have finished its headers before it). Only recorded for "nav"
+// rows; scroll/tick/click operations have no main resource of their own.
+extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double connectMs,
+    double tlsMs, double ttfbMs, int httpVersion)
+{
+    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav || !isMainResource)
+        return;
+    if (g_perfCur.netTtfb >= 0)   // first main-resource report of this navigation wins
+        return;
+    g_perfCur.netDns = dnsMs;
+    g_perfCur.netConnect = connectMs;
+    g_perfCur.netTls = tlsMs;
+    g_perfCur.netTtfb = ttfbMs;
+    g_perfCur.httpVer = httpVersion;
+}
 
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
@@ -1609,6 +1645,20 @@ void WebCoreSetCrashLogPath(const char* path)
     WTFWinUWPSetCrashHook(&crashLogWtfHook);
     AddVectoredExceptionHandler(1, &crashLogVectoredHandler);
     std::signal(SIGABRT, &crashLogSignalHandler);
+}
+
+// Apotheosis (M4): resolve-mode switch for the curl backend. The phone has global
+// IPv6 addresses; on some links the v6 path is a black hole and the first contact
+// with a host stalls 14-22 s before the main resource commits, while an immediate
+// reload takes 0.4 s. Rather than hardcoding IPv4 we let the harness flip it at
+// runtime so it can be A/B-measured against the net_dns/net_connect/net_ttfb columns.
+// Takes effect for handles created after the call (i.e. the next request), so call
+// it before starting a navigation. Implemented in WebKit's CurlContext.cpp.
+extern "C" void WebCorePortSetIPv4Only(int on);
+
+void WebCoreSetIPv4Only(int enable)
+{
+    WebCorePortSetIPv4Only(enable);
 }
 
 // Apotheosis (M4 step 1): switch per-phase timing on and point it at a CSV file.

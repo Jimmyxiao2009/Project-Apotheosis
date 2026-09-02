@@ -83,6 +83,16 @@ void WebCorePerfFlush(void);
 // call it as early as possible (SetupRuntimeEnv).
 void WebCoreSetCrashLogPath(const char* path);
 
+// ---- network resolve mode ----
+// Force the curl backend to resolve names to IPv4 only (1) or let it use whatever
+// the resolver returns (0, the default). The phone has global IPv6 addresses and on
+// some links the v6 path is a black hole: first contact with a host then stalls for
+// 14-22 s before the main resource commits, while an immediate reload takes 0.4 s.
+// Takes effect for the next request, so call it before starting a navigation.
+// Measure the effect with the net_dns/net_connect/net_tls/net_ttfb columns of the
+// perf CSV. Engine-thread call.
+void WebCoreSetIPv4Only(int enable);
+
 // ---- diagnostics / page metadata (written by the render/load paths) ----
 // Each copies a NUL-terminated UTF-8 string into buf (<= len bytes) and returns
 // the number of bytes written (excluding NUL); empty string if nothing recorded.
