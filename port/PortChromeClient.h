@@ -34,6 +34,9 @@ public:
     // ---- driver-facing accessors (the whole point of this subclass) ----
     WebCore::GraphicsLayer* rootLayer() const { return m_rootLayer; }
     bool takeNeedsPresent() { bool v = m_needsPresent; m_needsPresent = false; return v; }
+    // Apotheosis (M4): non-consuming read, lets WebCoreLiveTick decide whether a tick may keep
+    // the already-uploaded tiles (nothing asked for a rendering update since the last present).
+    bool peekNeedsPresent() const { return m_needsPresent; }
 
     // ======================================================================
     // REAL accelerated-compositing behavior

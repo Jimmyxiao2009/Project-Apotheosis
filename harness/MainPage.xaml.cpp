@@ -1390,7 +1390,12 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
         || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
         || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) { StopLiveMode(); return; }
     if (m_liveBusy) {                      // 上一帧引擎任务还没回
-        if (++m_liveBusyAge < 5) return;   // 正常等(~1s 内)
+        // Apotheosis (M4): perf.csv showed a live tick costing 1-4 s on github.com. With the
+        // old 5-tick (~1 s) self-heal a new tick was queued on the engine thread every second
+        // while the previous one was still running, so the FIFO grew without bound and every
+        // navigation/scroll queued behind minutes of ticks ("load timeout", eventually OOM).
+        // Only self-heal after 30 s - that is a genuinely lost RunAsync, not a slow frame.
+        if (++m_liveBusyAge < 150) return;
         m_liveBusy = false;                // 卡过久 → RunAsync 很可能丢了,自愈不死循环
     }
     m_liveBusyAge = 0;

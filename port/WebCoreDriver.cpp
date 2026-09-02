@@ -562,7 +562,10 @@ static void perfEnd()
     }
     if (g_perfRows < kPerfRingSize)
         g_perfRing[g_perfRows++] = g_perfCur;
-    if (g_perfOpIsNav || g_perfRows >= kPerfRingSize)
+    // Flush on nav completion, and every 32 rows so a crash mid-session (seen
+    // on ntv.de) does not take the whole ring with it - still one file open per
+    // ~6 s of ticks, not per frame.
+    if (g_perfOpIsNav || g_perfRows >= 32)
         perfFlush();
 }
 
@@ -2604,6 +2607,15 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     }
     g_lastPendingResources = countPendingResources(*doc);
     int nonWhite = 0;
+    // Apotheosis (M4): perf.csv showed every idle tick paying ~1 s in
+    // updateBackingStoreIncludingSubLayers because gpuPrepare force-dirties the
+    // whole layer tree. If WebCore did not ask for a rendering update since the
+    // last present and no layer animation is running, nothing can have changed:
+    // take the scroll fast path and keep the uploaded tiles. Any invalidation
+    // (JS/DOM change, image decode, new layers) sets needsPresent through
+    // triggerRenderingUpdate and still gets the full dirty-tree composite.
+    if (g_gpuActive && !g_session->chrome->peekNeedsPresent() && !g_gpuAnimating)
+        g_gpuScrollFast = true;
     return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
 }
 
