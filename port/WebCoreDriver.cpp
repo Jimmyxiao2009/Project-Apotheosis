@@ -230,6 +230,12 @@ static bool isValidSurfaceSize(int w, int h)
 bool ensureWebCoreInitialized()
 {
     static bool initialized = [] {
+        // Apotheosis (M4): JSC reads JSC_* options from the environment during initialize().
+        // Set them here (same CRT as the engine) rather than in the harness. gcMaxHeapSize
+        // bounds the JS heap on the 1.5 GB app cap (it is unlimited by default and github.com
+        // took the process to 770 MB); _putenv_s does not overwrite a value the tester set.
+        if (!std::getenv("JSC_gcMaxHeapSize"))
+            _putenv_s("JSC_gcMaxHeapSize", "402653184");   // 384 MB
         JSC::initialize();                       // JSC heap/threading/options
         WTF::initializeMainThread();             // pins this thread as the WebKit main thread + RunLoop::main
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
