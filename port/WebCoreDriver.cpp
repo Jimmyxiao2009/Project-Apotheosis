@@ -2826,7 +2826,13 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // take the scroll fast path and keep the uploaded tiles. Any invalidation
     // (JS/DOM change, image decode, new layers) sets needsPresent through
     // triggerRenderingUpdate and still gets the full dirty-tree composite.
-    if (g_gpuActive && !g_session->chrome->peekNeedsPresent() && !g_gpuAnimating)
+    // Experiment F (2026-09-02): on github.com not one of 84 ticks took the fast
+    // path - the page requests a rendering update every tick, so each tick still
+    // re-rasterised the whole tree (0.8-1.1 s). Scroll frames prove the retained
+    // tiles are correct: take the fast path on every tick. WebCore's own dirty
+    // rects (setNeedsDisplayInRect via RenderLayerBacking) still repaint what
+    // changed; navigation/click/type keep the full force-dirty composite.
+    if (g_gpuActive)
         g_gpuScrollFast = true;
     return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
 }
