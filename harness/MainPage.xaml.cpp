@@ -917,12 +917,16 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                         //   引擎侧不受影响(g_directPresent 只 gate harness 的 BlitToBitmap)。
                         //   判据用本页实际合成状态(comp=根图层已附),而不是"有会话":GpuInit 恰好在
                         //   这次加载途中完成时,会话是无合成建起来的 → 引擎按 cairo 填了 rgba,必须走软件面。
+                        //   ★ GpuInit 成功后绝不再 Collapse GpuPanel:折叠 = 面板变 0×0,ANGLE 会经面板
+                        //   dispatcher 重建/缩放交换链,按作者的线程约定那条路会 std::terminate(真机上
+                        //   开第二个标签即崩)。改用 Opacity=0 隐藏 —— 面板留在树里、尺寸不变、不绘制,
+                        //   下层 RenderImage 直接透出来(GpuPanel 本来就 IsHitTestVisible=False,不挡点击)。
                         if (s->m_gpuOn && (sessionActive && comp != 0) != s->m_gpuPresent) {
                             bool present = (sessionActive && comp != 0);
                             s->m_gpuPresent = present;
                             g_directPresent.store(present);
-                            s->GpuPanel->Visibility = present
-                                ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+                            s->GpuPanel->Opacity = present ? 1.0 : 0.0;
+                            s->GpuPanel->IsHitTestVisible = false;
                             s->RenderImage->Visibility = present
                                 ? Windows::UI::Xaml::Visibility::Collapsed : Windows::UI::Xaml::Visibility::Visible;
                         }
@@ -2605,7 +2609,8 @@ void MainPage::RestoreTab(int i)
     ++m_opSeq;
     m_interacting = false;
     if (m_loadWatchdog) m_loadWatchdog->Stop();
-    m_loading = false;
+    SetLoading(false);          // 同 NewTab:复位进度条/图标,并清掉 GPU 优先拦截置的加载态
+    CancelPendingFirstNav();    // 上一个标签攒下的待发导航不许打进这个标签
     UpdateNavButtons();
     UpdateLockIcon();
     m_urlSyncing = true;
@@ -2624,7 +2629,8 @@ void MainPage::NewTab()
     ++m_opSeq;
     m_interacting = false;
     if (m_loadWatchdog) m_loadWatchdog->Stop();
-    m_loading = false;
+    SetLoading(false);          // 直接写 m_loading 会漏掉进度条/地址栏图标复位(GPU 优先拦截也置过它)
+    CancelPendingFirstNav();    // 上一个标签攒下的待发导航不许打进新标签
     m_navStack.clear(); m_navIndex = -1;
     m_currentUrl.clear(); m_currentTitle.clear();
     m_pageScale = 1.0f;
@@ -2641,7 +2647,8 @@ void MainPage::CloseTab(int i)
         Tab t; t.currentUrl = g_homeUrl;
         m_tabs.push_back(t);
         m_activeTab = 0;
-        ++m_opSeq; m_interacting = false; if (m_loadWatchdog) m_loadWatchdog->Stop(); m_loading = false;
+        ++m_opSeq; m_interacting = false; if (m_loadWatchdog) m_loadWatchdog->Stop();
+        SetLoading(false); CancelPendingFirstNav();   // 同 NewTab/RestoreTab
         m_navStack.clear(); m_navIndex = -1; m_currentUrl.clear(); m_currentTitle.clear(); m_pageScale = 1.0f;
         UpdateTabCount();
         NavigateTo(ref new String(g_homeUrl.c_str()), true);
@@ -2780,7 +2787,10 @@ void MainPage::EnableGpu()
                     else if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
                         s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
                 } else {
-                    s->GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                    // 同上:只隐不折叠。GpuInit 可能是"窗口表面已建、TextureMapper 才失败"(rc=-22),
+                    // 那时 ANGLE 已绑在面板上,折叠 → 0×0 重建交换链 = 崩。
+                    s->GpuPanel->Opacity = 0.0;
+                    s->GpuPanel->IsHitTestVisible = false;
                     s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU\x2717");
                     s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
                     // Apotheosis (M4): GPU 起不来 → 待发的首次导航照常走软件路径(g_gpuActive 仍 false)。
@@ -2833,6 +2843,15 @@ void MainPage::StartupGpuThenNav()
     if (m_gpuOn || m_gpuAutoTried) { StartPendingFirstNav(); return; }   // 不该发生;绝不吞掉首次导航
     m_gpuAutoTried = true;   // 占住 OnNavDone 里的自动开 GPU 分支(否则加载完又开一次并重载)
     EnableGpu();             // 成功/失败的 UI 回调都会调 StartPendingFirstNav()
+}
+
+// Apotheosis (M4): 取消待发的首次网络导航 + 停兜底定时器。开/切/关标签时必调:否则上一个标签攒下的
+// 待发导航会打进新标签(NavigateTo 的 GPU 优先拦截见本文件 ~:797)。GpuInit 本身不取消(幂等、已在飞,
+// 成功了对新标签一样有用);m_gpuStartupBegun 保持 true → 拦截是一次性的,不会再拦第二次。
+void MainPage::CancelPendingFirstNav()
+{
+    m_pendingFirstNav.clear();
+    if (m_startupNavTimer) m_startupNavTimer->Stop();
 }
 
 // 发出被推迟的第一次导航(此刻 GpuInit 已有结论:成功=合成+直呈现,失败=软件路径)。

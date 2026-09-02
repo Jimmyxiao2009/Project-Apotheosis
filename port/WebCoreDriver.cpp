@@ -369,6 +369,12 @@ static size_t webcoreDownloadWrite(void* ptr, size_t size, size_t nmemb, void* s
 struct DriverLoadState {
     bool mainDone = false;   // 主文档完成(成功或失败),由完成回调置位
     bool failed   = false;
+    // Apotheosis (M3): the main document reached dispatchDidCommitLoad (set from
+    // perfNavCommit, the driver's only commit observer — LoadingFrameLoaderClient
+    // exists for the main frame only, createFrame() returns nullptr). Lets the load
+    // path tell "committed but no load event" (ImageDocument / deferred-load bug →
+    // render what we have) from "nothing ever arrived" (a real timeout).
+    bool committed = false;
 };
 
 struct Session {
@@ -844,6 +850,10 @@ void perfNavStart()
 
 void perfNavCommit()
 {
+    // Apotheosis (M3): commit bookkeeping runs even with perf logging off — the load
+    // path needs it to decide timeout vs. "committed, just no load event".
+    if (g_session)
+        g_session->load.committed = true;
     if (!g_perfOn || !g_perfInOp || g_perfCur.netCommit >= 0)
         return;
     g_perfCur.netCommit = perfSinceNavStart();
@@ -932,7 +942,19 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             RefPtr<DocumentLoader> dl = frameRef->loader().activeDocumentLoader();
             bool loading = dl && dl->isLoadingInAPISense();
             bool navDone = mainDone && *mainDone;
-            bool ready = navDone || allowEarlyStopWithoutNav;
+            // Apotheosis (M3): some main-frame loads commit and go idle without ever
+            // dispatching a load event — ImageDocument (image URL in the main frame),
+            // and occasionally an HTML page hit by the defer/cancel bug. *mainDone then
+            // stays false forever and only the watchdog ends the pump (30 s of dead UI,
+            // then kErrLoadTimeout). Accept "committed document loader, no longer
+            // loading, parser finished" as a second readiness signal. It only opens the
+            // *gate*: the 16-quiet-tick hysteresis below still has to be satisfied, so a
+            // live load (which keeps the loader busy) cannot be cut short by this.
+            RefPtr<DocumentLoader> committedLoader = frameRef->loader().documentLoader();
+            RefPtr<Document> frameDoc = frameRef->document();
+            bool loaderIdle = committedLoader && committedLoader->isCommitted()
+                && !committedLoader->isLoading() && frameDoc && !frameDoc->parsing();
+            bool ready = navDone || allowEarlyStopWithoutNav || loaderIdle;
 
             // ★ 关键:绝不在 isLoadingInAPISense 一转 false 就停。模块求值(<script type=module>)和
             //   重定向后最终文档的样式表应用都发生在"加载器空闲之后",经 ScriptRunner/WindowEventLoop 的
@@ -1352,6 +1374,17 @@ static void teardownSession()
     using namespace WebCore;
     if (!g_session)
         return;
+    // Apotheosis: (a) GPU sessions must be torn down with the ANGLE context current.
+    // ~Page destroys the GraphicsLayerTextureMapper tree, and with it the BitmapTextures /
+    // FBOs it owns — those destructors call into GL. Outside gpuPresent nothing makes the
+    // context current, so on the second tab the GL deletes ran against no current context
+    // (suspected device crash). Make it current first. Also drop the per-frame flags, which
+    // describe the session that is going away; g_gpuActive / g_gpuPresentMode / g_glContext /
+    // g_textureMapper are deliberately process-lifetime and stay untouched.
+    if (g_gpuActive && g_glContext)
+        g_glContext->makeContextCurrent();
+    g_gpuAnimating = false;
+    g_gpuScrollFast = false;
     if (g_session->client)
         g_session->client->setLoadCompletionHandler({});       // (b)
     if (g_session->mainFrame)
@@ -1474,9 +1507,20 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
                  /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
     }
 
-    if (!g_session->load.mainDone)
-        return kErrLoadTimeout;
-    if (g_session->load.failed)
+    // Apotheosis (M3): "no load event" is not "nothing loaded". An ImageDocument (main
+    // frame navigated to an image URL) and, occasionally, an HTML page hit by the
+    // defer/cancel bug commit, parse and paint but never dispatch a load event, so
+    // mainDone stays false and pumpLoop only ends via its watchdog. If the main document
+    // did commit, render what we have and report success (the diag is tagged below);
+    // only a load that never committed anything is a genuine timeout.
+    bool noLoadEvent = false;
+    if (!g_session->load.mainDone) {
+        RefPtr<DocumentLoader> committedLoader = localMainFrame->loader().documentLoader();
+        bool committed = g_session->load.committed || (committedLoader && committedLoader->isCommitted());
+        if (!committed || !localMainFrame->document())
+            return kErrLoadTimeout;
+        noLoadEvent = true;
+    } else if (g_session->load.failed)
         return kErrLoadFailed;
 
     // 提交后 WebKit 给新文档新建了 LocalFrameView,加载前的 view 已失效 → 重取 + 重设背景/尺寸。
@@ -1522,6 +1566,11 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     if (prc != kOK)
         return prc;
     writeDiag(*document, *view, w, h, nonWhite);
+    if (noLoadEvent) {   // Apotheosis (M3): keep the device log honest about why we returned early
+        const size_t used = std::strlen(g_lastDiag);
+        if (used + 1 < sizeof g_lastDiag)
+            std::snprintf(g_lastDiag + used, sizeof g_lastDiag - used, " (no load event)");
+    }
     return kOK;
 }
 
@@ -2476,6 +2525,7 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;
+    PerfOpGuard perfOp("scale", nullptr, 0, 0);   // Apotheosis (M4): pinch/double-tap zoom gets its own perf.csv row
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();

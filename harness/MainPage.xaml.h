@@ -119,6 +119,7 @@ namespace Harness {
         //   使首个会话就带合成(引擎侧合成只在 buildSession 按 g_gpuActive 打开),省掉启动时的重复加载。
         void StartupGpuThenNav();      // 触发源(页面/面板 Loaded、面板 SizeChanged)共用,自带去重
         void StartPendingFirstNav();   // 发出并清空 m_pendingFirstNav(GPU 成功/失败/兜底都走这里)
+        void CancelPendingFirstNav();  // 丢弃待发导航 + 停兜底定时器(开/切/关标签时必调)
         void OnStartupNavTimer(Platform::Object^ sender, Platform::Object^ e);   // 兜底定时器:触发源都没来也要导航
         void OnPageLoadedForGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);  // 页面 Loaded:保底触发源
         void ArmStartupNavTimer();      // (重新)武装 6s 兜底定时器:待发导航必须出去
