@@ -77,6 +77,10 @@ if ($XamlMode -eq 'Official') {
         '/p:ApotheosisXamlCodegen=true',
         '/p:IntDir=Harness\ARM\XamlCodegen\'
     )
+    # BuildCompile also links, so this pass needs the same engine/driver trees as the v143 pass;
+    # otherwise it falls back to <root>\build-clang-gpu and fails with LNK1181 WebCore.lib.
+    if ($EngineBuildDir) { $xamlArgs += "/p:ApotheosisEngineBuildDir=$EngineBuildDir" }
+    if ($DriverDir) { $xamlArgs += "/p:ApotheosisDriverDir=$DriverDir" }
     Write-Host "=== [1/2] Official XAML codegen: VS2017 + SDK $XamlSdkVersion ===" -ForegroundColor Cyan
     & $msbuild2017 @xamlArgs /t:Clean /v:minimal
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
