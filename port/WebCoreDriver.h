@@ -178,6 +178,22 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA);
 void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
+
+// Nested-scroll support (cookie-consent overlays, modals, iframes): unlike WebCoreScrollBy, which
+// only ever moves the main frame, these route through WebCore's real wheel-event scroll targeting
+// so an overflow:auto container/modal/iframe under the point scrolls instead of the page behind it.
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt/WebCoreScrollBy.
+//
+// WebCoreIsScrollableAt: hit test only, no event dispatched. Returns 1 if a scrollable ancestor
+// (or an iframe) is under the point, else 0. Call at gesture start to pick the fast path.
+int WebCoreIsScrollableAt(int x, int y);
+// WebCoreWheelAt: dispatches one synthetic wheel event (delta in px, granularity
+// ScrollByPixelWheelEvent). phase: 0 none / 1 began / 2 changed / 3 ended (currently inert on this
+// port, see WebCoreDriver.cpp). Returns 1 if a nested scroller consumed it (call again with the
+// next delta), 0 if it did not (main-frame scroll position is left unchanged either way — on a 0
+// return the harness must call WebCoreScrollBy itself for this delta).
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase);
+
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal

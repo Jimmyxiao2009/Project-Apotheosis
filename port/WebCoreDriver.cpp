@@ -168,6 +168,12 @@ void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTe
 #include <WebCore/DoublePoint.h>             // PlatformMouseEvent 的坐标类型
 #include <wtf/MonotonicTime.h>               // PlatformMouseEvent 时间戳
 #include <wtf/OptionSet.h>                   // OptionSet<PlatformEvent::Modifier>
+#include <WebCore/PlatformWheelEvent.h>      // PlatformWheelEvent(WebCoreWheelAt)
+#include <WebCore/ScrollingCoordinatorTypes.h> // WheelEventProcessingSteps(full definition; EventHandler.h only forward-declares it)
+#include <WebCore/RenderBox.h>               // RenderBox::canBeScrolledAndHasScrollableArea()(WebCoreIsScrollableAt)
+#include <WebCore/RenderElement.h>           // RenderObject::parent()
+#include <WebCore/ContainerNodeInlines.h>    // inline ContainerNode::renderer()(hit->renderer() in WebCoreIsScrollableAt)
+#include <WebCore/HTMLIFrameElement.h>       // is<HTMLIFrameElement>(WebCoreIsScrollableAt)
 #include <optional>
 #include <algorithm>
 
@@ -2918,6 +2924,124 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     if (prc != kOK)
         return prc;
     return kOK;
+}
+
+// Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
+// whether a touch-pan should route through WebCoreWheelAt (nested scroller under the finger) or
+// go straight to the WebCoreScrollBy main-frame fast path — without dispatching a real event.
+// Hit test only (elementFromPoint(), same call WebCoreClickAt already uses to find the focus
+// target); walks the render tree up from the hit element the same way WebCore's own wheel/touch
+// default-action target search does (Source/WebCore/dom/Node.cpp defaultEventHandler(), the
+// PAN_SCROLLING and TOUCH_EVENTS legs both walk renderer()->parent() looking for the first
+// RenderBox::canBeScrolledAndHasScrollableArea()). Also counts an ancestor <iframe> as scrollable
+// (its own EventHandler/FrameView owns that, not this frame's). Stops at the RenderView — the
+// main frame itself is never "nested". (x,y) = viewport/bitmap px, same convention as
+// WebCoreClickAt/WebCoreScrollBy. Returns 1/0; no session or bad hit test also returns 0.
+int WebCoreIsScrollableAt(int x, int y)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+
+    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    if (!hit)
+        return 0;
+
+    for (RenderObject* r = hit->renderer(); r; r = r->parent()) {
+        if (r->isRenderView())
+            break;   // reached the main frame's own box — not nested, stop here
+        if (Node* node = r->node()) {
+            if (is<HTMLIFrameElement>(*node))
+                return 1;
+        }
+        if (is<RenderBox>(*r) && downcast<RenderBox>(*r).canBeScrolledAndHasScrollableArea())
+            return 1;
+    }
+    return 0;
+}
+
+// Apotheosis (nested-scroll support): dispatch a synthetic wheel event at (x,y) so WebCore's own
+// scroll routing — the same default-action walk WebCoreIsScrollableAt above inspects
+// (EventHandler::handleWheelEventInAppropriateEnclosingBox, Source/WebCore/page/EventHandler.cpp)
+// — can hand the delta to the innermost overflow:auto container, a modal, or an iframe under the
+// point, instead of only ever moving the main frame the way WebCoreScrollBy does. (x,y) =
+// viewport/bitmap px, same convention as WebCoreClickAt/ScrollBy (EventHandler's
+// windowToContents() adds the scroll offset internally, see the comment on WebCoreClickAt).
+// deltaX/deltaY = px, granularity ScrollByPixelWheelEvent. `phase` (0 none/1 began/2 changed/
+// 3 ended) is accepted for a future gesture-latching port but currently inert: OptionsWinUWP.cmake
+// sets ENABLE_ASYNC_SCROLLING OFF (KINETIC_SCROLLING is likewise off), so on this port
+// PlatformWheelEventPhase has only the `None` enumerator — Began/Changed/Ended do not exist to
+// name — and PlatformWheelEvent's only public constructor (the one used below) does not expose a
+// phase setter regardless. EventHandler still routes the event correctly with Phase::None;
+// phases only ever refine latching/momentum on the platforms that have them.
+//
+// Returns 1 if a nested scroller consumed the event (WebCore reported it handled AND the
+// main-frame scroll position did not move), 0 to tell the harness to fall back to its
+// WebCoreScrollBy path for this delta. handleWheelEvent()'s own default action can itself scroll
+// the main FrameView when nothing nested claims the delta first
+// (EventHandler::processWheelEventForScrolling -> handleWheelEventInScrollableArea(view)) — so
+// whenever that happens (or nothing was handled at all) the main-frame scroll position is
+// explicitly restored here before returning 0. That keeps WebCoreScrollBy the *only* thing that
+// ever moves the main frame, so the harness can always call it unconditionally on a 0 return
+// without risking a double-scroll.
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase)
+{
+    using namespace WebCore;
+    (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    // Same reason WebCoreScrollBy does this first: drain a decode callback that finished mid-
+    // gesture so it is visible before we hit-test/scroll, not one tick later.
+    RunLoop::cycle();
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return 0;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test + scrollable-area lookup need current layout
+
+    const ScrollPosition beforeMain = view->scrollPosition();
+
+    IntPoint p(x, y);
+    PlatformWheelEvent wheelEvent(p, p, deltaX, deltaY, deltaX, deltaY,
+        PlatformWheelEventGranularity::ScrollByPixelWheelEvent,
+        /* shiftKey */ false, /* ctrlKey */ false, /* altKey */ false, /* metaKey */ false);
+    OptionSet<WheelEventProcessingSteps> steps { WheelEventProcessingSteps::SynchronousScrolling,
+        WheelEventProcessingSteps::BlockingDOMEventDispatch };   // the default/synchronous steps (see EventHandlerMac/IOS)
+    auto [result, handling] = lf->eventHandler().handleWheelEvent(wheelEvent, steps);
+    (void)handling;
+
+    const ScrollPosition afterMain = view->scrollPosition();
+    const bool consumedByNested = result.wasHandled() && (afterMain == beforeMain);
+
+    if (!consumedByNested && afterMain != beforeMain)
+        view->setScrollPosition(beforeMain);   // undo any main-frame move: that is WebCoreScrollBy's job
+
+    if (consumedByNested) {
+        // Same present path WebCoreScrollBy uses (578cbc3/82c5cef): commit the moved layer's
+        // compositing update now — this is what arms PortChromeClient::m_needsPresent, via
+        // scheduleRenderingUpdate() — and skip forceDirtyTree, since only a scroll layer moved.
+        g_session->page->isolatedUpdateRendering();
+        g_gpuScrollFast = true;
+    }
+
+    return consumedByNested ? 1 : 0;
 }
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了 extractLinks)。轻量:仅布局 + 提取,不绘制、不派发事件。

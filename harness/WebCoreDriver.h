@@ -170,6 +170,20 @@ int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 
 // 垂直滚动 dy 像素(正=向下),触发懒加载图片后重绘到 outBuf。
 int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
+
+// 嵌套滚动支持(cookie 同意浮层/模态框/iframe):WebCoreScrollBy 只会移动主帧,这两个走 WebCore
+// 真实的 wheel 事件滚动目标查找,让点下方的 overflow:auto 容器/模态框/iframe 自己滚,而不是滚到
+// 它背后的整页。(x,y) = 位图/视口像素,同 WebCoreClickAt/WebCoreScrollBy 约定。
+//
+// WebCoreIsScrollableAt:只命中测试,不派发事件。点下方有可滚动祖先(或 iframe)返回 1,否则 0。
+// 手势开始时调一次,决定走这条路还是直接 WebCoreScrollBy 快路径。
+int WebCoreIsScrollableAt(int x, int y);
+// WebCoreWheelAt:派发一次合成 wheel 事件(delta 像素,granularity=ScrollByPixelWheelEvent)。
+// phase:0 none / 1 began / 2 changed / 3 ended(此 port 上目前不生效,见 WebCoreDriver.cpp)。
+// 返回 1 = 被嵌套滚动体消费(下一个 delta 继续调它),0 = 未消费(无论哪种情况主帧滚动位置都不变——
+// 返回 0 时 harness 必须自己为这个 delta 调 WebCoreScrollBy)。
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase);
+
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();
 // 诊断:最近一次 WebCoreTypeText 的可编辑/聚焦/插入状态(排查"打字不进框")。
