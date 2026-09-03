@@ -1271,7 +1271,14 @@ static bool consoleLoggingEnabled()
 }
 
 static constexpr int kConsoleRingSize = 16;
-static std::string g_consoleRing[kConsoleRingSize];
+static constexpr int kConsoleRowSize = 600;
+// Apotheosis: POD rows, exactly like PerfRow — NOT std::string. Rows are written on the engine
+// thread (PortChromeClient::addMessageToConsole) while consoleFlush() can run from the UI thread
+// (WebCorePerfFlush on suspend) and from the crash legs (VEH / SIGABRT / terminate, on whatever
+// thread died). std::string assignment there means malloc/free on a heap another thread may be
+// inside → heap corruption in exactly the situation the log exists to explain. A fixed char array
+// only ever races on bytes: a torn row, never a crash.
+static char g_consoleRing[kConsoleRingSize][kConsoleRowSize];
 static int g_consoleRows = 0;
 static std::atomic<int> g_consoleFlushBusy { 0 };   // same re-entrancy guard shape as g_perfFlushBusy
 
@@ -1284,8 +1291,10 @@ static void consoleFlushLocked()
         g_consoleRows = 0;   // an unwritable path must not make the ring grow forever
         return;
     }
-    for (int i = 0; i < g_consoleRows; ++i)
-        std::fwrite(g_consoleRing[i].data(), 1, g_consoleRing[i].size(), fp);
+    for (int i = 0; i < g_consoleRows; ++i) {
+        g_consoleRing[i][kConsoleRowSize - 1] = '\0';   // paranoia: never fwrite past the row
+        std::fwrite(g_consoleRing[i], 1, std::strlen(g_consoleRing[i]), fp);
+    }
     std::fclose(fp);
     g_consoleRows = 0;
 }
@@ -1305,15 +1314,26 @@ static void consoleAppendLine(const char* levelStr, const char* sourceID, unsign
 {
     if (!consoleLoggingEnabled())
         return;
+    if (g_consoleRows >= kConsoleRingSize)
+        return;   // full and the flush below could not drain it: drop rather than overrun the ring
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char line[600];
-    // %.512s: printf precision truncates the message for us, no separate strncpy needed.
-    std::snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s %s:%u %.512s\n",
+    char* line = g_consoleRing[g_consoleRows];
+    // %.128s / %.512s: printf precision truncates for us, no separate strncpy needed. sourceID is
+    // a page-controlled URL and used to be unbounded — a long data:/blob: script URL alone could
+    // fill the row and push the terminating newline out of it, gluing two console lines together.
+    // Cap it, and then append the newline by hand from the *clamped* length so every row ends in
+    // exactly one '\n' no matter how snprintf truncated.
+    int n = std::snprintf(line, kConsoleRowSize - 1, "%02u:%02u:%02u.%03u %s %.128s:%u %.512s",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         levelStr ? levelStr : "?", sourceID ? sourceID : "", lineNumber, utf8Message ? utf8Message : "");
-    if (g_consoleRows < kConsoleRingSize)
-        g_consoleRing[g_consoleRows++] = line;
+    if (n < 0)
+        return;                                  // encoding error: leave the slot unused
+    if (n > kConsoleRowSize - 2)
+        n = kConsoleRowSize - 2;                 // truncated: snprintf returns what it *wanted* to write
+    line[n] = '\n';
+    line[n + 1] = '\0';
+    ++g_consoleRows;
     if (g_consoleRows >= kConsoleRingSize)
         consoleFlush();
 }
