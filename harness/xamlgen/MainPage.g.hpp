@@ -94,14 +94,15 @@ static ::Platform::String^ __MainPageXaml() {
                 </Setter.Value>
             </Setter>
         </Style>
-        <!-- 动作面板:顶部快捷图标列 -->
+        <!-- 动作面板:顶部快捷图标列。Apotheosis: 图标与文字改成并排(见下面那一行的注释),
+             行高因此只剩图标那一行,竖直内边距从 13 收到 6 —— 整行约 76 → 41 DIP,字形仍是 22。 -->
         <Style x:Key="QuickBtn" TargetType="Button">
             <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="BorderThickness" Value=")APO",
+        LR"APO(0" />
             <Setter Property="Foreground" Value="{StaticResource TxtHi}" />
-            <Setter)APO",
-        LR"APO( Property="HorizontalAlignment" Value="Stretch" />
-            <Setter Property="Padding" Value="0,13" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="Padding" Value="0,6" />
         </Style>
         <!-- 动作面板:整行菜单项 -->
         <Style x:Key="MenuRow" TargetType="Button">
@@ -178,9 +179,9 @@ static ::Platform::String^ __MainPageXaml() {
                                                         </VisualStateGroup>
                                                     </VisualStateManager.VisualStateGroups>
                                                     <!-- 字形靠右钉死:按钮比默认模板的 34 宽了 10,居中会把 ✕ 往左推 10/2+…;
-                                                         右边距 10 让字形正好落在默认模板的位置,多出来的宽度全部向左扩成触摸区。 -->
-          )APO",
-        LR"APO(                                          <TextBlock x:Name="GlyphElement" Text="" FontFamily="Segoe MDL2 Assets" FontSize="14" FontStyle="Normal" Foreground="{StaticResource TxtLo}" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" AutomationProperties.AccessibilityView="Raw" />
+         )APO",
+        LR"APO(                                                右边距 10 让字形正好落在默认模板的位置,多出来的宽度全部向左扩成触摸区。 -->
+                                                    <TextBlock x:Name="GlyphElement" Text="" FontFamily="Segoe MDL2 Assets" FontSize="14" FontStyle="Normal" Foreground="{StaticResource TxtLo}" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" AutomationProperties.AccessibilityView="Raw" />
                                                 </Grid>
                                             </ControlTemplate>
                                         </Setter.Value>
@@ -233,8 +234,8 @@ static ::Platform::String^ __MainPageXaml() {
                             <ContentPresenter x:Name="PlaceholderTextContentPresenter" Grid.Row="1" Grid.ColumnSpan="2" Foreground="{StaticResource TxtLo}" IsHitTestVisible="False" Margin="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" Content="{TemplateBinding PlaceholderText}" TextWrapping="{TemplateBinding TextWrapping}" />
                             <!-- 清除键固定贴输入框右缘(第 1 列 = Auto,靠右;绝不铺满内容列)。
                                  Margin 右 -2 = 默认模板的 HelperButtonThemePadding,位置与默认模板一致。 -->
-                            <Button x:Name="DeleteButton" Grid.Row="1" Grid.Column="1" Style="{StaticResource DarkFieldDeleteButtonStyle}" Background="Transparent" BorderThickness="0" Padding="0" Margin="0,0,-2,0" MinWidth="44" MinHeight="36" HorizontalAlignment="Right" VerticalAlignment="Stretch" IsTabStop="False" Visibility="Collapsed" Automati)APO",
-        LR"APO(onProperties.AccessibilityView="Raw" />
+                            <Button x:Name="DeleteButton" Grid.Row="1" Grid.Column="1" Style="{StaticResource DarkFieldDeleteButtonStyle}" Background="Transparent" BorderThickness="0" Padding="0" Margin="0,0,-2,0" MinWidth="44" MinHeight="36" Hor)APO",
+        LR"APO(izontalAlignment="Right" VerticalAlignment="Stretch" IsTabStop="False" Visibility="Collapsed" AutomationProperties.AccessibilityView="Raw" />
                         </Grid>
                     </ControlTemplate>
                 </Setter.Value>
@@ -322,10 +323,10 @@ static ::Platform::String^ __MainPageXaml() {
 
             <!-- 导航栏:[标签数] | 🔒 地址 [Go/⟳/✕] | ⋯ -->
             <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
-                <Grid.ColumnDefinitions>
+                <Grid.ColumnDefini)APO",
+        LR"APO(tions>
                     <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition W)APO",
-        LR"APO(idth="Auto" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
@@ -383,94 +384,104 @@ static ::Platform::String^ __MainPageXaml() {
                             </StackPanel>
                             <Border Grid.Column="1" Width="34" Height="4" CornerRadius="2" Background="{StaticResource Sep}" VerticalAlignment="Top" Margin="0,3,0,0" />
                         </Grid>
-                        <!-- 快捷:后退 / 前进 / 收藏。刷新已在地址栏上下文键提供，避免重复。 -->
+                        <!-- Apotheosis: 快捷行 = 后退 / 前进 / 刷新 / 收藏。刷新原先只在地址栏上下文键上,
+                             但那颗键在编辑地址时会被清除键顶掉,而且这一排本来就是"当前页面"的动作,
+                             缺一个刷新反而要绕路;Tag="reload" 已被 OnAction 分发,无需新代码。
+                             图标与文字由上下叠放改为并排:行高从"图标+间距+文字+两倍内边距"塌成"图标+两倍内边距",
+                             约 76 → 41 DIP(要求的一半),而字形仍是 22 —— 只是排布变了,图标没缩小。 -->
                         <Grid Margin="10,2,10,8" Background="{StaticResource Inset}">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" /><ColumnDefinition Width="*")APO",
+        LR"APO( />
                             </Grid.ColumnDefinitions>
                             <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource QuickBtn}" IsEnabled="False">
-                                <StackPanel>
-                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}" />
-                                    <TextBlock T)APO",
-        LR"APO(ext="后退" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0" />
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
+                                    <TextBlock Text="后退" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
                             </Button>
                             <Button x:Name="FwdBtn" Grid.Column="1" Style="{StaticResource QuickBtn}" IsEnabled="False">
-                                <StackPanel>
-                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}" />
-                                    <TextBlock Text="前进" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0" />
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
+                                    <TextBlock Text="前进" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
                             </Button>
-                            <Button Grid.Column="2" Tag="bookmark" Style="{StaticResource QuickBtn}" x:Name="_ev4">
-                                <StackPanel>
-                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource Warm}" />
-                                    <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0" />
+                            <Button Grid.Column="2" Tag="reload" Style="{StaticResource QuickBtn}" x:Name="_ev4">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
+                                    <TextBlock Text="刷新" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
+                                </StackPanel>
+                            </Button>
+                            <Button Grid.Column="3" Tag="bookmark" Style="{StaticResource QuickBtn}" x:Name="_ev5">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Warm}" />
+                                    <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
                             </Button>
                         </Grid>
 
                         <TextBlock Text="BROWSE" Foreground="{StaticResource TxtLo}" FontSize="10" CharacterSpacing="120" Margin="18,8,18,3" />
 
-                        <Button Tag="newtab" Style="{StaticResource MenuRow}" x:Name="_ev5">
+                        <Button Tag="newtab" Style="{StaticResource MenuRow}" x:Name="_ev6">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="新标签页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="home" Style="{StaticResource MenuRow}" x:Name="_ev6">
+                        <Button Tag="home" Style="{StaticResource MenuRow}" x:Name="_ev7">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="主页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="ua" Style="{StaticResource MenuRow}" x:Name="_ev7">
+                        <Button Tag="ua" Style="{StaticResource MenuRow}" x:Name="_ev8">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock x:Name="ActUaLabel" Text="桌面版网站" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="find" Style="{StaticResource MenuRow}" x:Name="_ev8">
+                        <Button Tag="find" Style="{StaticResource MenuRow}" x:Name="_ev9">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="页内查找" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="share" Style="{StaticResource MenuRow}" x:Name="_ev9">
+                        <Button Tag="share" Style="{StaticResource MenuRow}" x:Name="_ev10">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="分享" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="copylink" Style="{StaticResource MenuRow}" x:Name="_ev10">
+                        <Button Tag="copylink" Style="{StaticResource MenuRow}" x:Name="_ev11">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="复制链接" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="download" Style="{StaticResource MenuRow}" x:Name="_ev11">
+                        <Button Tag="download" Style="{StaticResource MenuRow}" x:Name="_ev12">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock Text=)APO",
+        LR"APO("" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载此页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
 
                         <TextBlock Text="LIBRARY" Foreground="{StaticResource TxtLo}" FontSize="10" CharacterSpacing="120" Margin="18,10,18,3" />
 
-                        <Button Tag="bookmarks" Style="{StaticResource MenuRow}" x:Name="_ev12">
+                        <Button Tag="bookmarks" Style="{StaticResource MenuRow}" x:Name="_ev13">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="书签" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="history" Style="{StaticResource MenuRow}" x:Name="_ev13">
+                        <Button Tag="history" Style="{StaticResource MenuRow}" x:Name="_ev14">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" Vertical)APO",
-        LR"APO(Alignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="历史记录" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="downloads" Style="{StaticResource MenuRow}" x:Name="_ev14">
+                        <Button Tag="downloads" Style="{StaticResource MenuRow}" x:Name="_ev15">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载内容" VerticalAlignment="Center" />
@@ -479,7 +490,7 @@ static ::Platform::String^ __MainPageXaml() {
 
                         <Border Height="1" Background="{StaticResource Sep}" Margin="16,10,16,5" />
 
-                        <Button Tag="settings" Style="{StaticResource MenuRow}" x:Name="_ev15">
+                        <Button Tag="settings" Style="{StaticResource MenuRow}" x:Name="_ev16">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="设置" VerticalAlignment="Center" />
@@ -511,7 +522,7 @@ static ::Platform::String^ __MainPageXaml() {
                 </StackPanel>
                 <Button x:Name="GpuBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource TxtLo}" Content="🖥 GPU" VerticalAlignment="Center" />
                 <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="📱 手机UA" VerticalAlignment="Center" />
-                <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="✕" x:Name="_ev16" />
+                <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="✕" x:Name="_ev17" />
             </Grid>
 
             <Grid Grid.Row="1" Background="{StaticResource Chrome}" Margin="8,8,8,0">
@@ -541,9 +552,10 @@ static ::Platform::String^ __MainPageXaml() {
             <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="8,8" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
+        )APO",
+        LR"APO(            <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
-                <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="" x:Name="_ev17" />
+                <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="" x:Name="_ev18" />
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="7,0">
                     <TextBlock Text="SYSTEM" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="140" />
                     <TextBlock Text="浏览器设置" Foreground="{StaticResource TxtHi}" FontSize="20" FontWeight="SemiBold" Margin="0,1,0,0" />
@@ -556,8 +568,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="界面语言" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4" />
                     <ComboBox x:Name="SetLangCombo" HorizontalAlignment="Stretch">
                         <ComboBoxItem Content="中文" />
-        )APO",
-        LR"APO(                <ComboBoxItem Content="English" />
+                        <ComboBoxItem Content="English" />
                     </ComboBox>
 
                     <TextBlock Text="SEARCH &amp; START" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
@@ -589,18 +600,18 @@ static ::Platform::String^ __MainPageXaml() {
 
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
-                    <Button Tag="gpu" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)" x:Name="_ev18" />
+                    <Button Tag="gpu" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)" x:Name="_ev19" />
 
                     <TextBlock Text="PRIVACY" Foreground="{StaticResource Warm}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
-                    <Button Tag="clearhist" Style="{StaticResource SetRow}" Content="清除历史记录" Margin="0,0,0,6" x:Name="_ev19" />
-                    <Button Tag="clearfav" Style="{StaticResource SetRow}" Content="清除全部收藏" Margin="0,0,0,6" x:Name="_ev20" />
-                    <Button Tag="cleardl" Style="{StaticResource SetRow}" Content="清除下载记录" Margin="0,0,0,6" x:Name="_ev21" />
-                    <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev22" />
+                    <Button Tag="clearhist" Style="{StaticResource SetRow}" Content="清除历史记录" Margin="0,0,0,6" x:Name="_ev20" />
+                    <Button Tag="clearfav" Style="{StaticResource SetRow}" Content="清除全部收藏" Margin="0,0,0,6" x:Name="_ev21" />
+                    <Button Tag="cleardl" Style="{StaticResource SetRow}" Content="清除下载记录" Margin="0,0,0,6" x:Name="_ev22" />
+                    <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev23" />
 
                     <!-- 自动检查更新：唯一一条非用户发起的外部请求（api.github.com），默认关。 -->
                     <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticResource TxtHi}" Margin="0,12,0,2" />
                     <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8" />
-                    <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="立即检查更新" x:Name="_ev23" />
+                    <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="立即检查更新" x:Name="_ev24" />
 
                     <!-- 推测预取（speculation rules）：页面可提前取用户未点击的 URL。默认关； -->
                     <!-- “仅 Wi-Fi”按连接资费判定（NetworkCostType::Unrestricted），网络变化时重算。 -->
@@ -612,8 +623,9 @@ static ::Platform::String^ __MainPageXaml() {
                     </ComboBox>
                     <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0" />
 
-                    <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
-                    <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev24" />
+                    <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7)APO",
+        LR"APO(" />
+                    <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev25" />
 
                     <!-- 开发者选项:默认关闭的调试用界面元素。 -->
                     <TextBlock Text="DEVELOPER" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
@@ -629,8 +641,7 @@ static ::Platform::String^ __MainPageXaml() {
             </ScrollViewer>
         </Grid>
 
-        <)APO",
-        LR"APO(!-- ===== 标签切换器(全屏)===== -->
+        <!-- ===== 标签切换器(全屏)===== -->
         <Grid x:Name="TabSwitcher" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -643,12 +654,12 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="WORKSPACE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="140" />
                     <TextBlock x:Name="TabSwitcherTitle" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="SemiBold" Margin="0,2,0,0" />
                 </StackPanel>
-                <Button Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="完成" x:Name="_ev25" />
+                <Button Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="完成" x:Name="_ev26" />
             </Grid>
             <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="TabList" Margin="12,12" />
             </ScrollViewer>
-            <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Background="{StaticResource AccentDim}" Foreground="{StaticResource Accent}" BorderBrush="{StaticResource Accent}" BorderThickness="0,1,0,0" Padding="0,16" x:Name="_ev26">
+            <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Background="{StaticResource AccentDim}" Foreground="{StaticResource Accent}" BorderBrush="{StaticResource Accent}" BorderThickness="0,1,0,0" Padding="0,16" x:Name="_ev27">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
                     <TextBlock Text="新建标签页" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
@@ -668,10 +679,10 @@ static ::Platform::String^ __MainPageXaml() {
                 <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
                 <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
                 <Border Background="{StaticResource Accent}" CornerRadius="4" Margin="0,0,0,12">
-                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev27" />
+                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev28" />
                 </Border>
                 <Border Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="4">
-                    <Button Tag="zh" Background="Transparent" Foreground="{StaticResource TxtHi}" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="中文" x:Name="_ev28" />
+                    <Button Tag="zh" Background="Transparent" Foreground="{StaticResource TxtHi}" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="中文" x:Name="_ev29" />
                 </Border>
             </StackPanel>
         </Grid>
@@ -747,8 +758,8 @@ void MainPage::InitializeComponent() {
     ContentArea = safe_cast<::Windows::UI::Xaml::Controls::Grid^>(__root->FindName(L"ContentArea"));
     RenderImage = safe_cast<::Windows::UI::Xaml::Controls::Image^>(__root->FindName(L"RenderImage"));
     // ---- 挂事件 ----
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
@@ -761,8 +772,8 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
@@ -784,26 +795,27 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev13"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev14"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev15"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnAction);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev16"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"GpuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnToggleGpu);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UaBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnToggleUA);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev16"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnDrawerClose);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev17"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnDrawerClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabFav"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabFav);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabHist"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabHist);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabDl"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabDl);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"ActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnPrimaryAction);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev17"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBack);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev18"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBack);
     safe_cast<::Windows::UI::Xaml::Controls::Slider^>(__root->FindName(L"SetZoomSlider"))->ValueChanged += ref new ::Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventHandler(this, &MainPage::OnZoomChanged);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev18"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev19"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev20"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev21"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev22"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev23"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev24"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev25"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabSwitcherDone);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev26"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnNewTab);
-    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev27"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnOobeLang);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev25"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev26"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabSwitcherDone);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev27"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnNewTab);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev28"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnOobeLang);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev29"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnOobeLang);
 }
 
 void MainPage::Connect(int, ::Platform::Object^) { }

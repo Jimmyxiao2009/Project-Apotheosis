@@ -97,13 +97,14 @@
                 </Setter.Value>
             </Setter>
         </Style>
-        <!-- 动作面板:顶部快捷图标列 -->
+        <!-- 动作面板:顶部快捷图标列。Apotheosis: 图标与文字改成并排(见下面那一行的注释),
+             行高因此只剩图标那一行,竖直内边距从 13 收到 6 —— 整行约 76 → 41 DIP,字形仍是 22。 -->
         <Style x:Key="QuickBtn" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
             <Setter Property="HorizontalAlignment" Value="Stretch"/>
-            <Setter Property="Padding" Value="0,13"/>
+            <Setter Property="Padding" Value="0,6"/>
         </Style>
         <!-- 动作面板:整行菜单项 -->
         <Style x:Key="MenuRow" TargetType="Button">
@@ -443,28 +444,38 @@
                             </StackPanel>
                             <Border Grid.Column="1" Width="34" Height="4" CornerRadius="2" Background="{StaticResource Sep}" VerticalAlignment="Top" Margin="0,3,0,0"/>
                         </Grid>
-                        <!-- 快捷:后退 / 前进 / 收藏。刷新已在地址栏上下文键提供，避免重复。 -->
+                        <!-- Apotheosis: 快捷行 = 后退 / 前进 / 刷新 / 收藏。刷新原先只在地址栏上下文键上,
+                             但那颗键在编辑地址时会被清除键顶掉,而且这一排本来就是"当前页面"的动作,
+                             缺一个刷新反而要绕路;Tag="reload" 已被 OnAction 分发,无需新代码。
+                             图标与文字由上下叠放改为并排:行高从"图标+间距+文字+两倍内边距"塌成"图标+两倍内边距",
+                             约 76 → 41 DIP(要求的一半),而字形仍是 22 —— 只是排布变了,图标没缩小。 -->
                         <Grid Margin="10,2,10,8" Background="{StaticResource Inset}">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
                             <Button x:Name="BackBtn" Grid.Column="0" Click="OnBack" Style="{StaticResource QuickBtn}" IsEnabled="False">
-                                <StackPanel>
-                                    <TextBlock Text="&#xE72B;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
-                                    <TextBlock Text="后退" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="&#xE72B;" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
+                                    <TextBlock Text="后退" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0"/>
                                 </StackPanel>
                             </Button>
                             <Button x:Name="FwdBtn" Grid.Column="1" Click="OnForward" Style="{StaticResource QuickBtn}" IsEnabled="False">
-                                <StackPanel>
-                                    <TextBlock Text="&#xE72A;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
-                                    <TextBlock Text="前进" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="&#xE72A;" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}"/>
+                                    <TextBlock Text="前进" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0"/>
                                 </StackPanel>
                             </Button>
-                            <Button Grid.Column="2" Tag="bookmark" Click="OnAction" Style="{StaticResource QuickBtn}">
-                                <StackPanel>
-                                    <TextBlock Text="&#xE734;" FontFamily="Segoe MDL2 Assets" FontSize="22" HorizontalAlignment="Center" Foreground="{StaticResource Warm}"/>
-                                    <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" HorizontalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="0,5,0,0"/>
+                            <Button Grid.Column="2" Tag="reload" Click="OnAction" Style="{StaticResource QuickBtn}">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Accent}"/>
+                                    <TextBlock Text="刷新" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0"/>
+                                </StackPanel>
+                            </Button>
+                            <Button Grid.Column="3" Tag="bookmark" Click="OnAction" Style="{StaticResource QuickBtn}">
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <TextBlock Text="&#xE734;" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Warm}"/>
+                                    <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0"/>
                                 </StackPanel>
                             </Button>
                         </Grid>
