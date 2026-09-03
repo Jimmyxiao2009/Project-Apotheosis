@@ -1044,6 +1044,14 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
     }
     {
         PerfPhase perfFlushPhase(&g_perfCur.flush);        // M4: compositing flush (+ scroll-layer positioning)
+        // Apotheosis (C2): position the scrolled-contents layer *before* the flush as well.
+        // GraphicsLayerTextureMapper::flushCompositingState() now derives every layer's visible
+        // rect from the layer positions it walks over, so with -scrollPosition applied only
+        // after the flush each visible rect would lag one tick behind and tiles would be created
+        // for the previous viewport (blank strips while scrolling). The call after the flush
+        // stays the authoritative one for compositing.
+        if (auto* renderViewBeforeFlush = view.renderView())
+            renderViewBeforeFlush->compositor().frameViewDidScroll();
         view.flushCompositingStateIncludingSubframes();    // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
         // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
         // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
