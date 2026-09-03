@@ -1916,6 +1916,15 @@ void MainPage::ClampPanRemainder()
 // UP on screen → negative translation.
 void MainPage::ApplyPanTransform()
 {
+    // Apotheosis (review 2026-09-03): during a pinch (and its spring-back) m_panTranslate belongs
+    //   to the zoom path — ApplyLiveZoom writes the clamp/recentre offset into the very same
+    //   transform (see the comment at m_panTranslate's reuse there). A late engine frame
+    //   (InstantPanApplied) or the async WebCoreGetScrollState answer (RequestScrollState) landing
+    //   mid-gesture would come in here with a zero remainder, write X/Y = 0 and detach the
+    //   translation — wiping the clamp and letting the preview jump past the document edge.
+    //   InstantPanBy already refuses to run while pinching; do the same for every other caller.
+    if (m_pinching || m_zoomSpring != nullptr)
+        return;
     if (m_panRemX == 0 && m_panRemY == 0) {
         if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
         ApplyPresentTransform();
@@ -2049,7 +2058,6 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         //   (Fnew − Fold)·(1 − live), which is exactly the "it snaps to the other finger" jump on
         //   release (worst when zooming in, where 1 − live is largest).
         if (!m_pinching) {
-            m_pinching = true;
             // Apotheosis (review 2026-09-03): this gesture turns out to be a pinch, not a pan —
             // drop anything buffered for the (never-resolved) nested-scroll route so it cannot be
             // replayed as a scroll on top of the zoom.
@@ -2057,7 +2065,10 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             // Apotheosis (instant pan): a pinch and a pan must not fight over the presenting
             // element's transform — drop the pan preview before the anchor is taken (SetPinchAnchor
             // needs an untransformed TransformToVisual).
+            // Order matters: ApplyPanTransform now refuses to touch the transform while m_pinching
+            // is set (it belongs to the zoom clamp then), so this reset must run before the flag.
             InstantPanReset();
+            m_pinching = true;
             SetPinchAnchor(e->Position.X, e->Position.Y);
         }
         if (ds > 0.0f) m_liveScale *= ds;
