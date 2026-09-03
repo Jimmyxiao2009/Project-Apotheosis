@@ -241,6 +241,10 @@ namespace Harness {
         void OnImeKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
         void OpenKeyboard();
         void CloseKeyboard();
+        // Apotheosis: action menu / settings / tab switcher all cover the address bar — hide the
+        //   OS keyboard and actually move focus off UrlBox (TryHide() alone can let it reappear on
+        //   the next tap while UrlBox still has focus).
+        void DismissKeyboardForOverlay();
         // kind: 0=插入文本(text),1=回车,2=退格。转发到引擎并重绘。
         void SendKeyToEngine(int kind, Platform::String^ text);
         // GPU 路径1 探针:SwapChainPanel 就绪后启动 ANGLE 三角形探针(验 GPU 管线在 App Container 通)。

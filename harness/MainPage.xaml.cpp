@@ -623,6 +623,11 @@ MainPage::MainPage()
 {
     InitializeComponent();
 
+    // Apotheosis: focus sink for DismissKeyboardForOverlay() — Grid (RootGrid) has no IsTabStop
+    //   property (that's Control-only), so the page itself takes focus instead; set here in code
+    //   rather than in MainPage.xaml since Page IS a Control (via UserControl).
+    try { this->IsTabStop = true; } catch (...) {}
+
     // Apotheosis: MainPage.xaml only wires ContentArea's ManipulationDelta/ManipulationCompleted
     // (see MainPage.xaml) — ManipulationStarted has no markup hook, so it is subscribed here in
     // code instead of touching the XAML. Kicks off the nested-scroll hit test (WebCoreIsScrollableAt)
@@ -755,23 +760,24 @@ MainPage::MainPage()
                         });
                 });
     } catch (...) {}
-    // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
-    //   (地址胶囊+建议浮到键盘上方);网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
+    // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把导航栏(标签数/地址胶囊/
+    //   菜单键那一行,NavBarShift)上移键盘高度;细状态行(标题/加载点,在它上面那一行)刻意不受
+    //   影响的话,键盘再高也推不出屏幕。网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
     try {
         auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
         ip->Showing += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
-                if (m_urlFocused && RootShift) {
-                    RootShift->Y = -e->OccludedRect.Height;
+                if (m_urlFocused && NavBarShift) {
+                    NavBarShift->Y = -e->OccludedRect.Height;
                     e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
                 }
             });
         ip->Hiding += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
-                if (RootShift && RootShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
-                    RootShift->Y = 0;
+                if (NavBarShift && NavBarShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
+                    NavBarShift->Y = 0;
                     e->EnsuredFocusedElementInView = true;
                 }
             });
@@ -2388,6 +2394,19 @@ void MainPage::CloseKeyboard()
     // 地址栏键盘并不经过 ImeBox，不能因 m_imeOpen=false 而漏掉 TryHide；否则菜单关闭后会重新露出。
     try { Windows::UI::ViewManagement::InputPane::GetForCurrentView()->TryHide(); } catch (...) {}
 }
+
+// Apotheosis: TryHide() alone is not enough — a still-focused UrlBox can bring the keyboard right
+//   back on the next unrelated tap (any control regaining focus re-evaluates the input pane). Move
+//   focus onto the page itself (IsTabStop set true in the constructor — Grid has no such property,
+//   so this is done as a plain Control member instead of a MainPage.xaml attribute) so nothing
+//   editable is focused while the action menu / settings / tab switcher sit on top of it.
+void MainPage::DismissKeyboardForOverlay()
+{
+    m_urlFocused = false;
+    SetUrlEditingChrome(false);   // 焦点没真的离开 UrlBox → LostFocus 不会触发,手动还原刷新/停止键
+    CloseKeyboard();
+    try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
+}
 void MainPage::OnImeTextChanged(Platform::Object^, Windows::UI::Xaml::Controls::TextChangedEventArgs^)
 {
     // 诊断埋点(imedebug.txt 存在才记,见 ImeDebugEnabled):记录本回调是否触发 + 门控状态 + 文本长度。
@@ -3069,11 +3088,9 @@ void MainPage::HideSuggestions()
 void MainPage::ShowActionMenu()
 {
     HideSuggestions();
-    // 收起网页/地址栏输入法并撤销地址栏的“编辑中”状态。硬件 Back 只会关闭当前 sheet，
-    // 不应因此把此前保留焦点的键盘重新唤起。
-    m_urlFocused = false;
-    SetUrlEditingChrome(false);   // 焦点没真的离开 UrlBox → LostFocus 不会触发,手动还原刷新/停止键
-    CloseKeyboard();
+    // 收起网页/地址栏输入法并撤销地址栏的“编辑中”状态、真正挪走焦点。硬件 Back 只会关闭当前
+    // sheet，不应因此把此前保留焦点的键盘重新唤起。
+    DismissKeyboardForOverlay();
     if (ActFavLabel)
         ActFavLabel->Text = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"已收藏", L"Saved") : L8(L"收藏", L"Bookmark");
     if (ActUaLabel)
@@ -3248,6 +3265,7 @@ void MainPage::SaveSettings()
 void MainPage::ShowSettings()
 {
     HideActionMenu();
+    DismissKeyboardForOverlay();   // Apotheosis: the settings page covers the address bar too.
     if (SetLangCombo) SetLangCombo->SelectedIndex = (g_lang == L"en") ? 1 : 0;
     if (SetSearchCombo) SetSearchCombo->SelectedIndex = m_setSearch;
     if (SetHomeBox) SetHomeBox->Text = ref new String(g_homeUrl == L"about:home" ? L"" : g_homeUrl.c_str());
@@ -3870,6 +3888,7 @@ void MainPage::ShowTabSwitcher()
 {
     HideActionMenu();
     HideSuggestions();
+    DismissKeyboardForOverlay();   // Apotheosis: the tab switcher covers the address bar too.
     SaveActiveTab();
     RebuildTabSwitcher();
     TabSwitcher->Visibility = Windows::UI::Xaml::Visibility::Visible;

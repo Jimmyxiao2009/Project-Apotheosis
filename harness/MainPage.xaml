@@ -275,10 +275,6 @@
     </Page.Resources>
 
     <Grid x:Name="RootGrid" Background="{StaticResource PageBg}">
-        <!-- 软键盘弹出时整体上移(仅地址栏聚焦时,见 code-behind InputPane 处理) -->
-        <Grid.RenderTransform>
-            <TranslateTransform x:Name="RootShift" Y="0"/>
-        </Grid.RenderTransform>
         <Grid.RowDefinitions>
             <RowDefinition Height="*"/>      <!-- 内容(网页) -->
             <RowDefinition Height="Auto"/>   <!-- 底部 chrome -->
@@ -370,7 +366,12 @@
             </Border>
 
             <!-- 导航栏:[标签数] | 🔒 地址 [Go/⟳/✕] | ⋯ -->
+            <!-- Apotheosis: 软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理) —
+                 细状态行(标题/加载点)留在原位,键盘再高也不会把它推出屏幕。 -->
             <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
+                <Grid.RenderTransform>
+                    <TranslateTransform x:Name="NavBarShift" Y="0"/>
+                </Grid.RenderTransform>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="Auto"/>
