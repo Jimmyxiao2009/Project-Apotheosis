@@ -3025,7 +3025,8 @@ int WebCoreFindClear(uint8_t* outRGBA)
 // M4 捏合缩放:把页面缩放因子设为 scale(钳到 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 为锚 —— 缩放后让焦点
 //   下的内容点仍停在焦点处(据此算新滚动原点)。setPageScaleFactor 触发按新尺度重栅格(TextureMapper backing 的
 //   contentsScale = pageScaleFactor*deviceScale → 文字清晰)。重绘到 outRGBA。引擎线程串行调。返回 0。
-//   注:焦点/滚动坐标空间在本无头配置下可能略有偏差,真机微调;核心(缩放生效+按新尺度重栅格)是主目标。
+//   focalX/focalY are ENGINE VIEWPORT PIXELS (0..w, 0..h) — the same space the harness paints
+//   into, not CSS/document coordinates. See the anchor derivation below for the scroll units.
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
 {
     using namespace WebCore;
@@ -3054,18 +3055,44 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     float oldScale = g_session->page->pageScaleFactor();
     if (oldScale <= 0.0f) oldScale = 1.0f;
     ScrollPosition scroll = view->scrollPosition();
-    // FrameView 的 scrollPosition 已是 CSS 内容坐标，pageScale 改变的是视口中每个设备像素
-    // 对应的 CSS 距离。因此焦点内容点 = scroll + focal / oldScale；新 scroll = 内容点 - focal / newScale。
-    // 旧公式把 scroll 也除以 oldScale、又把结果乘 scale，缩回 1x 时常被钳到 (0,0)。
-    double cx = static_cast<double>(scroll.x()) + static_cast<double>(focalX) / oldScale;
-    double cy = static_cast<double>(scroll.y()) + static_cast<double>(focalY) / oldScale;
-    int nsx = static_cast<int>(cx - static_cast<double>(focalX) / scale + 0.5);
-    int nsy = static_cast<int>(cy - static_cast<double>(focalY) / scale + 0.5);
-    if (nsx < 0) nsx = 0;
-    if (nsy < 0) nsy = 0;
+    // Apotheosis (M4): pinch anchor. Page::setPageScaleFactor(scale, origin) hands `origin`
+    // straight to LocalFrameView::setScrollPosition() — it is the NEW SCROLL POSITION, not a
+    // focal point. Its unit is the frame view's own scroll space, and that space is SCALED:
+    //   * ScrollView::contentsSize() comes from LocalFrameView::adjustViewSize() ->
+    //     RenderView::documentRect(), which maps unscaledDocumentRect() through the RenderView
+    //     layer transform (i.e. multiplies by the page scale) — see RenderView.cpp:779.
+    //   * LocalFrameView::getPossiblyFixedRectToExpose() says it outright ("exposeRect is in
+    //     absolute coords, affected by page scale") and scales its result by frameScaleFactor()
+    //     before returning it as a scroll position — LocalFrameView.cpp:7141/7159.
+    // So one viewport pixel is one scroll unit at every scale, and the document (CSS) point
+    // under a viewport-pixel focal F is doc = (P0 + F) / s0. Keeping it under the finger:
+    //
+    //     P1 = doc * s1 - F = (P0 + F) * (s1 / s0) - F
+    //
+    // Worked example s0 = 1, s1 = 2, P0 = (0, 1000), F = (360, 540):
+    //     doc = (360, 1540)  ->  P1 = (720, 3080) - (360, 540) = (360, 2540).
+    // The old code treated P0 as CSS units (doc = P0 + F/s0, P1 = doc - F/s1) and produced
+    // (180, 1270) here — roughly half the intended offset, i.e. the page jumped a long way
+    // towards the top on release, exactly the reported symptom. The error grows with P0, so
+    // it looked like "it snaps to the top-of-page view" far down a long page.
+    double ratio = static_cast<double>(scale) / static_cast<double>(oldScale);
+    double nx = (static_cast<double>(scroll.x()) + static_cast<double>(focalX)) * ratio - static_cast<double>(focalX);
+    double ny = (static_cast<double>(scroll.y()) + static_cast<double>(focalY)) * ratio - static_cast<double>(focalY);
+    int nsx = static_cast<int>(nx < 0 ? nx - 0.5 : nx + 0.5);
+    int nsy = static_cast<int>(ny < 0 ? ny - 0.5 : ny + 0.5);
+    IntPoint wanted = view->constrainedScrollPosition(IntPoint(nsx, nsy));
 
-    g_session->page->setPageScaleFactor(scale, IntPoint(nsx, nsy));
+    g_session->page->setPageScaleFactor(scale, wanted);
     g_session->page->isolatedUpdateRendering();
+    // Apotheosis: re-apply the anchor AFTER the relayout at the new scale. setPageScaleFactor
+    // clamps `origin` inside setScrollPosition against the contents size of that moment, and
+    // when zooming in that is still the OLD (smaller) scaled document — the clamp then eats
+    // most of the new offset near the bottom of a page. Constraining again once adjustViewSize()
+    // has published the new scaled contents size gives the correct final position.
+    doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });
+    IntPoint settled = view->constrainedScrollPosition(IntPoint(nsx, nsy));
+    if (view->scrollPosition() != settled)
+        view->setScrollPosition(settled);
     doc->updateLayoutIgnorePendingStylesheets();
 
     int nonWhite = 0;
