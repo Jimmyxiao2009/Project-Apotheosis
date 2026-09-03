@@ -263,6 +263,13 @@ int WebCoreGpuLayerInfo(char* outBuf, int len);
 // Takes effect from the next composite and may be flipped at any time. Engine thread only.
 void WebCoreSetThreadedRaster(int enabled);
 
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 事件驱动呈现。引擎在“有东西需要重新呈现”时
+// （调度渲染更新 / 图片加载完 / 异步栅格化瓦片落地 / 一次 tick 结束时仍脏）回调它，代替
+// harness 固定 200ms 轮询。每次合成最多回调一次（WebCoreLiveTick 开头重新武装）。
+// ★ 回调可能在引擎线程或栅格化工作线程上跑：不得阻塞、不得反过来调引擎，只能投队列。
+// 传 nullptr = 取消注册（回到纯轮询）。引擎线程上注册一次，首次导航前。
+void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
+
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);
 

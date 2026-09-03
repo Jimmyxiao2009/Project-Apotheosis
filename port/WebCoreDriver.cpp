@@ -455,6 +455,54 @@ static bool g_dragActive = false;
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
+// ---------------------------------------------------------------------------
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
+//
+// The harness used to poll us with a fixed 200 ms DispatcherTimer because the C ABI had no way
+// of saying "something changed". It now registers a wake callback here; every invalidation
+// (PortChromeClient::scheduleRenderingUpdate / triggerRenderingUpdate / setNeedsOneShotDrawing-
+// Synchronization / didFinishLoadingImageForElement, the raster-completion hook, and the tick's
+// own "still dirty when it finished" state) funnels into presentRequested().
+//
+// Contract with the harness: the callback may run on ANY thread (engine thread for the WebCore
+// hooks, a raster worker for the completion hook), must not block and must not call back into
+// the engine - all it may do is post to a queue. See MainPage::PresentWakeThunk.
+//
+// Rate control lives on both sides: here an atomic arms the callback so a burst of invalidations
+// produces exactly one wake-up (disarmed again at the top of WebCoreLiveTick, i.e. once a
+// composite is actually under way, so anything raised during that composite arms the next one);
+// in the harness a >= ~16 ms gap between presents. g_presentWakes counts the wake-ups fired
+// since the last tick and becomes the perf row's wake_count column.
+// ---------------------------------------------------------------------------
+static std::atomic<void (*)(void*)> g_presentCb { nullptr };
+static std::atomic<void*> g_presentCbCtx { nullptr };
+static std::atomic<int> g_presentWakeArmed { 0 };
+static std::atomic<unsigned> g_presentWakes { 0 };
+
+namespace WebCorePort {
+
+void presentRequested()
+{
+    void (*cb)(void*) = g_presentCb.load(std::memory_order_acquire);
+    if (!cb)
+        return;   // fixed-tick mode: nobody registered, the flag alone does the work
+    int expected = 0;
+    if (!g_presentWakeArmed.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
+        return;   // a wake is already on its way; it will cover this request too
+    g_presentWakes.fetch_add(1, std::memory_order_relaxed);
+    cb(g_presentCbCtx.load(std::memory_order_acquire));
+}
+
+} // namespace WebCorePort
+
+// Called at the top of every WebCoreLiveTick: the composite the last wake asked for is happening
+// now, so the next invalidation must be able to arm a new one.
+static void presentWakeDisarm()
+{
+    g_presentWakeArmed.store(0, std::memory_order_release);
+}
+
+
 // 子资源加载诊断计数(主文档 + CSS/JS/图片全经 ResourceHandle 桥)。由 ResourceHandle.cpp
 // 的 WebCorePortBumpLoad 累加;在 WebCoreLoadUrl 开头清零,结束并入 g_lastDiag,真机定位"子资源不加载"。
 static int g_loadStarted = 0, g_loadResponse = 0, g_loadComplete = 0, g_loadFail = 0;
@@ -998,7 +1046,7 @@ static const char* const kPerfHeader =
     "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
     "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
     "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver,"
-    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked\n";
+    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked,wake_count\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1032,6 +1080,11 @@ struct PerfRow {
     // last one is the one to watch: it must stay near zero, otherwise off-thread raster is worse
     // than synchronous raster.
     int rasterDone = -1, rasterPosted = -1, rasterCancelled = -1, rasterBlocked = -1;
+    // Apotheosis (event-driven present): wake-ups fired to the harness since the previous tick.
+    // 0 on an idle page (the loop is asleep, only the 1 s fallback tick runs), ~1 per frame on an
+    // animating one; a number much larger than 1 means the arming atomic stopped collapsing bursts.
+    // -1 = the operation was not a tick (only WebCoreLiveTick reads and resets the counter).
+    int wakes = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1147,12 +1200,14 @@ static void perfFlushLocked()
         char rs[5][12];
         for (int k = 0; k < 5; ++k)
             perfFmtI(rs[k], sizeof rs[k], rasterVals[k]);
-        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        char wk[12];
+        perfFmtI(wk, sizeof wk, r.wakes);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
             nt[0], nt[1], nt[2], nt[3], hv,
-            rs[0], rs[1], rs[2], rs[3], rs[4]);
+            rs[0], rs[1], rs[2], rs[3], rs[4], wk);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -3214,6 +3269,19 @@ int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* vie
 // switch is a plain file-static bool read once per tile update, so this is safe between composites
 // and needs no teardown when it goes off (in-flight replays are still collected by
 // wkFinishPendingPaints/the 4-composite deadline).
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): register the harness' present wake-up. Pass
+// nullptr to go back to pure polling (the fixed-interval live tick). See the "event-driven
+// present" block near the top of this file for the threading contract: the callback can be
+// invoked on the engine thread OR on a raster worker, must not block and must not re-enter the
+// engine - it may only post to a queue. Registration itself is expected on the engine thread,
+// once at startup, but the atomics make a late or repeated registration harmless.
+void WebCoreSetPresentRequestCallback(void (*cb)(void*), void* ctx)
+{
+    g_presentCbCtx.store(ctx, std::memory_order_release);
+    g_presentCb.store(cb, std::memory_order_release);
+    g_presentWakeArmed.store(0, std::memory_order_release);
+}
+
 void WebCoreSetThreadedRaster(int enabled)
 {
     // The completion handler is installed together with the feature (and removed with it) so that
@@ -4189,9 +4257,19 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
 
+    // Apotheosis (event-driven present): the composite the last wake-up asked for starts here, so
+    // re-arm the wake path. Anything invalidated from now on - including from inside this very
+    // tick's isolatedUpdateRendering (a rAF callback re-registering, a CSS animation asking for the
+    // next frame) - fires a fresh wake and therefore schedules the next tick. Nothing asking =
+    // no wake = the harness goes idle after this tick. This is what makes the loop event-driven.
+    presentWakeDisarm();
+
     // 网络 / 图片解码完成回调经 RunLoop 任务投递。仅 isolatedUpdateRendering 不会取这些任务,
     // 所以空白占位图会一直等到下一次点击/滚动的 pumpLoop 才刷新。实时 tick 先轻量转几轮队列。
     PerfOpGuard perfOp("tick", nullptr, 0, 0);   // M4
+    // After perfBegin() (it resets the row): wake-ups fired since the previous tick -> wake_count.
+    if (g_perfOn)
+        g_perfCur.wakes = static_cast<int>(g_presentWakes.exchange(0, std::memory_order_relaxed));
     for (int i = 0; i < 3; ++i)
         RunLoop::cycle();
     {
@@ -4230,7 +4308,14 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // changed; navigation/click/type keep the full force-dirty composite.
     if (g_gpuActive)
         g_gpuScrollFast = true;
-    return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    const int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    // Apotheosis (event-driven present): belt and braces for the "still dirty when the tick ended"
+    // case - a repaint request that landed after gpuPresent() consumed takeNeedsPresent(), or one
+    // notePendingRasterTiles() re-armed. presentRequested() is a no-op when a wake is already armed
+    // (the usual case for an animating page, which armed one during isolatedUpdateRendering above).
+    if (g_session && g_session->chrome && g_session->chrome->peekNeedsPresent())
+        WebCorePort::presentRequested();
+    return prc;
 }
 
 int WebCoreGetPendingResourceCount()

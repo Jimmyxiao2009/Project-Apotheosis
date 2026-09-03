@@ -251,6 +251,15 @@ int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scr
 // async; first paints and recycled tiles stay synchronous, so no tile is ever composited empty.
 // Takes effect from the next composite and may be flipped at any time. Engine thread only.
 void WebCoreSetThreadedRaster(int enabled);
+
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present. Register a wake-up the
+// engine calls whenever something wants to be presented (rendering update scheduled, image
+// loaded, off-thread raster tile finished, a tick that ended still dirty) instead of having the
+// harness poll on a fixed timer. Fired at most once per composite; disarmed at the top of every
+// WebCoreLiveTick. THE CALLBACK MAY RUN ON THE ENGINE THREAD OR ON A RASTER WORKER: it must not
+// block and must not call back into the engine - post to a queue and return. nullptr unregisters
+// (back to pure polling). Register from the engine thread, once, before the first navigation.
+void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document
