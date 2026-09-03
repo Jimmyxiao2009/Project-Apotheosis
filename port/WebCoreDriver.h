@@ -225,6 +225,12 @@ int WebCoreComposite();                               // M2: composite current s
 int WebCoreCompositeReadback(uint8_t* outRGBA);       // M2: offscreen composite + readback RGBA (verify), shown via existing WriteableBitmap path
 void WebCoreGpuSetFlip(int flipH, int flipV);         // M2 debug: set readback flip (find correct orientation); repaint to apply
 int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scroll/contents + layerTreeAsText dump
+
+// Apotheosis (OFFTHREAD-RASTER-LOG.md): rasterise TextureMapper tiles on a worker pool instead of
+// on the engine thread (experimental, default OFF). Only tiles that already hold valid content go
+// async; first paints and recycled tiles stay synchronous, so no tile is ever composited empty.
+// Takes effect from the next composite and may be flipped at any time. Engine thread only.
+void WebCoreSetThreadedRaster(int enabled);
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document

@@ -217,6 +217,9 @@ namespace Harness {
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
         //   presenting element (TransformGroup, scale first so the translation stays screen-space).
         void ApplyPresentTransform();
+        // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
+        //   the engine thread. Never called from the UI thread without a post.
+        void ApplyThreadedRasterSetting();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -304,8 +307,10 @@ namespace Harness {
         bool m_updateAuto { false };  // 隐私：启动后自动查 GitHub 更新（默认关）；settings.ini updatecheck
         int  m_prefetch { 0 };        // 隐私：推测预取 0=关/1=仅 Wi-Fi(不计费连接)/2=始终；settings.ini prefetch
         bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
-        // Apotheosis: DEVELOPER toggle. On by default - it is what makes a pan feel like a pan.
+        // Apotheosis: DEVELOPER toggles. Instant pan is on by default (it is what makes a pan feel
+        //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
+        bool m_threadedRaster { false };// settings.ini threadraster
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };

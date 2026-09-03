@@ -43,6 +43,11 @@ public:
     // Apotheosis (M4): non-consuming read, lets WebCoreLiveTick decide whether a tick may keep
     // the already-uploaded tiles (nothing asked for a rendering update since the last present).
     bool peekNeedsPresent() const { return m_needsPresent; }
+    // Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2): arm a follow-up present from the driver itself.
+    // With threaded raster on, a tile replay that lands after the last composite of an operation
+    // would otherwise sit in its buffer until something else dirties the page; the driver sets this
+    // whenever replays are still in flight, so the next tick composites and uploads them.
+    void setNeedsPresent() { m_needsPresent = true; }
 
     // ======================================================================
     // REAL accelerated-compositing behavior

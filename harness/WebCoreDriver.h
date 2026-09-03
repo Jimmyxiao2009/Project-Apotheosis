@@ -241,6 +241,12 @@ void WebCoreGpuSetFlip(int flipH, int flipV);
 // 调试:把 FrameView 滚动/内容尺寸 + 合成图层树文本写入 outBuf(定位背景丢失/滚动失效)。返回 0 成功。
 int WebCoreGpuLayerInfo(char* outBuf, int len);
 
+// Apotheosis (OFFTHREAD-RASTER-LOG.md): rasterise TextureMapper tiles on a worker pool instead of
+// on the engine thread (experimental, default OFF). Only tiles that already hold valid content go
+// async; first paints and recycled tiles stay synchronous, so no tile is ever composited empty.
+// Takes effect from the next composite and may be flipped at any time. Engine thread only.
+void WebCoreSetThreadedRaster(int enabled);
+
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);
 

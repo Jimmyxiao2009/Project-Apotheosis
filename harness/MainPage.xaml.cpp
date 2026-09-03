@@ -1903,6 +1903,13 @@ void MainPage::ApplyPresentTransform()
     else              RenderImage->RenderTransform = t;
 }
 
+// Apotheosis (OFFTHREAD-RASTER-LOG.md): DEVELOPER toggle "Threaded raster". Engine-thread call.
+void MainPage::ApplyThreadedRasterSetting()
+{
+    const int en = m_threadedRaster ? 1 : 0;
+    WebEngine::instance().post([en]() { try { WebCoreSetThreadedRaster(en); } catch (...) {} });
+}
+
 // 自由滚动:内容区 ManipulationDelta(去掉 ScrollViewer 后,触摸不再被吞)。单指拖拽的累计 ΔY → 引擎滚动。
 // TranslateInertia 让松手后继续惯性滚(ManipulationDelta 在惯性期持续触发)。点击经 Tapped 走(手势识别器
 // 区分点按 vs 拖拽,小位移=Tapped、越阈值=Manipulation,不会冲突)。
@@ -3100,6 +3107,7 @@ void MainPage::ApplySettings()
     });
     UpdateScrollFab();
     ApplyPrefetchSetting();
+    ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
     if (!m_instantPan) InstantPanReset();    // Apotheosis: switching it off must clear a live preview
     if (UaBtn) {
         bool en = (g_lang == L"en");
@@ -3131,6 +3139,7 @@ void MainPage::LoadSettings()
             else if (k == "prefetch") m_prefetch = atoi(v.c_str());
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
+            else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -3155,6 +3164,7 @@ void MainPage::SaveSettings()
     s += "prefetch=" + std::to_string(m_prefetch) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
+    s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -3175,6 +3185,7 @@ void MainPage::ShowSettings()
     if (SetPrefetchCombo) SetPrefetchCombo->SelectedIndex = m_prefetch;
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
+    if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -3211,6 +3222,7 @@ void MainPage::HideSettings()
     if (SetPrefetchCombo && SetPrefetchCombo->SelectedIndex >= 0) m_prefetch = SetPrefetchCombo->SelectedIndex;
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
+    if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -3253,6 +3265,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
+    { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
     { L"自动检查更新", L"Check for updates automatically" },
     { L"开启后每次启动会连接 api.github.com 一次",

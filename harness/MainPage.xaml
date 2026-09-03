@@ -691,6 +691,7 @@
                     <TextBlock Text="开发者选项" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>

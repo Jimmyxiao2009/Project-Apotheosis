@@ -102,6 +102,19 @@
 namespace WebCore {
 void wkWinUWPTexmapTextureStats(uint64_t& bytes, unsigned& count);   // BitmapTexture.h
 void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTexturePool.h
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §4): off-thread tile rasterisation switch and its in-flight
+// counter (TextureMapperTile.h, WebKit winuwp 54db7b8987). Declared here for the same reason as
+// the two above — including the texmap header would drag in TextureMapperGLHeaders.h.
+void wkWinUWPSetThreadedRaster(bool);
+bool wkWinUWPThreadedRaster();
+unsigned wkWinUWPTexmapPendingRasterTiles();
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §10, WebKit winuwp 099064a24d..c0608a6353): step 4 made
+// first paints asynchronous too, so a tile whose replay has not landed draws NOTHING. Missing the
+// follow-up composite is now an empty tile, not a stale one — hence the edge-triggered counter and
+// the worker-side wake-up below, which cover the two cases polling alone cannot.
+unsigned wkWinUWPTexmapTakeFinishedRasterTiles();          // engine thread; reading resets
+void wkWinUWPSetRasterCompletionHandler(void (*)());       // called ON A WORKER thread
+void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& blockingWaits);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -971,7 +984,8 @@ static bool g_perfHeaderDone = false;
 static const char* const kPerfHeader =
     "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
     "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
-    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver\n";
+    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver,"
+    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -994,6 +1008,17 @@ struct PerfRow {
     // Chasing the sporadic 14-22 s "first contact" stalls seen on the Lumia over Wi-Fi.
     double netDns = -1, netConnect = -1, netTls = -1, netTtfb = -1;
     int httpVer = -1;         // 10 / 11 / 20 / 30; 0 = curl could not tell
+    // Apotheosis (OFFTHREAD-RASTER-LOG.md §4.3): tile replays still running on the worker pool when
+    // this operation's last composite finished. 0 with threaded raster on = the pool kept up;
+    // -1 = no composite happened (or the feature is off), i.e. an empty CSV cell.
+    int rasterPending = -1;
+    // Apotheosis (OFFTHREAD-RASTER-LOG.md §10): raster_done = replays that finished since the last
+    // composite and are therefore owed a present (edge-triggered, wkWinUWPTexmapTakeFinishedRasterTiles).
+    // The other three are running totals since process start: replays posted, replays cancelled
+    // before a worker picked them up, and times the engine thread had to BLOCK on a replay. The
+    // last one is the one to watch: it must stay near zero, otherwise off-thread raster is worse
+    // than synchronous raster.
+    int rasterDone = -1, rasterPosted = -1, rasterCancelled = -1, rasterBlocked = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1104,11 +1129,17 @@ static void perfFlushLocked()
             perfFmtD(nt[k], sizeof nt[k], netVals[k]);
         char hv[12];
         perfFmtI(hv, sizeof hv, r.httpVer);
-        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s\n",
+        const int rasterVals[5] = { r.rasterPending, r.rasterDone, r.rasterPosted,
+                                    r.rasterCancelled, r.rasterBlocked };
+        char rs[5][12];
+        for (int k = 0; k < 5; ++k)
+            perfFmtI(rs[k], sizeof rs[k], rasterVals[k]);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
-            nt[0], nt[1], nt[2], nt[3], hv);
+            nt[0], nt[1], nt[2], nt[3], hv,
+            rs[0], rs[1], rs[2], rs[3], rs[4]);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1623,6 +1654,64 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     return kOK;
 }
 
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2/§4.3): call right after a composite. With threaded
+// raster on, a replay that finishes after this composite has no one to upload it — the tile would
+// keep its old pixels until the page happens to be dirtied again. Arming m_needsPresent makes the
+// harness' next live tick composite (and the tick's own peekNeedsPresent() fast-path check take the
+// heavy branch), where wkFinishPendingPaints() picks the finished buffers up. Bumping the frame
+// hash keeps the live loop from judging the frame static and stopping before that tick happens.
+// The count also becomes the perf row's raster_pending column, which is the only way to see
+// whether the worker pool kept up. No-op (and no counter read) while the feature is off.
+static void notePendingRasterTiles()
+{
+    if (!WebCore::wkWinUWPThreadedRaster())
+        return;
+    // Both are needed. `pending` covers "a replay is still running" — one more composite will be
+    // owed. `finished` (edge-triggered, reading resets) covers the replay that started AND ended
+    // between two composites, which leaves `pending` at zero although nothing has uploaded the new
+    // pixels yet. With step 4's asynchronous first paints (OFFTHREAD-RASTER-LOG.md §10) that case
+    // is an *empty* tile on screen, not a stale one, so it is the more important of the two.
+    const unsigned pending = WebCore::wkWinUWPTexmapPendingRasterTiles();
+    const unsigned finished = WebCore::wkWinUWPTexmapTakeFinishedRasterTiles();
+    if (g_perfOn) {
+        g_perfCur.rasterPending = static_cast<int>(pending);
+        g_perfCur.rasterDone = static_cast<int>(finished);
+        unsigned posted = 0, cancelled = 0, blocking = 0;
+        WebCore::wkWinUWPTexmapRasterStats(posted, cancelled, blocking);
+        g_perfCur.rasterPosted = static_cast<int>(posted);
+        g_perfCur.rasterCancelled = static_cast<int>(cancelled);
+        g_perfCur.rasterBlocked = static_cast<int>(blocking);
+    }
+    if (!pending && !finished)
+        return;
+    if (g_session && g_session->chrome)
+        g_session->chrome->setNeedsPresent();
+    ++g_lastFrameHash;
+}
+
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §10): the case polling cannot cover — a replay lands while
+// the harness' tick loop has already gone idle, so no composite is coming and the tile stays empty.
+// wkWinUWPSetRasterCompletionHandler() calls this ON A WORKER THREAD, so the contract is strict:
+// non-blocking, thread-safe, must not touch WebCore. All it does is hop to the engine thread
+// through WTF's main-thread function queue — the same queue the finished image decodes arrive on,
+// drained by the RunLoop::cycle() at the top of WebCoreScrollBy / WebCoreLiveTick — and set
+// m_needsPresent there, on the thread that owns it. The atomic collapses a burst of completions
+// into one hop: several tiles finishing together only need one composite.
+static std::atomic<int> g_rasterWakeQueued { 0 };
+
+static void rasterCompletedOnWorker()
+{
+    int expected = 0;
+    if (!g_rasterWakeQueued.compare_exchange_strong(expected, 1))
+        return;   // a hop is already queued; it will pick this completion up too
+    WTF::callOnMainThread([] {
+        g_rasterWakeQueued.store(0);
+        if (g_session && g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+        ++g_lastFrameHash;   // so the harness' live loop does not judge the frame static and stop
+    });
+}
+
 // view->paint → Cairo ARGB32 → 调用方 RGBA8888 缓冲(B<->R 交换 + 去预乘)。统计非白像素数。
 // 同时供一次性 WebCoreLoadUrl 与会话各入口复用(单一绘制实现)。
 static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* outRGBA, int& nonWhiteOut)
@@ -1646,10 +1735,13 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
                     // 链接表兜底误导航)。takeNeedsPresent 此前无人消费,在此消费正好。
                     if (g_session->chrome->takeNeedsPresent() || g_gpuAnimating)
                         ++g_lastFrameHash;
+                    notePendingRasterTiles();   // after takeNeedsPresent(), so it is not consumed again
                     return kOK;
                 }
-            } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK)
+            } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK) {
+                notePendingRasterTiles();
                 return kOK;
+            }
         }
     }
 
@@ -3099,6 +3191,18 @@ int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* vie
     if (viewW) *viewW = contents.width() - maxP.x();
     if (viewH) *viewH = contents.height() - maxP.y();
     return kOK;
+}
+
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.1): flip off-thread tile rasterisation. The engine-side
+// switch is a plain file-static bool read once per tile update, so this is safe between composites
+// and needs no teardown when it goes off (in-flight replays are still collected by
+// wkFinishPendingPaints/the 4-composite deadline).
+void WebCoreSetThreadedRaster(int enabled)
+{
+    // The completion handler is installed together with the feature (and removed with it) so that
+    // no worker can call into a driver that has stopped expecting it. Both calls are engine thread.
+    WebCore::wkWinUWPSetRasterCompletionHandler(enabled ? &rasterCompletedOnWorker : nullptr);
+    WebCore::wkWinUWPSetThreadedRaster(enabled != 0);
 }
 
 // Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
