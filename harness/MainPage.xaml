@@ -83,7 +83,8 @@
         <!-- 深色输入框(地址栏/查找条)。默认 TextBox 模板在 Focused 态把 BorderElement 刷白、
              把 ContentElement 切到 Light 主题(文字变黑) → 聚焦时整条地址栏发白。这里的模板
              (基于 SDK 15063 默认模板)让 Normal/PointerOver/Focused 三态外观完全一致,
-             并把内置 DeleteButton 的触摸目标放大到 44x40(字形仍是 14)。
+             并把内置 DeleteButton 的触摸目标放大到 44x40(字形仍是 14);触摸区只向左扩,
+             ✕ 本身仍贴输入框右缘(与默认模板同位置)。
              注意:不要给模板加 VerticalContentAlignment 绑定 —— 文字垂直居中仍靠元素上的 Padding。 -->
         <Style x:Key="DarkFieldBox" TargetType="TextBox">
             <Setter Property="MinWidth" Value="0"/>
@@ -133,10 +134,12 @@
                                                             </VisualState>
                                                         </VisualStateGroup>
                                                     </VisualStateManager.VisualStateGroups>
+                                                    <!-- 字形靠右钉死:按钮比默认模板的 34 宽了 10,居中会把 ✕ 往左推 10/2+…;
+                                                         右边距 10 让字形正好落在默认模板的位置,多出来的宽度全部向左扩成触摸区。 -->
                                                     <TextBlock x:Name="GlyphElement" Text="&#xE10A;"
                                                                FontFamily="Segoe MDL2 Assets" FontSize="14" FontStyle="Normal"
                                                                Foreground="{StaticResource TxtLo}"
-                                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                               HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"
                                                                AutomationProperties.AccessibilityView="Raw"/>
                                                 </Grid>
                                             </ControlTemplate>
@@ -209,10 +212,13 @@
                                               Margin="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
                                               Content="{TemplateBinding PlaceholderText}"
                                               TextWrapping="{TemplateBinding TextWrapping}"/>
+                            <!-- 清除键固定贴输入框右缘(第 1 列 = Auto,靠右;绝不铺满内容列)。
+                                 Margin 右 -2 = 默认模板的 HelperButtonThemePadding,位置与默认模板一致。 -->
                             <Button x:Name="DeleteButton" Grid.Row="1" Grid.Column="1"
                                     Style="{StaticResource DarkFieldDeleteButtonStyle}"
-                                    Background="Transparent" BorderThickness="0" Padding="0" Margin="0"
-                                    MinWidth="44" MinHeight="36" VerticalAlignment="Stretch"
+                                    Background="Transparent" BorderThickness="0" Padding="0" Margin="0,0,-2,0"
+                                    MinWidth="44" MinHeight="36"
+                                    HorizontalAlignment="Right" VerticalAlignment="Stretch"
                                     IsTabStop="False" Visibility="Collapsed"
                                     AutomationProperties.AccessibilityView="Raw"/>
                         </Grid>
