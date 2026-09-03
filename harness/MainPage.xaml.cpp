@@ -449,6 +449,25 @@ static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int 
 
 static const int kW = 720, kH = 1080;
 
+// Apotheosis (M4): 页面缩放边界必须与引擎侧一致 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
+//   自己把 scale 钳到 [0.5, 6.0]；harness 若用别的上下界，超界的捏合会被引擎悄悄改成别的值，
+//   harness 记的 m_pageScale 就和 Page::pageScaleFactor() 对不上（下次捏合基准错）。
+static const float kMinPageScale = 0.5f;
+static const float kMaxPageScale = 6.0f;
+// 松手后 |scale − 1| ≤ 6 % 直接吸附到精确 1.0：捏合是浮点乘积的累积，靠手指几乎不可能正好回到
+//   1:1，实机表现为“怎么捏都回不到原始大小、总停在某个缩放级别”。
+static const float kPageScaleSnapTol = 0.06f;
+
+// 钳到引擎接受的区间，并把接近 1:1 的结果吸附成精确 1.0。
+static float SnapAndClampPageScale(float s)
+{
+    if (!(s > 0.0f)) s = 1.0f;
+    if (s < kMinPageScale) s = kMinPageScale;
+    if (s > kMaxPageScale) s = kMaxPageScale;
+    if (s > 1.0f - kPageScaleSnapTol && s < 1.0f + kPageScaleSnapTol) s = 1.0f;
+    return s;
+}
+
 // 取一块引擎渲染输出缓冲(kW*kH*4)。直呈现模式:UI 从不读这块 RGBA(BlitToBitmap 空转、各回调按
 // m_gpuPresent 跳过贴图),且引擎线程严格串行 → 全程复用同一块,免去热路径(实时 tick/拖拽滚动/
 // 逐键重绘)每帧 3MB 的分配+清零。软件模式必须每次新分配:UI 线程可能还拿着上一帧在读。
@@ -1317,9 +1336,11 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     if (m_pinching || (ds > 0.0f && (ds > 1.002f || ds < 0.998f))) {
         m_pinching = true;
         if (ds > 0.0f) m_liveScale *= ds;
-        float total = m_pageScale * m_liveScale;          // 钳总缩放到 [0.5,6.0]
-        if (total < 0.5f) m_liveScale = 0.5f / m_pageScale;
-        if (total > 6.0f) m_liveScale = 6.0f / m_pageScale;
+        float total = m_pageScale * m_liveScale;          // 钳总缩放到 [kMinPageScale,kMaxPageScale]
+        if (m_pageScale > 0.0f) {
+            if (total < kMinPageScale) m_liveScale = kMinPageScale / m_pageScale;
+            if (total > kMaxPageScale) m_liveScale = kMaxPageScale / m_pageScale;
+        }
         auto fp = e->Position;                            // 捏合焦点(相对 ContentArea = 视口坐标)
         m_focalX = fp.X; m_focalY = fp.Y;
         ApplyLiveZoom();
@@ -1354,9 +1375,9 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     if (!m_pinching) return;
     m_pinching = false;
     float live = m_liveScale; m_liveScale = 1.0f;
-    float newScale = m_pageScale * live;
-    if (newScale < 0.5f) newScale = 0.5f;
-    if (newScale > 6.0f) newScale = 6.0f;
+    // 钳到引擎区间 + 吸附 1:1（见 SnapAndClampPageScale）。没有吸附时，捏回去总差百分之几，
+    //   页面永远停在“差不多但不是原始大小”的状态上，且误差每次捏合继续累积。
+    float newScale = SnapAndClampPageScale(m_pageScale * live);
     // 焦点同样从显示坐标(DIP,用于 ScaleTransform 中心)映回引擎像素空间再交引擎,避免缩放锚点偏。
     int fpx, fpy; MapTapToEngine(m_focalX, m_focalY, fpx, fpy);
     PinchCommit(newScale, fpx, fpy);
