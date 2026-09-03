@@ -179,6 +179,17 @@ void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
 
+// Apotheosis (instant pan): where the main frame actually is. The harness applies a touch pan to
+// the presenting XAML element immediately and only needs the engine to tell it how far it has
+// really got, so the preview can be reduced to the not-yet-applied remainder and clamped to the
+// document instead of sliding the page off its own content.
+// All values are in the units WebCoreScrollBy's dx/dy use (engine viewport px at the current page
+// scale). viewW/viewH are the visible size the engine clamps against, i.e. the maximum scroll
+// position is exactly (contentW-viewW, contentH-viewH), floored at 0. Any pointer may be null.
+// Cheap: reads the existing layout, no relayout and no paint. Returns 0, or a negative error when
+// there is no session/view. Engine thread only.
+int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* viewW, int* viewH);
+
 // Nested-scroll support (cookie-consent overlays, modals, iframes): unlike WebCoreScrollBy, which
 // only ever moves the main frame, these route through WebCore's real wheel-event scroll targeting
 // so an overflow:auto container/modal/iframe under the point scrolls instead of the page behind it.

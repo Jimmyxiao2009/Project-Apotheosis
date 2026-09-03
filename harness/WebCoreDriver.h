@@ -171,6 +171,17 @@ int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 // 垂直滚动 dy 像素(正=向下),触发懒加载图片后重绘到 outBuf。
 int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
 
+// Apotheosis (instant pan): where the main frame actually is. The harness applies a touch pan to
+// the presenting XAML element immediately and only needs the engine to tell it how far it has
+// really got, so the preview can be reduced to the not-yet-applied remainder and clamped to the
+// document instead of sliding the page off its own content.
+// All values are in the units WebCoreScrollBy's dx/dy use (engine viewport px at the current page
+// scale). viewW/viewH are the visible size the engine clamps against, i.e. the maximum scroll
+// position is exactly (contentW-viewW, contentH-viewH), floored at 0. Any pointer may be null.
+// Cheap: reads the existing layout, no relayout and no paint. Returns 0, or a negative error when
+// there is no session/view. Engine thread only.
+int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* viewW, int* viewH);
+
 // 嵌套滚动支持(cookie 同意浮层/模态框/iframe):WebCoreScrollBy 只会移动主帧,这两个走 WebCore
 // 真实的 wheel 事件滚动目标查找,让点下方的 overflow:auto 容器/模态框/iframe 自己滚,而不是滚到
 // 它背后的整页。(x,y) = 位图/视口像素,同 WebCoreClickAt/WebCoreScrollBy 约定。

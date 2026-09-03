@@ -3069,6 +3069,38 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     return kOK;
 }
 
+// Apotheosis (instant pan): where the main frame actually is, so the harness can turn "what the
+// finger asked for" into "what the engine has not applied yet" and clamp its own pan preview to the
+// document. Deliberately does NO layout and NO paint: it is called straight after a
+// WebCoreScrollBy on the same engine-thread hop, whose updateLayoutIgnorePendingStylesheets() has
+// just run, and at gesture start where a stale-by-one-frame answer is harmless. Not gated on
+// g_inPump either — it changes nothing, so it cannot re-enter anything.
+//
+// viewW/viewH are reported as contentsSize - maximumScrollPosition rather than as
+// visibleContentRect(), so that the harness' max = content - view is *exactly* the position
+// WebCoreScrollBy clamps to (headers/footers and the minimum scroll position included). Everything
+// is in the same units as WebCoreScrollBy's dx/dy.
+int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* viewW, int* viewH)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    RefPtr<LocalFrameView> view = g_session->mainFrame->view();
+    if (!view)
+        return kErrNoView;
+
+    const ScrollPosition cur = view->scrollPosition();
+    const ScrollPosition maxP = view->maximumScrollPosition();
+    const IntSize contents = view->contentsSize();
+    if (x) *x = cur.x();
+    if (y) *y = cur.y();
+    if (contentW) *contentW = contents.width();
+    if (contentH) *contentH = contents.height();
+    if (viewW) *viewW = contents.width() - maxP.x();
+    if (viewH) *viewH = contents.height() - maxP.y();
+    return kOK;
+}
+
 // Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
 // whether a touch-pan should route through WebCoreWheelAt (nested scroller under the finger) or
 // go straight to the WebCoreScrollBy main-frame fast path — without dispatching a real event.

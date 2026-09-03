@@ -200,6 +200,23 @@ namespace Harness {
         // 手势前几个 delta 抢在 WebCoreIsScrollableAt 答案之前到达时先缓存(见 m_pendingPan*),
         // 答案落地(或手势结束)后按选定路径一次性补发。
         void ReplayPendingPan();
+        // ---- Apotheosis (instant pan, developer setting "Instant pan"): the last frame follows
+        // the finger. A main-frame pan is applied to the presenting element as a XAML
+        // TranslateTransform on the UI thread *immediately*, while the coalesced WebCoreScrollBy
+        // goes to the engine exactly as before; every engine frame that lands subtracts what the
+        // engine really scrolled, so the transform only ever carries the not-yet-applied remainder.
+        void InstantPanBy(int dx, int dy);            // finger asked for this much more (engine px)
+        void InstantPanApplied(int newScrollX, int newScrollY, bool haveScrollState,
+                               int fallbackDx, int fallbackDy);   // an engine frame landed
+        void InstantPanReset();                       // remainder → 0, transform → identity
+        void ClampPanRemainder();                     // document bounds + one screen
+        void ApplyPanTransform();                     // remainder (engine px) → translation (DIP)
+        void RequestScrollState();                    // seed the cached scroll/bounds (async)
+        void RestartPanSnapTimer();                   // ~1 s after the last movement the engine wins
+        void OnPanSnapTick(Platform::Object^ sender, Platform::Object^ e);
+        // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
+        //   presenting element (TransformGroup, scale first so the translation stays screen-space).
+        void ApplyPresentTransform();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -287,6 +304,8 @@ namespace Harness {
         bool m_updateAuto { false };  // 隐私：启动后自动查 GitHub 更新（默认关）；settings.ini updatecheck
         int  m_prefetch { 0 };        // 隐私：推测预取 0=关/1=仅 Wi-Fi(不计费连接)/2=始终；settings.ini prefetch
         bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
+        // Apotheosis: DEVELOPER toggle. On by default - it is what makes a pan feel like a pan.
+        bool m_instantPan { true };     // settings.ini instantpan
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };
@@ -338,6 +357,19 @@ namespace Harness {
         Windows::UI::Xaml::Media::ScaleTransform^ m_zoomTransform;
         Windows::UI::Xaml::Media::Animation::Storyboard^ m_zoomSpring;
         float m_springTargetLive { 1.0f };
+        // ---- Apotheosis (instant pan) ----
+        // m_panRem* = engine viewport px the finger has asked for that the engine has not applied
+        //   yet. The transform shows -m_panRem*, converted to presenting-layer DIPs.
+        Windows::UI::Xaml::Media::TranslateTransform^ m_panTranslate;
+        Windows::UI::Xaml::Media::TransformGroup^ m_presentGroup;
+        Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
+        int  m_panRemX { 0 }, m_panRemY { 0 };
+        // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Only used to
+        //   clamp the preview to the document and to measure how far the engine really got.
+        int  m_scrollX { 0 }, m_scrollY { 0 };
+        int  m_contentW { 0 }, m_contentH { 0 }, m_viewW { 0 }, m_viewH { 0 };
+        bool m_scrollStateValid { false };
+        unsigned long long m_scrollStateGen { 0 };   // drops answers from a superseded gesture
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)
         double m_dragLastY { 0 };     // 上次指针 Y(算增量)
