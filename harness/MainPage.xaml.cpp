@@ -658,6 +658,19 @@ MainPage::MainPage()
                 WebEngine::instance().post([]() { try { WebCoreFlushCookiesToDisk(); } catch (...) {} });
             }
         });
+    // Apotheosis (PRIVACY-AUDIT.md): "Wi-Fi only" prefetch has to follow the connection. The event
+    //   arrives on a worker thread, so hop to the UI thread first (m_prefetch lives there) and let
+    //   ApplyPrefetchSetting post the engine call - never call the engine from here.
+    try {
+        Windows::Networking::Connectivity::NetworkInformation::NetworkStatusChanged +=
+            ref new Windows::Networking::Connectivity::NetworkStatusChangedEventHandler(
+                [this](Platform::Object^) {
+                    try {
+                        Dispatcher->RunAsync(CoreDispatcherPriority::Normal,
+                            ref new DispatchedHandler([this]() { ApplyPrefetchSetting(); }));
+                    } catch (...) {}
+                });
+    } catch (...) {}
     // 实体返回键(Win10M 硬件 Back):接管系统返回事件 → 先关浮层/再浏览器后退/否则交系统。
     try {
         Windows::UI::Core::SystemNavigationManager::GetForCurrentView()->BackRequested +=
@@ -1380,6 +1393,31 @@ void MainPage::EngineScroll(int dy)
         } catch (...) {}
     });
 }
+// Apotheosis (PRIVACY-AUDIT.md recommended action 4): is the connection we are on unmetered?
+//   Anything that is not explicitly Unrestricted (Fixed / Variable / Unknown, or no profile at all)
+//   counts as metered, so "Wi-Fi only" errs towards not spending the user's data plan.
+static bool ConnectionIsUnmetered()
+{
+    using namespace Windows::Networking::Connectivity;
+    try {
+        ConnectionProfile^ profile = NetworkInformation::GetInternetConnectionProfile();
+        if (!profile) return false;
+        ConnectionCost^ cost = profile->GetConnectionCost();
+        if (!cost) return false;
+        return cost->NetworkCostType == NetworkCostType::Unrestricted;
+    } catch (...) { return false; }
+}
+
+// Apotheosis: speculation-rules prefetch = Off / Wi-Fi only / Always (Settings -> PRIVACY).
+//   Called from ApplySettings and whenever the network changes; the engine call goes through the
+//   engine thread (thread rule: the UI thread never calls WebCore directly).
+void MainPage::ApplyPrefetchSetting()
+{
+    if (m_prefetch < 0 || m_prefetch > 2) m_prefetch = 0;
+    int en = (m_prefetch == 2 || (m_prefetch == 1 && ConnectionIsUnmetered())) ? 1 : 0;
+    WebEngine::instance().post([en]() { try { WebCoreSetSpeculativePrefetch(en); } catch (...) {} });
+}
+
 // Apotheosis: the floating page up/down buttons are a developer aid (they were there to trigger
 //   lazy loading before touch scrolling worked). Off unless Settings → DEVELOPER turns them on.
 void MainPage::UpdateScrollFab()
@@ -2505,6 +2543,7 @@ void MainPage::ApplySettings()
         try { WebCoreSetUserAgentString(ua.empty() ? nullptr : ua.c_str()); } catch (...) {}   // 自定义 UA(空=清除回退开关)
     });
     UpdateScrollFab();
+    ApplyPrefetchSetting();
     if (UaBtn) {
         bool en = (g_lang == L"en");
         UaBtn->Content = ref new String(m_uaMobile ? (en ? L"\U0001F4F1 Mobile UA" : L"\U0001F4F1 手机UA")
@@ -2532,6 +2571,7 @@ void MainPage::LoadSettings()
             else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
             else if (k == "updatecheck") m_updateAuto = (atoi(v.c_str()) != 0);
+            else if (k == "prefetch") m_prefetch = atoi(v.c_str());
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
@@ -2554,6 +2594,7 @@ void MainPage::SaveSettings()
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
     s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "\n";
+    s += "prefetch=" + std::to_string(m_prefetch) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
@@ -2572,6 +2613,7 @@ void MainPage::ShowSettings()
     if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring(m_defaultZoom) + L"%").c_str());
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
     if (SetUpdateSwitch) SetUpdateSwitch->IsOn = m_updateAuto;
+    if (SetPrefetchCombo) SetPrefetchCombo->SelectedIndex = m_prefetch;
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
@@ -2606,6 +2648,7 @@ void MainPage::HideSettings()
     if (SetZoomSlider) m_defaultZoom = (int)(SetZoomSlider->Value + 0.5);
     if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
     if (SetUpdateSwitch) m_updateAuto = SetUpdateSwitch->IsOn;
+    if (SetPrefetchCombo && SetPrefetchCombo->SelectedIndex >= 0) m_prefetch = SetPrefetchCombo->SelectedIndex;
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
@@ -2653,6 +2696,10 @@ static const wchar_t* const kI18n[][2] = {
     { L"开启后每次启动会连接 api.github.com 一次",
       L"When on, the app contacts api.github.com once per start" },
     { L"立即检查更新", L"Check now" },
+    { L"预取网站建议的页面", L"Prefetch pages suggested by sites" },
+    { L"关闭预取", L"Off" }, { L"仅 Wi-Fi", L"Wi-Fi only" }, { L"始终", L"Always" },
+    { L"网站可提前加载你还没点击的链接",
+      L"Sites may load links you have not clicked yet" },
     { L"标签", L"Tabs" }, { L"完成", L"Done" }, { L"新建标签页", L"New tab" },
 };
 static Platform::String^ I18n(Platform::String^ s, bool toEn) {

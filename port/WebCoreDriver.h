@@ -189,6 +189,7 @@ int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into f
 int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Edge UA
 void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
+void WebCoreSetSpeculativePrefetch(int enabled);      // <script type="speculationrules"> prefetch, default off; sticky (live page + new sessions)
 int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
 int WebCoreGpuInit(void* nativeWindow, int w, int h); // M2: init GPU present (engine thread). nativeWindow=SwapChainPanel PropertySet IInspectable*; nullptr=offscreen(readback)
 int WebCoreComposite();                               // M2: composite current session layer tree to the window surface (swapBuffers)

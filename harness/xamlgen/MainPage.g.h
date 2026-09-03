@@ -75,6 +75,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetTabModeSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetGpuSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetUpdateSwitch;
+        private: ::Windows::UI::Xaml::Controls::ComboBox^ SetPrefetchCombo;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ AboutFooterText;

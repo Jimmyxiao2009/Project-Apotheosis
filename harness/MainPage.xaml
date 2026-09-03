@@ -622,6 +622,16 @@
                     <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8"/>
                     <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="立即检查更新"/>
 
+                    <!-- 推测预取（speculation rules）：页面可提前取用户未点击的 URL。默认关； -->
+                    <!-- “仅 Wi-Fi”按连接资费判定（NetworkCostType::Unrestricted），网络变化时重算。 -->
+                    <TextBlock Text="预取网站建议的页面" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
+                    <ComboBox x:Name="SetPrefetchCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem Content="关闭预取"/>
+                        <ComboBoxItem Content="仅 Wi-Fi"/>
+                        <ComboBoxItem Content="始终"/>
+                    </ComboBox>
+                    <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0"/>
+
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <Button Tag="export" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump"/>
 

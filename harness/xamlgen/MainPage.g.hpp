@@ -564,6 +564,16 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8" />
                     <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="立即检查更新" x:Name="_ev23" />
 
+                    <!-- 推测预取（speculation rules）：页面可提前取用户未点击的 URL。默认关； -->
+                    <!-- “仅 Wi-Fi”按连接资费判定（NetworkCostType::Unrestricted），网络变化时重算。 -->
+                    <TextBlock Text="预取网站建议的页面" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4" />
+                    <ComboBox x:Name="SetPrefetchCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem Content="关闭预取" />
+                        <ComboBoxItem Content="仅 Wi-Fi" />
+                        <ComboBoxItem Content="始终" />
+                    </ComboBox>
+                    <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0" />
+
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev24" />
 
@@ -611,13 +621,13 @@ static ::Platform::String^ __MainPageXaml() {
         <Grid x:Name="OobePanel" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="36,0" MaxWidth="380">
                 <Border Width="64" Height="64" CornerRadius="32" BorderBrush="{StaticResource Accent}" BorderThickness="2" Background="{StaticResource AccentDim}" Margin="0,0,0,22">
-                    <TextBlock Text="A" Foreground="{StaticResource Accent}" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    <TextBlock Text="A" Foreground="{StaticResource Accen)APO",
+        LR"APO(t}" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
                 </Border>
                 <TextBlock Text="APOTHEOSIS" Foreground="{StaticResource Accent}" FontSize="12" CharacterSpacing="220" HorizontalAlignment="Center" />
                 <TextBlock Text="EdgeHTML Reborn" Foreground="{StaticResource TxtHi}" FontSize="30" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,6,0,0" />
                 <TextBlock Text="Modern web, reborn on Windows Phone" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0" />
-                <TextBlock Text="让被放弃的 Windows Phone 重新跑现代)APO",
-        LR"APO(网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
+                <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
                 <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
                 <Border Background="{StaticResource Accent}" CornerRadius="4" Margin="0,0,0,12">
                     <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev27" />
@@ -660,6 +670,7 @@ void MainPage::InitializeComponent() {
     SetTabModeSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetTabModeSwitch"));
     SetGpuSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetGpuSwitch"));
     SetUpdateSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetUpdateSwitch"));
+    SetPrefetchCombo = safe_cast<::Windows::UI::Xaml::Controls::ComboBox^>(__root->FindName(L"SetPrefetchCombo"));
     SetScrollFabSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetScrollFabSwitch"));
     VersionText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"VersionText"));
     AboutFooterText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"AboutFooterText"));
@@ -702,20 +713,20 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev1"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollUp);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev2"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollDown);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindPrev"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindPrev);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"MenuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnMenu);

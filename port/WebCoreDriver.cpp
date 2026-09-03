@@ -383,6 +383,12 @@ static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判
 static int g_lastPendingResources = 0; // 最近文档仍在加载/未知状态的缓存资源数(防实时循环过早停)
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobile/desktop。WebCoreSetUserAgentString 设。
+// Apotheosis (PRIVACY-AUDIT.md recommended action 4): speculation-rules prefetch.
+//   WebCore defaults speculationRulesPrefetchEnabled to true, so a page's
+//   <script type="speculationrules"> may issue full requests for URLs the user never clicked.
+//   Off unless the harness turns it on (Settings -> PRIVACY: Off / Wi-Fi only / Always).
+//   WebCoreSetSpeculativePrefetch() sets it; every Page created afterwards reads it.
+static bool g_apoSpecPrefetch = false;
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
@@ -1805,6 +1811,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setAcceleratedCompositingEnabled(g_gpuActive);   // 仅 GPU 就绪才开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层),经 TextureMapper GPU 呈现
     page->settings().setForceCompositingMode(g_gpuActive);            // 同上;GPU 未起时关闭 → 纯软件 cairo,零回归
     page->settings().setShouldAllowUserInstalledFonts(false);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
     //   ReferenceError("Can't find variable: localStorage")崩溃,React 永不挂载(白屏)。开了它们才行。
@@ -2402,6 +2409,7 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     page->settings().setScriptEnabled(false);
     page->settings().setAcceleratedCompositingEnabled(false);
     page->settings().setShouldAllowUserInstalledFonts(false);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
 #if ENABLE(VIDEO)
     page->settings().setMediaEnabled(false);
 #endif
@@ -2588,6 +2596,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setLoadsImagesAutomatically(true);   // 确保 <img>/CSS 背景图自动加载
     page->settings().setAcceleratedCompositingEnabled(false);
     page->settings().setShouldAllowUserInstalledFonts(false);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
 #if ENABLE(VIDEO)
     page->settings().setMediaEnabled(false);
 #endif
@@ -3086,6 +3095,17 @@ void WebCoreSetUserAgentString(const char* ua)
 
 // M1 验证:GPU 合成是否在跑。PortChromeClient 的 attachRootGraphicsLayer 被调=合成激活+图层树已建;
 // 根图层非空即证。加载后查(图层树在布局/合成更新时建)。返回 1=合成在跑,0=未。
+// Apotheosis (PRIVACY-AUDIT.md recommended action 4): switch speculation-rules prefetch on/off.
+// enabled!=0 -> a page's <script type="speculationrules"> may prefetch URLs the user has not clicked.
+// Engine thread only (touches the live Page). Sticky: applies to the current session and to every
+// session created afterwards, so the harness sets it at startup and on every network-cost change.
+void WebCoreSetSpeculativePrefetch(int enabled)
+{
+    g_apoSpecPrefetch = (enabled != 0);
+    if (g_session && g_session->page)
+        g_session->page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);
+}
+
 int WebCoreEnableCompositing()
 {
     if (!g_session || !g_session->chrome)

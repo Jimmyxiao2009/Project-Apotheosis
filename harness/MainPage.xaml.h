@@ -165,6 +165,9 @@ namespace Harness {
         void EngineScroll(int dy);
         // Apotheosis: show/hide the floating page up/down buttons (developer setting, off by default).
         void UpdateScrollFab();
+        // Apotheosis: push the PRIVACY prefetch choice (m_prefetch + current connection cost) to the
+        //   engine. UI thread only; posts to the engine thread, never waits on it.
+        void ApplyPrefetchSetting();
         void OnScrollUp(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnScrollDown(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 自由滚动:内容区 ManipulationDelta(单指拖拽 ΔY)→ 累积位移 → 合并成引擎滚动(无 spinner,带惯性)。
@@ -259,6 +262,7 @@ namespace Harness {
         int  m_tabMode { 0 };         // 0=单热会话 / 1=并发多引擎(实验);增量5/7 使用
         std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom
         bool m_updateAuto { false };  // 隐私：启动后自动查 GitHub 更新（默认关）；settings.ini updatecheck
+        int  m_prefetch { 0 };        // 隐私：推测预取 0=关/1=仅 Wi-Fi(不计费连接)/2=始终；settings.ini prefetch
         bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;

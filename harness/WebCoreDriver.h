@@ -196,6 +196,10 @@ void WebCoreSetUserAgentMobile(int mobile);
 // 自定义 UA:非空覆盖 mobile/desktop(绕开按 UA 拦截的站点如 microsoft);空串=清除回退开关。切后重载生效。
 void WebCoreSetUserAgentString(const char* ua);
 
+// Apotheosis (PRIVACY-AUDIT.md): 推测预取（<script type="speculationrules">）开关，默认关。
+// enabled!=0 时网页可预取用户未点击的 URL。仅引擎线程调；对当前会话和新建会话都生效。
+void WebCoreSetSpeculativePrefetch(int enabled);
+
 // M1:GPU 合成是否在跑(根 GraphicsLayer 已附)。加载后查,返回 1/0。
 int WebCoreEnableCompositing();
 
