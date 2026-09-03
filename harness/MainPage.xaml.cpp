@@ -297,22 +297,6 @@ static const char* U8(const char* zh, const char* en) {
     return g_lang == L"en" ? en : zh;
 }
 
-// 本地起始页(主页),WebCoreRenderHtml 渲染。CJK 已可用(SimHei)。
-static const char* kHomeHtml =
-    "<html><head><meta charset='utf-8'></head>"
-    "<body style='margin:0;background:#f5f6f8;font-family:sans-serif;color:#202124'>"
-    "<div style='background:linear-gradient(135deg,#00aa77,#0088cc);color:#fff;padding:40px 24px'>"
-    "<h1 style='margin:0;font-size:48px'>EdgeHTML Reborn</h1>"
-    "<p style='margin:8px 0 0;font-size:22px;opacity:.9'>现代浏览器引擎 &middot; Windows 10 Mobile &middot; ARM32</p></div>"
-    "<div style='padding:28px 24px'>"
-    "<p style='font-size:26px;margin:0 0 18px'>在上方地址栏输入网址访问网页。</p>"
-    "<div style='background:#fff;border-radius:14px;padding:20px 24px;box-shadow:0 2px 8px rgba(0,0,0,.08)'>"
-    "<p style='margin:0 0 10px;font-size:20px;color:#5f6368'>引擎能力</p>"
-    "<p style='margin:6px 0;font-size:22px'>HTTPS &middot; TLS 1.3 &middot; JavaScript &middot; 重定向 &middot; 中文字体</p>"
-    "<p style='margin:6px 0;font-size:22px'>WebKit (WebCore) 2.52.4</p></div>"
-    "<p style='margin:22px 0 0;font-size:20px;color:#80868b'>试试 &nbsp;example.com &nbsp;&middot;&nbsp; github.com &nbsp;&middot;&nbsp; bing.com</p>"
-    "</div></body></html>";
-
 static std::string MakeErrorHtml(const std::string& url, const char* err)
 {
     std::string e = err ? err : "";
@@ -3330,6 +3314,11 @@ void MainPage::SetLanguage(const std::wstring& lang) {
     g_lang = want;
     m_langSet = true;
     ApplySettings();          // UaBtn 等运行期标签按新语言重刷
+    // Apotheosis: TabSwitcherTitle is built at runtime as "标签 (N)" / "Tabs (N)" (RebuildTabSwitcher) —
+    //   once a count is appended it no longer exact-matches either kI18n key, so TranslateNode above
+    //   silently leaves it in the old language until something else rebuilds the switcher. Do it here
+    //   unconditionally (cheap, safe whether or not the switcher is currently open).
+    RebuildTabSwitcher();
 }
 
 void MainPage::OnOobeLang(Platform::Object^ sender, RoutedEventArgs^) {
