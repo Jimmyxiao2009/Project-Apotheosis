@@ -196,6 +196,22 @@ int WebCoreIsScrollableAt(int x, int y);
 // (与 WebCoreScrollBy 相同的 paintToRGBA 调用)——harness 不需要再补一次呈现才能看到嵌套滚动体动。
 int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outBuf);
 
+// Apotheosis(拖拽即指针事件):地图类控件(Google 地图 / OpenStreetMap-Leaflet / canvas 应用)
+// 自己监听 pointerdown/mousedown 并移动自身内容,不滚动任何可滚动盒 —— 对它们来说
+// WebCoreScrollBy 和 WebCoreWheelAt 都是错的路。下面两个导出让 harness 把这种手势按真实鼠标
+// 拖拽交给页面。
+//
+// WebCoreWantsDragAt:仅命中测试,不派发事件,足够便宜可在手势开始时调(与 WebCoreIsScrollableAt
+// 并列)。返回 1 = (x,y) 下的元素或其 <body> 以下的祖先带 pointerdown/mousedown/touchstart/
+// pointermove/touchmove 监听器、是 <canvas>、或 CSS touch-action 非 auto/manipulation。
+int WebCoreWantsDragAt(int x, int y);
+// WebCoreDragAt:把手势按左键鼠标拖拽派发(引擎会一并生成 pointerdown/pointermove/pointerup)。
+// phase:0=按下 / 1=移动 / 2=抬起 / 3=取消;(x,y)=视口/位图像素,同 WebCoreClickAt/WebCoreScrollBy。
+// 返回 1 = 这次手势归页面所有,0 = 不归(harness 把余下手势走回正常滚动路径)。只有按下这一步做决定:
+// 按下未被消费时 phase 1-3 直接返回 0 且不派发,故某个页面不理会的 mousemove 不会在拖拽中途把手势夺走。
+// 返回 1 时已按 WebCoreWheelAt 的方式合成/呈现到 outBuf;outBuf 可为 null(则不呈现)。
+int WebCoreDragAt(int phase, int x, int y, uint8_t* outBuf);
+
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();
 // 诊断:最近一次 WebCoreTypeText 的可编辑/聚焦/插入状态(排查"打字不进框")。

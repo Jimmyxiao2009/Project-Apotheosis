@@ -207,6 +207,26 @@ int WebCoreIsScrollableAt(int x, int y);
 // harness does not need a follow-up call to see the nested scroller move.
 int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA);
 
+// Apotheosis (drag as pointer events): map widgets (Google Maps, OpenStreetMap/Leaflet, canvas
+// apps) pan by handling pointerdown/mousedown themselves and moving their own content — they
+// scroll no scrollable box, so neither WebCoreScrollBy nor WebCoreWheelAt does anything useful
+// over them. These two let the harness hand such a gesture to the page as a real mouse drag.
+//
+// WebCoreWantsDragAt: hit test only, no event dispatched, cheap enough for gesture start (run it
+// next to WebCoreIsScrollableAt). 1 = the element under (x,y) or an ancestor below <body> has a
+// pointerdown/mousedown/touchstart/pointermove/touchmove listener, is a <canvas>, or sets CSS
+// touch-action to something other than auto/manipulation.
+int WebCoreWantsDragAt(int x, int y);
+// WebCoreDragAt: dispatch the gesture as a left-button mouse drag (which the engine also turns
+// into pointerdown/pointermove/pointerup). phase: 0 = press, 1 = move, 2 = release, 3 = cancel;
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt/WebCoreScrollBy. Returns 1 while
+// the page owns the gesture, 0 when it does not (the harness then routes the rest of the gesture
+// down its normal scroll path). Only the press decides: phases 1-3 are inert — and answer 0 —
+// unless the press was consumed, so an individual mousemove that the page ignores never yanks the
+// gesture away mid-pan. On a 1 return the frame is already composited/presented into outRGBA the
+// way WebCoreWheelAt does it; outRGBA may be null (no present attempted).
+int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA);
+
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal

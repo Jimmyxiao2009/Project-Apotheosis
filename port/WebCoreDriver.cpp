@@ -189,6 +189,15 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 #include <WebCore/HTMLIFrameElement.h>       // is<HTMLIFrameElement>(WebCoreIsScrollableAt)
 #include <WebCore/ShadowRoot.h>              // ShadowRoot::mode()/elementFromPoint(WebCoreIsScrollableAt)
 #include <WebCore/ShadowRootMode.h>          // ShadowRootMode::Open(同上)
+#include <WebCore/EventTargetInlines.h>   // Node::hasEventListeners()(WebCoreWantsDragAt)
+#include <WebCore/EventNames.h>           // eventNames().pointerdownEvent/... (WebCoreWantsDragAt)
+#include <WebCore/HTMLCanvasElement.h>    // is<HTMLCanvasElement>(WebCoreWantsDragAt)
+#include <WebCore/HTMLBodyElement.h>      // is<HTMLBodyElement>: stop the ancestor walk before <body>
+#include <WebCore/StyleTouchAction.h>     // Style::TouchAction::isAuto/isManipulation
+#include <WebCore/RenderObjectStyle.h>        // inline RenderObject::style()
+#include <WebCore/RenderStyle+GettersInlines.h>  // RenderStyle::touchAction()(the umbrella header; the
+                                              // RenderStyleProperties/ComputedStyleProperties inline files
+                                              // it pulls in #error out if included directly)
 #include <optional>
 #include <algorithm>
 
@@ -439,6 +448,10 @@ static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即�
 static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
+// Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
+// consumed is still in flight — moves/releases only reach the page while this is set, and
+// teardownSession() clears it. Engine thread only, like every other flag here.
+static bool g_dragActive = false;
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
@@ -1941,6 +1954,10 @@ static void teardownSession()
         g_glContext->makeContextCurrent();
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
+    // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
+    // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
+    // mousemove/mouseup into a document that never saw the press.
+    g_dragActive = false;
     if (g_session->client)
         g_session->client->setLoadCompletionHandler({});       // (b)
     if (g_session->mainFrame)
@@ -3386,6 +3403,208 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     }
 
     return consumedByNested ? 1 : 0;
+}
+
+// ===========================================================================
+// Apotheosis (drag as pointer events): map widgets — Google Maps, OpenStreetMap /
+// Leaflet, canvas apps — pan by listening to pointerdown/mousedown themselves and
+// moving their own content. They scroll no scrollable box at all, so BOTH of the
+// harness' existing gesture routes are wrong for them: the main-frame fast path
+// (WebCoreScrollBy) scrolls the document behind the map, and the nested route
+// (WebCoreWheelAt) finds nothing that consumes a wheel and falls back to exactly
+// that. WebCore already knows what such a page wants — it only never receives the
+// events, because a touch pan in this port is translated to scrolling, never to
+// input. The two exports below give the harness (a) a cheap "does this point
+// belong to something that drags itself?" probe to run at gesture start, next to
+// WebCoreIsScrollableAt, and (b) a way to feed the gesture to the page as a real
+// left-button mouse drag (mousedown → mousemove* → mouseup, which the engine also
+// turns into pointerdown/pointermove/pointerup — PointerEvent is built in this
+// port even though ENABLE_TOUCH_EVENTS is off, so pointer-first libraries like
+// Leaflet and Google Maps get the events they actually listen for).
+// ===========================================================================
+
+// Hit test only, no event dispatched — same shape as WebCoreIsScrollableAt above
+// (pump guard, layout, elementFromPoint, open-shadow descent, walk up the element
+// chain). Returns 1 when the element under (x,y) or one of its ancestors looks
+// like it handles dragging itself:
+//   * a JS listener for pointerdown / mousedown / touchstart / pointermove /
+//     touchmove (Leaflet, Google Maps, OpenLayers, MapLibre and every canvas app
+//     register at least one of these on their container; hasEventListeners() is a
+//     hash lookup on the target's listener map, so this stays cheap even though
+//     five names are asked per ancestor). touchstart/touchmove are worth asking
+//     even though ENABLE_TOUCH_EVENTS is 0 here: addEventListener() stores the
+//     listener regardless of whether the engine ever fires that event, so the
+//     name is still a reliable marker of "this widget wants the gesture".
+//   * a <canvas> (the app draws and pans its own content — there is nothing else
+//     a drag over it could sensibly mean)
+//   * CSS touch-action other than auto/manipulation: none / pan-x / pan-y is
+//     precisely how a widget tells the UA "I take this gesture", and it is what
+//     .leaflet-container, .maplibregl-canvas and the Google Maps root all set.
+// The walk deliberately stops at <body>/<html>: page-wide mousedown handlers
+// (dropdown menus, "click outside to close", analytics) sit on the document and
+// body of half the web, and treating those as drag widgets would make ordinary
+// pages stop scrolling. (x,y) = viewport/bitmap px, same convention as
+// WebCoreClickAt/WebCoreScrollBy/WebCoreIsScrollableAt. No session, no hit, or a
+// concurrent engine op all answer 0 — the harness then keeps its scroll routing.
+int WebCoreWantsDragAt(int x, int y)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+
+    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    if (!hit)
+        return 0;
+
+    // Same open-shadow descent as WebCoreIsScrollableAt: TreeScope::elementFromPoint retargets its
+    // result to the scope it was called on, so on the document scope a point inside a web component
+    // resolves to the host element and the listeners on the real target would never be seen. Map
+    // widgets are increasingly shipped as custom elements (gmp-map is one), so this matters here too.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    Element* root = doc->documentElement();
+    const auto& names = eventNames();
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (e.get() == root || is<HTMLBodyElement>(*e))
+            break;   // page-wide handlers are not a drag widget — see the comment above
+        if (is<HTMLCanvasElement>(*e))
+            return 1;
+        if (e->hasEventListeners(names.pointerdownEvent)
+            || e->hasEventListeners(names.mousedownEvent)
+            || e->hasEventListeners(names.touchstartEvent)
+            || e->hasEventListeners(names.pointermoveEvent)
+            || e->hasEventListeners(names.touchmoveEvent))
+            return 1;
+        if (RenderObject* r = e->renderer()) {
+            auto touchAction = r->style().touchAction();
+            if (!touchAction.isAuto() && !touchAction.isManipulation())
+                return 1;   // none / pan-x / pan-y: the element claims the gesture
+        }
+    }
+    return 0;
+}
+
+// Apotheosis (drag as pointer events): drive one touch pan through WebCore as a left-button mouse
+// drag. `phase`: 0 = press, 1 = move, 2 = release, 3 = cancel. (x,y) = viewport/bitmap px, same
+// convention as every other input export (EventHandler's windowToContents() adds the scroll offset
+// internally). Returns 1 while the page owns the gesture, 0 to tell the harness to route the rest
+// of it down its normal scroll path.
+//
+// The press is the decision point. handleMousePressEvent() reports handled both when a DOM listener
+// called preventDefault() and when WebCore's own default action took the press (starting a text
+// selection, grabbing a scrollbar), so on its own it is far too eager — plain body text would claim
+// every gesture. That is why the harness only ever calls this after WebCoreWantsDragAt() has already
+// said the point belongs to a drag widget; the press result then means what it should ("something
+// took it"), and a 0 is the honest signal that nothing did.
+//
+// Phases 1–3 are inert unless the press was taken (g_dragActive). That keeps the contract simple for
+// the caller — once the press answers 0 the whole gesture is the harness' again, and no half-drag can
+// leak into the page — and it means individual mousemove results are never consulted: a map that
+// preventDefaults pointerdown but not mousemove (most of them) would otherwise look "not consumed"
+// on its second event and have the gesture yanked away mid-pan. (g_dragActive is declared with the
+// other engine-thread session flags at the top of this file, because teardownSession() clears it.)
+//
+// outRGBA (optional, may be null): on a 1 return the moved content is composited/presented exactly
+// the way WebCoreWheelAt does it — isolatedUpdateRendering() to arm PortChromeClient::m_needsPresent,
+// then paintToRGBA. Without this the page would only reach the screen on the next live tick, i.e.
+// never during a gesture that keeps the engine busy. Deliberately NOT g_gpuScrollFast: the widget
+// repaints its own content into an ordinary backing store, so the dirty pass must run.
+int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame) {
+        g_dragActive = false;
+        return 0;
+    }
+    if (g_inPump)
+        return 0;
+    if (phase != 0 && !g_dragActive)
+        return 0;   // nothing took the press (or there was none): the gesture is not ours
+    g_inPump = true;
+    PumpGuard guard;
+
+    // Same reason WebCoreScrollBy/WebCoreWheelAt do this first: drain a decode callback that
+    // finished mid-gesture so it is visible before we dispatch, not one tick later.
+    RunLoop::cycle();
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view) {
+        g_dragActive = false;
+        return 0;
+    }
+    RefPtr<Document> doc = lf->document();
+    if (!doc) {
+        g_dragActive = false;
+        return 0;
+    }
+    if (phase == 0)
+        doc->updateLayoutIgnorePendingStylesheets();   // the press hit-tests; moves reuse that layout
+
+    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    OptionSet<PlatformEvent::Modifier> mods;
+    MonotonicTime t = MonotonicTime::now();
+    bool handled = false;
+
+    if (phase == 0) {
+        // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
+        // what several widgets key their pointerdown handling off.
+        PlatformMouseEvent hover(p, p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+        lf->eventHandler().handleMouseMoveEvent(hover);
+        PlatformMouseEvent down(p, p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, 0.0, SyntheticClickType::NoTap);
+        handled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
+        g_dragActive = handled;
+    } else if (phase == 1) {
+        // Button held: EventHandler's m_mousePressed is still set from the press, so this is a drag
+        // move, not a hover move. clickCount 0 is what a real platform move carries.
+        PlatformMouseEvent move(p, p, MouseButton::Left, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+        lf->eventHandler().handleMouseMoveEvent(move);
+        handled = true;   // see the header comment: the press decided, per-move results are noise
+    } else {
+        // 2 = release, 3 = cancel (and any unknown phase): both must end with a mouseup, otherwise
+        // EventHandler keeps m_mousePressed set and every later hover/tap behaves like a drag.
+        PlatformMouseEvent up(p, p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, t, 0.0, SyntheticClickType::NoTap);
+        lf->eventHandler().handleMouseReleaseEvent(up);
+        g_dragActive = false;
+        handled = true;
+    }
+
+    if (!handled)
+        return 0;
+
+    // A mouseup can navigate (a link inside the widget), which rebuilds frame and view — re-fetch
+    // before painting, the way WebCoreClickAt does after its pump.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf)
+        return 1;
+    view = lf->view();
+    if (!view)
+        return 1;
+
+    g_session->page->isolatedUpdateRendering();   // arms PortChromeClient::m_needsPresent (578cbc3/82c5cef)
+    if (outRGBA) {
+        int nonWhite = 0;
+        paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // best-effort, as in WebCoreWheelAt
+    }
+    return 1;
 }
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了 extractLinks)。轻量:仅布局 + 提取,不绘制、不派发事件。
