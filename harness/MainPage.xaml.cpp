@@ -1604,16 +1604,25 @@ void MainPage::SyncLinksAfterScroll()
 // Apotheosis (d982774): gesture start — fire-and-forget hit test (WebCoreIsScrollableAt) at the
 // touch-down point, posted to the engine thread, never blocking the UI thread. The answer lands
 // later via RunAsync; m_nestedScrollGen guards against a gesture that has already ended (or been
-// replaced by a new one) applying a stale answer. If OnImageManipDelta's first delta arrives
-// before the answer is back, m_nestedScrollState is still Unknown, which OnImageManipDelta already
-// treats as "not scrollable" (existing fast path) — no extra bookkeeping needed for that case.
+// replaced by a new one) applying a stale answer.
+//
+// Apotheosis (review 2026-09-03): deltas arriving before the answer are now BUFFERED
+// (m_pendingPan*) rather than run down the main-frame fast path — that first delta moved the page
+// behind a cookie overlay by a visible jerk before the route switched. ReplayPendingPan() below
+// sends them through whichever path the answer selects. Because Unknown no longer means "fast
+// path", the two early returns here must set the state explicitly: no hit test is posted on them,
+// so nothing would ever resolve Unknown and the whole gesture would buffer forever.
 void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationStartedRoutedEventArgs^ e)
 {
     unsigned long long gen = ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
-    if (!m_sessionActive) return;
+    m_pendingPanX = 0; m_pendingPanY = 0;
+    if (!m_sessionActive) { m_nestedScrollState = NestedScrollState::No; return; }
     int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
-    if (px < 0 || py < 0 || px >= kW || py >= kH) return;   // off-viewport touch-down: leave Unknown -> fast path
+    if (px < 0 || py < 0 || px >= kW || py >= kH) {
+        m_nestedScrollState = NestedScrollState::No;   // off-viewport touch-down: main-frame fast path
+        return;
+    }
 
     Platform::Agile<MainPage^> self(this);
     CoreDispatcher^ disp = this->Dispatcher;
@@ -1625,9 +1634,27 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_nestedScrollGen != gen) return;   // gesture already ended / superseded: drop the answer
                 s->m_nestedScrollState = r ? NestedScrollState::Yes : NestedScrollState::No;
+                s->ReplayPendingPan();   // the answer is in: send what the finger did while waiting
             }));
         } catch (...) {}
     });
+}
+
+// Apotheosis (review 2026-09-03): flush the deltas buffered while the nested-scroll answer was
+// still Unknown, down the path that answer chose. Called from the hit-test callback and from
+// OnImageManipCompleted (belt and braces: if the answer never arrives — engine post dropped, or
+// the gesture outlived it — the movement is still applied rather than silently lost, and by then
+// the state is whatever it ended up being, defaulting to the main-frame fast path).
+void MainPage::ReplayPendingPan()
+{
+    int dx = m_pendingPanX, dy = m_pendingPanY;
+    m_pendingPanX = 0; m_pendingPanY = 0;
+    if ((dx == 0 && dy == 0) || !m_sessionActive)
+        return;
+    if (m_nestedScrollState == NestedScrollState::Yes)
+        NestedScrollBy(m_pendingPanPx, m_pendingPanPy, dx, dy);
+    else
+        FreeScrollBy(dx, dy);
 }
 
 // 自由滚动:内容区 ManipulationDelta(去掉 ScrollViewer 后,触摸不再被吞)。单指拖拽的累计 ΔY → 引擎滚动。
@@ -1648,6 +1675,10 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         //   release (worst when zooming in, where 1 − live is largest).
         if (!m_pinching) {
             m_pinching = true;
+            // Apotheosis (review 2026-09-03): this gesture turns out to be a pinch, not a pan —
+            // drop anything buffered for the (never-resolved) nested-scroll route so it cannot be
+            // replayed as a scroll on top of the zoom.
+            m_pendingPanX = 0; m_pendingPanY = 0;
             SetPinchAnchor(e->Position.X, e->Position.Y);
         }
         if (ds > 0.0f) m_liveScale *= ds;
@@ -1674,6 +1705,19 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     // too: OnImageManipDelta keeps firing translation deltas during TranslateInertia, and
     // m_nestedScrollState is only reset (to Unknown) in OnImageManipCompleted, so inertia deltas
     // of a gesture that started nested stay on this path all the way to rest.
+    if (m_nestedScrollState == NestedScrollState::Unknown) {
+        // Apotheosis (review 2026-09-03): the hit test has not answered yet. Buffer instead of
+        // guessing — running these through the main-frame fast path scrolled the page behind the
+        // overlay by one visible jerk on every gesture that turned out to be nested. Nothing is
+        // lost by waiting: WebCoreIsScrollableAt sits in the same engine-thread queue a
+        // WebCoreScrollBy would, so the frame could not have been produced any earlier anyway.
+        int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
+        if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
+        if (py < 0) py = 0; else if (py >= kH) py = kH - 1;
+        m_pendingPanPx = px; m_pendingPanPy = py;
+        m_pendingPanX += idx; m_pendingPanY += idy;
+        return;
+    }
     if (m_nestedScrollState == NestedScrollState::Yes) {
         int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
         if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
@@ -1681,7 +1725,7 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         NestedScrollBy(px, py, idx, idy);
         return;
     }
-    // Unknown(hit test 还没回,含手势第一个 delta 抢在答案之前到达的情况)或 No:现有主帧快路径不变。
+    // No:现有主帧快路径不变。
     FreeScrollBy(idx, idy);
 }
 
@@ -1820,6 +1864,9 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // Apotheosis (d982774): reset the nested-scroll gesture state regardless of pinch/pan — bumping
     // the generation also drops any WebCoreIsScrollableAt answer for this gesture that is still in
     // flight when it lands (OnImageManipStarted checks it against m_nestedScrollGen).
+    // Apotheosis (review 2026-09-03): flush first — the answer may never have arrived, and buffered
+    // finger movement must reach the page rather than vanish with the gesture.
+    ReplayPendingPan();
     ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     if (!m_pinching) return;

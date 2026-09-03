@@ -197,6 +197,9 @@ namespace Harness {
         // WebCoreScrollBy 走主帧(顺序保持,和 FreeScrollBy/PumpScroll 的快路径是姊妹实现)。
         void NestedScrollBy(int px, int py, int dx, int dy);
         void PumpNestedScroll();
+        // 手势前几个 delta 抢在 WebCoreIsScrollableAt 答案之前到达时先缓存(见 m_pendingPan*),
+        // 答案落地(或手势结束)后按选定路径一次性补发。
+        void ReplayPendingPan();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -317,6 +320,13 @@ namespace Harness {
         int  m_nestedAccumY { 0 };    // 未冲刷的累积竖向位移
         int  m_nestedPx { 0 }, m_nestedPy { 0 };   // wheel 派发点(引擎像素),跟随手指当前位置
         bool m_nestedScrollBusy { false };   // 有 NestedScrollBy 任务在引擎线程飞行
+        // Apotheosis (review 2026-09-03): deltas that arrived while m_nestedScrollState was still
+        // Unknown. They used to go straight down the main-frame fast path, so a pan started on a
+        // cookie overlay jerked the page behind it once before the hit-test answer switched routes.
+        // Buffered here instead and replayed through whichever path the answer picks
+        // (ReplayPendingPan). Reset per gesture in OnImageManipStarted.
+        int  m_pendingPanX { 0 }, m_pendingPanY { 0 };     // accumulated buffered offset delta
+        int  m_pendingPanPx { 0 }, m_pendingPanPy { 0 };   // finger position (engine px) of the last of them
         // M4 捏合缩放状态
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
         float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)
