@@ -17,6 +17,11 @@ namespace Harness {
 
     enum class DrawerTab { Favorites, History, Downloads };
 
+    // Apotheosis: nested-scroll routing (commit d982774, WebCoreIsScrollableAt/WebCoreWheelAt).
+    // Unknown = hit test still in flight (or none posted this gesture): existing main-frame fast
+    // path. Yes/No = the async answer for the point the current gesture started at.
+    enum class NestedScrollState { Unknown, Yes, No };
+
     // 网页链接命中矩形(位图坐标)+ URL,用于点击交互。
     struct PageLink { int x, y, w, h; std::wstring url; };
 
@@ -180,9 +185,18 @@ namespace Harness {
         void FreeScrollBy(int dx, int dy);   // 累积 dx/dy 并在引擎空闲时冲刷
         void PumpScroll();           // 把累积位移作为一次 WebCoreScrollBy 派发(完成后若仍有累积再派发)
         void SyncLinksAfterScroll(); // 滚动停止后一次性刷新链接命中表(滚动期跳过了引擎 extractLinks)
+        // 手势开始:异步问引擎这一点下面有没有可滚动祖先/iframe(WebCoreIsScrollableAt),决定本次手势
+        // (含惯性)走 NestedScrollBy 还是现有主帧快路径。ManipulationStarted 在 XAML 里没有挂钩(见
+        // MainPage.xaml,只接了 Delta/Completed)——构造函数里手动订阅(ContentArea->ManipulationStarted +=)。
+        void OnImageManipStarted(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationStartedRoutedEventArgs^ e);
         void OnImageManipDelta(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e);
         // M4 捏合缩放:捏合期间对显示层做实时 ScaleTransform(零引擎),松手提交给引擎按新尺度重栅格(文字清晰)。
         void OnImageManipCompleted(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^ e);
+        // 嵌套滚动(cookie 浮层/模态框/iframe):累积一次手势内的位移,合并成一次引擎线程调用——
+        // WebCoreWheelAt 先派发真实 wheel,消费(1)则到此为止;未消费(0)则在同一次 post 里补
+        // WebCoreScrollBy 走主帧(顺序保持,和 FreeScrollBy/PumpScroll 的快路径是姊妹实现)。
+        void NestedScrollBy(int px, int py, int dx, int dy);
+        void PumpNestedScroll();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -295,6 +309,14 @@ namespace Harness {
         int  m_scrollAccum { 0 };     // 未冲刷的累积竖向滚动位移(像素,>0 向下)
         int  m_scrollAccumX { 0 };    // 未冲刷的累积横向滚动位移(像素,>0 向右)
         bool m_scrollBusy { false };  // 有 WebCoreScrollBy 任务在引擎线程飞行
+        // Apotheosis: nested-scroll routing state (WebCoreIsScrollableAt/WebCoreWheelAt, d982774).
+        NestedScrollState m_nestedScrollState { NestedScrollState::Unknown };  // this gesture's answer
+        unsigned long long m_nestedScrollGen { 0 };   // bumped at ManipulationStarted; a late hit-test
+                                                       // answer whose gen no longer matches is dropped
+        int  m_nestedAccumX { 0 };    // 未冲刷的累积横向位移(嵌套滚动路径,同 m_scrollAccumX 但走 wheel)
+        int  m_nestedAccumY { 0 };    // 未冲刷的累积竖向位移
+        int  m_nestedPx { 0 }, m_nestedPy { 0 };   // wheel 派发点(引擎像素),跟随手指当前位置
+        bool m_nestedScrollBusy { false };   // 有 NestedScrollBy 任务在引擎线程飞行
         // M4 捏合缩放状态
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
         float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)

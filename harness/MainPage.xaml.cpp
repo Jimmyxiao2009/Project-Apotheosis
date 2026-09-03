@@ -601,6 +601,13 @@ MainPage::MainPage()
 {
     InitializeComponent();
 
+    // Apotheosis: MainPage.xaml only wires ContentArea's ManipulationDelta/ManipulationCompleted
+    // (see MainPage.xaml) — ManipulationStarted has no markup hook, so it is subscribed here in
+    // code instead of touching the XAML. Kicks off the nested-scroll hit test (WebCoreIsScrollableAt)
+    // as early as possible, before the first ManipulationDelta of the gesture arrives.
+    ContentArea->ManipulationStarted += ref new Windows::UI::Xaml::Input::ManipulationStartedEventHandler(
+        this, &MainPage::OnImageManipStarted);
+
     // 分享:注册一次 DataRequested(原生分享契约,App Container/1607 起可用)。分享当前页 URL+标题。
     try {
         auto dtm = Windows::ApplicationModel::DataTransfer::DataTransferManager::GetForCurrentView();
@@ -1502,6 +1509,64 @@ void MainPage::PumpScroll()
     });
 }
 
+// Apotheosis (d982774): nested-scroll sibling of FreeScrollBy/PumpScroll above — same accumulate-
+// then-flush shape (m_nestedScrollBusy gates one in-flight engine post at a time), but the flush
+// dispatches through WebCoreWheelAt first so an overflow:auto container/modal/iframe under the
+// dispatch point scrolls itself. dx/dy accumulate across deltas the same way; the dispatch point
+// (px,py) is refreshed on every call, i.e. tracks the finger's current position, not the gesture's
+// starting point.
+void MainPage::NestedScrollBy(int px, int py, int dx, int dy)
+{
+    if (!m_sessionActive || (dx == 0 && dy == 0)) return;
+    m_nestedAccumX += dx;
+    m_nestedAccumY += dy;
+    m_nestedPx = px; m_nestedPy = py;
+    if (!m_nestedScrollBusy) PumpNestedScroll();
+}
+
+void MainPage::PumpNestedScroll()
+{
+    if ((m_nestedAccumX == 0 && m_nestedAccumY == 0) || !m_sessionActive) { m_nestedScrollBusy = false; return; }
+    int dx = m_nestedAccumX; m_nestedAccumX = 0;
+    int dy = m_nestedAccumY; m_nestedAccumY = 0;
+    int px = m_nestedPx, py = m_nestedPy;
+    m_nestedScrollBusy = true;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;   // 被动滚动:不作废点击/导航令牌,但被它们作废(同 PumpScroll)
+    bool present = m_gpuPresent;
+    WebEngine::instance().post([disp, self, px, py, dx, dy, mySeq, present]() {
+        int wrc = -999;
+        try { wrc = WebCoreWheelAt(px, py, (float)dx, (float)dy, 2 /* changed */); } catch (...) { wrc = -1000; }
+        // wrc == 1: consumed by a nested scroller, main-frame position guaranteed untouched — done,
+        // no WebCoreScrollBy for this delta. Any other value (0 = not consumed, or a driver
+        // exception): main-frame scroll position is left unchanged either way, so WebCoreScrollBy
+        // is safe to call unconditionally for the same delta (ordering preserved: wheel first).
+        std::shared_ptr<std::vector<uint8_t>> rgba;
+        int rc = 0;
+        if (wrc != 1) {
+            rgba = AcquireEngineBuffer(present);
+            try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
+        }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, wrc]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) { s->m_nestedScrollBusy = false; s->m_nestedAccumX = 0; s->m_nestedAccumY = 0; return; }   // 被导航/点击取代
+                if (wrc == 1) {
+                    s->m_lastFrameHash = 0;   // 嵌套滚动体已变;下一次实时 tick(present 呈现/软件贴图)会捡起
+                } else if (rcCopy == 0) {
+                    if (!present) s->PresentSoftwareFrame(rgba);
+                    s->m_lastFrameHash = 0;
+                }
+                s->m_nestedScrollBusy = false;
+                if (s->m_nestedAccumX != 0 || s->m_nestedAccumY != 0) s->PumpNestedScroll();   // 拖拽期间又攒了位移,继续冲刷
+                else { s->SyncLinksAfterScroll(); s->StartLiveMode(); }
+            }));
+        } catch (...) {}
+    });
+}
+
 // 滚动停止后一次性刷新链接命中表(滚动期间为提速跳过了引擎 extractLinks)。点击走引擎实时命中测试(权威),
 // 故此刷新主要服务点击兜底/主页路径;陈旧窗口仅限"刚停手到这帧返回"之间,无碍。
 void MainPage::SyncLinksAfterScroll()
@@ -1528,6 +1593,35 @@ void MainPage::SyncLinksAfterScroll()
         } catch (...) {}
     });
 }
+// Apotheosis (d982774): gesture start — fire-and-forget hit test (WebCoreIsScrollableAt) at the
+// touch-down point, posted to the engine thread, never blocking the UI thread. The answer lands
+// later via RunAsync; m_nestedScrollGen guards against a gesture that has already ended (or been
+// replaced by a new one) applying a stale answer. If OnImageManipDelta's first delta arrives
+// before the answer is back, m_nestedScrollState is still Unknown, which OnImageManipDelta already
+// treats as "not scrollable" (existing fast path) — no extra bookkeeping needed for that case.
+void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationStartedRoutedEventArgs^ e)
+{
+    unsigned long long gen = ++m_nestedScrollGen;
+    m_nestedScrollState = NestedScrollState::Unknown;
+    if (!m_sessionActive) return;
+    int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
+    if (px < 0 || py < 0 || px >= kW || py >= kH) return;   // off-viewport touch-down: leave Unknown -> fast path
+
+    Platform::Agile<MainPage^> self(this);
+    CoreDispatcher^ disp = this->Dispatcher;
+    WebEngine::instance().post([disp, self, px, py, gen]() {
+        int r = 0;
+        try { r = WebCoreIsScrollableAt(px, py); } catch (...) { r = 0; }
+        try {
+            disp->RunAsync(CoreDispatcherPriority::High, ref new DispatchedHandler([self, r, gen]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_nestedScrollGen != gen) return;   // gesture already ended / superseded: drop the answer
+                s->m_nestedScrollState = r ? NestedScrollState::Yes : NestedScrollState::No;
+            }));
+        } catch (...) {}
+    });
+}
+
 // 自由滚动:内容区 ManipulationDelta(去掉 ScrollViewer 后,触摸不再被吞)。单指拖拽的累计 ΔY → 引擎滚动。
 // TranslateInertia 让松手后继续惯性滚(ManipulationDelta 在惯性期持续触发)。点击经 Tapped 走(手势识别器
 // 区分点按 vs 拖拽,小位移=Tapped、越阈值=Manipulation,不会冲突)。
@@ -1566,7 +1660,21 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     double dy = -e->Delta.Translation.Y * sy;        // 手指上移(ΔY<0)→ 内容下滚(dy>0)
     int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
-    if (idx != 0 || idy != 0) FreeScrollBy(idx, idy);
+    if (idx == 0 && idy == 0) return;
+    // Apotheosis (d982774): this gesture started over a nested scroller (cookie overlay/modal/
+    // iframe) -> route through WebCoreWheelAt instead of the main-frame fast path. Covers inertia
+    // too: OnImageManipDelta keeps firing translation deltas during TranslateInertia, and
+    // m_nestedScrollState is only reset (to Unknown) in OnImageManipCompleted, so inertia deltas
+    // of a gesture that started nested stay on this path all the way to rest.
+    if (m_nestedScrollState == NestedScrollState::Yes) {
+        int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
+        if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
+        if (py < 0) py = 0; else if (py >= kH) py = kH - 1;
+        NestedScrollBy(px, py, idx, idy);
+        return;
+    }
+    // Unknown(hit test 还没回,含手势第一个 delta 抢在答案之前到达的情况)或 No:现有主帧快路径不变。
+    FreeScrollBy(idx, idy);
 }
 
 // Apotheosis: the element that actually shows the engine output — in direct-present mode the
@@ -1701,6 +1809,11 @@ void MainPage::SpringBackZoom(float targetLive, float commitScale)
 // 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
 void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^)
 {
+    // Apotheosis (d982774): reset the nested-scroll gesture state regardless of pinch/pan — bumping
+    // the generation also drops any WebCoreIsScrollableAt answer for this gesture that is still in
+    // flight when it lands (OnImageManipStarted checks it against m_nestedScrollGen).
+    ++m_nestedScrollGen;
+    m_nestedScrollState = NestedScrollState::Unknown;
     if (!m_pinching) return;
     m_pinching = false;
     float live = m_liveScale;
