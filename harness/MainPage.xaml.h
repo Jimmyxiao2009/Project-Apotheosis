@@ -64,6 +64,10 @@ namespace Harness {
         void HideSuggestions();
         void OnUrlGotFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlLostFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        // 编辑地址时白色 ✕ 顶掉刷新/停止键:清空地址栏,不夺焦(IsTabStop=False)。
+        void OnUrlClear(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void SetUrlEditingChrome(bool editing);   // 刷新/停止键 <-> 白色清除键
+        void HideUrlBoxDeleteButton();            // 收起 UrlBox 模板自带的 ✕(地址栏用胶囊右侧那个)
 
         // ---- 动作面板(菜单键弹出的 action sheet)----
         void ShowActionMenu();
@@ -231,6 +235,7 @@ namespace Harness {
         bool m_uaMobile { true };     // UA 模式:true=手机(默认),false=桌面
         bool m_urlSyncing { false };  // 正在程序化改 UrlBox.Text(导航/回调同步地址栏)→ 抑制建议下拉回环
         bool m_urlFocused { false };  // 地址栏是否聚焦(编辑中)→ 仅聚焦时才弹建议,杜绝"莫名其妙弹出"
+        bool m_urlDeleteBtnHidden { false };  // UrlBox 模板自带的 ✕ 已收起(只做一次)
         bool m_updateChecking { false };  // 检测更新进行中(防并发重复点)
         bool m_updateAutoChecked { false };  // 启动后已静默自检过一次(首个网络页加载完触发,CA 此时已就绪)
         // 设置(持久化到 LocalState\settings.ini;搜索前缀/主页是全局,见 .cpp)

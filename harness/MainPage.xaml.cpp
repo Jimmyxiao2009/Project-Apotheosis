@@ -2108,9 +2108,55 @@ void MainPage::OnUrlChanged(Platform::Object^, Windows::UI::Xaml::Controls::Text
     ShowSuggestions(q);
 }
 
-void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^) { m_urlFocused = true; }
+// 编辑地址时把胶囊右侧的刷新/停止键换成白色 ✕(清除),输入框因此拿到整条胶囊的宽度。
+void MainPage::SetUrlEditingChrome(bool editing)
+{
+    using Vis = Windows::UI::Xaml::Visibility;
+    if (UrlActionBtn) UrlActionBtn->Visibility = editing ? Vis::Collapsed : Vis::Visible;
+    if (UrlClearBtn)  UrlClearBtn->Visibility  = editing ? Vis::Visible   : Vis::Collapsed;
+}
+
+// UrlBox 用胶囊右侧那个 ✕,模板自带的清除键就多余了(两个 ✕ 很怪,且占掉输入宽度)。
+// 只收 UrlBox 这一个实例(查找条 FindBox 仍保留模板自带的清除键):视觉状态只动 Visibility,
+// 所以改 Width/Opacity/命中测试能一直生效。
+void MainPage::HideUrlBoxDeleteButton()
+{
+    if (m_urlDeleteBtnHidden || !UrlBox) return;
+    std::function<FrameworkElement^(DependencyObject^)> find = [&](DependencyObject^ node) -> FrameworkElement^ {
+        int n = VisualTreeHelper::GetChildrenCount(node);
+        for (int i = 0; i < n; ++i) {
+            auto child = VisualTreeHelper::GetChild(node, i);
+            auto fe = dynamic_cast<FrameworkElement^>(child);
+            if (fe && fe->Name == L"DeleteButton") return fe;
+            if (auto hit = find(child)) return hit;
+        }
+        return nullptr;
+    };
+    auto btn = find(UrlBox);
+    if (!btn) return;
+    btn->MinWidth = 0; btn->Width = 0; btn->Opacity = 0; btn->IsHitTestVisible = false;
+    m_urlDeleteBtnHidden = true;
+}
+
+void MainPage::OnUrlClear(Platform::Object^, RoutedEventArgs^)
+{
+    if (!UrlBox) return;
+    UrlBox->Text = ref new String(L"");
+    UrlBox->Focus(Windows::UI::Xaml::FocusState::Programmatic);   // 保持编辑态 + 软键盘
+}
+
+void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
+{
+    m_urlFocused = true;
+    HideUrlBoxDeleteButton();
+    SetUrlEditingChrome(true);
+}
 // 不在 LostFocus 里收建议:点建议项会先夺焦再触发其 Click,提前收会取消点击。改由点页面(OnPageTapped)/导航收。
-void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^) { m_urlFocused = false; }
+void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
+{
+    m_urlFocused = false;
+    SetUrlEditingChrome(false);
+}
 
 // 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。
 void MainPage::ShowSuggestions(const std::wstring& query)
@@ -2177,6 +2223,7 @@ void MainPage::ShowActionMenu()
     // 收起网页/地址栏输入法并撤销地址栏的“编辑中”状态。硬件 Back 只会关闭当前 sheet，
     // 不应因此把此前保留焦点的键盘重新唤起。
     m_urlFocused = false;
+    SetUrlEditingChrome(false);   // 焦点没真的离开 UrlBox → LostFocus 不会触发,手动还原刷新/停止键
     CloseKeyboard();
     if (ActFavLabel)
         ActFavLabel->Text = (!m_currentUrl.empty() && IsBookmarked(m_currentUrl)) ? L8(L"已收藏", L"Saved") : L8(L"收藏", L"Bookmark");

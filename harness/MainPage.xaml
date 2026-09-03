@@ -369,6 +369,13 @@
                                 Foreground="{StaticResource Accent}" Width="42" Height="40" Padding="0" FontSize="17"
                                 VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
                                 Content="&#x21BB;" Click="OnUrlAction"/>
+                        <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
+                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。 -->
+                        <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
+                                Foreground="{StaticResource TxtHi}" Width="44" Height="40" Padding="0" FontSize="17"
+                                IsTabStop="False" Visibility="Collapsed"
+                                VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
+                                Content="&#x2715;" Click="OnUrlClear"/>
                     </Grid>
                 </Border>
 
