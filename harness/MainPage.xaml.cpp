@@ -1102,7 +1102,7 @@ void MainPage::OnNavDone(Platform::String^ finalTitle, bool ok, bool loadOk)
     UpdateNavButtons();
     // 启动静默自检更新:首个网络页加载成功后跑一次(此时 CA blob 已注入,WebCoreDownload 才能过 TLS);
     //   有新版才提示,无更新/失败静默。manual 检查在设置里按钮。
-    if (!m_updateAutoChecked && loadOk && m_currentUrl != L"about:home") {
+    if (m_updateAuto && !m_updateAutoChecked && loadOk && m_currentUrl != L"about:home") {
         m_updateAutoChecked = true;
         CheckForUpdate(false);
     }
@@ -2525,6 +2525,7 @@ void MainPage::LoadSettings()
             else if (k == "tabmode") m_tabMode = atoi(v.c_str());
             else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
+            else if (k == "updatecheck") m_updateAuto = (atoi(v.c_str()) != 0);
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
@@ -2546,6 +2547,8 @@ void MainPage::SaveSettings()
     s += "tabmode=" + std::to_string(m_tabMode) + "\n";
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
+    s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "
+";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
@@ -2563,6 +2566,7 @@ void MainPage::ShowSettings()
     if (SetZoomSlider) SetZoomSlider->Value = m_defaultZoom;
     if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring(m_defaultZoom) + L"%").c_str());
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
+    if (SetUpdateSwitch) SetUpdateSwitch->IsOn = m_updateAuto;
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
@@ -2596,6 +2600,7 @@ void MainPage::HideSettings()
     if (SetTabModeSwitch) m_tabMode = SetTabModeSwitch->IsOn ? 1 : 0;
     if (SetZoomSlider) m_defaultZoom = (int)(SetZoomSlider->Value + 0.5);
     if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
+    if (SetUpdateSwitch) m_updateAuto = SetUpdateSwitch->IsOn;
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
@@ -2639,7 +2644,10 @@ static const wchar_t* const kI18n[][2] = {
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
-    { L"检查更新(GitHub Releases)", L"Check for updates (GitHub Releases)" },
+    { L"自动检查更新", L"Check for updates automatically" },
+    { L"开启后每次启动会连接 api.github.com 一次",
+      L"When on, the app contacts api.github.com once per start" },
+    { L"立即检查更新", L"Check now" },
     { L"标签", L"Tabs" }, { L"完成", L"Done" }, { L"新建标签页", L"New tab" },
 };
 static Platform::String^ I18n(Platform::String^ s, bool toEn) {

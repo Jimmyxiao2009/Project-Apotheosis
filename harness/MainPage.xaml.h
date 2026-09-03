@@ -258,6 +258,7 @@ namespace Harness {
         int  m_defaultZoom { 100 };   // 默认缩放百分比(50–200)
         int  m_tabMode { 0 };         // 0=单热会话 / 1=并发多引擎(实验);增量5/7 使用
         std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom
+        bool m_updateAuto { false };  // 隐私：启动后自动查 GitHub 更新（默认关）；settings.ini updatecheck
         bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;

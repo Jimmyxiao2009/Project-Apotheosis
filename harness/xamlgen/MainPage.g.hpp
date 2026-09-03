@@ -558,8 +558,13 @@ static ::Platform::String^ __MainPageXaml() {
                     <Button Tag="cleardl" Style="{StaticResource SetRow}" Content="清除下载记录" Margin="0,0,0,6" x:Name="_ev21" />
                     <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev22" />
 
+                    <!-- 自动检查更新：唯一一条非用户发起的外部请求（api.github.com），默认关。 -->
+                    <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticResource TxtHi}" Margin="0,12,0,2" />
+                    <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8" />
+                    <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="立即检查更新" x:Name="_ev23" />
+
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
-                    <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev23" />
+                    <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev24" />
 
                     <!-- 开发者选项:默认关闭的调试用界面元素。 -->
                     <TextBlock Text="DEVELOPER" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
@@ -568,7 +573,6 @@ static ::Platform::String^ __MainPageXaml() {
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8" />
-                    <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="检查更新(GitHub Releases)" x:Name="_ev24" />
 
                     <!-- App 版本由 ShowSettings 从包清单填进来(见 code-behind)。 -->
                     <TextBlock x:Name="AboutFooterText" Text="EdgeHTML Reborn / Apotheosis — WebKit (WebCore) 2.52.4 — ARM32 UWP" Foreground="#FF80868B" FontSize="12" TextWrapping="Wrap" Margin="0,22,0,24" />
@@ -611,11 +615,11 @@ static ::Platform::String^ __MainPageXaml() {
                 <TextBlock Text="APOTHEOSIS" Foreground="{StaticResource Accent}" FontSize="12" CharacterSpacing="220" HorizontalAlignment="Center" />
                 <TextBlock Text="EdgeHTML Reborn" Foreground="{StaticResource TxtHi}" FontSize="30" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,6,0,0" />
                 <TextBlock Text="Modern web, reborn on Windows Phone" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0" />
-                <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
+                <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" Hori)APO",
+        LR"APO(zontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
                 <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
                 <Border Background="{StaticResource Accent}" CornerRadius="4" Margin="0,0,0,12">
-)APO",
-        LR"APO(                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev27" />
+                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev27" />
                 </Border>
                 <Border Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="4">
                     <Button Tag="zh" Background="Transparent" Foreground="{StaticResource TxtHi}" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="中文" x:Name="_ev28" />
@@ -654,6 +658,7 @@ void MainPage::InitializeComponent() {
     SetZoomSlider = safe_cast<::Windows::UI::Xaml::Controls::Slider^>(__root->FindName(L"SetZoomSlider"));
     SetTabModeSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetTabModeSwitch"));
     SetGpuSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetGpuSwitch"));
+    SetUpdateSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetUpdateSwitch"));
     SetScrollFabSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetScrollFabSwitch"));
     VersionText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"VersionText"));
     AboutFooterText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"AboutFooterText"));

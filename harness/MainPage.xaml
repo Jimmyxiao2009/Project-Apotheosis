@@ -616,6 +616,11 @@
                     <Button Tag="cleardl" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="清除下载记录" Margin="0,0,0,6"/>
                     <Button Tag="clearcookies" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)"/>
 
+                    <!-- 自动检查更新：唯一一条非用户发起的外部请求（api.github.com），默认关。 -->
+                    <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticResource TxtHi}" Margin="0,12,0,2"/>
+                    <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                    <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="立即检查更新"/>
+
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <Button Tag="export" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump"/>
 
@@ -626,7 +631,6 @@
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>
-                    <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="检查更新(GitHub Releases)"/>
 
                     <!-- App 版本由 ShowSettings 从包清单填进来(见 code-behind)。 -->
                     <TextBlock x:Name="AboutFooterText" Text="EdgeHTML Reborn / Apotheosis — WebKit (WebCore) 2.52.4 — ARM32 UWP"
