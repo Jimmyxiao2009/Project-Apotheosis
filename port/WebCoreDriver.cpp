@@ -87,6 +87,18 @@
 #include <WebCore/MemoryCache.h>         // Apotheosis: 资源缓存上限
 #include <WebCore/MemoryRelease.h>       // Apotheosis: WebCore::releaseMemory(内存压力时一把清)
 #include <wtf/MemoryPressureHandler.h>   // Apotheosis: WTF::Critical / Synchronous
+#include <WebCore/CommonVM.h>            // Apotheosis: g_commonVMOrNull(WebCoreGetMemoryStats 的 JSC 堆数)
+#include <JavaScriptCore/VM.h>           // Apotheosis: JSC::VM::heap
+#include <JavaScriptCore/HeapInlines.h>  // Apotheosis: Heap::size()/capacity()/extraMemorySize()
+#include <JavaScriptCore/JSLock.h>       // Apotheosis: JSLockHolder(读堆前取 VM 锁)
+#include <wtf/FastMalloc.h>              // Apotheosis: WTF::releaseFastMallocFreeMemory
+// Apotheosis: texmap memory counters (WebKit winuwp 0c78243bf5). Declared by hand rather than
+// included: BitmapTexture.h pulls in TextureMapperGLHeaders.h, whose GL prototypes collide with
+// the ANGLE headers this file already uses (glFinish/glReadPixels/glViewport go missing).
+namespace WebCore {
+void wkWinUWPTexmapTextureStats(uint64_t& bytes, unsigned& count);   // BitmapTexture.h
+void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTexturePool.h
+}
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
@@ -224,6 +236,72 @@ static bool isValidSurfaceSize(int w, int h)
     return static_cast<uint64_t>(w) * static_cast<uint64_t>(h) <= kMaxSurfacePixels;
 }
 
+// ---------------------------------------------------------------------------
+// Apotheosis (MEMORY-PLAN.md §3 changes 3/4/6): memory-pressure state.
+// The App Container cap is 1536 MB and the OS kills us at it with no exception and no dump,
+// so the only defence is to shrink before we get there. The numbers come from the harness
+// (MemoryManager.AppMemoryUsage / AppMemoryUsageLimit) and arrive through
+// WebCoreSetMemoryPressure(); everything below runs on the single engine thread.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMB = 1024u * 1024u;
+// MemoryCache budgets per level: (maxDeadBytes, totalBytes). minDeadBytes stays 0 — we never
+// want dead resources kept while under pressure.
+static constexpr unsigned kMemCacheDeadNormal   = 16u * kMB;
+static constexpr unsigned kMemCacheTotalNormal  = 32u * kMB;
+static constexpr unsigned kMemCacheDeadMedium   =  4u * kMB;
+static constexpr unsigned kMemCacheTotalMedium  =  8u * kMB;
+static constexpr unsigned kMemCacheDeadHigh     =  1u * kMB;
+static constexpr unsigned kMemCacheTotalHigh    =  2u * kMB;
+
+static int g_memPressureLevel = 0;              // last level pushed by the harness (0..2)
+static unsigned g_memCacheCapacity = 0;         // total budget currently configured (for the stats log)
+
+static void wkSetMemoryCacheCapacities(unsigned maxDead, unsigned total)
+{
+    WebCore::MemoryCache::singleton().setCapacities(0, maxDead, total);
+    g_memCacheCapacity = total;
+}
+
+// The one place that actually gives memory back. level: 0 = nothing but a prune, 1 = the
+// non-critical trim, 2 = the critical one (drops decoded data of *live* resources → visible
+// images go white until they are re-decoded, and runs a synchronous full GC).
+// keepResourceCache: keep the encoded resource cache. Yes on a navigation/tab switch, where
+// the next page usually wants the same CSS/JS; No when the user closes the page for good.
+// Engine thread only — releaseMemory() walks every Document and collects the JSC heap.
+static void wkReleaseMemoryLevel(int level, bool keepResourceCache)
+{
+    using namespace WebCore;
+    const auto maintainCache = keepResourceCache ? MaintainMemoryCache::Yes : MaintainMemoryCache::No;
+    if (level <= 0) {
+        // prune() is otherwise only ever reached from pruneSoon() on an insert, so a page that
+        // just sits there never trims at all (MemoryCache.cpp:793).
+        MemoryCache::singleton().prune();
+        return;
+    }
+    // Critical::Yes also does WTF::releaseFastMallocFreeMemory() + GarbageCollectionController::
+    // garbageCollectNow() (a synchronous full collection) inside releaseCriticalMemory();
+    // Synchronous::Yes adds the per-thread fastMalloc cache flush. No need to duplicate either.
+    releaseMemory(level >= 2 ? WTF::Critical::Yes : WTF::Critical::No,
+                  WTF::Synchronous::Yes,
+                  MaintainBackForwardCache::No,
+                  maintainCache);
+    if (level < 2)
+        WTF::releaseFastMallocFreeMemory();   // Critical::No skips it; it is cheap and USE_SYSTEM_MALLOC fragments
+}
+
+// A synchronous full collection of the common VM, without releaseCriticalMemory()'s
+// deleteAllCode(PreventCollectionAndDeleteAllCode). Used where we want the dead page's JS heap
+// back but not to throw away every piece of JIT code the next page will have to compile again.
+// No-op while no VM exists (commonVM() would create one just to collect it).
+static void wkCollectJSCHeapNow()
+{
+    JSC::VM* vm = WebCore::g_commonVMOrNull;
+    if (!vm)
+        return;
+    JSC::JSLockHolder locker(vm);
+    vm->heap.collectNow(JSC::Synchronousness::Sync, JSC::CollectionScope::Full);
+}
+
 // Run the WebCore one-time process initialization exactly once.
 // Sequence taken from Source/WebKit/Shared/WebKit2Initialize.cpp
 // (the !PLATFORM(COCOA) branch — our case).
@@ -262,7 +340,26 @@ bool ensureWebCoreInitialized()
         // 是 32 位地址空间最大的隐性占用),资源缓存收紧上限。系统内存压力来时由 harness 经
         // WebCoreReleaseMemory() 主动放(WebCore::releaseMemory 一把清缓存 + JSC GC + 字体缓存)。
         WebCore::BackForwardCache::singleton().setMaxSize(0);
-        WebCore::MemoryCache::singleton().setCapacities(0, 8u * 1024 * 1024, 16u * 1024 * 1024);
+        // Apotheosis (MEMORY-PLAN.md §3 change 4): sized for the 1536 MB App Container cap.
+        // 8/16 MB was too tight for repeat visits and bought nothing - encoded resources are a
+        // rounding error next to the decoded bitmaps (§1). What actually bounds us is the
+        // *decoded* data, and that needs the deletion interval below.
+        wkSetMemoryCacheCapacities(kMemCacheDeadNormal, kMemCacheTotalNormal);
+        // Apotheosis: without this the interval is 0 and CachedResource::destroyDecodedDataIfNeeded()
+        // returns immediately, so a client-less resource keeps its decoded bitmap until some
+        // *insert* happens to trigger a prune - i.e. never, on a page that just sits there.
+        // 5 s after the last client goes away is safe: nothing on screen references it.
+        WebCore::MemoryCache::singleton().setDeadDecodedDataDeletionInterval(WTF::Seconds(5));
+        // Apotheosis (MEMORY-PLAN.md §3 change 3): MemoryPressureHandler is never install()ed on
+        // this port on purpose - its Windows poll (windowsMeasurementTimerFired) would reset the
+        // status to Normal every 60 s, and the App Container has no CreateMemoryResourceNotification
+        // anyway. We only push the status in from the harness (WebCoreSetMemoryPressure). Giving it
+        // a low-memory handler makes the few in-engine paths that call releaseMemory() work.
+        WTF::MemoryPressureHandler::singleton().setLowMemoryHandler([](WTF::Critical critical, WTF::Synchronous synchronous) {
+            WebCore::releaseMemory(critical, synchronous,
+                                   WebCore::MaintainBackForwardCache::No,
+                                   WebCore::MaintainMemoryCache::No);
+        });
         return true;
     }();
     return initialized;
@@ -1424,6 +1521,20 @@ static void teardownSession()
     g_session.reset();                                          // (f) 此时 Session.page 已空,~Session 不再触发回调
     for (int i = 0; i < 4; ++i)                                  // (g) 排空延迟清理 / curl 取消
         RunLoop::cycle();
+    // Apotheosis (MEMORY-PLAN.md §3 change 6): (h) ~Page freed the layer tree and its textures,
+    // but the JSC heap and the MemoryCache survive a tab switch untouched — that is why the
+    // second tab measured 951 MB while the same page alone costs 620 MB. Give it back here,
+    // after the Page is gone (nothing can re-populate the caches at this point) and after the
+    // RunLoop drain (so the deferred deletions above are already counted as garbage).
+    // keepResourceCache: this path also runs at the start of every WebCoreSessionLoad, and the
+    // next page usually wants the same CSS/JS — dropping the encoded cache here would cost a
+    // full re-download on every navigation. WebCoreCloseSession() clears it as well.
+    // Deliberately *not* wkReleaseMemoryLevel(2): the critical path's
+    // deleteAllCode(PreventCollectionAndDeleteAllCode) would discard every piece of JIT code on
+    // every navigation, which is exactly what we bought the JIT tree for. The explicit full
+    // collection below reclaims the dead page's heap without that.
+    wkReleaseMemoryLevel(1, /*keepResourceCache*/ true);
+    wkCollectJSCHeapNow();
 }
 
 // 在已 emplace 的 g_session 上建立 Page、发起网络加载、settle、布局、提链接、绘制。
@@ -1644,10 +1755,123 @@ extern "C" void WebCorePortRecordNetError(int code, const char* domain, const ch
 extern "C" void WebCoreReleaseMemory(int critical)
 {
     if (!ensureWebCoreInitialized()) return;
-    WebCore::releaseMemory(critical ? WTF::Critical::Yes : WTF::Critical::No,
-                           WTF::Synchronous::Yes,
-                           WebCore::MaintainBackForwardCache::No,
-                           WebCore::MaintainMemoryCache::No);
+    wkReleaseMemoryLevel(critical ? 2 : 1, /*keepResourceCache*/ false);
+}
+
+// Apotheosis (MEMORY-PLAN.md §3 change 3): push the harness' MemoryManager numbers into WebCore.
+// Two effects, both of which the port was missing entirely:
+//  (1) MemoryPressureHandler's status. It is never install()ed here (the Windows 60 s poll would
+//      just reset it to Normal — MemoryPressureHandlerWin.cpp is a stub in an App Container), so
+//      isUnderMemoryPressure() was permanently false at all ~22 WebCore call sites: FontCache,
+//      WidthCache, GlyphDisplayListCache, RenderLayerCompositor's cover-area multiplier, the
+//      pruning reason in MemoryRelease. Setting it is what makes those react.
+//  (2) our own MemoryCache budget, plus a release when the level rises.
+// Level transitions only — the harness applies hysteresis and calls on change; re-calling with
+// the level already in effect is a no-op, so this is safe to call from a tick.
+// Engine thread only.
+extern "C" void WebCoreSetMemoryPressure(int level)
+{
+    if (!ensureWebCoreInitialized()) return;
+    if (level < 0) level = 0;
+    if (level > 2) level = 2;
+    const int previous = g_memPressureLevel;
+    if (level == previous)
+        return;
+    g_memPressureLevel = level;
+
+    using SysStatus = WTF::SystemMemoryPressureStatus;
+    WTF::MemoryPressureHandler::singleton().setMemoryPressureStatus(
+        level >= 2 ? SysStatus::Critical : (level == 1 ? SysStatus::Warning : SysStatus::Normal));
+
+    switch (level) {
+    case 0:
+        wkSetMemoryCacheCapacities(kMemCacheDeadNormal, kMemCacheTotalNormal);
+        break;
+    case 1:
+        wkSetMemoryCacheCapacities(kMemCacheDeadMedium, kMemCacheTotalMedium);
+        break;
+    default:
+        wkSetMemoryCacheCapacities(kMemCacheDeadHigh, kMemCacheTotalHigh);
+        break;
+    }
+
+    // Only release when the pressure *rises*. Falling back to 0 just restores the budget —
+    // running a full GC on the way down would be pure cost.
+    if (level > previous) {
+        // Keep the encoded resource cache at level 1; at level 2 we are close enough to the
+        // kill threshold that a white image is better than a dead app.
+        wkReleaseMemoryLevel(level, /*keepResourceCache*/ level < 2);
+    }
+}
+
+// Apotheosis (MEMORY-PLAN.md §3 change 2): engine-side memory numbers for the harness' mem.txt.
+// Without these, mem.txt only carries the OS view (AppMemoryUsage) and every one of the eight
+// buckets in §1 is a guess. Engine thread only: getStatistics() walks the whole resource map
+// and the JSC accessors touch the heap.
+extern "C" int WebCoreGetMemoryStats(WebCoreMemoryStats* out)
+{
+    if (!out)
+        return kErrBadArgs;
+    int cap = out->structSize;
+    if (cap < (int)sizeof(int) || cap > (int)sizeof(WebCoreMemoryStats))
+        cap = (int)sizeof(WebCoreMemoryStats);
+    WebCoreMemoryStats s;
+    std::memset(&s, 0, sizeof s);
+    s.structSize = cap;
+    s.pressureLevel = g_memPressureLevel;
+
+    if (!ensureWebCoreInitialized()) {
+        std::memcpy(out, &s, cap);
+        return kErrBadArgs;
+    }
+
+    // JSC — commonVM() would *create* a VM, so go through the raw pointer: a page that never
+    // ran script leaves these zero instead of allocating a heap just to measure it.
+    if (JSC::VM* vm = WebCore::g_commonVMOrNull) {
+        JSC::JSLockHolder locker(vm);
+        s.jscHeapSize     = vm->heap.size();
+        s.jscHeapCapacity = vm->heap.capacity();
+        s.jscExtraMemory  = vm->heap.extraMemorySize();
+        s.jscObjectCount  = vm->heap.objectCount();
+    }
+
+    auto& cache = WebCore::MemoryCache::singleton();
+    auto stats = cache.getStatistics();
+    s.cacheTotal    = cache.size();
+    s.cacheCapacity = g_memCacheCapacity;
+    const WebCore::MemoryCache::TypeStatistic* types[] = {
+        &stats.images, &stats.cssStyleSheets, &stats.scripts, &stats.fonts, &stats.xslStyleSheets };
+    for (auto* t : types) {
+        s.cacheLive    += (uint64_t)(t->liveSize    > 0 ? t->liveSize    : 0);
+        s.cacheDecoded += (uint64_t)(t->decodedSize > 0 ? t->decodedSize : 0);
+    }
+    s.imagesSize    = (uint64_t)(stats.images.size > 0 ? stats.images.size : 0);
+    s.imagesDecoded = (uint64_t)(stats.images.decodedSize > 0 ? stats.images.decodedSize : 0);
+    s.cssSize       = (uint64_t)(stats.cssStyleSheets.size > 0 ? stats.cssStyleSheets.size : 0);
+    s.scriptsSize   = (uint64_t)(stats.scripts.size > 0 ? stats.scripts.size : 0);
+    s.fontsSize     = (uint64_t)(stats.fonts.size > 0 ? stats.fonts.size : 0);
+    s.imagesCount   = (uint32_t)(stats.images.count > 0 ? stats.images.count : 0);
+    s.cssCount      = (uint32_t)(stats.cssStyleSheets.count > 0 ? stats.cssStyleSheets.count : 0);
+    s.scriptsCount  = (uint32_t)(stats.scripts.count > 0 ? stats.scripts.count : 0);
+    s.fontsCount    = (uint32_t)(stats.fonts.count > 0 ? stats.fonts.count : 0);
+
+    // TextureMapper. The counters are process-wide levels maintained in BitmapTexture's
+    // ctor/reset/dtor (WebKit 0c78243bf5) — no GL calls, no context needed. Only ask the pool
+    // once GPU compositing is actually up: BitmapTexturePool::singleton() would otherwise
+    // construct the pool (and its RunLoop timer) just to report zero.
+    uint64_t texBytes = 0; unsigned texCount = 0;
+    WebCore::wkWinUWPTexmapTextureStats(texBytes, texCount);
+    s.texBytes = texBytes;
+    s.texCount = texCount;
+    if (g_gpuActive) {
+        uint64_t poolBytes = 0; unsigned poolCount = 0;
+        WebCore::wkWinUWPTexmapPoolStats(poolBytes, poolCount);
+        s.poolBytes = poolBytes;
+        s.poolCount = poolCount;
+    }
+
+    std::memcpy(out, &s, cap);
+    return kOK;
 }
 
 // Apotheosis: 清除全部 cookie。设置页"清除数据"用。引擎线程调。清完立即落盘(空文件),否则
@@ -2268,7 +2492,13 @@ void WebCoreCloseSession()
 {
     if (g_inPump)
         return;
+    const bool hadSession = g_session.has_value();
     teardownSession();
+    // Apotheosis (MEMORY-PLAN.md §3 change 6): the user left the page for good (home screen,
+    // suspend, tab closed) — unlike the navigation path there is no next page that would reuse
+    // the encoded resources or the compiled code, so take the critical route as well.
+    if (hadSession)
+        wkReleaseMemoryLevel(2, /*keepResourceCache*/ false);
 }
 
 // 在 (x,y)(位图/视口像素,无需减 scroll —— EventHandler 内部 windowToContents 会加 scrollY)派发一次

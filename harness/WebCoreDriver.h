@@ -22,6 +22,52 @@ void WebCoreSetCACertPath(const char* path);
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
 
+// Apotheosis (MEMORY-PLAN.md §3 change 2): engine-side memory accounting, so the harness'
+// mem.txt carries more than the OS view of our working set. All sizes are bytes.
+// Usage: zero the struct, set structSize = sizeof(WebCoreMemoryStats), call. The driver
+// writes at most structSize bytes, so the two copies of this header may drift by a trailing
+// field without breaking the ABI. Engine thread only (walks the MemoryCache and the JSC heap).
+typedef struct WebCoreMemoryStats {
+    int      structSize;      // in: sizeof(WebCoreMemoryStats); out: bytes actually written
+    // JavaScriptCore, common VM (all zero while no VM exists yet)
+    uint64_t jscHeapSize;     // Heap::size()
+    uint64_t jscHeapCapacity; // Heap::capacity()
+    uint64_t jscExtraMemory;  // Heap::extraMemorySize() - non-GC memory owned by GC objects
+    uint64_t jscObjectCount;  // Heap::objectCount() (blockBytesAllocated needs ENABLE(RESOURCE_USAGE))
+    // WebCore MemoryCache
+    uint64_t cacheTotal;      // MemoryCache::size() = live + dead encoded data
+    uint64_t cacheLive;       // of that, resources that still have clients
+    uint64_t cacheDecoded;    // decoded (bitmap/parsed) data, all types
+    uint64_t cacheCapacity;   // total budget the driver currently configured
+    uint64_t imagesSize;
+    uint64_t imagesDecoded;   // the big unknown: decoded image bitmaps
+    uint64_t cssSize;
+    uint64_t scriptsSize;
+    uint64_t fontsSize;
+    uint32_t imagesCount;
+    uint32_t cssCount;
+    uint32_t scriptsCount;
+    uint32_t fontsCount;
+    // TextureMapper GL textures - graphics commits are charged to AppMemoryUsage too
+    uint64_t texBytes;        // every live BitmapTexture (tiles + pool + filter surfaces)
+    uint32_t texCount;
+    uint64_t poolBytes;       // of that, parked in BitmapTexturePool (recoverable)
+    uint32_t poolCount;
+    int32_t  pressureLevel;   // last level pushed via WebCoreSetMemoryPressure()
+} WebCoreMemoryStats;
+
+// Fill *out. 0 on success, negative on bad args / uninitialised engine.
+int WebCoreGetMemoryStats(WebCoreMemoryStats* out);
+
+// Apotheosis: push the harness' MemoryManager view into WebCore. level: 0 = normal,
+// 1 = medium (>= 65 % of AppMemoryUsageLimit), 2 = high/critical (>= 80 %, or a High/
+// OverLimit MemoryManager event). Sets WTF::MemoryPressureHandler's status - the only way
+// isUnderMemoryPressure() can ever become true on this port, since the Windows poll is a
+// no-op in an App Container - shrinks the MemoryCache budget and, when the level rises,
+// releases memory (level 2 = synchronous full GC + drop the resource cache). Idempotent:
+// calling it with the level already in effect does nothing. Engine thread only.
+void WebCoreSetMemoryPressure(int level);
+
 // 清除全部 cookie(含持久 SQLite 库里的)。设置页"清除数据"用;引擎线程调。
 void WebCoreClearCookies();
 

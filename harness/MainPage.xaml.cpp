@@ -200,6 +200,75 @@ static void WriteMemLog(const std::string& line)
     } catch (...) {}
 }
 
+// Apotheosis (MEMORY-PLAN.md §3 change 2): the engine's own view, appended to the OS view above.
+// MemSnapshot() only says *that* we are at 620 MB, never which of the eight buckets moved.
+// ENGINE THREAD ONLY — WebCoreGetMemoryStats() walks the MemoryCache and locks the JSC VM.
+static std::string EngineMemStats()
+{
+    WebCoreMemoryStats st = {};
+    st.structSize = (int)sizeof st;
+    try {
+        if (WebCoreGetMemoryStats(&st) != 0) return std::string(" eng=n/a");
+    } catch (...) { return std::string(" eng=n/a"); }
+    const unsigned long long kMB = 1024ULL * 1024ULL;
+    auto mb = [kMB](unsigned long long v) { return std::to_string((v + kMB / 2) / kMB); };
+    return " eng jsc=" + mb(st.jscHeapSize) + "/" + mb(st.jscHeapCapacity) + "MB"
+         + " extra=" + mb(st.jscExtraMemory) + "MB obj=" + std::to_string(st.jscObjectCount)
+         + " mc=" + mb(st.cacheTotal) + "/" + mb(st.cacheLive) + "MB dec=" + mb(st.cacheDecoded) + "MB"
+         + " cap=" + mb(st.cacheCapacity) + "MB"
+         + " img=" + std::to_string(st.imagesCount) + "/" + mb(st.imagesSize) + "MB/"
+                   + mb(st.imagesDecoded) + "MB"
+         + " css=" + mb(st.cssSize) + "MB js=" + mb(st.scriptsSize) + "MB font=" + mb(st.fontsSize) + "MB"
+         + " tex=" + mb(st.texBytes) + "MB/" + std::to_string(st.texCount)
+         + " pool=" + mb(st.poolBytes) + "MB/" + std::to_string(st.poolCount)
+         + " plvl=" + std::to_string(st.pressureLevel);
+}
+
+// Apotheosis (MEMORY-PLAN.md §3 change 3 / §4): the memory-pressure level we last pushed into
+// WebCore. Only ever read/written on the engine thread — the UI-thread MemoryManager handlers
+// post into the engine instead of touching it. The OS raises AppMemoryUsageIncreased only on a
+// level boundary and never before the silent kill, so our own sampling is the primary source.
+static int g_engMemPressure = 0;
+
+// ENGINE THREAD ONLY.
+static void ApplyMemoryPressure(int level, const std::string& why)
+{
+    if (level == g_engMemPressure) return;
+    const int previous = g_engMemPressure;
+    g_engMemPressure = level;
+    try { WebCoreSetMemoryPressure(level); } catch (...) {}
+    // One line per transition, so a death after the fact is attributable.
+    WriteMemLog("mem-pressure " + std::to_string(previous) + "->" + std::to_string(level)
+                + " (" + why + ") " + MemSnapshot());
+}
+
+// ENGINE THREAD ONLY. Two property reads per call, so it is cheap enough for every live tick;
+// the engine is only touched on an actual transition. Hysteresis: up at 65 %/80 %, down at
+// 60 %/75 %, and never straight from 2 back to 0.
+static void SampleMemoryPressure()
+{
+    unsigned long long used = 0, limit = 0;
+    try {
+        used = Windows::System::MemoryManager::AppMemoryUsage;
+        limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
+    } catch (...) { return; }
+    if (!limit) return;
+    const int pct = (int)((used * 100ULL) / limit);
+    const int cur = g_engMemPressure;
+    int want = cur;
+    if (cur <= 0) {
+        if (pct >= 80) want = 2;
+        else if (pct >= 65) want = 1;
+    } else if (cur == 1) {
+        if (pct >= 80) want = 2;
+        else if (pct < 60) want = 0;
+    } else {
+        if (pct < 75) want = 1;
+    }
+    if (want != cur)
+        ApplyMemoryPressure(want, "sample pct=" + std::to_string(pct));
+}
+
 // IME 诊断日志开关:仅当 LocalState\imedebug.txt 已存在(测试者经 WDP 放置,重启生效)才追加记录 ——
 // 对齐 autodiag.txt 的"设备侧显式开启"模式。此前每敲一键 UI/引擎线程各开写一次文件,是打字延迟的
 // 固定开销,且日志跨会话无限增长。
@@ -570,8 +639,18 @@ MainPage::MainPage()
                     // Apotheosis (M4): the OS only raises this when we cross a level boundary (rare),
                     // so logging it is free and it is the last breadcrumb before a silent kill.
                     WriteMemLog("mem-event increased " + MemSnapshot());
+                    // Apotheosis (MEMORY-PLAN.md §3 change 3): Medium is the level we actually
+                    // spend our time in and it used to do nothing at all. Push every level into
+                    // WebCore — on the engine thread, never from here.
+                    int want = 0;
+                    if (lvl == Windows::System::AppMemoryUsageLevel::Medium) want = 1;
+                    else if (lvl == Windows::System::AppMemoryUsageLevel::High) want = 2;
+                    else if (lvl == Windows::System::AppMemoryUsageLevel::OverLimit) want = 2;
+                    WebEngine::instance().post([want]() { try { ApplyMemoryPressure(want, "mem-event"); } catch (...) {} });
                     if (lvl == Windows::System::AppMemoryUsageLevel::High || lvl == Windows::System::AppMemoryUsageLevel::OverLimit) {
                         int crit = (lvl == Windows::System::AppMemoryUsageLevel::OverLimit) ? 1 : 0;
+                        // Unconditional: ApplyMemoryPressure() above is a no-op once the level is
+                        // already 2, and OverLimit is the last breadcrumb before the kill.
                         WebEngine::instance().post([crit]() { try { WebCoreReleaseMemory(crit); } catch (...) {} });
                     }
                 });
@@ -588,7 +667,10 @@ MainPage::MainPage()
                                 + MemSnapshot());
                     // 新上限已低于当前用量 → 立刻按临界级别放缓存,别等 AppMemoryUsageIncreased。
                     if (newLimit > 0 && Windows::System::MemoryManager::AppMemoryUsage >= newLimit)
-                        WebEngine::instance().post([]() { try { WebCoreReleaseMemory(1); } catch (...) {} });
+                        WebEngine::instance().post([]() {
+                            try { ApplyMemoryPressure(2, "limit-changing"); } catch (...) {}
+                            try { WebCoreReleaseMemory(1); } catch (...) {}
+                        });
                 });
     } catch (...) {}
     // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把整页上移键盘高度
@@ -883,7 +965,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 title = L"主页";
             } else {
                 WriteStage(("before-load " + surl).c_str());
-                WriteMemLog("before-load url=" + surl + " " + MemSnapshot());   // Apotheosis (M4)
+                WriteMemLog("before-load url=" + surl + " " + MemSnapshot() + EngineMemStats());   // Apotheosis (M4)
                 int netRc = WebCoreSessionLoad(surl.c_str(), kW, kH, rgba->data());   // 常驻会话加载
                 // Apotheosis (M4): peak right after the load, still before title/diag/compositing
                 // queries — if the OS kills us in those, mem.txt already carries the number.
@@ -897,7 +979,8 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                             + " compositing=" + std::to_string(comp)
                             + "\nERR: " + err + "\ndiag: " + diag).c_str());
                 WriteMemLog("after-load url=" + surl + " rc=" + std::to_string(netRc)
-                            + " " + MemSnapshot());   // Apotheosis (M4)
+                            + " " + MemSnapshot() + EngineMemStats());   // Apotheosis (M4)
+                SampleMemoryPressure();   // Apotheosis: a load is where the level actually moves
                 if (netRc == 0) {
                     rc = 0;
                     loadOk = true;
@@ -1618,6 +1701,12 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999; unsigned hash = 0; int pending = 0;
         try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
+        // Apotheosis (MEMORY-PLAN.md §3/§4): sample here, on the engine thread, not in the UI
+        // continuation below — WebCoreGetMemoryStats()/WebCoreSetMemoryPressure() must never be
+        // called from the UI thread, and the UI thread must never wait on the engine.
+        SampleMemoryPressure();
+        if (g_perfLogEnabled && (++g_memTickCount % 50) == 0)
+            WriteMemLog("mem-tick n=" + std::to_string(g_memTickCount) + " " + MemSnapshot() + EngineMemStats());
         int rcCopy = rc; unsigned hashCopy = hash; int pendingCopy = pending;
         try {
             disp->RunAsync(CoreDispatcherPriority::Low,
@@ -1634,11 +1723,8 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                         }
                         return;
                     }
-                    // Apotheosis (M4): memory trend while a page just sits there (SPA/animation ticks
-                    // grow the heap). Ticks are the hot path → opt-in (LocalState\perf.txt) and only
-                    // every 50th completed tick, i.e. every ~10 s at 5 fps.
-                    if (g_perfLogEnabled && (++g_memTickCount % 50) == 0)
-                        WriteMemLog("mem-tick n=" + std::to_string(g_memTickCount) + " " + MemSnapshot());
+                    // Apotheosis (M4): the mem-tick line moved to the engine-thread part of this
+                    // tick, where the engine-side numbers can be read (EngineMemStats()).
                     if (hashCopy == s->m_lastFrameHash) {        // 画面没变:连续静止则停帧省电
                         if (pendingCopy > 0) {
                             s->m_liveStaticTicks = 0;            // 仍有图片/子资源在途:继续 tick,等待完成回调和解码
