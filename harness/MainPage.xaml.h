@@ -20,7 +20,7 @@ namespace Harness {
     // Apotheosis: nested-scroll routing (commit d982774, WebCoreIsScrollableAt/WebCoreWheelAt).
     // Unknown = hit test still in flight (or none posted this gesture): existing main-frame fast
     // path. Yes/No = the async answer for the point the current gesture started at.
-    enum class NestedScrollState { Unknown, Yes, No };
+    enum class NestedScrollState { Unknown, Yes, No, Drag };
 
     // 网页链接命中矩形(位图坐标)+ URL,用于点击交互。
     struct PageLink { int x, y, w, h; std::wstring url; };
@@ -204,6 +204,15 @@ namespace Harness {
         // 手势前几个 delta 抢在 WebCoreIsScrollableAt 答案之前到达时先缓存(见 m_pendingPan*),
         // 答案落地(或手势结束)后按选定路径一次性补发。
         void ReplayPendingPan();
+        // Apotheosis (drag as pointer events): a gesture that started over something which drags
+        // itself (map, canvas — WebCoreWantsDragAt said so) is fed to the page as a real mouse
+        // drag instead of being turned into scrolling. Same one-in-flight shape as
+        // NestedScrollBy/PumpNestedScroll, but the state machine is ordered rather than
+        // accumulating: the press must land (and be consumed) before any move is sent, because
+        // its return value is what decides whether the gesture belongs to the page at all.
+        void DragMoveTo(int px, int py, int fallbackDx, int fallbackDy);   // finger is here now
+        void PumpDrag();          // send the next queued phase, one engine post at a time
+        void DragReset();         // forget the gesture (new gesture, session gone, superseded)
         // ---- Apotheosis (instant pan, developer setting "Instant pan"): the last frame follows
         // the finger. A main-frame pan is applied to the presenting element as a XAML
         // TranslateTransform on the UI thread *immediately*, while the coalesced WebCoreScrollBy
@@ -326,6 +335,10 @@ namespace Harness {
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
         bool m_threadedRaster { false };// settings.ini threadraster
+        // Apotheosis (drag as pointer events): route a pan that starts over a drag widget (map,
+        //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is
+        //   the only way those pages can be panned at all. settings.ini dragpointer
+        bool m_dragPointer { true };
         // Apotheosis (review 2026-09-03): DISPLAY toggle. Off = the phone keeps its software
         //   back/Windows/search bar; on = SuppressSystemOverlays hands that strip to us and the
         //   bottom inset in ApplyViewInsets() goes to 0. settings.ini hidenavbar
@@ -370,6 +383,23 @@ namespace Harness {
         // (ReplayPendingPan). Reset per gesture in OnImageManipStarted.
         int  m_pendingPanX { 0 }, m_pendingPanY { 0 };     // accumulated buffered offset delta
         int  m_pendingPanPx { 0 }, m_pendingPanPy { 0 };   // finger position (engine px) of the last of them
+        // Apotheosis (drag as pointer events): state of the WebCoreDragAt route. m_dragGen is bumped
+        // only at ManipulationStarted (NOT at ManipulationCompleted like m_nestedScrollGen), because
+        // the release is posted while the gesture is still current and its answer must not be dropped.
+        unsigned long long m_dragGen { 0 };
+        int  m_dragStartPx { 0 }, m_dragStartPy { 0 };   // touch-down point (engine px) = the press point
+        bool m_dragBusy { false };            // a WebCoreDragAt post is in flight
+        bool m_dragActive { false };          // the page consumed the press and owns this gesture
+        bool m_dragPressPending { false };    // phase 0 still to send
+        bool m_dragPressSent { false };       // ...and it has been sent once (do not press twice)
+        bool m_dragMovePending { false };     // phase 1 still to send (coalesced: latest point wins)
+        bool m_dragReleasePending { false };  // phase 2/3 still to send
+        bool m_dragCancel { false };          // that end is a cancel (pinch took over), not a release
+        int  m_dragMoveX { 0 }, m_dragMoveY { 0 };        // latest finger position (engine px)
+        int  m_dragPressX { 0 }, m_dragPressY { 0 };      // press point actually queued
+        // Movement that happened before the press was answered. If nothing took the press, this is
+        // what the gesture owes the normal scroll path, so it is flushed there instead of lost.
+        int  m_dragFallbackDx { 0 }, m_dragFallbackDy { 0 };
         // M4 捏合缩放状态
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
         float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)

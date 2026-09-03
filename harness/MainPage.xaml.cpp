@@ -1761,6 +1761,130 @@ void MainPage::PumpNestedScroll()
     });
 }
 
+// ===========================================================================
+// Apotheosis (drag as pointer events): the WebCoreDragAt route.
+//
+// Google Maps, OpenStreetMap/Leaflet and canvas apps pan by handling
+// pointerdown/mousedown and moving their own content — no scrollable box is
+// involved anywhere, so translating the gesture into scrolling (either route
+// above) leaves the widget frozen and drags the document behind it instead.
+// WebCoreWantsDragAt, asked once at ManipulationStarted, says whether the point
+// belongs to such a widget; if it does, the whole gesture is replayed into the
+// page as a left-button mouse drag and NOTHING scrolls.
+//
+// Shape: like PumpNestedScroll, one engine post in flight at a time. Unlike it,
+// the phases are ordered rather than summed — the press has to land first,
+// because its return value is what decides whether this gesture is the page's at
+// all, and moves must never overtake it. Moves coalesce to the latest position
+// (an absolute point, not a delta: "the finger is here now").
+// ===========================================================================
+
+// The finger moved to (px,py) in engine viewport px. fallbackDx/fallbackDy are the
+// same scroll-offset deltas the other routes take — kept only until the press is
+// answered, so that a gesture the page turns out NOT to want can still be handed
+// to the scroll path with nothing lost.
+void MainPage::DragMoveTo(int px, int py, int fallbackDx, int fallbackDy)
+{
+    if (!m_sessionActive) return;
+    // First movement of the gesture: queue the press at the touch-down point. Doing it here rather
+    // than at ManipulationStarted means a gesture that never moves never presses — no stray
+    // mousedown/mouseup pair, and taps keep going through Tapped/WebCoreClickAt as before.
+    if (!m_dragActive && !m_dragPressPending && !m_dragPressSent) {
+        m_dragPressPending = true;
+        m_dragPressX = m_dragStartPx; m_dragPressY = m_dragStartPy;
+        m_dragMoveX = m_dragStartPx; m_dragMoveY = m_dragStartPy;
+    }
+    m_dragMoveX = px; m_dragMoveY = py;
+    m_dragMovePending = true;
+    if (!m_dragActive) { m_dragFallbackDx += fallbackDx; m_dragFallbackDy += fallbackDy; }
+    PumpDrag();
+}
+
+void MainPage::DragReset()
+{
+    // NOTE: this only forgets the gesture on the harness side. If a press is still in flight when a
+    // navigation supersedes it, the engine's own teardownSession() drops its drag flag, so no
+    // half-pressed state survives into the next page either.
+    m_dragBusy = false;
+    m_dragActive = false;
+    m_dragPressPending = false;
+    m_dragPressSent = false;
+    m_dragMovePending = false;
+    m_dragReleasePending = false;
+    m_dragCancel = false;
+    m_dragFallbackDx = 0; m_dragFallbackDy = 0;
+}
+
+void MainPage::PumpDrag()
+{
+    if (m_dragBusy) return;
+    if (!m_sessionActive) { DragReset(); return; }
+    int phase, px, py;
+    if (m_dragPressPending) {
+        phase = 0; px = m_dragPressX; py = m_dragPressY;
+        m_dragPressPending = false; m_dragPressSent = true;
+    } else if (!m_dragActive) {
+        // No press was consumed (or none was ever sent): the gesture is not the page's, so anything
+        // still queued for it is dropped rather than dispatched into a document that saw no mousedown.
+        m_dragMovePending = false; m_dragReleasePending = false;
+        return;
+    } else if (m_dragMovePending) {
+        phase = 1; px = m_dragMoveX; py = m_dragMoveY;
+        m_dragMovePending = false;
+    } else if (m_dragReleasePending) {
+        phase = m_dragCancel ? 3 : 2; px = m_dragMoveX; py = m_dragMoveY;
+        m_dragReleasePending = false;
+        m_dragActive = false;   // the gesture ends with this post; nothing more may be queued for it
+    } else
+        return;
+
+    m_dragBusy = true;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;      // 同 PumpScroll:不作废点击/导航令牌,但被它们作废
+    unsigned long long myGen = m_dragGen;    // per gesture; a late answer from the previous one is dropped
+    bool present = m_gpuPresent;
+    WebEngine::instance().post([disp, self, phase, px, py, mySeq, myGen, present]() {
+        auto rgba = AcquireEngineBuffer(present);
+        int rc = -999;
+        try { rc = WebCoreDragAt(phase, px, py, rgba->data()); } catch (...) { rc = -1000; }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, phase, mySeq, myGen, present]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) { s->DragReset(); return; }   // 被导航/点击取代
+                if (s->m_dragGen != myGen) return;                     // answer belongs to a finished gesture
+                if (phase == 0) {
+                    s->m_dragActive = (rcCopy == 1);
+                    if (!s->m_dragActive) {
+                        // Nothing took the press even though WebCoreWantsDragAt liked the point: this is
+                        // an ordinary pan after all. Hand the gesture back to the scroll path, including
+                        // the movement that happened while the press was in flight.
+                        s->m_nestedScrollState = NestedScrollState::No;
+                        s->m_dragMovePending = false;
+                        s->m_dragReleasePending = false;
+                        s->m_dragBusy = false;
+                        int fdx = s->m_dragFallbackDx, fdy = s->m_dragFallbackDy;
+                        s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;
+                        if (fdx != 0 || fdy != 0) { s->InstantPanBy(fdx, fdy); s->FreeScrollBy(fdx, fdy); }
+                        return;
+                    }
+                    s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;   // the page owns it now
+                }
+                if (rcCopy == 1) {
+                    // WebCoreDragAt already composited/presented this frame (direct swap in present
+                    // mode), same contract as WebCoreWheelAt — only the software path needs the blit.
+                    if (!present) s->PresentSoftwareFrame(rgba);
+                    s->m_lastFrameHash = 0;
+                }
+                s->m_dragBusy = false;
+                if (s->m_dragMovePending || s->m_dragReleasePending) s->PumpDrag();
+                else if (!s->m_dragActive) { s->SyncLinksAfterScroll(); s->StartLiveMode(); }
+            }));
+        } catch (...) {}
+    });
+}
+
 // 滚动停止后一次性刷新链接命中表(滚动期间为提速跳过了引擎 extractLinks)。点击走引擎实时命中测试(权威),
 // 故此刷新主要服务点击兜底/主页路径;陈旧窗口仅限"刚停手到这帧返回"之间,无碍。
 void MainPage::SyncLinksAfterScroll()
@@ -1803,6 +1927,10 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     unsigned long long gen = ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     m_pendingPanX = 0; m_pendingPanY = 0;
+    // Apotheosis (drag as pointer events): a new gesture — drop whatever the previous one left
+    // behind before the probe below can answer Drag for this one.
+    ++m_dragGen;
+    DragReset();
     // Apotheosis (instant pan): a new gesture starts from the frame that is on screen — drop any
     // remainder the previous one left behind, then ask the engine where it is so the very first
     // delta can already be clamped to the document.
@@ -1815,17 +1943,27 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
         m_nestedScrollState = NestedScrollState::No;   // off-viewport touch-down: main-frame fast path
         return;
     }
+    m_dragStartPx = px; m_dragStartPy = py;   // the press, if this turns out to be a drag, goes here
 
     Platform::Agile<MainPage^> self(this);
     CoreDispatcher^ disp = this->Dispatcher;
-    WebEngine::instance().post([disp, self, px, py, gen]() {
+    // Apotheosis (drag as pointer events): two probes, cheapest routing decision first. A point that
+    // belongs to something which drags itself (map/canvas/touch-action widget) wins over "there is a
+    // scrollable ancestor", because such widgets are routinely nested inside a scrollable container
+    // and scrolling that container is exactly the wrong answer. WebCoreIsScrollableAt is then not
+    // even asked, which keeps the added cost of this feature at zero for the Drag case.
+    bool probeDrag = m_dragPointer;
+    WebEngine::instance().post([disp, self, px, py, gen, probeDrag]() {
+        int drag = 0;
+        if (probeDrag) { try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; } }
         int r = 0;
-        try { r = WebCoreIsScrollableAt(px, py); } catch (...) { r = 0; }
+        if (!drag) { try { r = WebCoreIsScrollableAt(px, py); } catch (...) { r = 0; } }
         try {
-            disp->RunAsync(CoreDispatcherPriority::High, ref new DispatchedHandler([self, r, gen]() {
+            disp->RunAsync(CoreDispatcherPriority::High, ref new DispatchedHandler([self, r, drag, gen]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_nestedScrollGen != gen) return;   // gesture already ended / superseded: drop the answer
-                s->m_nestedScrollState = r ? NestedScrollState::Yes : NestedScrollState::No;
+                s->m_nestedScrollState = drag ? NestedScrollState::Drag
+                                              : (r ? NestedScrollState::Yes : NestedScrollState::No);
                 s->ReplayPendingPan();   // the answer is in: send what the finger did while waiting
             }));
         } catch (...) {}
@@ -1843,7 +1981,9 @@ void MainPage::ReplayPendingPan()
     m_pendingPanX = 0; m_pendingPanY = 0;
     if ((dx == 0 && dy == 0) || !m_sessionActive)
         return;
-    if (m_nestedScrollState == NestedScrollState::Yes)
+    if (m_nestedScrollState == NestedScrollState::Drag)
+        DragMoveTo(m_pendingPanPx, m_pendingPanPy, dx, dy);   // presses at the touch-down point first
+    else if (m_nestedScrollState == NestedScrollState::Yes)
         NestedScrollBy(m_pendingPanPx, m_pendingPanPy, dx, dy);
     else {
         InstantPanBy(dx, dy);
@@ -2109,6 +2249,16 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             // drop anything buffered for the (never-resolved) nested-scroll route so it cannot be
             // replayed as a scroll on top of the zoom.
             m_pendingPanX = 0; m_pendingPanY = 0;
+            // Apotheosis (drag as pointer events): the page is holding a mouse button we pressed —
+            // end it as a cancel before the zoom takes over, or the page keeps dragging its content
+            // for the rest of the gesture and never sees a mouseup.
+            if (m_dragActive || m_dragPressPending || m_dragBusy) {
+                m_dragCancel = true;
+                m_dragMovePending = false;
+                m_dragReleasePending = true;
+                PumpDrag();
+            }
+            m_nestedScrollState = NestedScrollState::No;
             // Apotheosis (instant pan): a pinch and a pan must not fight over the presenting
             // element's transform — drop the pan preview before the anchor is taken (SetPinchAnchor
             // needs an untransformed TransformToVisual).
@@ -2153,6 +2303,17 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         if (py < 0) py = 0; else if (py >= kH) py = kH - 1;
         m_pendingPanPx = px; m_pendingPanPy = py;
         m_pendingPanX += idx; m_pendingPanY += idy;
+        return;
+    }
+    // Apotheosis (drag as pointer events): the gesture started over a map/canvas — hand the finger
+    // to the page as a mouse drag. Absolute position, not a delta: the page moves its own content
+    // from where the pointer is, so a coalesced move simply means "the finger is here now".
+    // Deliberately no InstantPanBy and no WebCoreScrollBy on this path: the document must not move.
+    if (m_nestedScrollState == NestedScrollState::Drag) {
+        int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
+        if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
+        if (py < 0) py = 0; else if (py >= kH) py = kH - 1;
+        DragMoveTo(px, py, idx, idy);
         return;
     }
     if (m_nestedScrollState == NestedScrollState::Yes) {
@@ -2354,6 +2515,12 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // Apotheosis (review 2026-09-03): flush first — the answer may never have arrived, and buffered
     // finger movement must reach the page rather than vanish with the gesture.
     ReplayPendingPan();
+    // Apotheosis (drag as pointer events): finger left the glass — the page must get its mouseup,
+    // whether or not the press has even been answered yet (PumpDrag orders it after the press).
+    if (m_dragActive || m_dragPressPending || m_dragBusy) {
+        m_dragReleasePending = true;
+        PumpDrag();
+    }
     ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     if (!m_pinching) return;
@@ -3379,6 +3546,7 @@ void MainPage::LoadSettings()
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
+            else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
@@ -3405,6 +3573,7 @@ void MainPage::SaveSettings()
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
+    s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
@@ -3428,6 +3597,7 @@ void MainPage::ShowSettings()
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
     if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
+    if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
@@ -3466,6 +3636,7 @@ void MainPage::HideSettings()
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
     if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
+    if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
