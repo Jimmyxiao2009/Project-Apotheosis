@@ -248,10 +248,19 @@ static bool isValidSurfaceSize(int w, int h)
 // WebCoreSetMemoryPressure(); everything below runs on the single engine thread.
 // ---------------------------------------------------------------------------
 static constexpr unsigned kMB = 1024u * 1024u;
-// MemoryCache budgets per level: (maxDeadBytes, totalBytes). minDeadBytes stays 0 — we never
-// want dead resources kept while under pressure.
-static constexpr unsigned kMemCacheDeadNormal   = 16u * kMB;
-static constexpr unsigned kMemCacheTotalNormal  = 32u * kMB;
+// MemoryCache budgets per level: (minDeadBytes, maxDeadBytes, totalBytes).
+// Apotheosis: the unpressured budget was 0/16/32 MB, which is smaller than a single image-heavy
+// viewport once the frames are decoded. On chaos.social (200+ images) mem.txt showed dec=32 MB
+// against cap=32 MB while the process sat at 35 % of the App Container limit: every insert pruned
+// what the previous decode had just produced, so large images ping-ponged between the async decode
+// queue (11b3bbd2b9) and the pruner and some never reached a paint at all. 32/64/128 MB is still a
+// twelfth of the cap and leaves the decoded-bitmap ceiling where it belongs - with the texture pool
+// and the tile budget (0c78243bf5, 8585f00e3f), not with a cache that was starving the decoder.
+// minDeadBytes is what survives a prune, so it is non-zero only in the unpressured state; under
+// pressure we still want every dead resource gone, and the two smaller budgets are unchanged.
+static constexpr unsigned kMemCacheMinDeadNormal =  32u * kMB;
+static constexpr unsigned kMemCacheDeadNormal   =  64u * kMB;
+static constexpr unsigned kMemCacheTotalNormal  = 128u * kMB;
 static constexpr unsigned kMemCacheDeadMedium   =  4u * kMB;
 static constexpr unsigned kMemCacheTotalMedium  =  8u * kMB;
 static constexpr unsigned kMemCacheDeadHigh     =  1u * kMB;
@@ -260,9 +269,10 @@ static constexpr unsigned kMemCacheTotalHigh    =  2u * kMB;
 static int g_memPressureLevel = 0;              // last level pushed by the harness (0..2)
 static unsigned g_memCacheCapacity = 0;         // total budget currently configured (for the stats log)
 
-static void wkSetMemoryCacheCapacities(unsigned maxDead, unsigned total)
+// setCapacities(minDeadBytes, maxDeadBytes, totalBytes) - see MemoryCache.h:124.
+static void wkSetMemoryCacheCapacities(unsigned minDead, unsigned maxDead, unsigned total)
 {
-    WebCore::MemoryCache::singleton().setCapacities(0, maxDead, total);
+    WebCore::MemoryCache::singleton().setCapacities(minDead, maxDead, total);
     g_memCacheCapacity = total;
 }
 
@@ -347,8 +357,9 @@ bool ensureWebCoreInitialized()
         // Apotheosis (MEMORY-PLAN.md §3 change 4): sized for the 1536 MB App Container cap.
         // 8/16 MB was too tight for repeat visits and bought nothing - encoded resources are a
         // rounding error next to the decoded bitmaps (§1). What actually bounds us is the
-        // *decoded* data, and that needs the deletion interval below.
-        wkSetMemoryCacheCapacities(kMemCacheDeadNormal, kMemCacheTotalNormal);
+        // *decoded* data, and that needs the deletion interval below - and enough headroom that
+        // the pruner does not eat the frames the decode queue has just produced (see the constants).
+        wkSetMemoryCacheCapacities(kMemCacheMinDeadNormal, kMemCacheDeadNormal, kMemCacheTotalNormal);
         // Apotheosis: without this the interval is 0 and CachedResource::destroyDecodedDataIfNeeded()
         // returns immediately, so a client-less resource keeps its decoded bitmap until some
         // *insert* happens to trigger a prune - i.e. never, on a page that just sits there.
@@ -1998,13 +2009,13 @@ extern "C" void WebCoreSetMemoryPressure(int level)
 
     switch (level) {
     case 0:
-        wkSetMemoryCacheCapacities(kMemCacheDeadNormal, kMemCacheTotalNormal);
+        wkSetMemoryCacheCapacities(kMemCacheMinDeadNormal, kMemCacheDeadNormal, kMemCacheTotalNormal);
         break;
     case 1:
-        wkSetMemoryCacheCapacities(kMemCacheDeadMedium, kMemCacheTotalMedium);
+        wkSetMemoryCacheCapacities(0, kMemCacheDeadMedium, kMemCacheTotalMedium);
         break;
     default:
-        wkSetMemoryCacheCapacities(kMemCacheDeadHigh, kMemCacheTotalHigh);
+        wkSetMemoryCacheCapacities(0, kMemCacheDeadHigh, kMemCacheTotalHigh);
         break;
     }
 
