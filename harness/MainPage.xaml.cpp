@@ -1429,15 +1429,22 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     //   丝滑),不走引擎滚动;松手(OnImageManipCompleted)再把累计缩放提交给引擎按新尺度重栅格。
     float ds = e->Delta.Scale;
     if (m_pinching || (ds > 0.0f && (ds > 1.002f || ds < 0.998f))) {
-        m_pinching = true;
+        // Apotheosis: the anchor is taken ONCE, at the first pinch delta, and then frozen for the
+        //   whole gesture. It used to follow e->Position on every delta, and the centroid of a
+        //   two-finger manipulation becomes the position of the remaining finger the moment the
+        //   first one leaves the glass — re-centring the transform there shifts the content by
+        //   (Fnew − Fold)·(1 − live), which is exactly the "it snaps to the other finger" jump on
+        //   release (worst when zooming in, where 1 − live is largest).
+        if (!m_pinching) {
+            m_pinching = true;
+            SetPinchAnchor(e->Position.X, e->Position.Y);
+        }
         if (ds > 0.0f) m_liveScale *= ds;
         float total = m_pageScale * m_liveScale;          // 钳总缩放到 [kMinPageScale,kMaxPageScale]
         if (m_pageScale > 0.0f) {
             if (total < kMinPageScale) m_liveScale = kMinPageScale / m_pageScale;
             if (total > kMaxPageScale) m_liveScale = kMaxPageScale / m_pageScale;
         }
-        auto fp = e->Position;                            // 捏合焦点(相对 ContentArea = 视口坐标)
-        m_focalX = fp.X; m_focalY = fp.Y;
         ApplyLiveZoom();
         return;
     }
@@ -1451,6 +1458,67 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
     if (idx != 0 || idy != 0) FreeScrollBy(idx, idy);
+}
+
+// Apotheosis: the element that actually shows the engine output — in direct-present mode the
+//   engine composites straight into GpuPanel, otherwise the software frame sits on RenderImage.
+//   Note GpuPanel spans the whole content row while ContentArea sits 6 DIP inside it (Border
+//   Margin="6,6,6,0"), so the two are NOT the same coordinate space.
+Windows::UI::Xaml::FrameworkElement^ MainPage::PresentLayer()
+{
+    return m_gpuPresent ? static_cast<Windows::UI::Xaml::FrameworkElement^>(GpuPanel)
+                        : static_cast<Windows::UI::Xaml::FrameworkElement^>(RenderImage);
+}
+
+// Apotheosis: fix the pinch anchor from a manipulation position (ContentArea DIPs).
+//
+// Preview and engine must keep the SAME point of the page pinned, otherwise the engine frame
+// that replaces the preview lands somewhere else and the content visibly jumps on release.
+// Both sides pin a point, but they name it in different spaces:
+//
+//   preview  ScaleTransform(live, centre = A) on the presenting layer maps a layer point p to
+//            A + (p − A)·live, i.e. the layer point A is the fixed point.
+//   engine   WebCoreSetPageScale(scale, focalX, focalY) — port\WebCoreDriver.cpp — takes the
+//            focal in ENGINE VIEWPORT PIXELS (0..kW × 0..kH), not in page/CSS coordinates and
+//            not in DIPs. It computes the content point c = scroll + focal/oldScale and sets
+//            the new scroll to c − focal/newScale, i.e. the viewport pixel `focal` is the fixed
+//            point. Scroll offset and the current page scale therefore need no term of their
+//            own here — the engine reads both itself; passing the anchor is enough.
+//
+// So the committed focal is simply the preview's transform centre expressed in engine pixels:
+//
+//     A     = TransformToVisual(ContentArea → presenting layer) · position    [layer DIPs]
+//     focal = A · (kW / layer.ActualWidth, kH / layer.ActualHeight)           [engine px]
+//
+// (The engine surface is created at kW×kH and stretched over the whole presenting layer, so the
+// DIP→px factor is the layer's own size — the same kW/ActualWidth idea as MapTapToEngine, but
+// against the layer that carries the transform instead of against ContentArea.)
+void MainPage::SetPinchAnchor(double dipX, double dipY)
+{
+    auto layer = PresentLayer();
+    double lx = dipX, ly = dipY;
+    // TransformToVisual would fold in a RenderTransform still sitting on the layer, so drop it
+    //   first — at pinch start m_liveScale is 1.0, i.e. that transform is the identity anyway.
+    GpuPanel->RenderTransform = nullptr;
+    RenderImage->RenderTransform = nullptr;
+    if (layer != nullptr && layer != static_cast<Windows::UI::Xaml::FrameworkElement^>(ContentArea)) {
+        try {
+            auto tv = ContentArea->TransformToVisual(layer);
+            auto p = tv->TransformPoint(Windows::Foundation::Point((float)dipX, (float)dipY));
+            lx = p.X; ly = p.Y;
+        } catch (...) {}
+    }
+    m_focalX = lx; m_focalY = ly;                     // presenting-layer DIPs = ScaleTransform centre
+    double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
+    double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
+    if (!(lw > 1.0)) lw = ContentArea->ActualWidth;
+    if (!(lh > 1.0)) lh = ContentArea->ActualHeight;
+    double px = (lw > 1.0) ? lx * (double)kW / lw : lx;
+    double py = (lh > 1.0) ? ly * (double)kH / lh : ly;
+    if (px < 0.0) px = 0.0; if (px > (double)kW) px = (double)kW;
+    if (py < 0.0) py = 0.0; if (py > (double)kH) py = (double)kH;
+    m_focalPx = (int)(px + 0.5);
+    m_focalPy = (int)(py + 0.5);
 }
 
 // 实时缩放变换:把 ScaleTransform(以焦点为中心)挂到当前显示层(present=GpuPanel,readback=RenderImage)。
@@ -1473,9 +1541,10 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // 钳到引擎区间 + 吸附 1:1（见 SnapAndClampPageScale）。没有吸附时，捏回去总差百分之几，
     //   页面永远停在“差不多但不是原始大小”的状态上，且误差每次捏合继续累积。
     float newScale = SnapAndClampPageScale(m_pageScale * live);
-    // 焦点同样从显示坐标(DIP,用于 ScaleTransform 中心)映回引擎像素空间再交引擎,避免缩放锚点偏。
-    int fpx, fpy; MapTapToEngine(m_focalX, m_focalY, fpx, fpy);
-    PinchCommit(newScale, fpx, fpy);
+    // The focal was converted to engine pixels once, when the anchor was fixed (SetPinchAnchor):
+    //   it is the very point the preview transform is centred on, so the engine frame lands
+    //   exactly where the preview showed it.
+    PinchCommit(newScale, m_focalPx, m_focalPy);
 }
 
 // 把缩放提交给引擎线程:WebCoreSetPageScale → 新清晰帧;回 UI 后更新已提交尺度 + 复位 RenderTransform + 显示。

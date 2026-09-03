@@ -172,6 +172,12 @@ namespace Harness {
         void OnImageManipCompleted(Platform::Object^ sender, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^ e);
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
+        // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
+        //   RenderImage otherwise) — the pinch preview transform hangs off it.
+        Windows::UI::Xaml::FrameworkElement^ PresentLayer();
+        // Apotheosis: fix the pinch anchor (once per gesture) from a ContentArea DIP position;
+        //   fills m_focalX/Y (transform centre) and m_focalPx/Py (engine pixels for the commit).
+        void SetPinchAnchor(double dipX, double dipY);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
@@ -270,7 +276,9 @@ namespace Harness {
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
         float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)
         float  m_pageScale { 1.0f };   // 已提交给引擎的页面缩放因子(Page::pageScaleFactor)
-        double m_focalX { 360 }, m_focalY { 540 };  // 捏合焦点(ContentArea/视口坐标)
+        // 捏合锚点。手势开始时固定一次(SetPinchAnchor),期间不再跟随焦点移动。
+        double m_focalX { 360 }, m_focalY { 540 };  // 显示层 DIP(= ScaleTransform 中心)
+        int    m_focalPx { 360 }, m_focalPy { 540 };// 同一点的引擎视口像素(= WebCoreSetPageScale 焦点)
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)
         double m_dragLastY { 0 };     // 上次指针 Y(算增量)
