@@ -83,6 +83,14 @@ void WebCorePerfFlush(void);
 // call it as early as possible (SetupRuntimeEnv).
 void WebCoreSetCrashLogPath(const char* path);
 
+// Append one "reason:" line plus the current stack to that crash log from outside the
+// engine. The harness runs on its own CRT instance (C++/CX, MSVC v143, exceptions on),
+// so the engine's terminate/new/invalid-parameter/purecall handlers never see the
+// harness' own fatal paths — Application::UnhandledException and its std::terminate use
+// this instead, so those aborts stop looking like a silent OS memory kill. No-op until
+// WebCoreSetCrashLogPath() has run. Callable from any thread, including a dying one.
+void WebCoreCrashNote(const char* reason);
+
 // ---- network resolve mode ----
 // Force the curl backend to resolve names to IPv4 only (1) or let it use whatever
 // the resolver returns (0, the default). The phone has global IPv6 addresses and on

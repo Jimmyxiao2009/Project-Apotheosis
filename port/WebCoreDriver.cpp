@@ -47,6 +47,10 @@
 #include <cstring>
 #include <cstdio>
 #include <csignal>
+#include <cstdlib>     // Apotheosis: std::abort / _set_purecall_handler (crash.txt legs)
+#include <atomic>      // Apotheosis: try-flag guarding perfFlush() from the crash legs
+#include <exception>   // Apotheosis: std::set_terminate (crash.txt leg (d))
+#include <new.h>       // Apotheosis: _set_new_handler — CRT form, gets the requested size
 #include <JavaScriptCore/ExecutableAllocator.h>   // Apotheosis: JIT pool range / isJITPC for crash.txt       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
 #include <vector>
 #include <curl/curl.h>   // 下载用独立 curl_easy 句柄(WebCoreDownload)
@@ -543,6 +547,73 @@ static bool g_crashLogInProgress = false;   // re-entrancy guard (crash while lo
 static int  g_crashLogEntries = 0;          // hard cap, see kMaxCrashLogEntries
 static const int kMaxCrashLogEntries = 16;
 
+// Apotheosis (2026-09-03): a device abort left only "signal 22 (SIGABRT)" and the
+// handler frame — abort() reached us without going through WTFCrash, so the reason
+// was invisible. Everything that can abort *behind* WTF's back now gets its own
+// leg, each writing a distinct `reason:` line before falling through:
+//   (d) std::terminate      — uncaught exception, or ANGLE's RunOnUIThread timeout
+//                             (the thread rule in CLAUDE.md) reaching our CRT;
+//   (e) _set_new_handler    — operator new failed: address-space/commit exhaustion,
+//                             which with _HAS_EXCEPTIONS=0 aborts with no message;
+//   (f) invalid parameter   — CRT contract violation (bad handle, bad printf, ...);
+//   (g) purecall            — call through a partially destroyed object's vtable.
+// All four are CRT-level, so they see aborts the WTF hook and the VEH never do.
+static void perfFlush();   // fwd decl: drain the perf ring before we die (see (3) below)
+
+// Memory numbers for the OOM-shaped legs. GlobalMemoryStatusEx is APP-partition and
+// comes from WindowsApp.lib; K32GetProcessMemoryInfo is APP-partition too but lives in
+// a psapi apiset we do not otherwise link, so resolve it once at install time and keep
+// the pointer — never call GetProcAddress from inside a crash handler.
+struct CrashProcessMemoryCounters {   // layout of PROCESS_MEMORY_COUNTERS (psapi.h)
+    DWORD cb;
+    DWORD pageFaultCount;
+    SIZE_T peakWorkingSetSize;
+    SIZE_T workingSetSize;
+    SIZE_T quotaPeakPagedPoolUsage;
+    SIZE_T quotaPagedPoolUsage;
+    SIZE_T quotaPeakNonPagedPoolUsage;
+    SIZE_T quotaNonPagedPoolUsage;
+    SIZE_T pagefileUsage;
+    SIZE_T peakPagefileUsage;
+};
+using CrashGetProcessMemoryInfoFn = BOOL (WINAPI*)(HANDLE, CrashProcessMemoryCounters*, DWORD);
+static CrashGetProcessMemoryInfoFn g_crashGetProcessMemoryInfo = nullptr;
+
+// Driver and harness are both /MD, so they share one vcruntime and one set of CRT
+// handler slots: whoever installs last wins. The harness installs its own terminate
+// handler in App() (it has exceptions and can describe the exception object; we cannot),
+// and SetupRuntimeEnv arms us afterwards — so keep the previous handlers and call them
+// once we have logged. Both reasons then appear in crash.txt, ours with the stack.
+static std::terminate_handler g_crashPrevTerminate = nullptr;
+static _invalid_parameter_handler g_crashPrevInvalidParameter = nullptr;
+static _purecall_handler g_crashPrevPureCall = nullptr;
+
+// "ws=..M priv=..M availVirt=..M load=..%" — appended to the reason of the OOM-shaped
+// legs so an abort can be told apart from a genuine logic failure at a glance. Never
+// allocates; every value that cannot be had is simply left out.
+static void crashLogMemorySuffix(char* out, size_t outSize)
+{
+    out[0] = 0;
+    int off = 0;
+    if (g_crashGetProcessMemoryInfo) {
+        CrashProcessMemoryCounters pmc = { };
+        pmc.cb = sizeof(pmc);
+        if (g_crashGetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+            off += std::snprintf(out + off, outSize - off, " ws=%lluM commit=%lluM",
+                static_cast<unsigned long long>(pmc.workingSetSize >> 20),
+                static_cast<unsigned long long>(pmc.pagefileUsage >> 20));
+    }
+    if (off >= static_cast<int>(outSize) - 1)
+        return;
+    MEMORYSTATUSEX ms = { };
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms))
+        std::snprintf(out + off, outSize - off, " availPhys=%lluM availVirt=%lluM load=%lu%%",
+            static_cast<unsigned long long>(ms.ullAvailPhys >> 20),
+            static_cast<unsigned long long>(ms.ullAvailVirtual >> 20),
+            static_cast<unsigned long>(ms.dwMemoryLoad));
+}
+
 // Basename of a module path, ASCII-folded into `out` (module names are ASCII).
 static void crashLogModuleName(HMODULE module, char* out, size_t outSize)
 {
@@ -624,6 +695,10 @@ static void crashLogWrite(const char* reason, const CONTEXT* ctxOrNull)
 
     void* frames[48] = { nullptr };
     USHORT captured = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    // Apotheosis: say how many frames the unwinder actually produced. On ARM32 Thumb
+    // it regularly returns 1 (no unwind data for the CRT's abort tail), and a file
+    // with a single frame must be readable as "the unwinder failed", not "shallow stack".
+    std::fprintf(fp, "stack: captured=%u\n", static_cast<unsigned>(captured));
     for (USHORT i = 0; i < captured; ++i) {
         uintptr_t addr = reinterpret_cast<uintptr_t>(frames[i]);
         HMODULE mod = nullptr;
@@ -637,6 +712,34 @@ static void crashLogWrite(const char* reason, const CONTEXT* ctxOrNull)
         } else
             std::fprintf(fp, "frame %2u: ? 0x%08llx\n", static_cast<unsigned>(i),
                 static_cast<unsigned long long>(addr));
+    }
+
+    // Apotheosis: unwinder fallback. When RtlCaptureStackBackTrace gives us almost
+    // nothing (the ARM32 abort tail), raw-scan this thread's stack for words that look
+    // like Thumb return addresses inside the host image and log them as candidates.
+    // Noisy by construction — stale frames survive on the stack — but "cand" lines feed
+    // local\symbolize-crash.ps1 exactly like "frame" lines and usually contain the real
+    // caller. Bounded scan, no allocation, VirtualQuery for the stack extent.
+    if (captured < 4 && exe) {
+        const uintptr_t exeBase = reinterpret_cast<uintptr_t>(exe);
+        const uintptr_t exeEnd = exeBase + crashLogModuleSize(exe);
+        volatile uintptr_t probe = 0;
+        const uintptr_t here = reinterpret_cast<uintptr_t>(const_cast<uintptr_t*>(&probe));
+        MEMORY_BASIC_INFORMATION mbi = { };
+        if (crashLogModuleSize(exe) && VirtualQuery(reinterpret_cast<const void*>(here), &mbi, sizeof(mbi))) {
+            uintptr_t top = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (top > here + 16384)
+                top = here + 16384;          // 4k words is plenty and keeps the file small
+            int found = 0;
+            for (uintptr_t p = here; p + sizeof(uintptr_t) <= top && found < 24; p += sizeof(uintptr_t)) {
+                const uintptr_t v = *reinterpret_cast<const uintptr_t*>(p);
+                if (v <= exeBase || v >= exeEnd || !(v & 1))
+                    continue;                // Thumb return addresses have bit 0 set
+                std::fprintf(fp, "cand %2d: %s +0x%08llx\n", found, exeName[0] ? exeName : "?",
+                    static_cast<unsigned long long>((v & ~static_cast<uintptr_t>(1)) - exeBase));
+                ++found;
+            }
+        }
     }
 
     std::fflush(fp);
@@ -723,11 +826,99 @@ static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
 }
 
 // (c) abort() tail. Returns; the CRT then fast-fails as usual.
+// The perf ring is drained first: abort() is the one exit where the rows leading up to
+// the crash (the `scale` rows of a pinch, say) would otherwise be lost with the process.
 static void __cdecl crashLogSignalHandler(int sig)
 {
-    char reason[64];
-    std::snprintf(reason, sizeof(reason), "signal %d (SIGABRT)", sig);
+    char reason[128];
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    std::snprintf(reason, sizeof(reason), "signal %d (SIGABRT)%s", sig, mem);
     crashLogWrite(reason, nullptr);
+    perfFlush();
+}
+
+// (d) std::terminate. Reached by an uncaught exception, a noexcept violation, or a
+// terminate() call — on this port most plausibly ANGLE's RunOnUIThread timeout (see
+// the thread rule in CLAUDE.md) unwinding into our CRT. The driver is built with
+// _HAS_EXCEPTIONS=0, so there is no exception object to describe: say so explicitly
+// rather than leaving the reader guessing. Must not return — the CRT would abort
+// anyway; we abort ourselves so leg (c) also runs and the RVAs land in the file.
+static void __cdecl crashLogTerminateHandler()
+{
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    char reason[256];
+#if defined(_HAS_EXCEPTIONS) && !_HAS_EXCEPTIONS
+    std::snprintf(reason, sizeof(reason),
+        "terminate (driver _HAS_EXCEPTIONS=0: no exception object; uncaught throw came from another module)%s", mem);
+#else
+    std::snprintf(reason, sizeof(reason), "terminate (pending exception=%d)%s",
+        std::current_exception() ? 1 : 0, mem);
+#endif
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    if (g_crashPrevTerminate && g_crashPrevTerminate != &crashLogTerminateHandler)
+        g_crashPrevTerminate();   // harness leg: names the exception; aborts itself
+    std::abort();
+}
+
+// (e) operator new failure. Uses the CRT hook rather than std::set_new_handler because
+// this one is handed the requested size — the number that tells an ordinary large
+// allocation apart from 32-bit address-space exhaustion, which is what a 770 MB working
+// set on a Lumia produces. Returning 0 means "do not retry", so the CRT proceeds to its
+// usual bad_alloc/terminate path; returning non-zero here would spin operator new forever.
+static int __cdecl crashLogNewHandler(size_t size)
+{
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    char reason[256];
+    std::snprintf(reason, sizeof(reason), "operation new failed size=%llu%s",
+        static_cast<unsigned long long>(size), mem);
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    return 0;
+}
+
+// (f) CRT contract violation (bad handle, malformed printf spec, out-of-range index in a
+// checked call). In a release CRT every string argument is null — that is expected; the
+// stack in the same entry is what identifies the call site.
+static void __cdecl crashLogInvalidParameterHandler(const wchar_t* expression, const wchar_t* function,
+    const wchar_t* file, unsigned int line, uintptr_t /*reserved*/)
+{
+    auto narrow = [](const wchar_t* w, char* out, size_t outSize) {
+        size_t i = 0;
+        if (!w) {
+            std::snprintf(out, outSize, "(null)");
+            return;
+        }
+        for (; w[i] && i + 1 < outSize; ++i)
+            out[i] = (w[i] < 128) ? static_cast<char>(w[i]) : '?';
+        out[i] = 0;
+    };
+    char e[96], f[96], fl[128];
+    narrow(expression, e, sizeof e);
+    narrow(function, f, sizeof f);
+    narrow(file, fl, sizeof fl);
+    char reason[400];
+    std::snprintf(reason, sizeof(reason), "invalid parameter expr=%s func=%s file=%s line=%u", e, f, fl, line);
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    if (g_crashPrevInvalidParameter && g_crashPrevInvalidParameter != &crashLogInvalidParameterHandler)
+        g_crashPrevInvalidParameter(expression, function, file, line, 0);
+    // Return: the CRT then fast-fails exactly as it would have without us.
+}
+
+// (g) pure virtual call — a virtual dispatched on a half-constructed/half-destroyed
+// object. On this port the prime suspects are the teardown paths (session/tab destruction
+// racing a queued engine call), which look identical to an OOM kill from outside.
+static void __cdecl crashLogPureCallHandler()
+{
+    crashLogWrite("pure virtual call", nullptr);
+    perfFlush();
+    if (g_crashPrevPureCall && g_crashPrevPureCall != &crashLogPureCallHandler)
+        g_crashPrevPureCall();
+    // Return: the CRT fast-fails as before.
 }
 
 // ==================== M4 step 1: per-phase timing (PerfLog) ==================
@@ -841,7 +1032,13 @@ static void perfFmtI(char* buf, size_t cap, int v)
 
 // Drain the ring to disk. Single open/append/close (App-Container-safe, the same
 // shape PortNetworkStorageSession uses for its cookie diag).
-static void perfFlush()
+// Apotheosis: the crash legs above call this so the rows leading up to an abort are not
+// lost with the process. There is no lock to deadlock on, but the crash may well *be*
+// inside this function (a fopen/fprintf on an exhausted heap), so entry is gated by an
+// atomic try-flag: a flush already in flight is never re-entered, we simply skip it.
+static std::atomic<int> g_perfFlushBusy { 0 };
+
+static void perfFlushLocked()
 {
     if (!g_perfOn || g_perfPath.empty() || !g_perfRows)
         return;
@@ -884,6 +1081,15 @@ static void perfFlush()
     }
     std::fclose(fp);
     g_perfRows = 0;
+}
+
+static void perfFlush()
+{
+    int expected = 0;
+    if (!g_perfFlushBusy.compare_exchange_strong(expected, 1))
+        return;
+    perfFlushLocked();
+    g_perfFlushBusy.store(0);
 }
 
 static void perfBegin(const char* kind, const char* url, int w, int h)
@@ -1941,9 +2147,30 @@ void WebCoreSetCrashLogPath(const char* path)
     if (g_crashLogInstalled)
         return;
     g_crashLogInstalled = true;
+    // Resolve the memory probe once, here — never from inside a crash handler.
+    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+        g_crashGetProcessMemoryInfo = reinterpret_cast<CrashGetProcessMemoryInfoFn>(
+            reinterpret_cast<void*>(GetProcAddress(k32, "K32GetProcessMemoryInfo")));
     WTFWinUWPSetCrashHook(&crashLogWtfHook);
     AddVectoredExceptionHandler(1, &crashLogVectoredHandler);
     std::signal(SIGABRT, &crashLogSignalHandler);
+    // The four CRT legs (see the block comment above crashLogMemorySuffix): every path
+    // that aborts without ever reaching WTFCrash now names itself in crash.txt.
+    g_crashPrevTerminate = std::set_terminate(&crashLogTerminateHandler);
+    _set_new_handler(&crashLogNewHandler);
+    g_crashPrevInvalidParameter = _set_invalid_parameter_handler(&crashLogInvalidParameterHandler);
+    g_crashPrevPureCall = _set_purecall_handler(&crashLogPureCallHandler);
+}
+
+// Apotheosis: append one reason line (plus the current stack) to crash.txt from outside
+// the engine. The harness owns the terminate/UnhandledException paths of its own CRT —
+// C++/CX, exceptions enabled, a different CRT instance from this DLL's — so it cannot
+// reuse the handlers above and needs a way to record *why* it is about to die. No-op
+// until WebCoreSetCrashLogPath() has run. Safe from any thread and from a dying one.
+void WebCoreCrashNote(const char* reason)
+{
+    crashLogWrite(reason && *reason ? reason : "(note)", nullptr);
+    perfFlush();
 }
 
 // Apotheosis (M4): resolve-mode switch for the curl backend. The phone has global
