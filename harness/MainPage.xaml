@@ -52,6 +52,51 @@
             <Setter Property="Height" Value="46"/>
             <Setter Property="Padding" Value="10,0"/>
         </Style>
+        <!-- Apotheosis: 悬浮翻页键(▲/▼)。原先上键是 SurfaceHi 圆底 + 亮字形,下键固定用 Accent 圆底 +
+             深色字形 —— 一对键里有一个永远看着像"被按住/选中",实机上就是那颗反白的按钮。两键现在共用
+             同一常态外观,反白只出现在 Pressed 态(此时才换成 Accent 底 + 深色字形,给出按下反馈)。
+             圆底做进模板,XAML 里不再需要包一层 Border。 -->
+        <Style x:Key="ScrollFabBtn" TargetType="Button">
+            <Setter Property="Width" Value="46"/>
+            <Setter Property="Height" Value="46"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="FontSize" Value="19"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="FabRoot" Width="46" Height="46" CornerRadius="23"
+                                Background="{StaticResource SurfaceHi}"
+                                BorderBrush="{StaticResource Sep}" BorderThickness="1">
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualState x:Name="Normal"/>
+                                    <VisualState x:Name="PointerOver"/>
+                                    <VisualState x:Name="Pressed">
+                                        <Storyboard>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="FabRoot" Storyboard.TargetProperty="Background">
+                                                <DiscreteObjectKeyFrame KeyTime="0" Value="{StaticResource Accent}"/>
+                                            </ObjectAnimationUsingKeyFrames>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="FabGlyph" Storyboard.TargetProperty="Foreground">
+                                                <DiscreteObjectKeyFrame KeyTime="0" Value="#FF07110F"/>
+                                            </ObjectAnimationUsingKeyFrames>
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Disabled">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="FabRoot" Storyboard.TargetProperty="Opacity" To="0.4" Duration="0"/>
+                                        </Storyboard>
+                                    </VisualState>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <ContentPresenter x:Name="FabGlyph" Foreground="{StaticResource TxtHi}"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              Content="{TemplateBinding Content}" FontSize="{TemplateBinding FontSize}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <!-- 动作面板:顶部快捷图标列 -->
         <Style x:Key="QuickBtn" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
@@ -270,14 +315,8 @@
             <!-- 悬浮翻页键(触发懒加载/看下方内容)。仅有会话时显示。 -->
             <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom"
                          Margin="0,0,16,18" Visibility="Collapsed">
-                <Border Width="46" Height="46" CornerRadius="23" Background="{StaticResource SurfaceHi}" BorderBrush="{StaticResource Sep}" BorderThickness="1" Margin="0,0,0,9">
-                    <Button Width="46" Height="46" Padding="0" Background="Transparent" Foreground="{StaticResource TxtHi}"
-                             FontSize="19" BorderThickness="0" Content="&#x25B2;" Click="OnScrollUp"/>
-                </Border>
-                <Border Width="46" Height="46" CornerRadius="23" Background="{StaticResource Accent}">
-                    <Button Width="46" Height="46" Padding="0" Background="Transparent" Foreground="#FF07110F"
-                             FontSize="19" BorderThickness="0" Content="&#x25BC;" Click="OnScrollDown"/>
-                </Border>
+                <Button Style="{StaticResource ScrollFabBtn}" Margin="0,0,0,9" Content="&#x25B2;" Click="OnScrollUp"/>
+                <Button Style="{StaticResource ScrollFabBtn}" Content="&#x25BC;" Click="OnScrollDown"/>
             </StackPanel>
 
             <!-- 页内查找条(顶部浮条) -->
