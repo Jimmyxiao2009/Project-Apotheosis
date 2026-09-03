@@ -66,6 +66,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::Grid^ TabSwitcher;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ TabList;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TabSwitcherTitle;
+        private: ::Windows::UI::Xaml::Controls::ComboBox^ SetLangCombo;
         private: ::Windows::UI::Xaml::Controls::ComboBox^ SetSearchCombo;
         private: ::Windows::UI::Xaml::Controls::TextBox^ SetHomeBox;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetUaSwitch;

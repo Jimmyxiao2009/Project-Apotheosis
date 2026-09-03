@@ -571,7 +571,15 @@
             </Grid>
             <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
                 <StackPanel Margin="16,14">
-                    <TextBlock Text="SEARCH &amp; START" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,6,0,7"/>
+                    <!-- 界面语言:首启 OOBE 选定,这里可随时改(离开设置页即生效,见 HideSettings)。 -->
+                    <TextBlock Text="LANGUAGE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,6,0,7"/>
+                    <TextBlock Text="界面语言" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
+                    <ComboBox x:Name="SetLangCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem Content="中文"/>
+                        <ComboBoxItem Content="English"/>
+                    </ComboBox>
+
+                    <TextBlock Text="SEARCH &amp; START" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock Text="默认搜索引擎" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
                     <ComboBox x:Name="SetSearchCombo" HorizontalAlignment="Stretch">
                         <ComboBoxItem Content="Bing"/>

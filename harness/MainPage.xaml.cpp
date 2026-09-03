@@ -281,6 +281,22 @@ static bool ImeDebugEnabled()
     return enabled;
 }
 
+static std::wstring g_lang = L"zh";   // 界面语言:zh(默认)/ en;首启 OOBE 选定,存 settings.ini
+// 代码里动态设置的中/英文案(按当前语言返回)。静态 XAML 串由 TranslateNode 树遍历翻译;
+// 这个给"运行期才赋值、会盖掉翻译"的标签/toast 用(收藏状态、UA 状态等)。
+static Platform::String^ L8(const wchar_t* zh, const wchar_t* en) {
+    return ref new Platform::String(g_lang == L"en" ? en : zh);
+}
+// Apotheosis: same choice for the two other string flavours the harness builds text in —
+//   std::wstring (titles, status lines handed to the engine thread) and UTF-8 char* (the
+//   built-in home/error pages, which are HTML source).
+static std::wstring W8(const wchar_t* zh, const wchar_t* en) {
+    return std::wstring(g_lang == L"en" ? en : zh);
+}
+static const char* U8(const char* zh, const char* en) {
+    return g_lang == L"en" ? en : zh;
+}
+
 // 本地起始页(主页),WebCoreRenderHtml 渲染。CJK 已可用(SimHei)。
 static const char* kHomeHtml =
     "<html><head><meta charset='utf-8'></head>"
@@ -302,7 +318,8 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
     std::string e = err ? err : "";
     return "<html><head><meta charset='utf-8'></head>"
         "<body style='margin:0;background:#fff;font-family:sans-serif'>"
-        "<div style='background:#d93025;color:#fff;padding:32px 24px'><h1 style='margin:0;font-size:38px'>无法访问此页面</h1></div>"
+        "<div style='background:#d93025;color:#fff;padding:32px 24px'><h1 style='margin:0;font-size:38px'>"
+        + std::string(U8("无法访问此页面", "Can&rsquo;t reach this page")) + "</h1></div>"
         "<div style='padding:24px;color:#333;font-size:24px'><p style='word-break:break-all;color:#1a73e8'>" + url + "</p>"
         "<p style='color:#d93025;font-size:22px;word-break:break-all'>" + e + "</p></div></body></html>";
 }
@@ -310,12 +327,6 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
 // 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
 static std::wstring g_searchPrefix = L"https://cn.bing.com/search?q=";
 static std::wstring g_homeUrl = L"about:home";
-static std::wstring g_lang = L"zh";   // 界面语言:zh(默认)/ en;首启 OOBE 选定,存 settings.ini
-// 代码里动态设置的中/英文案(按当前语言返回)。静态 XAML 串由 TranslateNode 树遍历翻译;
-// 这个给"运行期才赋值、会盖掉翻译"的标签/toast 用(收藏状态、UA 状态等)。
-static Platform::String^ L8(const wchar_t* zh, const wchar_t* en) {
-    return ref new Platform::String(g_lang == L"en" ? en : zh);
-}
 static std::wstring SearchPrefixFor(int idx)
 {
     switch (idx) {
@@ -377,15 +388,22 @@ static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, c
     h += ".tile .t{font-size:20px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".tile .u{font-size:15px;color:#80868b;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += "</style></head><body>";
-    h += "<div class='hero'><h1>EdgeHTML Reborn</h1><p>\xE7\x8E\xB0\xE4\xBB\xA3\xE6\xB5\x8F\xE8\xA7\x88\xE5\x99\xA8\xE5\xBC\x95\xE6\x93\x8E &middot; Windows 10 Mobile &middot; ARM32</p></div>";
+    h += "<div class='hero'><h1>EdgeHTML Reborn</h1><p>";
+    h += U8("\xE7\x8E\xB0\xE4\xBB\xA3\xE6\xB5\x8F\xE8\xA7\x88\xE5\x99\xA8\xE5\xBC\x95\xE6\x93\x8E", "A modern browser engine");
+    h += " &middot; Windows 10 Mobile &middot; ARM32</p></div>";
     h += "<div class='wrap'>";
     if (tiles.empty()) {
-        h += "<p class='sec'>\xE5\x9C\xA8\xE4\xB8\x8A\xE6\x96\xB9\xE5\x9C\xB0\xE5\x9D\x80\xE6\xA0\x8F\xE8\xBE\x93\xE5\x85\xA5\xE7\xBD\x91\xE5\x9D\x80\xE8\xAE\xBF\xE9\x97\xAE\xE7\xBD\x91\xE9\xA1\xB5\xE3\x80\x82</p><div class='grid'>";
+        h += "<p class='sec'>";
+        h += U8("\xE5\x9C\xA8\xE4\xB8\x8A\xE6\x96\xB9\xE5\x9C\xB0\xE5\x9D\x80\xE6\xA0\x8F\xE8\xBE\x93\xE5\x85\xA5\xE7\xBD\x91\xE5\x9D\x80\xE8\xAE\xBF\xE9\x97\xAE\xE7\xBD\x91\xE9\xA1\xB5\xE3\x80\x82",
+                "Type a URL in the address bar above to open a page.");
+        h += "</p><div class='grid'>";
         const char* defs[][2] = { {"https://example.com","example.com"}, {"https://github.com","github.com"}, {"https://cn.bing.com","bing.com"}, {"https://en.wikipedia.org","wikipedia.org"} };
         for (auto& d : defs) { h += "<a class='tile' href='"; h += d[0]; h += "'><div class='t'>"; h += d[1]; h += "</div><div class='u'>"; h += d[0]; h += "</div></a>"; }
         h += "</div>";
     } else {
-        h += "<p class='sec'>\xE5\xB8\xB8\xE7\x94\xA8\xE7\xAB\x99\xE7\x82\xB9</p><div class='grid'>";
+        h += "<p class='sec'>";
+        h += U8("\xE5\xB8\xB8\xE7\x94\xA8\xE7\xAB\x99\xE7\x82\xB9", "Frequently visited");
+        h += "</p><div class='grid'>";
         for (const auto& e : tiles) {
             std::string href = HtmlEscape(WideToUtf8(e.url));
             std::string title = HtmlEscape(WideToUtf8(e.title.empty() ? e.url : e.title));
@@ -580,7 +598,7 @@ MainPage::MainPage()
             [this](Windows::ApplicationModel::DataTransfer::DataTransferManager^,
                    Windows::ApplicationModel::DataTransfer::DataRequestedEventArgs^ e) {
                 if (m_currentUrl.empty() || m_currentUrl == L"about:home") {
-                    e->Request->FailWithDisplayText(ref new Platform::String(L"无可分享内容"));
+                    e->Request->FailWithDisplayText(L8(L"无可分享内容", L"Nothing to share"));
                     return;
                 }
                 auto req = e->Request;
@@ -972,7 +990,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                 WebCoreCloseSession();   // 离开网络页:销毁会话,释放 Page + 取消在途加载
                 rc = WebCoreRenderHtml(homeHtml.c_str(), kW, kH, rgba->data());
                 loadOk = (rc == 0);
-                title = L"主页";
+                title = W8(L"主页", L"Home");
             } else {
                 WriteStage(("before-load " + surl).c_str());
                 WriteMemLog("before-load url=" + surl + " " + MemSnapshot() + EngineMemStats());   // Apotheosis (M4)
@@ -1001,10 +1019,10 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     std::string eh = MakeErrorHtml(surl, err);
                     rc = WebCoreRenderHtml(eh.c_str(), kW, kH, rgba->data());   // 渲染错误页(会话已被引擎清理)
                     loadOk = false;
-                    title = L"加载失败";
+                    title = W8(L"加载失败", L"Load failed");
                 }
             }
-        } catch (...) { rc = -1000; loadOk = false; title = L"渲染异常"; }
+        } catch (...) { rc = -1000; loadOk = false; title = W8(L"渲染异常", L"Render error"); }
 
         // 取链接命中表(渲染时已提取到驱动 g_links,这里在引擎线程读出)。
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
@@ -2164,8 +2182,8 @@ void MainPage::StartDownload(Platform::String^ url)
         long long sz = 0;
         try { std::ifstream f(u8out, std::ios::binary | std::ios::ate); if (f) sz = (long long)f.tellg(); } catch (...) {}
         std::wstring status = (code >= 200 && code < 400)
-            ? (L"已完成  " + std::to_wstring(sz / 1024) + L" KB")
-            : (L"失败(" + std::to_wstring(code) + L")");
+            ? (W8(L"已完成  ", L"Done  ") + std::to_wstring(sz / 1024) + L" KB")
+            : (W8(L"失败(", L"Failed (") + std::to_wstring(code) + L")");
         auto st = std::make_shared<std::wstring>(status);
         auto fnC = std::make_shared<std::wstring>(fnCopy);
         auto urlC = std::make_shared<std::wstring>(urlCopy);
@@ -2537,6 +2555,7 @@ void MainPage::SaveSettings()
 void MainPage::ShowSettings()
 {
     HideActionMenu();
+    if (SetLangCombo) SetLangCombo->SelectedIndex = (g_lang == L"en") ? 1 : 0;
     if (SetSearchCombo) SetSearchCombo->SelectedIndex = m_setSearch;
     if (SetHomeBox) SetHomeBox->Text = ref new String(g_homeUrl == L"about:home" ? L"" : g_homeUrl.c_str());
     if (SetUaSwitch) SetUaSwitch->IsOn = m_setUaDesktop;
@@ -2558,6 +2577,9 @@ void MainPage::ShowSettings()
 
 void MainPage::HideSettings()
 {
+    // 语言先切:后面的 ApplySettings 才会用新语言刷运行期标签。
+    if (SetLangCombo && SetLangCombo->SelectedIndex >= 0)
+        SetLanguage(SetLangCombo->SelectedIndex == 1 ? L"en" : L"zh");
     if (SetSearchCombo && SetSearchCombo->SelectedIndex >= 0) m_setSearch = SetSearchCombo->SelectedIndex;
     if (SetHomeBox) {
         std::wstring h = SetHomeBox->Text ? std::wstring(SetHomeBox->Text->Data()) : L"";
@@ -2597,6 +2619,8 @@ static const wchar_t* const kI18n[][2] = {
     { L"\U0001F4F1 手机UA", L"\U0001F4F1 Mobile UA" }, { L"\U0001F5A5 桌面UA", L"\U0001F5A5 Desktop UA" },
     { L"★ 收藏", L"★ Favorites" }, { L"\U0001F551 历史", L"\U0001F551 History" },
     { L"↓ 下载", L"↓ Downloads" }, { L"★ 收藏此页", L"★ Bookmark this" },
+    { L"当前页面", L"Current page" }, { L"浏览资料库", L"Library" }, { L"浏览器设置", L"Browser settings" },
+    { L"界面语言", L"Language" },
     { L"默认搜索引擎", L"Default search engine" }, { L"百度", L"Baidu" },
     { L"主页(URL,留空用内置主页)", L"Home (URL; blank = built-in)" },
     { L"自定义 User-Agent(留空=用上面的开关;改后刷新网页生效)", L"Custom User-Agent (blank = use the switch above; reload to apply)" },
@@ -2647,13 +2671,28 @@ void MainPage::ApplyLanguage() {
     TranslateNode(this->Content, true);
 }
 
+// Apotheosis: switch the interface language while the app runs (Settings → LANGUAGE, applied when
+//   the settings page closes; the OOBE choice is just the initial value).
+//   The loaded XAML tree is translated in place, in whichever direction we are going — kI18n is
+//   walked backwards for en → zh, so every English string in the table has to stay unique.
+//   Labels the code assigns at runtime do not live in the tree's original text, so they are
+//   re-stamped from L8 afterwards; panels that rebuild their contents on open (drawer, tab
+//   switcher, action sheet, settings footer) pick the new language up by themselves.
+void MainPage::SetLanguage(const std::wstring& lang) {
+    std::wstring want = (lang == L"en") ? L"en" : L"zh";
+    if (want == g_lang) return;
+    TranslateNode(this->Content, want == L"en");
+    g_lang = want;
+    m_langSet = true;
+    ApplySettings();          // UaBtn 等运行期标签按新语言重刷
+}
+
 void MainPage::OnOobeLang(Platform::Object^ sender, RoutedEventArgs^) {
     std::wstring tag = L"zh";
     if (auto b = dynamic_cast<Windows::UI::Xaml::Controls::Button^>(sender))
         if (auto t = dynamic_cast<Platform::String^>(b->Tag)) tag = std::wstring(t->Data());
-    g_lang = (tag == L"en") ? L"en" : L"zh";
+    SetLanguage(tag);         // 立即把整个界面翻过去(选中文=默认,无操作)
     m_langSet = true;
-    if (g_lang == L"en") ApplyLanguage();   // 立即把整个界面翻成英文
     SaveSettings();
     if (OobePanel) OobePanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
 }
@@ -2756,10 +2795,12 @@ void MainPage::CheckForUpdate(bool manual)
                         : pageW;
                     try {
                         auto dlg = ref new Windows::UI::Popups::MessageDialog(
-                            ref new String((L"发现新版本 " + tagW + L"\n是否打开发布页下载 appx?").c_str()),
-                            ref new String(L"有可用更新"));
-                        auto go = ref new Windows::UI::Popups::UICommand(ref new String(L"前往下载"));
-                        auto later = ref new Windows::UI::Popups::UICommand(ref new String(L"稍后"));
+                            ref new String((W8(L"发现新版本 ", L"New version ") + tagW
+                                            + W8(L"\n是否打开发布页下载 appx?",
+                                                 L"\nOpen the release page to download the appx?")).c_str()),
+                            L8(L"有可用更新", L"Update available"));
+                        auto go = ref new Windows::UI::Popups::UICommand(L8(L"前往下载", L"Download"));
+                        auto later = ref new Windows::UI::Popups::UICommand(L8(L"稍后", L"Later"));
                         dlg->Commands->Append(go);
                         dlg->Commands->Append(later);
                         dlg->DefaultCommandIndex = 0;
@@ -2783,7 +2824,7 @@ void MainPage::CheckForUpdate(bool manual)
 void MainPage::ExportDebug()
 {
     std::wstring d = LocalStateDir();
-    std::string report = "=== Apotheosis 调试报告 ===\n";
+    std::string report = std::string("=== Apotheosis ") + U8("调试报告", "debug report") + " ===\n";
     report += "harness / WebCore 2.52.4 / ARM32 UWP\n\n";
     if (!d.empty()) {
         std::string dd = WideToUtf8(d);
@@ -2794,7 +2835,9 @@ void MainPage::ExportDebug()
             std::stringstream ss; ss << f.rdbuf();
             report += std::string("---------- ") + fn + " ----------\n" + ss.str() + "\n\n";
         }
-        report += "---------- crash dumps ----------\n(崩溃 dump 文件在 LocalState 根目录,可经 Device Portal 拉取)\n";
+        report += "---------- crash dumps ----------\n";
+        report += U8("(崩溃 dump 文件在 LocalState 根目录,可经 Device Portal 拉取)\n",
+                     "(crash dumps sit in the LocalState root; pull them with Device Portal)\n");
         try { std::ofstream o(dd + "\\debug-report.txt", std::ios::binary | std::ios::trunc); if (o) o.write(report.data(), report.size()); } catch (...) {}
     }
     Platform::String^ reportW = ref new String(Utf8ToWide(report).c_str());
@@ -2804,7 +2847,7 @@ void MainPage::ExportDebug()
         picker->SuggestedFileName = ref new String(L"apotheosis-debug");
         auto exts = ref new Platform::Collections::Vector<Platform::String^>();
         exts->Append(".txt");
-        picker->FileTypeChoices->Insert(ref new String(L"文本文件"), exts);
+        picker->FileTypeChoices->Insert(L8(L"文本文件", L"Text file"), exts);
         concurrency::create_task(picker->PickSaveFileAsync()).then([reportW](Windows::Storage::StorageFile^ file) {
             if (file) concurrency::create_task(Windows::Storage::FileIO::WriteTextAsync(file, reportW));
         });
@@ -3133,7 +3176,7 @@ void MainPage::RebuildTabSwitcher()
         const Tab& t = m_tabs[i];
         bool active = (idx == m_activeTab);
         std::wstring title = t.currentTitle.empty()
-            ? (t.currentUrl == L"about:home" ? std::wstring(L"主页") : t.currentUrl)
+            ? (t.currentUrl == L"about:home" ? W8(L"主页", L"Home") : t.currentUrl)
             : t.currentTitle;
         std::wstring sub = (t.currentUrl == L"about:home") ? std::wstring(L"about:home") : t.currentUrl;
 

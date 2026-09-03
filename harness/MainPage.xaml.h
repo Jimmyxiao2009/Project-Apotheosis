@@ -97,6 +97,8 @@ namespace Harness {
         void OnOobeLang(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void ApplyLanguage();
         void TranslateNode(Platform::Object^ node, bool toEn);
+        // Apotheosis: 运行期换语言(设置页 LANGUAGE / OOBE)。就地翻译已加载树 + 重刷运行期标签。
+        void SetLanguage(const std::wstring& lang);
 
         // ---- 页内查找 ----
         void ShowFindBar();
