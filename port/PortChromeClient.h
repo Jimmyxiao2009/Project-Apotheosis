@@ -47,6 +47,15 @@ public:
     void attachViewOverlayGraphicsLayer(WebCore::GraphicsLayer*) final { }
     void setNeedsOneShotDrawingSynchronization() final { m_needsPresent = true; }
     void triggerRenderingUpdate() final { m_needsPresent = true; }
+    // Apotheosis (M4): Page::scheduleRenderingUpdateInternal() asks us first and only falls
+    // back to RenderingUpdateScheduler (display link / timer -> triggerRenderingUpdate) when
+    // we return false. Every repaint request goes through here - including the one an
+    // asynchronous image decode raises via CachedImage::imageFrameAvailable ->
+    // RenderImage::imageChanged -> GraphicsLayerTextureMapper::setNeedsDisplayInRect ->
+    // notifyFlushRequired. Flag the present right away so the very next harness tick shows the
+    // repaired tile instead of waiting for the scheduler's timer; keep returning false so the
+    // scheduler still runs exactly as before.
+    bool scheduleRenderingUpdate() final { m_needsPresent = true; return false; }
 
     // Use the default GraphicsLayerTextureMapper factory.
     WebCore::GraphicsLayerFactory* graphicsLayerFactory() const final { return nullptr; }
