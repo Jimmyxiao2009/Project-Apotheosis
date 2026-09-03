@@ -346,7 +346,10 @@
                     </Border>
                 </Button>
 
-                <Rectangle Grid.Column="1" Fill="{StaticResource Sep}" Width="1" Height="26" VerticalAlignment="Center"/>
+                <!-- Apotheosis: the hairline separators that used to sit in columns 1 and 3 are
+                     gone — on a 432 DIP phone screen every DIP of the address field counts, and
+                     the pill's own rounded border already separates it from the two keys. The
+                     Auto columns stay (empty = zero width) so no Grid.Column index moves. -->
 
                 <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。三者统一 40 高。UWP TextBox 不理会 VerticalContentAlignment(模板没绑),文字靠 Padding 上下值居中。 -->
                 <Border Grid.Column="2" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="20" Margin="7,9" Padding="0" Height="42">
@@ -378,8 +381,6 @@
                                 Content="&#x2715;" Click="OnUrlClear"/>
                     </Grid>
                 </Border>
-
-                <Rectangle Grid.Column="3" Fill="{StaticResource Sep}" Width="1" Height="26" VerticalAlignment="Center"/>
 
                 <!-- 菜单(More):弹出底部动作面板 -->
                 <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>

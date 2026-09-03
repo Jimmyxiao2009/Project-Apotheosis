@@ -2369,10 +2369,28 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
     SetUrlEditingChrome(true);
 }
 // 不在 LostFocus 里收建议:点建议项会先夺焦再触发其 Click,提前收会取消点击。改由点页面(OnPageTapped)/导航收。
+//
+// Apotheosis: leaving the field WITHOUT committing (tapped the page, hardware Back, keyboard
+//   dismissed) has to undo the edit. Otherwise the box keeps half-typed text that no longer
+//   describes what is on screen, and — because the context button is chosen by comparing the
+//   box against m_currentUrl — the button stays a "→" (go), so the only way back to reload/stop
+//   is to retype the URL. Restore m_currentUrl (empty box on about:home, matching NavigateTo)
+//   and let UpdateUrlActionGlyph put ⟳/✕ back. A committed navigation already wrote
+//   m_currentUrl and the box together, so nothing is reverted in that case.
 void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
 {
     m_urlFocused = false;
+    if (UrlBox) {
+        std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
+        std::wstring want = (m_currentUrl == L"about:home") ? std::wstring() : m_currentUrl;
+        if (boxText != want) {
+            m_urlSyncing = true;                       // programmatic write: no suggestion popup
+            UrlBox->Text = ref new String(want.c_str());
+            m_urlSyncing = false;
+        }
+    }
     SetUrlEditingChrome(false);
+    UpdateUrlActionGlyph();
 }
 
 // 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。
