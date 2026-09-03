@@ -98,6 +98,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::TextBlock^ LockIcon;
         private: ::Windows::UI::Xaml::Controls::TextBox^ UrlBox;
         private: ::Windows::UI::Xaml::Controls::Button^ UrlActionBtn;
+        private: ::Windows::UI::Xaml::Controls::TextBlock^ UrlActionGlyph;
         private: ::Windows::UI::Xaml::Controls::Button^ UrlClearBtn;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TabCountText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TitleText;

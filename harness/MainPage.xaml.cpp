@@ -2904,11 +2904,11 @@ void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
 
 void MainPage::UpdateUrlActionGlyph()
 {
-    if (!UrlActionBtn) return;
-    if (m_loading) { UrlActionBtn->Content = ref new String(L"\x2715"); return; }   // ✕ 停止
+    if (!UrlActionBtn || !UrlActionGlyph) return;
+    if (m_loading) { UrlActionGlyph->Text = ref new String(L"\x2715"); return; }   // ✕ 停止
     std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
     bool pendingEdit = (m_currentUrl == L"about:home") ? !boxText.empty() : (boxText != m_currentUrl);
-    UrlActionBtn->Content = ref new String(pendingEdit ? L"\x2192" : L"\x21BB");     // → Go / ⟳ 刷新
+    UrlActionGlyph->Text = ref new String(pendingEdit ? L"\x2192" : L"\x21BB");     // → Go / ⟳ 刷新
 }
 
 // Segoe MDL2 Assets:Lock=E72E,Warning=E7BA。本地/主页留空。

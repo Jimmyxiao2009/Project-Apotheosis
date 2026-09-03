@@ -355,7 +355,12 @@ static ::Platform::String^ __MainPageXaml() {
                         <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
                         <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0" />
                         <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent" Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8" InputScope="Url" Text="" PlaceholderText="搜索或输入网址" />
-                        <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Foreground="{StaticResource Accent}" Width="42" Height="40" Padding="0" FontSize="17" VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Content="↻" />
+                        <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
+                             plain Button.Content centred on the font's line box, not its glyph ink, which
+                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now. -->
+                        <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="42" Height="40" Padding="0" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
+                            <TextBlock x:Name="UrlActionGlyph" Text="↻" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Button>
                         <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
                              输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。 -->
                         <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Foreground="{StaticResource TxtHi}" Width="44" Height="40" Padding="0" FontSize="17" IsTabStop="False" Visibility="Collapsed" VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Content="✕" />
@@ -386,14 +391,14 @@ static ::Platform::String^ __MainPageXaml() {
                         </Grid>
                         <!-- Apotheosis: 快捷行 = 后退 / 前进 / 刷新 / 收藏。刷新原先只在地址栏上下文键上,
                              但那颗键在编辑地址时会被清除键顶掉,而且这一排本来就是"当前页面"的动作,
-                             缺一个刷新反而要绕路;Tag="reload" 已被 OnAction 分发,无需新代码。
+                             缺一个刷新反而要绕路;Tag="reloa)APO",
+        LR"APO(d" 已被 OnAction 分发,无需新代码。
                              图标与文字由上下叠放改为并排:行高从"图标+间距+文字+两倍内边距"塌成"图标+两倍内边距",
                              约 76 → 41 DIP(要求的一半),而字形仍是 22 —— 只是排布变了,图标没缩小。 -->
                         <Grid Margin="10,2,10,8" Background="{StaticResource Inset}">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" /><ColumnDefinition Width="*")APO",
-        LR"APO( />
+                                <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource QuickBtn}" IsEnabled="False">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
@@ -455,14 +460,14 @@ static ::Platform::String^ __MainPageXaml() {
                         </Button>
                         <Button Tag="copylink" Style="{StaticResource MenuRow}" x:Name="_ev11">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock)APO",
+        LR"APO( Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="复制链接" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
                         <Button Tag="download" Style="{StaticResource MenuRow}" x:Name="_ev12">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text=)APO",
-        LR"APO("" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载此页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
@@ -544,7 +549,8 @@ static ::Platform::String^ __MainPageXaml() {
         </Grid>
 
         <!-- ===== 设置页(全屏)===== -->
-        <Grid x:Name="SettingsPage" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+        <Grid x:Name="SettingsPage")APO",
+        LR"APO( Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
@@ -552,8 +558,7 @@ static ::Platform::String^ __MainPageXaml() {
             <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="8,8" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
-        )APO",
-        LR"APO(            <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="" x:Name="_ev18" />
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="7,0">
@@ -616,15 +621,15 @@ static ::Platform::String^ __MainPageXaml() {
                     <!-- 推测预取（speculation rules）：页面可提前取用户未点击的 URL。默认关； -->
                     <!-- “仅 Wi-Fi”按连接资费判定（NetworkCostType::Unrestricted），网络变化时重算。 -->
                     <TextBlock Text="预取网站建议的页面" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4" />
-                    <ComboBox x:Name="SetPrefetchCombo" HorizontalAlignment="Stretch">
+                    <ComboBox x:Name="SetPrefetchCombo" HorizontalAlign)APO",
+        LR"APO(ment="Stretch">
                         <ComboBoxItem Content="关闭预取" />
                         <ComboBoxItem Content="仅 Wi-Fi" />
                         <ComboBoxItem Content="始终" />
                     </ComboBox>
                     <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0" />
 
-                    <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7)APO",
-        LR"APO(" />
+                    <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev25" />
 
                     <!-- 开发者选项:默认关闭的调试用界面元素。 -->
@@ -681,14 +686,14 @@ static ::Platform::String^ __MainPageXaml() {
                 <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
                 <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
                 <Border Background="{StaticResource Accent}" CornerRadius="4" Margin="0,0,0,12">
-                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev28" />
+                    <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Con)APO",
+        LR"APO(tent="English" x:Name="_ev28" />
                 </Border>
                 <Border Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="4">
                     <Button Tag="zh" Background="Transparent" Foreground="{StaticResource TxtHi}" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="中文" x:Name="_ev29" />
                 </Border>
             </StackPanel>
-        </Gri)APO",
-        LR"APO(d>
+        </Grid>
     </Grid>)APO",
     };
     std::wstring __s;
@@ -745,6 +750,7 @@ void MainPage::InitializeComponent() {
     LockIcon = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"LockIcon"));
     UrlBox = safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"));
     UrlActionBtn = safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"));
+    UrlActionGlyph = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"UrlActionGlyph"));
     UrlClearBtn = safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"));
     TabCountText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"TabCountText"));
     TitleText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"TitleText"));
@@ -763,9 +769,9 @@ void MainPage::InitializeComponent() {
     ContentArea = safe_cast<::Windows::UI::Xaml::Controls::Grid^>(__root->FindName(L"ContentArea"));
     RenderImage = safe_cast<::Windows::UI::Xaml::Controls::Image^>(__root->FindName(L"RenderImage"));
     // ---- 挂事件 ----
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
@@ -778,9 +784,9 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"MenuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnMenu);
