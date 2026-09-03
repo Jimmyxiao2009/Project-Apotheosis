@@ -1163,9 +1163,17 @@ void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
 // 网页点击:软件帧与 GPU surface 都会铺满 ContentArea，故统一由显示坐标映回固定引擎视口。
 //  有会话(网络页):转发到引擎 WebCoreClickAt,经真实命中测试 + 默认动作(链接/表单/按钮 onclick/SPA)。
 //  无会话(主页/错误页):退回链接命中表导航。
-// 把内容区显示坐标(DIP)映回引擎像素空间(kW×kH)。直呈现模式下 GpuPanel 把 720×1080 表面拉伸填满内容区
-//   (并叠加设备分辨率缩放);软件模式同样以 Stretch=Fill 适配横竖屏，故两条路径均须按
-//   (kW/ActualWidth, kH/ActualHeight) 缩放回引擎像素。
+// 把内容区显示坐标(DIP)映回引擎像素空间(kW×kH)。
+//
+// Apotheosis: map against the layer that actually SHOWS the engine output, not against the one
+//   that receives the gesture. The caller hands us ContentArea DIPs, but in direct-present mode
+//   the 720x1080 surface is stretched over GpuPanel, and GpuPanel spans the whole content row
+//   while ContentArea sits 6 DIP inside it (Border Margin="6,6,6,0"). Mapping ContentArea DIPs
+//   with ContentArea's own size therefore misses on both counts — a missing 6 DIP origin shift
+//   and a scale factor off by 12/width — for a hit about 1.7 % away from the finger, growing
+//   towards the right and bottom edges. Small, but it is exactly what makes a link at the edge
+//   of a dense page refuse to open. PresentLayer() is the same layer SetPinchAnchor pins to, so
+//   taps and the pinch anchor now agree on one coordinate space.
 void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
 {
     if (dipX < 0.0 || dipY < 0.0) {
@@ -1173,7 +1181,20 @@ void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
         outPy = -1;
         return;
     }
+    double lx = dipX, ly = dipY;
     double aw = ContentArea->ActualWidth, ah = ContentArea->ActualHeight;
+    auto layer = PresentLayer();
+    if (layer != nullptr && layer != static_cast<Windows::UI::Xaml::FrameworkElement^>(ContentArea)) {
+        try {
+            auto tv = ContentArea->TransformToVisual(layer);
+            auto p = tv->TransformPoint(Windows::Foundation::Point((float)dipX, (float)dipY));
+            lx = p.X; ly = p.Y;
+            if (layer->ActualWidth > 1.0 && layer->ActualHeight > 1.0) {
+                aw = layer->ActualWidth; ah = layer->ActualHeight;
+            }
+        } catch (...) { lx = dipX; ly = dipY; }   // no visual relation yet: fall back to ContentArea
+    }
+    dipX = lx; dipY = ly;
     if (aw > 1.0 && ah > 1.0) {
         outPx = static_cast<int>(dipX * static_cast<double>(kW) / aw + 0.5);
         outPy = static_cast<int>(dipY * static_cast<double>(kH) / ah + 0.5);
