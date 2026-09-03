@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <cstdint>
 
 namespace Harness {
 
@@ -27,6 +28,11 @@ namespace Harness {
         std::wstring currentUrl { L"about:home" };
         std::wstring currentTitle;
         float pageScale { 1.0f };
+        // Apotheosis: 切走前抓下的最后一帧(RGBA8888,kW×kH,~3 MB)。只有**非活动**标签持有;
+        // 切回来时先贴出它、再让真实重载在下面跑(TABS-PLAN.md 方案 a)。snapSeq 用于超出
+        // 上限时丢最老的一张。
+        std::shared_ptr<std::vector<uint8_t>> snapshot;
+        unsigned long long snapSeq { 0 };
     };
 
     public ref class MainPage sealed {
@@ -110,6 +116,11 @@ namespace Harness {
         void CloseTab(int i);
         void SwitchTab(int i);
         void UpdateTabCount();
+        // Apotheosis: 标签切换快照(TABS-PLAN.md 方案 a)。
+        void CaptureActiveTabSnapshot();  // 把当前会话最后一帧读回,存进**离开**的那个标签(引擎线程,异步)
+        void ShowTabSnapshot(int i);      // 切到 i:立刻贴出它的快照(有的话)并释放之
+        void HideTabSnapshot();           // 新会话第一帧到位/加载超时:恢复正常显示面
+        void PruneTabSnapshots();         // 只保留最近 kMaxTabSnapshots 张,其余释放
         // UA 切换:手机/桌面,切后重载当前页(遇到对移动 UA 抽风的站点用)。
         void OnToggleUA(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // GPU 合成开关(M2):一次性开启(引擎线程 WebCoreGpuInit 离屏成功→重载当前页走 TextureMapper 合成)。
@@ -268,6 +279,10 @@ namespace Harness {
         Windows::UI::Xaml::Media::Imaging::WriteableBitmap^ m_frameBmpA;
         Windows::UI::Xaml::Media::Imaging::WriteableBitmap^ m_frameBmpB;
         bool m_frameBmpFlip { false };
+        // Apotheosis: 标签切换快照的显示位图(按需建,HideTabSnapshot 里放掉)+ 当前是否正显示快照。
+        Windows::UI::Xaml::Media::Imaging::WriteableBitmap^ m_snapBmp;
+        bool m_snapshotShown { false };
+        unsigned long long m_snapSeq { 0 };   // 快照新鲜度计数(PruneTabSnapshots 用)
 
         // 实时渲染循环状态
         Windows::UI::Xaml::DispatcherTimer^ m_liveTimer;

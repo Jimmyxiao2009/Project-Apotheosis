@@ -400,9 +400,9 @@ void MainPage::FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDefer
 static std::atomic<bool> g_directPresent { false };
 
 // ===== 渲染缓冲 → WriteableBitmap(RGBA→BGRA)=====
-static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, int W, int H)
+// Raw 版无条件贴图:标签切换快照要在直呈现模式下也贴得出来(那时它盖在透明的 GpuPanel 下面)。
+static void BlitToBitmapRaw(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, int W, int H)
 {
-    if (g_directPresent.load()) return;   // 直呈现:跳过软件 blit(GpuPanel 已由引擎呈现)
     ComPtr<Windows::Storage::Streams::IBufferByteAccess> bba;
     reinterpret_cast<IInspectable*>(wb->PixelBuffer)->QueryInterface(IID_PPV_ARGS(&bba));
     byte* dst = nullptr;
@@ -417,6 +417,12 @@ static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, 
         const uint32_t v = src[i];
         d32[i] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
     }
+}
+
+static void BlitToBitmap(WriteableBitmap^ wb, const std::vector<uint8_t>& rgba, int W, int H)
+{
+    if (g_directPresent.load()) return;   // 直呈现:跳过软件 blit(GpuPanel 已由引擎呈现)
+    BlitToBitmapRaw(wb, rgba, W, H);
 }
 
 // 把 RGBA(上→下)写成 32 位 BMP(BGRA,自下而上)——供自动诊断把 GPU readback 的实际帧落盘,
@@ -969,6 +975,9 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
 void MainPage::OnNavDone(Platform::String^ finalTitle, bool ok, bool loadOk)
 {
     if (m_loadWatchdog) m_loadWatchdog->Stop();
+    // Apotheosis: 新会话的第一帧已经呈现(GPU 面已 swapBuffers / 软件面已贴图,见调用点),
+    //   切换快照的占位使命结束 —— 上面的切面逻辑已按本页真实状态设好 m_gpuPresent。
+    HideTabSnapshot();
     m_currentTitle = finalTitle ? std::wstring(finalTitle->Data()) : L"";
     TitleText->Text = (m_currentTitle.empty() ? ref new String(L"EdgeHTML Reborn") : finalTitle);
     if (loadOk && m_currentUrl != L"about:home")   // 仅真正加载成功才记历史,失败不污染
@@ -1002,6 +1011,7 @@ void MainPage::OnNavDone(Platform::String^ finalTitle, bool ok, bool loadOk)
 void MainPage::OnLoadWatchdog(Platform::Object^, Platform::Object^)
 {
     if (m_loadWatchdog) m_loadWatchdog->Stop();
+    HideTabSnapshot();   // Apotheosis: 完成回调丢了也不能让切换快照永久占着画面
     if (m_loading || m_interacting) {   // 完成回调丢失,强制复位以恢复导航/交互
         ++m_opSeq;                      // 作废这次超时操作的迟到回调,使其回 UI 时被丢弃
         m_interacting = false;
@@ -2605,6 +2615,114 @@ void MainPage::UpdateTabCount()
     if (TabCountText) TabCountText->Text = ref new String(std::to_wstring(m_tabs.size()).c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Apotheosis: 标签切换快照(TABS-PLAN.md 方案 a)。
+// 切换仍是"拆会话 + 完整重载"(见 TABS-PLAN.md §1),但切过去的一瞬间先把目标标签上次离开时
+// 的那帧贴出来,而不是让用户盯着上一个标签的画面等一次完整网络加载。快照是明确的占位图:
+// 真实重载在下面照跑,第一帧到位(OnNavDone)就换回真画面。
+// ---------------------------------------------------------------------------
+
+static const size_t kMaxTabSnapshots = 3;   // 3 × 720×1080×4 ≈ 9 MB 上限(32 位进程,内存紧,见 MEMORY-PLAN.md)
+
+// 把当前会话的最后一帧读回,存进**当前活动**标签(调用时它马上就要变成非活动的)。
+// 线程:读回排在引擎线程队列上,而 RestoreTab→NavigateTo 的 WebCoreSessionLoad 排在其后
+//   (WebEngine 是单线程 FIFO),故快照一定在 teardownSession 拆掉图层树之前抓完。
+//   UI 线程只 post,不等 —— 线程铁律:UI 绝不同步 wait 引擎。
+void MainPage::CaptureActiveTabSnapshot()
+{
+    if (!m_sessionActive) return;   // 主页/错误页:无会话可读回,而且它们本来就是本地秒开
+    const int idx = m_activeTab;
+    if (idx < 0 || idx >= (int)m_tabs.size()) return;
+    const bool gpu = m_gpuPresent;
+    const std::wstring url = m_currentUrl;   // 防串位:回调落地时按 URL 校验这一格还是同一个页面
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    const unsigned long long seq = ++m_snapSeq;
+    WebEngine::instance().post([disp, self, idx, gpu, url, seq]() {
+        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        int rc = -1;
+        try {
+            // ★ 直呈现模式下不能用 WebCoreSessionPaint:它会走 gpuPresent 再 swapBuffers 一次,
+            //   且根本不填 rgba(见 port\WebCoreDriver.cpp paintToRGBA)。离屏合成+glReadPixels
+            //   的 WebCoreCompositeReadback 才是这里要的。软件模式反过来只有 SessionPaint 能用。
+            rc = gpu ? WebCoreCompositeReadback(rgba->data()) : WebCoreSessionPaint(rgba->data());
+        } catch (...) { rc = -1; }
+        if (rc != 0) return;   // 抓不到就没有快照,退回原来的行为(零回归)
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, rgba, idx, url, seq]() {
+                MainPage^ s = self.Get();
+                if (!s) return;
+                if (idx < 0 || idx >= (int)s->m_tabs.size()) return;   // 期间关过标签
+                if (idx == s->m_activeTab) return;                     // 又切回来了:活动标签不留快照
+                if (s->m_tabs[idx].currentUrl != url) return;          // 索引左移/该格换了页面
+                s->m_tabs[idx].snapshot = rgba;
+                s->m_tabs[idx].snapSeq = seq;
+                s->PruneTabSnapshots();
+            }));
+        } catch (...) {}
+    });
+}
+
+// 只留最近 kMaxTabSnapshots 张,其余释放(每张 ~3 MB)。
+void MainPage::PruneTabSnapshots()
+{
+    for (;;) {
+        size_t n = 0;
+        int oldest = -1;
+        unsigned long long oldestSeq = 0;
+        for (size_t k = 0; k < m_tabs.size(); ++k) {
+            if (!m_tabs[k].snapshot) continue;
+            ++n;
+            if (oldest < 0 || m_tabs[k].snapSeq < oldestSeq) { oldest = (int)k; oldestSeq = m_tabs[k].snapSeq; }
+        }
+        if (n <= kMaxTabSnapshots || oldest < 0) return;
+        m_tabs[oldest].snapshot.reset();
+        m_tabs[oldest].snapSeq = 0;
+    }
+}
+
+// 切到标签 i:有快照就立刻贴出来当占位图,并释放该标签持有的那份(活动标签不留快照)。
+// 直呈现模式下 GpuPanel 盖在 RenderImage 之上,故把它 Opacity=0 让下层透出 —— ★ 绝不 Collapse,
+// 面板变 0×0 会让 ANGLE 经面板 dispatcher 重建交换链而 std::terminate(见 NavigateTo 处的注释)。
+void MainPage::ShowTabSnapshot(int i)
+{
+    if (i < 0 || i >= (int)m_tabs.size()) return;
+    auto snap = m_tabs[i].snapshot;
+    m_tabs[i].snapshot.reset();
+    m_tabs[i].snapSeq = 0;
+    if (!snap || snap->size() != (size_t)kW * kH * 4) return;
+    if (!RenderImage || !GpuPanel) return;
+    try {
+        if (!m_snapBmp) m_snapBmp = ref new WriteableBitmap(kW, kH);
+        BlitToBitmapRaw(m_snapBmp, *snap, kW, kH);   // Raw:直呈现模式下 BlitToBitmap 会空转
+        m_snapBmp->Invalidate();
+        RenderImage->Source = m_snapBmp;
+        RenderImage->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        if (m_gpuPresent) GpuPanel->Opacity = 0.0;
+        m_snapshotShown = true;
+    } catch (...) {}
+}
+
+// 新会话第一帧到位(OnNavDone)/加载超时:按当前呈现模式恢复正常显示面并放掉快照位图。
+void MainPage::HideTabSnapshot()
+{
+    if (!m_snapshotShown) return;
+    m_snapshotShown = false;
+    try {
+        // 与 NavigateTo 完成回调里的切面逻辑同一套判据:present=GPU 面,否则软件面。
+        if (m_gpuPresent) {
+            GpuPanel->Opacity = 1.0;
+            RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+            RenderImage->Source = nullptr;
+        } else {
+            GpuPanel->Opacity = 0.0;
+            RenderImage->Visibility = Windows::UI::Xaml::Visibility::Visible;
+            // 软件面:PresentSoftwareFrame 已把新帧贴进 m_frameBmpA/B 并换掉 Source,这里不动它。
+        }
+    } catch (...) {}
+    m_snapBmp = nullptr;
+}
+
 void MainPage::SaveActiveTab()
 {
     if (m_activeTab < 0 || m_activeTab >= (int)m_tabs.size()) return;
@@ -2637,12 +2755,14 @@ void MainPage::RestoreTab(int i)
     m_urlSyncing = true;
     UrlBox->Text = ref new String(m_currentUrl == L"about:home" ? L"" : m_currentUrl.c_str());
     m_urlSyncing = false;
+    ShowTabSnapshot(i);   // Apotheosis: 先贴上次离开这个标签时的画面,重载在下面跑
     NavigateTo(ref new String(m_currentUrl.c_str()), false);
 }
 
 void MainPage::NewTab()
 {
     SaveActiveTab();
+    CaptureActiveTabSnapshot();   // Apotheosis: 离开的标签留一帧,切回来时秒出画面
     Tab t; t.currentUrl = g_homeUrl;
     m_tabs.push_back(t);
     m_activeTab = (int)m_tabs.size() - 1;
@@ -2685,6 +2805,8 @@ void MainPage::SwitchTab(int i)
 {
     if (i == m_activeTab) return;
     SaveActiveTab();
+    CaptureActiveTabSnapshot();   // Apotheosis: 必须在 RestoreTab 之前 post —— 引擎线程 FIFO,
+                                  //   读回排在 WebCoreSessionLoad(teardownSession)之前
     RestoreTab(i);
 }
 
