@@ -582,6 +582,7 @@ static const int kMaxCrashLogEntries = 16;
 //   (g) purecall            — call through a partially destroyed object's vtable.
 // All four are CRT-level, so they see aborts the WTF hook and the VEH never do.
 static void perfFlush();   // fwd decl: drain the perf ring before we die (see (3) below)
+static void consoleFlush(); // fwd decl: drain the console.txt ring before we die, same reason
 
 // Memory numbers for the OOM-shaped legs. GlobalMemoryStatusEx is APP-partition and
 // comes from WindowsApp.lib; K32GetProcessMemoryInfo is APP-partition too but lives in
@@ -859,6 +860,7 @@ static void __cdecl crashLogSignalHandler(int sig)
     std::snprintf(reason, sizeof(reason), "signal %d (SIGABRT)%s", sig, mem);
     crashLogWrite(reason, nullptr);
     perfFlush();
+    consoleFlush();
 }
 
 // (d) std::terminate. Reached by an uncaught exception, a noexcept violation, or a
@@ -881,6 +883,7 @@ static void __cdecl crashLogTerminateHandler()
 #endif
     crashLogWrite(reason, nullptr);
     perfFlush();
+    consoleFlush();
     if (g_crashPrevTerminate && g_crashPrevTerminate != &crashLogTerminateHandler)
         g_crashPrevTerminate();   // harness leg: names the exception; aborts itself
     std::abort();
@@ -900,6 +903,7 @@ static int __cdecl crashLogNewHandler(size_t size)
         static_cast<unsigned long long>(size), mem);
     crashLogWrite(reason, nullptr);
     perfFlush();
+    consoleFlush();
     return 0;
 }
 
@@ -927,6 +931,7 @@ static void __cdecl crashLogInvalidParameterHandler(const wchar_t* expression, c
     std::snprintf(reason, sizeof(reason), "invalid parameter expr=%s func=%s file=%s line=%u", e, f, fl, line);
     crashLogWrite(reason, nullptr);
     perfFlush();
+    consoleFlush();
     if (g_crashPrevInvalidParameter && g_crashPrevInvalidParameter != &crashLogInvalidParameterHandler)
         g_crashPrevInvalidParameter(expression, function, file, line, 0);
     // Return: the CRT then fast-fails exactly as it would have without us.
@@ -939,6 +944,7 @@ static void __cdecl crashLogPureCallHandler()
 {
     crashLogWrite("pure virtual call", nullptr);
     perfFlush();
+    consoleFlush();
     if (g_crashPrevPureCall && g_crashPrevPureCall != &crashLogPureCallHandler)
         g_crashPrevPureCall();
     // Return: the CRT fast-fails as before.
@@ -1239,6 +1245,89 @@ extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double co
     g_perfCur.netTtfb = ttfbMs;
     g_perfCur.httpVer = httpVersion;
 }
+
+// ==================== JS console -> LocalState\console.txt =================
+// Apotheosis: buffered mirror of PortChromeClient::addMessageToConsole() to disk — the JS-console
+// analogue of the perf/crash logs above, reachable without a debugger attached to a headless
+// ARM32 App Container. Same opt-in family as perf.txt/imedebug.txt (see WebCoreSetPerfLogPath):
+// on when perf logging is on (g_perfOn, reused rather than adding a second harness->driver
+// setter) OR when LocalState\console.txt already exists, so a tester who wants console output
+// without perf can just drop an empty file. The path is derived once, in WebCoreSetCrashLogPath,
+// from the crash log's own directory — crash logging is always armed (not opt-in), so its path is
+// the one thing guaranteed known by the time any JS can run, and deriving from it means no third
+// harness->driver path setter is needed for this feature.
+// One physical line per message: "HH:MM:SS.mmm level source:line message\n", message truncated to
+// 512 chars. Buffers in a small ring, same shape as the perf ring; flushes every ~16 lines, on
+// session teardown (teardownSession above), and from the crash legs / WebCoreCrashNote /
+// WebCorePerfFlush (suspend path) so a dying or backgrounded process does not take the trailing
+// console output with it. Engine thread only (PortChromeClient callbacks run on it).
+static std::string g_consolePath;
+static bool g_consolePathReady = false;
+static bool g_consoleFileExisted = false;   // opt-in probe result, computed once when the path becomes known
+
+static bool consoleLoggingEnabled()
+{
+    return g_consolePathReady && (g_perfOn || g_consoleFileExisted);
+}
+
+static constexpr int kConsoleRingSize = 16;
+static std::string g_consoleRing[kConsoleRingSize];
+static int g_consoleRows = 0;
+static std::atomic<int> g_consoleFlushBusy { 0 };   // same re-entrancy guard shape as g_perfFlushBusy
+
+static void consoleFlushLocked()
+{
+    if (g_consolePath.empty() || !g_consoleRows)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_consolePath.c_str(), "ab") != 0 || !fp) {
+        g_consoleRows = 0;   // an unwritable path must not make the ring grow forever
+        return;
+    }
+    for (int i = 0; i < g_consoleRows; ++i)
+        std::fwrite(g_consoleRing[i].data(), 1, g_consoleRing[i].size(), fp);
+    std::fclose(fp);
+    g_consoleRows = 0;
+}
+
+static void consoleFlush()
+{
+    int expected = 0;
+    if (!g_consoleFlushBusy.compare_exchange_strong(expected, 1))
+        return;
+    consoleFlushLocked();
+    g_consoleFlushBusy.store(0);
+}
+
+// Called by WebCorePort::consoleLogAppend() below. Plain C strings so PortChromeClient.cpp (which
+// calls that bridge) does not need to know about the ring/path statics living in this TU.
+static void consoleAppendLine(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message)
+{
+    if (!consoleLoggingEnabled())
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[600];
+    // %.512s: printf precision truncates the message for us, no separate strncpy needed.
+    std::snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s %s:%u %.512s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        levelStr ? levelStr : "?", sourceID ? sourceID : "", lineNumber, utf8Message ? utf8Message : "");
+    if (g_consoleRows < kConsoleRingSize)
+        g_consoleRing[g_consoleRows++] = line;
+    if (g_consoleRows >= kConsoleRingSize)
+        consoleFlush();
+}
+
+namespace WebCorePort {
+
+// Bridge for PortChromeClient::addMessageToConsole() (PortChromeClient.cpp) — kept as plain C
+// strings/ints rather than exposing JSC::MessageSource/MessageLevel or WTF::String here.
+void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message)
+{
+    consoleAppendLine(levelStr, sourceID, lineNumber, utf8Message);
+}
+
+} // namespace WebCorePort
 
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
@@ -1726,6 +1815,7 @@ static void teardownSession()
     using namespace WebCore;
     if (!g_session)
         return;
+    consoleFlush();   // Apotheosis: this session's console.txt lines otherwise wait for the next ~16-line batch
     // Apotheosis: (a) GPU sessions must be torn down with the ANGLE context current.
     // ~Page destroys the GraphicsLayerTextureMapper tree, and with it the BitmapTextures /
     // FBOs it owns — those destructors call into GL. Outside gpuPresent nothing makes the
@@ -2168,6 +2258,23 @@ void WebCoreSetCrashLogPath(const char* path)
         g_crashLogPath[i] = path[i];
     g_crashLogPath[i] = 0;
 
+    // Apotheosis: derive console.txt's path from crash.txt's directory — see the "JS console"
+    // block above consoleAppendLine() for why crash.txt's path is the one this rides on. Ordinary
+    // heap/file use, fine here (unlike the crash legs): this runs once from SetupRuntimeEnv, never
+    // from a dying process.
+    {
+        std::string crashPath(g_crashLogPath);
+        const size_t slash = crashPath.find_last_of("\\/");
+        g_consolePath = (slash == std::string::npos) ? std::string("console.txt")
+            : crashPath.substr(0, slash + 1) + "console.txt";
+        g_consolePathReady = true;
+        FILE* probe = nullptr;
+        if (fopen_s(&probe, g_consolePath.c_str(), "rb") == 0 && probe) {
+            g_consoleFileExisted = true;   // opt-in: console.txt already exists on disk
+            std::fclose(probe);
+        }
+    }
+
     if (g_crashLogInstalled)
         return;
     g_crashLogInstalled = true;
@@ -2195,6 +2302,7 @@ void WebCoreCrashNote(const char* reason)
 {
     crashLogWrite(reason && *reason ? reason : "(note)", nullptr);
     perfFlush();
+    consoleFlush();
 }
 
 // Apotheosis (M4): resolve-mode switch for the curl backend. The phone has global
@@ -2244,6 +2352,7 @@ void WebCoreSetPerfLogPath(const char* path)
 void WebCorePerfFlush()
 {
     perfFlush();
+    consoleFlush();
 }
 
 // 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。harness 在应用切后台

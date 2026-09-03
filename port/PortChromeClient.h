@@ -25,6 +25,12 @@ struct FocusOptions;
 
 namespace WebCorePort {
 
+// Apotheosis: buffered append to LocalState\console.txt, defined in WebCoreDriver.cpp (the
+// path/ring/opt-in flag are statics of that TU — see the "JS console" block there). Called by
+// PortChromeClient::addMessageToConsole() below. Plain C strings on purpose: keeps this header
+// decoupled from the perf/crash-log internals. No-op when console logging is off.
+void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message);
+
 class PortChromeClient final : public WebCore::ChromeClient {
     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(PortChromeClient);
 public:
@@ -103,7 +109,10 @@ public:
 
     void setResizable(bool) final { }
 
-    void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String&, unsigned, unsigned, const String&) final { }
+    // Apotheosis: mirrors JS console output to LocalState\console.txt (see the "JS console"
+    // block in WebCoreDriver.cpp, ahead of pumpLoop(), for the opt-in policy and ring buffer).
+    // Out-of-line (PortChromeClient.cpp) because it needs the MessageLevel -> string mapping.
+    void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String& message, unsigned lineNumber, unsigned columnNumber, const String& sourceID) final;
 
     bool canRunBeforeUnloadConfirmPanel() final { return false; }
     bool runBeforeUnloadConfirmPanel(String&&, WebCore::LocalFrame&) final { return true; }
