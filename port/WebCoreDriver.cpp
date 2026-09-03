@@ -231,11 +231,23 @@ bool ensureWebCoreInitialized()
 {
     static bool initialized = [] {
         // Apotheosis (M4): JSC reads JSC_* options from the environment during initialize().
-        // Set them here (same CRT as the engine) rather than in the harness. gcMaxHeapSize
-        // bounds the JS heap on the 1.5 GB app cap (it is unlimited by default and github.com
-        // took the process to 770 MB); _putenv_s does not overwrite a value the tester set.
-        if (!std::getenv("JSC_gcMaxHeapSize"))
-            _putenv_s("JSC_gcMaxHeapSize", "402653184");   // 384 MB
+        // Set them here (same CRT as the engine) rather than in the harness;
+        // _putenv_s does not overwrite a value the tester set.
+        //
+        // JSC sizes its whole GC heuristic from Heap::m_ramSize, which on Windows is
+        // GlobalMemoryStatusEx().ullTotalPhys (WTF/wtf/RAMSize.cpp) = the phone's ~3 GB of
+        // *physical* RAM — not the ~1.5 GB our App Container may actually use. forceRAMSize
+        // overrides that one input (Heap.cpp:330) and correctly scales everything derived
+        // from it: minBytesPerCycle/minHeapSize, the growth mode, proportionalHeapSize
+        // (Heap.cpp:2545) and m_maxEdenSizeWhenCritical, which is 25 % of the RAM above
+        // criticalGCMemoryThreshold (Heap.cpp:462) — 25 MB at 512 MB instead of 153 MB at 3 GB.
+        if (!std::getenv("JSC_forceRAMSize"))
+            _putenv_s("JSC_forceRAMSize", "536870912");   // 512 MB
+        // NOTE: do NOT set JSC_gcMaxHeapSize here. It is not a heap *cap*: when non-zero it
+        // short-circuits Heap::collectIfNecessaryOrDefer's shouldRequestGC (Heap.cpp:2901-2906)
+        // to "collect only once more than N bytes were allocated *this cycle*", bypassing the
+        // proportional heuristic entirely. The 384 MB we used to set therefore made GC happen
+        // *later*, not earlier — the opposite of what it was added for (see MEMORY-PLAN.md §3).
         JSC::initialize();                       // JSC heap/threading/options
         WTF::initializeMainThread();             // pins this thread as the WebKit main thread + RunLoop::main
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
