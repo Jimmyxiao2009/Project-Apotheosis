@@ -1537,7 +1537,14 @@ void MainPage::PumpNestedScroll()
     bool present = m_gpuPresent;
     WebEngine::instance().post([disp, self, px, py, dx, dy, mySeq, present]() {
         int wrc = -999;
-        try { wrc = WebCoreWheelAt(px, py, (float)dx, (float)dy, 2 /* changed */); } catch (...) { wrc = -1000; }
+        // Apotheosis: dx/dy here are scroll-offset deltas (finger up -> content moves down -> positive
+        // dy), the same convention WebCoreScrollBy takes below. WebCoreWheelAt instead builds a
+        // PlatformWheelEvent from its deltaX/deltaY unchanged (WebCoreDriver.cpp:3131) and WebCore's
+        // wheel convention is the opposite of that: positive deltaY means "wheel notch away from the
+        // user" == content scrolls up. Passing the offset-delta straight through inverted the nested
+        // scroller on device (banner moved opposite the finger) -> negate both axes only for this call,
+        // so a finger-up pan still scrolls nested content down, matching the main-frame fast path below.
+        try { wrc = WebCoreWheelAt(px, py, (float)-dx, (float)-dy, 2 /* changed */); } catch (...) { wrc = -1000; }
         // wrc == 1: consumed by a nested scroller, main-frame position guaranteed untouched — done,
         // no WebCoreScrollBy for this delta. Any other value (0 = not consumed, or a driver
         // exception): main-frame scroll position is left unchanged either way, so WebCoreScrollBy
