@@ -31,8 +31,11 @@
 #include <wtf/text/CString.h>
 
 // Apotheosis: 诊断通道,定义在 WebCoreDriver.cpp。把失败的 ResourceError 细节
-// (curl 错误码 + 域 + 描述 + 失败 URL)送给驱动,供真机网络失败定位。
-extern "C" void WebCorePortRecordNetError(int code, const char* domain, const char* desc, const char* url);
+// (curl 错误码 + type + 域 + 描述 + 失败 URL)送给驱动,供真机网络失败定位。type 是
+// ResourceError::Type(见下方 recordNetError)——投递重定向 bug 时加的,好在下一次真机
+// 测试里不用猜就能看出卡住的加载到底是不是撞见了 dispatchDidFailProvisionalLoad 里那条
+// Cancellation 一律吞掉的分支。
+extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain, const char* desc, const char* url);
 
 // Apotheosis: DNS prefetch for <link rel="dns-prefetch">. Implemented in
 // WebKit\Source\WebKitLegacy\WebCoreSupport\WebResourceLoadScheduler.cpp, which is
@@ -51,7 +54,7 @@ static void recordNetError(const ResourceError& error)
     auto domain = error.domain().utf8();
     auto desc = error.localizedDescription().utf8();
     auto url = error.failingURL().string().utf8();
-    WebCorePortRecordNetError(error.errorCode(), domain.data(), desc.data(), url.data());
+    WebCorePortRecordNetError(error.errorCode(), static_cast<int>(error.type()), domain.data(), desc.data(), url.data());
 }
 
 // ---------------------------------------------------------------------------

@@ -2062,11 +2062,23 @@ static int finishInteractionPaint(uint8_t* outRGBA)
     return kOK;
 }
 
-extern "C" void WebCorePortRecordNetError(int code, const char* domain, const char* desc, const char* url)
+// Apotheosis: `type` is WebCore::ResourceError::Type (0=Null 1=General 2=AccessControl
+// 3=Cancellation 4=Timeout — see ResourceErrorBase.h) as an int, so the driver
+// need not include WebCore headers here. Added while chasing the "every redirect ends in
+// the harness' error page" regression that surfaced once da68fe9fdd stopped the redirect
+// completion lambda from running on a cancelled ResourceHandle: our own
+// dispatchDidFailProvisionalLoad (LoadingFrameLoaderClient.cpp) swallows any
+// Type::Cancellation failure unconditionally, on the (previously accurate — pre-fix — but
+// now stale) assumption that WebKit always restarts the load itself. Logging the type
+// alongside domain/desc/url lets the next device run show, without guessing, whether the
+// stuck load is really hitting that Cancellation branch (in which case the swallow is the
+// bug) or failing immediately with a different type (AccessControl/General), which points
+// at a specific WebCore-side redirect check instead.
+extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain, const char* desc, const char* url)
 {
     std::snprintf(g_lastNetError, sizeof g_lastNetError,
-        "curlcode=%d domain=%s desc=%s url=%s",
-        code, domain ? domain : "", desc ? desc : "", url ? url : "");
+        "curlcode=%d type=%d domain=%s desc=%s url=%s",
+        code, type, domain ? domain : "", desc ? desc : "", url ? url : "");
 }
 
 // Apotheosis: 内存压力释放。harness 监听 UWP MemoryManager.AppMemoryUsageIncreased,
