@@ -2553,8 +2553,7 @@ void MainPage::SaveSettings()
     s += "tabmode=" + std::to_string(m_tabMode) + "\n";
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
-    s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "
-";
+    s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
