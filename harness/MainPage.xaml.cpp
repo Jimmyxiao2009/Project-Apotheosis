@@ -1956,12 +1956,31 @@ void MainPage::HookGpuPanelForStartup()
     m_gpuSizeWaitTimer->Start();
 }
 
-// 2s 到点还没等到 GpuPanel 的真实尺寸 —— 别把启动卡死,按老行为(不管尺寸)起 GPU。
+// 2s 到点还没等到 GpuPanel 的真实尺寸 —— 别把启动卡死。
+//
+// Apotheosis (review 2026-09-03): this used to call StartupGpuThenNav() unconditionally, which is
+// exactly the crash HookGpuPanelForStartup exists to prevent — WebCoreGpuInit on a panel that is
+// still 0×0, whose first real SizeChanged then makes XAML rebuild the swapchain under ANGLE's
+// half-built native window (SEH fault=0 inside libGLESv2.dll). The 2 s fallback reintroduced it
+// on every startup where the size never arrived. It must not: if the panel still has no size,
+// send the pending navigation on the software path instead (StartPendingFirstNav). GPU is not
+// lost, only deferred — m_gpuAutoTried is untouched on this path, so OnNavDone's "default GPU"
+// branch enables it once that first page has loaded and the panel has long since been arranged.
 void MainPage::OnGpuSizeWaitTimer(Platform::Object^, Platform::Object^)
 {
     if (m_gpuSizeWaitTimer) m_gpuSizeWaitTimer->Stop();
     if (m_pendingFirstNav.empty()) return;   // 导航已经用别的路径发出去了
-    StartupGpuThenNav();
+    bool sized = false;
+    try { sized = GpuPanel && GpuPanel->ActualWidth > 0.0 && GpuPanel->ActualHeight > 0.0; } catch (...) { sized = false; }
+    if (sized) {
+        StartupGpuThenNav();   // size did arrive, just no SizeChanged for it — the normal GPU-first path
+        return;
+    }
+    WriteMemLog("startup gpu-wait timeout (panel " + GpuPanelSizeStr() + ") -> software first paint"
+                " pageLoaded=" + std::string(m_pageLoadedSeen ? "1" : "0")
+                + " panelLoaded=" + (m_gpuPanelLoadedSeen ? "1" : "0")
+                + " url=" + WideToUtf8(m_pendingFirstNav));
+    StartPendingFirstNav();
 }
 
 // ---- 输入法/屏幕键盘 ----
@@ -3554,7 +3573,15 @@ void MainPage::EnableGpu()
                     // Apotheosis (M4): 启动路径把第一次导航推迟到这里 → 首个会话直接带合成,不再"加载两遍"。
                     if (!s->m_pendingFirstNav.empty())
                         s->StartPendingFirstNav();
-                    else if (!s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
+                    // Apotheosis (review 2026-09-03): only reload for a GPU enable that was NOT the
+                    // GPU-first startup. If m_gpuStartupBegun is set, this callback belongs to that
+                    // startup's own WebCoreGpuInit and an empty m_pendingFirstNav just means the 6 s
+                    // m_startupNavTimer (or the size-wait fallback) already sent the navigation
+                    // while GpuInit was still running — reloading it here is the "page loads twice"
+                    // path, now much easier to hit since the size gate delays GpuInit by up to 2 s.
+                    // The page is loading with software compositing; OnNavDone's zoom/GPU handling
+                    // covers it from there.
+                    else if (!s->m_gpuStartupBegun && !s->m_currentUrl.empty() && s->m_currentUrl != L"about:home")
                         s->NavigateTo(ref new String(s->m_currentUrl.c_str()), false);   // 重载使合成+直呈现生效
                 } else {
                     // 同上:只隐不折叠。GpuInit 可能是"窗口表面已建、TextureMapper 才失败"(rc=-22),
