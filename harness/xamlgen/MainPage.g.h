@@ -79,6 +79,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetInstantPanSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetThreadedRasterSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideNavBarSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ AboutFooterText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ SetZoomLabel;

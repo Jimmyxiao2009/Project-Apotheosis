@@ -788,6 +788,13 @@ MainPage::MainPage()
                 }
             });
     } catch (...) {}
+    // Apotheosis (review 2026-09-03): DISPLAY toggle "Hide navigation bar". Wired here rather than
+    //   with a Toggled="" attribute in the XAML: the hand-rolled code-behind generator
+    //   (port\gen-xaml-codebehind.ps1) knows no Toggled event, and an event attribute it cannot
+    //   resolve would make XamlReader::Load throw on that fallback path.
+    if (SetHideNavBarSwitch)
+        SetHideNavBarSwitch->Toggled += ref new Windows::UI::Xaml::RoutedEventHandler(
+            this, &MainPage::OnHideNavBarToggled);
     // Apotheosis: status bar like Edge — extend the app under it (translucent, page content may
     //   run behind it), but keep our own chrome clear of the shell's own furniture.
     //   Review 2026-09-03: SetDesiredBoundsMode(UseCoreWindow) extends the window under the
@@ -931,6 +938,46 @@ MainPage::MainPage()
             NavigateTo(ref new String(firstUrl.c_str()), true);
         }
     }
+}
+
+// Apotheosis (review 2026-09-03): DISPLAY toggle "Hide navigation bar". On a phone the software
+//   back/Windows/search bar owns the bottom strip of the screen; SuppressSystemOverlays hands that
+//   strip to the app (the user swipes up from the bottom edge to get the bar back for a moment).
+//   Not TryEnterFullScreenMode — that would also take away the status bar with the clock, which is
+//   exactly what the Edge-style top treatment above wants to keep.
+//   The property is phone-only (and was added after 10240), so it is both ApiInformation-guarded
+//   and wrapped: on a desktop/build without it the toggle simply does nothing.
+//   Hiding/showing the bar moves ApplicationView::VisibleBounds → VisibleBoundsChanged → the bottom
+//   inset ApplyViewInsets() computes drops to 0 on its own (and comes back while the bar is up).
+//   ApplyViewInsets() is still called here so the freed strip is used in the same frame.
+//   UI THREAD ONLY.
+void MainPage::ApplyHideNavBarSetting()
+{
+    try {
+        if (!Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+                L"Windows.UI.ViewManagement.ApplicationView", L"SuppressSystemOverlays"))
+            return;
+        auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
+        if (view == nullptr) return;
+        // C4973: the SDK marks SuppressSystemOverlays deprecated in favour of TryEnterFullScreenMode.
+        //   Not applicable here — full-screen mode would also take the status bar (clock) away, and
+        //   keeping that is the whole point of the Edge-style top treatment. Deliberate, so silenced.
+#pragma warning(push)
+#pragma warning(disable: 4973)
+        view->SuppressSystemOverlays = m_hideNavBar;
+#pragma warning(pop)
+    } catch (...) { return; }
+    ApplyViewInsets();
+}
+
+// The switch takes effect while the settings page is still open (the bar disappears under it), so
+//   the user can see what the toggle does. HideSettings() re-reads it anyway and persists it.
+void MainPage::OnHideNavBarToggled(Platform::Object^, RoutedEventArgs^)
+{
+    if (!SetHideNavBarSwitch) return;
+    if (m_hideNavBar == SetHideNavBarSwitch->IsOn) return;
+    m_hideNavBar = SetHideNavBarSwitch->IsOn;
+    ApplyHideNavBarSetting();
 }
 
 // Apotheosis (review 2026-09-03): move the URL suggestion dropdown together with the nav bar when
@@ -3299,6 +3346,7 @@ void MainPage::ApplySettings()
     UpdateScrollFab();
     ApplyPrefetchSetting();
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
+    ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     if (!m_instantPan) InstantPanReset();    // Apotheosis: switching it off must clear a live preview
     if (UaBtn) {
         bool en = (g_lang == L"en");
@@ -3331,6 +3379,7 @@ void MainPage::LoadSettings()
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
+            else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -3356,6 +3405,7 @@ void MainPage::SaveSettings()
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
+    s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -3378,6 +3428,7 @@ void MainPage::ShowSettings()
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
     if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
+    if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -3415,6 +3466,7 @@ void MainPage::HideSettings()
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
     if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
+    if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -3458,6 +3510,9 @@ static const wchar_t* const kI18n[][2] = {
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
+    { L"隐藏系统导航栏", L"Hide navigation bar" },
+    { L"从屏幕底部向上轻扫可临时唤回",
+      L"Swipe up from the bottom edge to bring it back temporarily" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
     { L"自动检查更新", L"Check for updates automatically" },
     { L"开启后每次启动会连接 api.github.com 一次",

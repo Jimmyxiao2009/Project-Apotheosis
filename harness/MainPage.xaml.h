@@ -91,6 +91,10 @@ namespace Harness {
         void OnSettingsBack(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnSettingsBtn(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);   // tag: clearhist/clearfav/cleardl/export/gpu
         void OnZoomChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs^ e);
+        // Apotheosis (review 2026-09-03): DISPLAY toggle "Hide navigation bar" =
+        //   ApplicationView::SuppressSystemOverlays (phone only, ApiInformation-guarded).
+        void OnHideNavBarToggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void ApplyHideNavBarSetting();
         void LoadSettings();
         void SaveSettings();
         void ApplySettings();
@@ -322,6 +326,10 @@ namespace Harness {
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
         bool m_threadedRaster { false };// settings.ini threadraster
+        // Apotheosis (review 2026-09-03): DISPLAY toggle. Off = the phone keeps its software
+        //   back/Windows/search bar; on = SuppressSystemOverlays hands that strip to us and the
+        //   bottom inset in ApplyViewInsets() goes to 0. settings.ini hidenavbar
+        bool m_hideNavBar { false };
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };
