@@ -217,6 +217,10 @@ namespace Harness {
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
         //   presenting element (TransformGroup, scale first so the translation stays screen-space).
         void ApplyPresentTransform();
+        // Apotheosis (review 2026-09-03): status-bar / software-nav-bar insets from
+        //   ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid bottom padding + top
+        //   margin of the top-anchored chrome. UI thread only.
+        void ApplyViewInsets();
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();

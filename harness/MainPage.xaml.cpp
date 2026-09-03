@@ -783,37 +783,36 @@ MainPage::MainPage()
             });
     } catch (...) {}
     // Apotheosis: status bar like Edge — extend the app under it (translucent, page content may
-    //   run behind it), but keep our own top-anchored chrome (loading bar, page-find bar) clear of
-    //   the clock by padding them down by however much of the top the bar currently occludes.
+    //   run behind it), but keep our own chrome clear of the shell's own furniture.
+    //   Review 2026-09-03: SetDesiredBoundsMode(UseCoreWindow) extends the window under the
+    //   *software navigation bar* as well, and StatusBar::OccludedRect reports an empty rect once
+    //   BackgroundOpacity is 0 — so the old OccludedRect padding never fired and the address row
+    //   sat under the back/home/search buttons. The insets now come from ApplicationView's
+    //   VisibleBounds (what the shell leaves usable) against the CoreWindow bounds; see
+    //   ApplyViewInsets(). VisibleBoundsChanged fires for rotation, status-bar and nav-bar changes.
     try {
-        Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
-            Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+        auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
+        view->SetDesiredBoundsMode(Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+        view->VisibleBoundsChanged += ref new Windows::Foundation::TypedEventHandler<
+            Windows::UI::ViewManagement::ApplicationView^, Platform::Object^>(
+            [this](Windows::UI::ViewManagement::ApplicationView^, Platform::Object^) { ApplyViewInsets(); });
     } catch (...) {}
     try {
         if (Windows::Foundation::Metadata::ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar")) {
             auto sb = Windows::UI::ViewManagement::StatusBar::GetForCurrentView();
             sb->BackgroundOpacity = 0.0;
             sb->ForegroundColor = Windows::UI::ColorHelper::FromArgb(0xFF, 0xF4, 0xF7, 0xF8);   // TxtHi:时钟在深色 chrome 上仍可读
-            auto applyStatusBarPad = [this](double h) {
-                Windows::UI::Xaml::Thickness m(0, h, 0, 0);
-                if (Progress) Progress->Margin = m;
-                if (FindBar) FindBar->Margin = m;
-            };
-            applyStatusBarPad(sb->OccludedRect.Height);
+            // Fallback only: on a shell that does not move VisibleBounds, showing/hiding the bar is
+            //   still the moment the usable top edge changes — re-measure, do not trust OccludedRect.
             sb->Showing += ref new Windows::Foundation::TypedEventHandler<
                 Windows::UI::ViewManagement::StatusBar^, Platform::Object^>(
-                [this, applyStatusBarPad](Windows::UI::ViewManagement::StatusBar^ s, Platform::Object^) {
-                    applyStatusBarPad(s->OccludedRect.Height);
-                });
+                [this](Windows::UI::ViewManagement::StatusBar^, Platform::Object^) { ApplyViewInsets(); });
             sb->Hiding += ref new Windows::Foundation::TypedEventHandler<
                 Windows::UI::ViewManagement::StatusBar^, Platform::Object^>(
-                [this](Windows::UI::ViewManagement::StatusBar^, Platform::Object^) {
-                    Windows::UI::Xaml::Thickness zero(0, 0, 0, 0);
-                    if (Progress) Progress->Margin = zero;
-                    if (FindBar) FindBar->Margin = zero;
-                });
+                [this](Windows::UI::ViewManagement::StatusBar^, Platform::Object^) { ApplyViewInsets(); });
         }
     } catch (...) {}
+    ApplyViewInsets();
     // 测试钩子:若 LocalState\testurl.txt 存在,启动直接导航到它(供 WDP 远程自动化测试,免 UI 输入)。
     std::wstring testUrl;
     try {
@@ -926,6 +925,40 @@ MainPage::MainPage()
             NavigateTo(ref new String(firstUrl.c_str()), true);
         }
     }
+}
+
+// Apotheosis (review 2026-09-03): with ApplicationViewBoundsMode::UseCoreWindow our window covers
+//   the whole screen, so the shell's status bar (top) and software navigation bar (bottom) sit on
+//   top of our chrome. ApplicationView::VisibleBounds is what the shell leaves usable; the gap
+//   against CoreWindow::Bounds is the inset we owe on each edge. Both rects are in the same DIP
+//   space, so plain arithmetic is enough.
+//   bottom → RootGrid padding, so the status line + address/nav row ride above the buttons;
+//   top    → top margin/padding of everything anchored to the top edge (loading bar, find bar) and
+//            of the full-screen overlays, whose own headers would otherwise sit under the clock.
+//   UI THREAD ONLY. Cheap and idempotent — safe to call from every event that may change the edges.
+void MainPage::ApplyViewInsets()
+{
+    double top = 0.0, bottom = 0.0;
+    try {
+        auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
+        auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (view == nullptr || win == nullptr) return;
+        Windows::Foundation::Rect vb = view->VisibleBounds;
+        Windows::Foundation::Rect wb = win->Bounds;
+        if (!(vb.Height > 0.0f) || !(wb.Height > 0.0f)) return;
+        top = (double)vb.Y - (double)wb.Y;
+        bottom = ((double)wb.Y + (double)wb.Height) - ((double)vb.Y + (double)vb.Height);
+    } catch (...) { return; }
+    if (!(top > 0.0)) top = 0.0;
+    if (!(bottom > 0.0)) bottom = 0.0;
+    Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
+    if (Progress) Progress->Margin = topPad;
+    if (FindBar) FindBar->Margin = topPad;
+    if (Drawer) Drawer->Padding = topPad;
+    if (SettingsPage) SettingsPage->Padding = topPad;
+    if (TabSwitcher) TabSwitcher->Padding = topPad;
+    if (OobePanel) OobePanel->Padding = topPad;
+    if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
 }
 
 // ---- 持久化 ----
