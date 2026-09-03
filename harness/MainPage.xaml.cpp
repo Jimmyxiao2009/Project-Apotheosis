@@ -524,10 +524,12 @@ static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int 
 
 static const int kW = 720, kH = 1080;
 
-// Apotheosis (M4): 页面缩放边界必须与引擎侧一致 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
-//   自己把 scale 钳到 [0.5, 6.0]；harness 若用别的上下界，超界的捏合会被引擎悄悄改成别的值，
-//   harness 记的 m_pageScale 就和 Page::pageScaleFactor() 对不上（下次捏合基准错）。
-static const float kMinPageScale = 0.5f;
+// Apotheosis (M4): 页面缩放边界不能超出引擎侧 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
+//   自己把 scale 钳到 [0.5, 6.0]；harness 若用更宽的上下界，超界的捏合会被引擎悄悄改成别的值，
+//   harness 记的 m_pageScale 就和 Page::pageScaleFactor() 对不上（下次捏合基准错）。子区间是安全的。
+// 下界取 1.0（而非引擎允许的 0.5）：布局按视口宽度做，缩到 1 以下并不会重排出更多内容，
+//   只是把同一张页面从左上角画小 —— 右边永远是空白。和手机浏览器一样，fit-to-width 即最小缩放。
+static const float kMinPageScale = 1.0f;
 static const float kMaxPageScale = 6.0f;
 // 松手后 |scale − 1| ≤ 6 % 直接吸附到精确 1.0：捏合是浮点乘积的累积，靠手指几乎不可能正好回到
 //   1:1，实机表现为“怎么捏都回不到原始大小、总停在某个缩放级别”。

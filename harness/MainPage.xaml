@@ -80,6 +80,146 @@
             <Setter Property="Padding" Value="15,13"/>
             <Setter Property="FontSize" Value="15"/>
         </Style>
+        <!-- 深色输入框(地址栏/查找条)。默认 TextBox 模板在 Focused 态把 BorderElement 刷白、
+             把 ContentElement 切到 Light 主题(文字变黑) → 聚焦时整条地址栏发白。这里的模板
+             (基于 SDK 15063 默认模板)让 Normal/PointerOver/Focused 三态外观完全一致,
+             并把内置 DeleteButton 的触摸目标放大到 44x40(字形仍是 14)。
+             注意:不要给模板加 VerticalContentAlignment 绑定 —— 文字垂直居中仍靠元素上的 Padding。 -->
+        <Style x:Key="DarkFieldBox" TargetType="TextBox">
+            <Setter Property="MinWidth" Value="0"/>
+            <Setter Property="MinHeight" Value="0"/>
+            <Setter Property="Foreground" Value="{StaticResource TxtHi}"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="SelectionHighlightColor" Value="{StaticResource Accent}"/>
+            <Setter Property="ScrollViewer.HorizontalScrollMode" Value="Auto"/>
+            <Setter Property="ScrollViewer.VerticalScrollMode" Value="Auto"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Hidden"/>
+            <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Hidden"/>
+            <Setter Property="ScrollViewer.IsDeferredScrollingEnabled" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Grid>
+                            <Grid.Resources>
+                                <!-- 清除键:透明底,大触摸目标,字形不变大 -->
+                                <Style x:Key="DarkFieldDeleteButtonStyle" TargetType="Button">
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="Button">
+                                                <Grid x:Name="ButtonLayoutGrid" Background="Transparent" BorderThickness="0">
+                                                    <VisualStateManager.VisualStateGroups>
+                                                        <VisualStateGroup x:Name="CommonStates">
+                                                            <VisualState x:Name="Normal"/>
+                                                            <VisualState x:Name="PointerOver">
+                                                                <Storyboard>
+                                                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="GlyphElement" Storyboard.TargetProperty="Foreground">
+                                                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{StaticResource TxtHi}"/>
+                                                                    </ObjectAnimationUsingKeyFrames>
+                                                                </Storyboard>
+                                                            </VisualState>
+                                                            <VisualState x:Name="Pressed">
+                                                                <Storyboard>
+                                                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="GlyphElement" Storyboard.TargetProperty="Foreground">
+                                                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{StaticResource Accent}"/>
+                                                                    </ObjectAnimationUsingKeyFrames>
+                                                                </Storyboard>
+                                                            </VisualState>
+                                                            <VisualState x:Name="Disabled">
+                                                                <Storyboard>
+                                                                    <DoubleAnimation Storyboard.TargetName="ButtonLayoutGrid" Storyboard.TargetProperty="Opacity" To="0" Duration="0"/>
+                                                                </Storyboard>
+                                                            </VisualState>
+                                                        </VisualStateGroup>
+                                                    </VisualStateManager.VisualStateGroups>
+                                                    <TextBlock x:Name="GlyphElement" Text="&#xE10A;"
+                                                               FontFamily="Segoe MDL2 Assets" FontSize="14" FontStyle="Normal"
+                                                               Foreground="{StaticResource TxtLo}"
+                                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                               AutomationProperties.AccessibilityView="Raw"/>
+                                                </Grid>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </Style>
+                            </Grid.Resources>
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualState x:Name="Normal"/>
+                                    <!-- 空:PointerOver / Focused 与 Normal 完全同貌 -->
+                                    <VisualState x:Name="PointerOver"/>
+                                    <VisualState x:Name="Focused"/>
+                                    <VisualState x:Name="Disabled">
+                                        <Storyboard>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ContentElement" Storyboard.TargetProperty="Foreground">
+                                                <DiscreteObjectKeyFrame KeyTime="0" Value="{StaticResource TxtLo}"/>
+                                            </ObjectAnimationUsingKeyFrames>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="PlaceholderTextContentPresenter" Storyboard.TargetProperty="Foreground">
+                                                <DiscreteObjectKeyFrame KeyTime="0" Value="{StaticResource TxtLo}"/>
+                                            </ObjectAnimationUsingKeyFrames>
+                                        </Storyboard>
+                                    </VisualState>
+                                </VisualStateGroup>
+                                <VisualStateGroup x:Name="ButtonStates">
+                                    <VisualState x:Name="ButtonVisible">
+                                        <Storyboard>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="DeleteButton" Storyboard.TargetProperty="Visibility">
+                                                <DiscreteObjectKeyFrame KeyTime="0">
+                                                    <DiscreteObjectKeyFrame.Value>
+                                                        <Visibility>Visible</Visibility>
+                                                    </DiscreteObjectKeyFrame.Value>
+                                                </DiscreteObjectKeyFrame>
+                                            </ObjectAnimationUsingKeyFrames>
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="ButtonCollapsed"/>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Border x:Name="BorderElement" Grid.Row="1" Grid.RowSpan="1" Grid.ColumnSpan="2"
+                                    Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"/>
+                            <ContentPresenter x:Name="HeaderContentPresenter" x:DeferLoadStrategy="Lazy" Visibility="Collapsed"
+                                              Grid.Row="0" Grid.ColumnSpan="2" Margin="0,0,0,8" FontWeight="Normal"
+                                              Foreground="{StaticResource TxtLo}"
+                                              Content="{TemplateBinding Header}" ContentTemplate="{TemplateBinding HeaderTemplate}"
+                                              TextWrapping="{TemplateBinding TextWrapping}"/>
+                            <ScrollViewer x:Name="ContentElement" Grid.Row="1"
+                                          HorizontalScrollMode="{TemplateBinding ScrollViewer.HorizontalScrollMode}"
+                                          HorizontalScrollBarVisibility="{TemplateBinding ScrollViewer.HorizontalScrollBarVisibility}"
+                                          VerticalScrollMode="{TemplateBinding ScrollViewer.VerticalScrollMode}"
+                                          VerticalScrollBarVisibility="{TemplateBinding ScrollViewer.VerticalScrollBarVisibility}"
+                                          IsHorizontalRailEnabled="{TemplateBinding ScrollViewer.IsHorizontalRailEnabled}"
+                                          IsVerticalRailEnabled="{TemplateBinding ScrollViewer.IsVerticalRailEnabled}"
+                                          IsDeferredScrollingEnabled="{TemplateBinding ScrollViewer.IsDeferredScrollingEnabled}"
+                                          Margin="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
+                                          IsTabStop="False" ZoomMode="Disabled"
+                                          AutomationProperties.AccessibilityView="Raw"/>
+                            <ContentPresenter x:Name="PlaceholderTextContentPresenter" Grid.Row="1" Grid.ColumnSpan="2"
+                                              Foreground="{StaticResource TxtLo}" IsHitTestVisible="False"
+                                              Margin="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}"
+                                              Content="{TemplateBinding PlaceholderText}"
+                                              TextWrapping="{TemplateBinding TextWrapping}"/>
+                            <Button x:Name="DeleteButton" Grid.Row="1" Grid.Column="1"
+                                    Style="{StaticResource DarkFieldDeleteButtonStyle}"
+                                    Background="Transparent" BorderThickness="0" Padding="0" Margin="0"
+                                    MinWidth="44" MinHeight="36" VerticalAlignment="Stretch"
+                                    IsTabStop="False" Visibility="Collapsed"
+                                    AutomationProperties.AccessibilityView="Raw"/>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Page.Resources>
 
     <Grid x:Name="RootGrid" Background="{StaticResource PageBg}">
@@ -146,7 +286,7 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <Border Grid.Column="0" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="18">
-                        <TextBox x:Name="FindBox" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
+                        <TextBox x:Name="FindBox" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
                                  Foreground="{StaticResource TxtHi}" VerticalContentAlignment="Center" MinHeight="0" Padding="10,8,10,6"
                                  PlaceholderText="页内查找" KeyDown="OnFindKeyDown" TextChanged="OnFindChanged"/>
                     </Border>
@@ -214,7 +354,7 @@
                         <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
                                    FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight"
                                    VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0"/>
-                        <TextBox x:Name="UrlBox" Grid.Column="1" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
+                        <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
                                  Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8"
                                  InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
                                  KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
