@@ -770,6 +770,11 @@ MainPage::MainPage()
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
                 if (m_urlFocused && NavBarShift) {
                     NavBarShift->Y = -e->OccludedRect.Height;
+                    // Apotheosis (review 2026-09-03): the suggestion dropdown is anchored to the
+                    //   bottom of the *content* row, i.e. it floats right on top of the nav bar.
+                    //   Shifting only the nav bar left it behind the keyboard while typing, so it
+                    //   rides along by the same amount (its own transform — different subtree).
+                    ShiftSuggestPanel(-e->OccludedRect.Height);
                     e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
                 }
             });
@@ -778,6 +783,7 @@ MainPage::MainPage()
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
                 if (NavBarShift && NavBarShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
                     NavBarShift->Y = 0;
+                    ShiftSuggestPanel(0.0);
                     e->EnsuredFocusedElementInView = true;
                 }
             });
@@ -925,6 +931,23 @@ MainPage::MainPage()
             NavigateTo(ref new String(firstUrl.c_str()), true);
         }
     }
+}
+
+// Apotheosis (review 2026-09-03): move the URL suggestion dropdown together with the nav bar when
+//   the soft keyboard comes up. SuggestPanel lives in the content row (bottom-anchored) while
+//   NavBarShift only covers the bottom chrome, so it needs its own translation by the same Y.
+//   Created lazily and kept on the element — y == 0 restores the resting position.
+//   UI THREAD ONLY.
+void MainPage::ShiftSuggestPanel(double y)
+{
+    if (!SuggestPanel) return;
+    auto t = dynamic_cast<Windows::UI::Xaml::Media::TranslateTransform^>(SuggestPanel->RenderTransform);
+    if (t == nullptr) {
+        if (y == 0.0) return;   // nothing to restore
+        t = ref new Windows::UI::Xaml::Media::TranslateTransform();
+        SuggestPanel->RenderTransform = t;
+    }
+    t->Y = y;
 }
 
 // Apotheosis (review 2026-09-03): with ApplicationViewBoundsMode::UseCoreWindow our window covers

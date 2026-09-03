@@ -221,6 +221,9 @@ namespace Harness {
         //   ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid bottom padding + top
         //   margin of the top-anchored chrome. UI thread only.
         void ApplyViewInsets();
+        // Apotheosis (review 2026-09-03): the URL suggestion dropdown sits in the content row, so
+        //   it needs the same soft-keyboard shift as NavBarShift. 0 = back to rest.
+        void ShiftSuggestPanel(double y);
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();
