@@ -325,15 +325,21 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
 }
 
 // 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
-static std::wstring g_searchPrefix = L"https://cn.bing.com/search?q=";
+static std::wstring g_searchPrefix = L"https://www.qwant.com/?q=";
 static std::wstring g_homeUrl = L"about:home";
+// Apotheosis (PRIVACY-AUDIT.md recommended action 3): index 4 = Qwant, the default for a fresh
+//   install - it is the only one of these that states it does not track or profile its users, and
+//   the previous default (cn.bing.com, Bing China) was a poor fit outside China. Bing now goes to
+//   www.bing.com. Existing users keep whatever settings.ini already stores, so the indices below
+//   must never be renumbered - new engines are appended.
 static std::wstring SearchPrefixFor(int idx)
 {
     switch (idx) {
+        case 0: return L"https://www.bing.com/search?q=";
         case 1: return L"https://www.google.com/search?q=";
         case 2: return L"https://duckduckgo.com/?q=";
         case 3: return L"https://www.baidu.com/s?wd=";
-        default: return L"https://cn.bing.com/search?q=";
+        default: return L"https://www.qwant.com/?q=";   // 4 = Qwant, also the fallback for a bad index
     }
 }
 
@@ -397,7 +403,7 @@ static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, c
         h += U8("\xE5\x9C\xA8\xE4\xB8\x8A\xE6\x96\xB9\xE5\x9C\xB0\xE5\x9D\x80\xE6\xA0\x8F\xE8\xBE\x93\xE5\x85\xA5\xE7\xBD\x91\xE5\x9D\x80\xE8\xAE\xBF\xE9\x97\xAE\xE7\xBD\x91\xE9\xA1\xB5\xE3\x80\x82",
                 "Type a URL in the address bar above to open a page.");
         h += "</p><div class='grid'>";
-        const char* defs[][2] = { {"https://example.com","example.com"}, {"https://github.com","github.com"}, {"https://cn.bing.com","bing.com"}, {"https://en.wikipedia.org","wikipedia.org"} };
+        const char* defs[][2] = { {"https://example.com","example.com"}, {"https://github.com","github.com"}, {"https://www.bing.com","bing.com"}, {"https://en.wikipedia.org","wikipedia.org"} };
         for (auto& d : defs) { h += "<a class='tile' href='"; h += d[0]; h += "'><div class='t'>"; h += d[1]; h += "</div><div class='u'>"; h += d[0]; h += "</div></a>"; }
         h += "</div>";
     } else {
@@ -423,7 +429,7 @@ static Platform::String^ NormalizeUrl(Platform::String^ raw)
     while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) s.pop_back();
     if (s.empty())
         return ref new String(L"about:home");
-    // 含空格或没有点且不像域名 → 当作搜索词走 Bing。
+    // 含空格或没有点且不像域名 → 当作搜索词交给默认搜索引擎(g_searchPrefix，设置里选)。
     bool looksUrl = (s.find(L"://") != std::wstring::npos) || (s.find(L'.') != std::wstring::npos && s.find(L' ') == std::wstring::npos);
     if (s.rfind(L"about:", 0) == 0)
         return ref new String(s.c_str());
@@ -2530,7 +2536,7 @@ void MainPage::LoadSettings()
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
-    if (m_setSearch < 0 || m_setSearch > 3) m_setSearch = 0;
+    if (m_setSearch < 0 || m_setSearch > 4) m_setSearch = 4;   // Apotheosis: unknown index -> Qwant
     if (g_lang != L"en" && g_lang != L"zh") g_lang = L"zh";
     ApplySettings();
 }

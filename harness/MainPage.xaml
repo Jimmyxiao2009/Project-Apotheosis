@@ -586,6 +586,7 @@
                         <ComboBoxItem Content="Google"/>
                         <ComboBoxItem Content="DuckDuckGo"/>
                         <ComboBoxItem Content="百度"/>
+                        <ComboBoxItem Content="Qwant"/>
                     </ComboBox>
 
                     <TextBlock Text="主页(URL,留空用内置主页)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4"/>
