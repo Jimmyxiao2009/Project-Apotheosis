@@ -3155,10 +3155,20 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     OptionSet<WheelEventProcessingSteps> steps { WheelEventProcessingSteps::SynchronousScrolling,
         WheelEventProcessingSteps::BlockingDOMEventDispatch };   // the default/synchronous steps (see EventHandlerMac/IOS)
     auto [result, handling] = lf->eventHandler().handleWheelEvent(wheelEvent, steps);
-    (void)handling;
 
     const ScrollPosition afterMain = view->scrollPosition();
-    const bool consumedByNested = result.wasHandled() && (afterMain == beforeMain);
+    // Apotheosis: "consumed by a nested scroller" must mean something actually scrolled.
+    // HandleUserInputEventResult::wasHandled() is ALSO true when the page's own wheel listener
+    // merely called preventDefault() and scrolled nothing: EventHandler::handleWheelEventInternal
+    // (Source/WebCore/page/EventHandler.cpp, the `if (!element->dispatchWheelEvent(...))` leg)
+    // returns handled and records EventHandling::DefaultPrevented in `handling`. Reporting that as
+    // 1 made the harness skip its WebCoreScrollBy fallback for the delta, so every site carrying a
+    // non-passive wheel listener (analytics/sticky-header scripts, most cookie banners) became
+    // completely unscrollable. Require all three: handled, not default-prevented, main frame
+    // still where it was.
+    const bool consumedByNested = result.wasHandled()
+        && !handling.contains(EventHandling::DefaultPrevented)
+        && (afterMain == beforeMain);
 
     if (!consumedByNested && afterMain != beforeMain)
         view->setScrollPosition(beforeMain);   // undo any main-frame move: that is WebCoreScrollBy's job
@@ -3166,9 +3176,15 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     if (consumedByNested) {
         // Same present path WebCoreScrollBy uses (578cbc3/82c5cef): commit the moved layer's
         // compositing update now — this is what arms PortChromeClient::m_needsPresent, via
-        // scheduleRenderingUpdate() — and skip forceDirtyTree, since only a scroll layer moved.
+        // scheduleRenderingUpdate().
         g_session->page->isolatedUpdateRendering();
-        g_gpuScrollFast = true;
+        // NOTE: deliberately NOT g_gpuScrollFast here (unlike WebCoreScrollBy). That flag skips
+        // forceDirtyTree for the next composite, which is only correct when the moved content has
+        // its own composited layer whose tiles are already painted — true for the main frame's
+        // scrolled-contents layer, but an overflow:auto container usually has no compositing layer
+        // of its own and is painted into its enclosing layer's backing store. Skipping the dirty
+        // pass there would re-present the identical tiles, i.e. the nested scroller would not move
+        // on screen at all.
         // Coalescing fix: without this, the moved nested scroller only reached the screen on the
         // next live tick (up to 200ms later, or never mid-drag since ticks pause while a gesture
         // holds the engine busy) — a consumed wheel event changed the DOM/layer position but this
