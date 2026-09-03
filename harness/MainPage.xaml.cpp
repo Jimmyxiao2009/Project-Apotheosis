@@ -845,18 +845,16 @@ MainPage::MainPage()
             m_pendingFirstNavPush = true;
             // 真机实测(第一版):GpuPanel 的 Loaded 从未到达 → 启动落到兜底定时器 → 又变回两次加载。
             //   原因:Visibility=Collapsed 的元素不参与 measure/arrange,既不 Loaded 也不 SizeChanged。
-            //   故这里就把面板设为可见(第一帧 GPU 内容前它是透明的,盖在 RenderImage 上不影响软件路径),
-            //   并在构造期就挂好事件——晚挂会错过已经发生的 Loaded。
-            if (GpuPanel) {
-                GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
-                GpuPanel->SizeChanged += ref new Windows::UI::Xaml::SizeChangedEventHandler(this, &MainPage::OnGpuPanelSizeChanged);
-            }
+            //   故这里就把面板设为可见(第一帧 GPU 内容前它是透明的,盖在 RenderImage 上不影响软件路径)。
+            //   面板可见/挂 SizeChanged/等真实尺寸都交给 HookGpuPanelForStartup(2026-09-03 崩溃修复,
+            //   见其定义处的注释)——不再在这里直接起 GPU。
             // 触发源取先到者(StartupGpuThenNav 自带去重):页面 Loaded 一定会来(Page 是可见根),
-            //   面板首次非零 SizeChanged / 面板 Loaded 通常更早。
+            //   面板首次非零 SizeChanged / 面板 Loaded 通常更早,但都要先确认面板尺寸是真的。
             this->Loaded += ref new Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnPageLoadedForGpu);
             // 兜底:6 s 内一个触发源都没来 → 照原路发导航(软件首屏,GPU 仍由 OnNavDone 的自动开关
             // 接手 = 老的两次加载)——绝不让启动停在"没有任何页面"。
             ArmStartupNavTimer();
+            HookGpuPanelForStartup();
         } else {
             NavigateTo(ref new String(firstUrl.c_str()), true);
         }
@@ -957,10 +955,16 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     if (!isHome && m_gpuDefault && !m_gpuOn && !m_gpuAutoTried && !m_gpuStartupBegun) {
         m_pendingFirstNav = wurl;
         m_pendingFirstNavPush = pushHistory;
-        if (GpuPanel) GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
         HideSuggestions();
         SetLoading(true);      // GpuInit 期间(几百 ms)显示进度条,并挡住重复点/回车(m_loading 早退)
-        StartupGpuThenNav();   // 起 GPU;导航由 EnableGpu 的回调发出,那时 m_gpuAutoTried 已为 true → 正常加载
+        // Apotheosis (2026-09-03 崩溃修复): 这条路径是新装后"首次输入网址回车"的实际触发点——此时
+        //   about:home 从未进过上面构造期的 GPU-first 分支,GpuPanel 还是 Collapsed/从未 arrange 过。
+        //   原代码在这里直接把面板设 Visible 就同步 StartupGpuThenNav() 起 GPU,面板此刻尺寸仍是
+        //   0x0(真机 mem.txt: "startup gpu-first (panel 0x0) ... panelLoaded=1"),ANGLE 绑定的
+        //   SwapChainPanel 还没走完首次 arrange;紧接着面板真正的第一次 SizeChanged 就会在
+        //   libGLESv2.dll 里空指针崩溃(SEH fault=0,UI 线程内 XAML SwapChainPanel 回调 → ANGLE)。
+        //   改走 HookGpuPanelForStartup:等面板报出真实非零尺寸再起 GPU,~2s 等不到才照老行为起。
+        HookGpuPanelForStartup();
         return;
     }
 
@@ -1759,7 +1763,13 @@ void MainPage::OnGpuPanelLoaded(Platform::Object^, RoutedEventArgs^)
         try { RunGpuProbe(GpuPanel, ref new String(LocalStateDir().c_str())); } catch (...) {}
         return;
     }
-    StartupGpuThenNav();   // 事件已在构造期挂好,这里只是最早的触发源之一(去重在 StartupGpuThenNav)
+    // Apotheosis (2026-09-03 崩溃修复): Loaded 到达不代表面板已经过 arrange——真机上这个事件带着
+    //   ActualWidth/Height 仍是 0 到达过,是崩溃根因之一(见 HookGpuPanelForStartup 注释)。只有此刻
+    //   尺寸已经是真的才在这里直接起 GPU;否则交给 SizeChanged 或 2s 兜底定时器。
+    if (GpuPanel && GpuPanel->ActualWidth > 0.0 && GpuPanel->ActualHeight > 0.0) {
+        if (m_gpuSizeWaitTimer) m_gpuSizeWaitTimer->Stop();
+        StartupGpuThenNav();
+    }
 }
 
 // Apotheosis (M4): 页面 Loaded —— 可视树已建,GpuPanel 已进树,是"起 GPU"的保底触发源
@@ -1768,7 +1778,12 @@ void MainPage::OnPageLoadedForGpu(Platform::Object^, RoutedEventArgs^)
 {
     m_pageLoadedSeen = true;
     if (m_pendingFirstNav.empty()) return;
-    StartupGpuThenNav();
+    // Apotheosis (2026-09-03 崩溃修复): 同 OnGpuPanelLoaded——页面 Loaded 也不能证明 GpuPanel 已经
+    //   arrange 过(它是页面里的一个子元素),同样先查真实尺寸,查不到就让 SizeChanged / 2s 兜底接手。
+    if (GpuPanel && GpuPanel->ActualWidth > 0.0 && GpuPanel->ActualHeight > 0.0) {
+        if (m_gpuSizeWaitTimer) m_gpuSizeWaitTimer->Stop();
+        StartupGpuThenNav();
+    }
 }
 
 // Apotheosis (M4): 面板拿到非零尺寸 = ANGLE 可以在它上面建窗口表面 → 起 GPU,再发第一次导航。
@@ -1776,6 +1791,55 @@ void MainPage::OnGpuPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::SizeC
 {
     if (m_pendingFirstNav.empty()) return;   // 导航已发出(GPU 路径或兜底)
     if (e->NewSize.Width <= 0.0f || e->NewSize.Height <= 0.0f) return;
+    if (m_gpuSizeWaitTimer) m_gpuSizeWaitTimer->Stop();   // 真实尺寸到了,2s 兜底不用再等
+    StartupGpuThenNav();
+}
+
+// ============================================================================
+// Apotheosis (2026-09-03 崩溃修复): GPU-first 起 GPU 前的尺寸门槛,两处触发点共用
+// (构造期 GPU-first 启动块 + NavigateTo 里"首次输入网址"拦截块)。
+//
+// 根因:两处触发点都曾经在把 GpuPanel 设为 Visible 后立刻(或靠 Loaded 事件立刻)调
+// StartupGpuThenNav()→EnableGpu()→WebCoreGpuInit(GpuPanel 包成的 EGLNativeWindowTypeProperty,...),
+// 完全不管此刻 GpuPanel->ActualWidth/ActualHeight 是不是还是 0(Loaded 触发时面板可能还没走完首次
+// arrange;真机 mem.txt 记录过 "startup gpu-first (panel 0x0) ... panelLoaded=1")。ANGLE 就在一个
+// 从未 arrange 过的 SwapChainPanel 上建好了窗口表面;紧接着面板真正完成布局、触发它*第一次*真实的
+// SizeChanged 时,XAML 内部重建/resize 该面板的合成 swapchain,libGLESv2.dll 里引用的还是那个没建
+// 完整的原生窗口状态 → SEH access violation fault=0(crash.txt: pc 落在 libGLESv2.dll,栈上是
+// Windows.UI.Xaml SwapChainPanel 的事件回调)。
+//
+// 修法:只在 GpuPanel 报出真实(非零)尺寸后才起 GPU。已经有尺寸就立即起;否则挂 SizeChanged
+// (只挂一次,m_gpuSizeHandlerWired 去重)等它到来。~2s 内还没等到 → 按老行为起 GPU(不然万一某些
+// 布局路径永远不给非零尺寸,启动会卡死),但至少把"用 0x0 面板起 GPU"的窗口从"必然"降到"少见兜底"。
+// ============================================================================
+void MainPage::HookGpuPanelForStartup()
+{
+    if (!GpuPanel) { StartupGpuThenNav(); return; }   // 没有面板可等,直接走老路(理论上不会发生)
+    if (GpuPanel->ActualWidth > 0.0 && GpuPanel->ActualHeight > 0.0) {
+        // 尺寸已经是真的(例如面板早被别的路径 arrange 过)——不用等,直接起。
+        StartupGpuThenNav();
+        return;
+    }
+    GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;   // 先可见,才谈得上 arrange/SizeChanged
+    if (!m_gpuSizeHandlerWired) {
+        m_gpuSizeHandlerWired = true;
+        GpuPanel->SizeChanged += ref new Windows::UI::Xaml::SizeChangedEventHandler(this, &MainPage::OnGpuPanelSizeChanged);
+    }
+    if (!m_gpuSizeWaitTimer) {
+        m_gpuSizeWaitTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        Windows::Foundation::TimeSpan sts; sts.Duration = 20000000LL;   // 2s(100ns 单位)
+        m_gpuSizeWaitTimer->Interval = sts;
+        m_gpuSizeWaitTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnGpuSizeWaitTimer);
+    }
+    m_gpuSizeWaitTimer->Stop();
+    m_gpuSizeWaitTimer->Start();
+}
+
+// 2s 到点还没等到 GpuPanel 的真实尺寸 —— 别把启动卡死,按老行为(不管尺寸)起 GPU。
+void MainPage::OnGpuSizeWaitTimer(Platform::Object^, Platform::Object^)
+{
+    if (m_gpuSizeWaitTimer) m_gpuSizeWaitTimer->Stop();
+    if (m_pendingFirstNav.empty()) return;   // 导航已经用别的路径发出去了
     StartupGpuThenNav();
 }
 

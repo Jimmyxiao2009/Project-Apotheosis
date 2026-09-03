@@ -141,6 +141,12 @@ namespace Harness {
         void OnPageLoadedForGpu(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);  // 页面 Loaded:保底触发源
         void ArmStartupNavTimer();      // (重新)武装 6s 兜底定时器:待发导航必须出去
         std::string GpuPanelSizeStr();  // 面板当前尺寸 "WxH"(启动诊断行用)
+        // Apotheosis (2026-09-03 崩溃修复): GPU-first 起 GPU 前必须等 GpuPanel 有真实(非零)尺寸——
+        //   Loaded 事件可能在面板还没走完第一次 arrange 时就到达(真机 mem.txt 记过 "panel 0x0"),
+        //   这时就绑 ANGLE 窗口表面,面板随后第一次真实 SizeChanged 会在 libGLESv2.dll 里空指针崩溃。
+        //   两处触发点(构造期 GPU-first 启动、NavigateTo 里的首次导航拦截)都改走这个入口。
+        void HookGpuPanelForStartup();  // 面板已有尺寸→立即起 GPU;否则挂 SizeChanged + 武装 2s 等待兜底
+        void OnGpuSizeWaitTimer(Platform::Object^ sender, Platform::Object^ e);  // 2s 内没等到真实尺寸→按老行为起 GPU,别把启动卡死
 
         // ---- 抽屉 ----
         void OnDrawerClose(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -279,6 +285,10 @@ namespace Harness {
         bool m_gpuStartupBegun { false };   // 已开始 GPU 优先启动(多触发源去重 + 兜底定时器不抢跑)
         bool m_pageLoadedSeen { false };    // 诊断:页面 Loaded 到过
         bool m_gpuPanelLoadedSeen { false };// 诊断:GpuPanel Loaded 到过(第一版真机上它没来)
+        // Apotheosis (2026-09-03 崩溃修复): 见 HookGpuPanelForStartup。2s 等待真实面板尺寸的兜底定时器,
+        //   与上面 6s 的 m_startupNavTimer 是两层不同的保险(这层等尺寸,那层等"有没有任何触发源")。
+        Windows::UI::Xaml::DispatcherTimer^ m_gpuSizeWaitTimer;
+        bool m_gpuSizeHandlerWired { false };// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
         int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态
