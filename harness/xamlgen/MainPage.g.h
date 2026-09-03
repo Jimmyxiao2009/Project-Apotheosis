@@ -73,6 +73,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::Slider^ SetZoomSlider;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetTabModeSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetGpuSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ SetZoomLabel;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ DrawerList;

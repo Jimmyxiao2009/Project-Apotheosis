@@ -161,6 +161,8 @@ namespace Harness {
         void ForwardClickToEngine(int px, int py);
         // 引擎滚动 dy 像素(触发懒加载图片)后重绘。dy>0 向下。
         void EngineScroll(int dy);
+        // Apotheosis: show/hide the floating page up/down buttons (developer setting, off by default).
+        void UpdateScrollFab();
         void OnScrollUp(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnScrollDown(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 自由滚动:内容区 ManipulationDelta(单指拖拽 ΔY)→ 累积位移 → 合并成引擎滚动(无 spinner,带惯性)。
@@ -254,6 +256,7 @@ namespace Harness {
         int  m_defaultZoom { 100 };   // 默认缩放百分比(50–200)
         int  m_tabMode { 0 };         // 0=单热会话 / 1=并发多引擎(实验);增量5/7 使用
         std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom
+        bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };

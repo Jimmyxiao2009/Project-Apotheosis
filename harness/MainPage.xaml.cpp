@@ -1052,8 +1052,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                         s->m_pageLinks = *links;   // 存当前页链接表供点击命中
                     }
                     s->m_sessionActive = sessionActive;
-                    s->ScrollFab->Visibility = sessionActive
-                        ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+                    s->UpdateScrollFab();
                     // 实时渲染:有会话则启动(让动画动、SPA 渐进挂载);无会话(主页/错误页)停。
                     s->m_lastFrameHash = 0;
                     if (sessionActive) s->StartLiveMode(); else s->StopLiveMode();
@@ -1357,6 +1356,15 @@ void MainPage::EngineScroll(int dy)
         } catch (...) {}
     });
 }
+// Apotheosis: the floating page up/down buttons are a developer aid (they were there to trigger
+//   lazy loading before touch scrolling worked). Off unless Settings → DEVELOPER turns them on.
+void MainPage::UpdateScrollFab()
+{
+    if (!ScrollFab) return;
+    ScrollFab->Visibility = (m_sessionActive && m_showScrollFab)
+        ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+}
+
 void MainPage::OnScrollUp(Platform::Object^, RoutedEventArgs^)   { EngineScroll(-900); }
 void MainPage::OnScrollDown(Platform::Object^, RoutedEventArgs^) { EngineScroll(900); }
 
@@ -2472,6 +2480,7 @@ void MainPage::ApplySettings()
         try { WebCoreSetUserAgentMobile(mobile); } catch (...) {}
         try { WebCoreSetUserAgentString(ua.empty() ? nullptr : ua.c_str()); } catch (...) {}   // 自定义 UA(空=清除回退开关)
     });
+    UpdateScrollFab();
     if (UaBtn) {
         bool en = (g_lang == L"en");
         UaBtn->Content = ref new String(m_uaMobile ? (en ? L"\U0001F4F1 Mobile UA" : L"\U0001F4F1 手机UA")
@@ -2498,6 +2507,7 @@ void MainPage::LoadSettings()
             else if (k == "tabmode") m_tabMode = atoi(v.c_str());
             else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
+            else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -2518,6 +2528,7 @@ void MainPage::SaveSettings()
     s += "tabmode=" + std::to_string(m_tabMode) + "\n";
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
+    s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -2533,6 +2544,7 @@ void MainPage::ShowSettings()
     if (SetZoomSlider) SetZoomSlider->Value = m_defaultZoom;
     if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring(m_defaultZoom) + L"%").c_str());
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
+    if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     if (VersionText) {
         auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
@@ -2558,6 +2570,7 @@ void MainPage::HideSettings()
     if (SetTabModeSwitch) m_tabMode = SetTabModeSwitch->IsOn ? 1 : 0;
     if (SetZoomSlider) m_defaultZoom = (int)(SetZoomSlider->Value + 0.5);
     if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
+    if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -2596,6 +2609,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"清除全部收藏", L"Clear all bookmarks" }, { L"清除下载记录", L"Clear downloads" },
     { L"清除 Cookie(退出全部登录)", L"Clear cookies (sign out everywhere)" },
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
+    { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
     { L"检查更新(GitHub Releases)", L"Check for updates (GitHub Releases)" },
     { L"标签", L"Tabs" }, { L"完成", L"Done" }, { L"新建标签页", L"New tab" },

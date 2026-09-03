@@ -611,6 +611,11 @@
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <Button Tag="export" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump"/>
 
+                    <!-- 开发者选项:默认关闭的调试用界面元素。 -->
+                    <TextBlock Text="DEVELOPER" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
+                    <TextBlock Text="开发者选项" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
+                    <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>
                     <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="检查更新(GitHub Releases)"/>
