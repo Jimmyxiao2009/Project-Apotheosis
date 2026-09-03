@@ -1536,6 +1536,10 @@ void MainPage::PumpNestedScroll()
     unsigned long long mySeq = m_opSeq;   // 被动滚动:不作废点击/导航令牌,但被它们作废(同 PumpScroll)
     bool present = m_gpuPresent;
     WebEngine::instance().post([disp, self, px, py, dx, dy, mySeq, present]() {
+        // Apotheosis: acquire the buffer up front (same as PumpScroll) — WebCoreWheelAt now presents
+        // this delta itself on a consumed (1) return, so it needs a real target even when the
+        // WebCoreScrollBy fallback below never runs.
+        auto rgba = AcquireEngineBuffer(present);
         int wrc = -999;
         // Apotheosis: dx/dy here are scroll-offset deltas (finger up -> content moves down -> positive
         // dy), the same convention WebCoreScrollBy takes below. WebCoreWheelAt instead builds a
@@ -1544,15 +1548,14 @@ void MainPage::PumpNestedScroll()
         // user" == content scrolls up. Passing the offset-delta straight through inverted the nested
         // scroller on device (banner moved opposite the finger) -> negate both axes only for this call,
         // so a finger-up pan still scrolls nested content down, matching the main-frame fast path below.
-        try { wrc = WebCoreWheelAt(px, py, (float)-dx, (float)-dy, 2 /* changed */); } catch (...) { wrc = -1000; }
-        // wrc == 1: consumed by a nested scroller, main-frame position guaranteed untouched — done,
-        // no WebCoreScrollBy for this delta. Any other value (0 = not consumed, or a driver
-        // exception): main-frame scroll position is left unchanged either way, so WebCoreScrollBy
-        // is safe to call unconditionally for the same delta (ordering preserved: wheel first).
-        std::shared_ptr<std::vector<uint8_t>> rgba;
+        try { wrc = WebCoreWheelAt(px, py, (float)-dx, (float)-dy, 2 /* changed */, rgba->data()); } catch (...) { wrc = -1000; }
+        // wrc == 1: consumed by a nested scroller, main-frame position guaranteed untouched, and the
+        // frame already composited/presented into rgba by WebCoreWheelAt itself — done, no
+        // WebCoreScrollBy for this delta. Any other value (0 = not consumed, or a driver exception):
+        // main-frame scroll position is left unchanged either way, so WebCoreScrollBy is safe to call
+        // unconditionally for the same delta (ordering preserved: wheel first).
         int rc = 0;
         if (wrc != 1) {
-            rgba = AcquireEngineBuffer(present);
             try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
         }
         int rcCopy = rc;
@@ -1560,10 +1563,8 @@ void MainPage::PumpNestedScroll()
             disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, wrc]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) { s->m_nestedScrollBusy = false; s->m_nestedAccumX = 0; s->m_nestedAccumY = 0; return; }   // 被导航/点击取代
-                if (wrc == 1) {
-                    s->m_lastFrameHash = 0;   // 嵌套滚动体已变;下一次实时 tick(present 呈现/软件贴图)会捡起
-                } else if (rcCopy == 0) {
-                    if (!present) s->PresentSoftwareFrame(rgba);
+                if (wrc == 1 || rcCopy == 0) {
+                    if (!present) s->PresentSoftwareFrame(rgba);   // present 模式:WebCoreWheelAt/ScrollBy 已经直呈现到 GpuPanel
                     s->m_lastFrameHash = 0;
                 }
                 s->m_nestedScrollBusy = false;

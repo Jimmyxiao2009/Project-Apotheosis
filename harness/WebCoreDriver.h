@@ -181,8 +181,9 @@ int WebCoreIsScrollableAt(int x, int y);
 // WebCoreWheelAt:派发一次合成 wheel 事件(delta 像素,granularity=ScrollByPixelWheelEvent)。
 // phase:0 none / 1 began / 2 changed / 3 ended(此 port 上目前不生效,见 WebCoreDriver.cpp)。
 // 返回 1 = 被嵌套滚动体消费(下一个 delta 继续调它),0 = 未消费(无论哪种情况主帧滚动位置都不变——
-// 返回 0 时 harness 必须自己为这个 delta 调 WebCoreScrollBy)。
-int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase);
+// 返回 0 时 harness 必须自己为这个 delta 调 WebCoreScrollBy)。返回 1 时已经把这帧合成/呈现进 outBuf
+// (与 WebCoreScrollBy 相同的 paintToRGBA 调用)——harness 不需要再补一次呈现才能看到嵌套滚动体动。
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outBuf);
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();

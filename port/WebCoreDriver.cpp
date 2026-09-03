@@ -3113,7 +3113,16 @@ int WebCoreIsScrollableAt(int x, int y)
 // explicitly restored here before returning 0. That keeps WebCoreScrollBy the *only* thing that
 // ever moves the main frame, so the harness can always call it unconditionally on a 0 return
 // without risking a double-scroll.
-int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase)
+//
+// outRGBA: on a 1 (consumed) return this composites/presents the frame the same way
+// WebCoreScrollBy does (paintToRGBA — direct swap in GPU present mode, cairo readback into
+// outRGBA otherwise), so the harness's per-gesture coalescing loop (PumpNestedScroll) gets exactly
+// one frame per flushed job instead of waiting for the next live tick to notice m_lastFrameHash
+// changed. A null outRGBA is tolerated (no present attempted, same as passing one in but the
+// caller not looking at it) — kept optional-by-null rather than added to the bad-args check
+// because a failed present must not turn a real "consumed" answer into a 0 (that would risk
+// WebCoreScrollBy double-moving the main frame for the same delta).
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA)
 {
     using namespace WebCore;
     (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
@@ -3160,6 +3169,18 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase)
         // scheduleRenderingUpdate() — and skip forceDirtyTree, since only a scroll layer moved.
         g_session->page->isolatedUpdateRendering();
         g_gpuScrollFast = true;
+        // Coalescing fix: without this, the moved nested scroller only reached the screen on the
+        // next live tick (up to 200ms later, or never mid-drag since ticks pause while a gesture
+        // holds the engine busy) — a consumed wheel event changed the DOM/layer position but this
+        // function returned before anyone composited/presented it. Present now, right here, so
+        // PumpNestedScroll's one-job-in-flight loop yields one frame per flush, same as
+        // WebCoreScrollBy below.
+        if (outRGBA) {
+            int nonWhite = 0;
+            paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // best-effort: a paint
+            // failure must not flip this back to 0 — the main frame is already confirmed untouched
+            // above, so WebCoreScrollBy must NOT also run for this delta regardless of paint outcome.
+        }
     }
 
     return consumedByNested ? 1 : 0;

@@ -191,8 +191,10 @@ int WebCoreIsScrollableAt(int x, int y);
 // ScrollByPixelWheelEvent). phase: 0 none / 1 began / 2 changed / 3 ended (currently inert on this
 // port, see WebCoreDriver.cpp). Returns 1 if a nested scroller consumed it (call again with the
 // next delta), 0 if it did not (main-frame scroll position is left unchanged either way — on a 0
-// return the harness must call WebCoreScrollBy itself for this delta).
-int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase);
+// return the harness must call WebCoreScrollBy itself for this delta). On a 1 return this already
+// composited/presented the frame into outRGBA (same paintToRGBA call WebCoreScrollBy makes) — the
+// harness does not need a follow-up call to see the nested scroller move.
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA);
 
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
