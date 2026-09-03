@@ -2373,6 +2373,15 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     PumpGuard guard;
     PerfOpGuard perfOp("scroll", nullptr, 0, 0);   // M4
 
+    // Apotheosis (M4): large images now decode on WebCore's ImageFrameWorkQueue
+    // (RenderBoxModelObject::decodingModeForImageDraw, WK_WINUWP). The decoder
+    // hands the NativeImage back via callOnMainThread, i.e. through the RunLoop
+    // function queue - without draining it here a finished decode would only
+    // become visible on the next live tick, so images would never appear while
+    // the finger keeps scrolling. One iteration is enough and is what
+    // WebCoreLiveTick already does (three times).
+    RunLoop::cycle();
+
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
     if (!view)
