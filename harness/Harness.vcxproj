@@ -48,6 +48,14 @@
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
+  <!-- Apotheosis: Windows::UI::ViewManagement::StatusBar (status-bar overlay, item 1 of the
+       2026-09-03 UI package) is declared in the Windows Mobile Extension SDK, not the base
+       Windows.winmd — without this reference the type does not exist at compile time even
+       behind an ApiInformation::IsTypePresent guard (that only gates the call at runtime). -->
+  <ItemGroup>
+    <SDKReference Include="WindowsMobile, Version=$(ApotheosisWindowsSdkVersion)" />
+  </ItemGroup>
+
   <PropertyGroup>
     <AppxBundle>Never</AppxBundle>
     <AppxPackageSigningEnabled>true</AppxPackageSigningEnabled>

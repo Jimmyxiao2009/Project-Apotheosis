@@ -782,6 +782,38 @@ MainPage::MainPage()
                 }
             });
     } catch (...) {}
+    // Apotheosis: status bar like Edge — extend the app under it (translucent, page content may
+    //   run behind it), but keep our own top-anchored chrome (loading bar, page-find bar) clear of
+    //   the clock by padding them down by however much of the top the bar currently occludes.
+    try {
+        Windows::UI::ViewManagement::ApplicationView::GetForCurrentView()->SetDesiredBoundsMode(
+            Windows::UI::ViewManagement::ApplicationViewBoundsMode::UseCoreWindow);
+    } catch (...) {}
+    try {
+        if (Windows::Foundation::Metadata::ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar")) {
+            auto sb = Windows::UI::ViewManagement::StatusBar::GetForCurrentView();
+            sb->BackgroundOpacity = 0.0;
+            sb->ForegroundColor = Windows::UI::ColorHelper::FromArgb(0xFF, 0xF4, 0xF7, 0xF8);   // TxtHi:时钟在深色 chrome 上仍可读
+            auto applyStatusBarPad = [this](double h) {
+                Windows::UI::Xaml::Thickness m(0, h, 0, 0);
+                if (Progress) Progress->Margin = m;
+                if (FindBar) FindBar->Margin = m;
+            };
+            applyStatusBarPad(sb->OccludedRect.Height);
+            sb->Showing += ref new Windows::Foundation::TypedEventHandler<
+                Windows::UI::ViewManagement::StatusBar^, Platform::Object^>(
+                [this, applyStatusBarPad](Windows::UI::ViewManagement::StatusBar^ s, Platform::Object^) {
+                    applyStatusBarPad(s->OccludedRect.Height);
+                });
+            sb->Hiding += ref new Windows::Foundation::TypedEventHandler<
+                Windows::UI::ViewManagement::StatusBar^, Platform::Object^>(
+                [this](Windows::UI::ViewManagement::StatusBar^, Platform::Object^) {
+                    Windows::UI::Xaml::Thickness zero(0, 0, 0, 0);
+                    if (Progress) Progress->Margin = zero;
+                    if (FindBar) FindBar->Margin = zero;
+                });
+        }
+    } catch (...) {}
     // 测试钩子:若 LocalState\testurl.txt 存在,启动直接导航到它(供 WDP 远程自动化测试,免 UI 输入)。
     std::wstring testUrl;
     try {
