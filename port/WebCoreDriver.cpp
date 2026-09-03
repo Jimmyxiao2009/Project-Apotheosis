@@ -174,6 +174,8 @@ void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTe
 #include <WebCore/RenderElement.h>           // RenderObject::parent()
 #include <WebCore/ContainerNodeInlines.h>    // inline ContainerNode::renderer()(hit->renderer() in WebCoreIsScrollableAt)
 #include <WebCore/HTMLIFrameElement.h>       // is<HTMLIFrameElement>(WebCoreIsScrollableAt)
+#include <WebCore/ShadowRoot.h>              // ShadowRoot::mode()/elementFromPoint(WebCoreIsScrollableAt)
+#include <WebCore/ShadowRootMode.h>          // ShadowRootMode::Open(同上)
 #include <optional>
 #include <algorithm>
 
@@ -3085,6 +3087,13 @@ int WebCoreIsScrollableAt(int x, int y)
         return 0;
     if (g_inPump)
         return 0;
+    // Apotheosis (review 2026-09-03): hold the pump guard for the layout below, like every other
+    // entry point that runs one (WebCoreScrollBy/WebCoreWheelAt/WebCoreClickAt). This function
+    // only *checked* g_inPump and never set it, so its updateLayoutIgnorePendingStylesheets() —
+    // which can run scripts through pending-stylesheet/font callbacks and re-enter the driver —
+    // was the one layout in the driver with nothing serialising it against a concurrent op.
+    g_inPump = true;
+    PumpGuard guard;
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<Document> doc = lf->document();
@@ -3095,6 +3104,27 @@ int WebCoreIsScrollableAt(int x, int y)
     RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
     if (!hit)
         return 0;
+
+    // Apotheosis (review 2026-09-03): TreeScope::elementFromPoint retargets its result to the tree
+    // scope it was called on (TreeScope.cpp: retargetToScope() after nodeFromPoint), so on the
+    // document scope a point inside a web component always resolves to the *host* element, not to
+    // the overflow:auto div the finger is actually over. Cookie banners and consent modals are
+    // routinely built that way, and the walk below then only sees the host's (unscrollable)
+    // renderer chain. Descend instead: as long as the current hit is a shadow host whose root is
+    // open, ask that root the same question — its elementFromPoint retargets to *its* scope, one
+    // level deeper. Closed and UA shadow roots are deliberately skipped: they are not script-
+    // reachable either, and DisallowUserAgentShadowContent is what the hit test uses anyway.
+    // (Element::shadowRoot() is inline in ElementRareData.h, which this port does not export as a
+    // private header — openOrClosedShadowRoot() is the out-of-line accessor for the same field.)
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
 
     for (RenderObject* r = hit->renderer(); r; r = r->parent()) {
         if (r->isRenderView())
