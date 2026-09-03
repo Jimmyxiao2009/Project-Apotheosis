@@ -1805,6 +1805,8 @@ void MainPage::ApplyPanTransform()
         ApplyPresentTransform();
         return;
     }
+    if (!GpuPanel || !RenderImage || !ContentArea)
+        return;
     auto layer = PresentLayer();
     double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
     double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
@@ -1883,6 +1885,10 @@ void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
 // may only have one parent, and re-appending one that still has its old parent throws.
 void MainPage::ApplyPresentTransform()
 {
+    // ApplySettings() can reach this before the XAML tree exists (settings.ini with instantpan=0
+    // is read in the constructor), so both elements are checked like NavigateTo does.
+    if (!GpuPanel || !RenderImage)
+        return;
     const bool haveZoom = (m_zoomTransform != nullptr);
     const bool havePan = (m_panTranslate != nullptr) && (m_panTranslate->X != 0.0 || m_panTranslate->Y != 0.0);
     GpuPanel->RenderTransform = nullptr;
