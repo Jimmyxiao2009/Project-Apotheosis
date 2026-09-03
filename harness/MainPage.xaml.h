@@ -47,6 +47,11 @@ namespace Harness {
         // deferral(见 App.xaml.cpp 注释——这是真正可靠的挂起前落盘点,取代 VisibilityChanged 那种
         // fire-and-forget)。
         void FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDeferral^ deferral);
+        // Apotheosis (event-driven present): the engine asked to be presented. Always arrives on
+        // the UI thread (PresentWakeThunk in MainPage.xaml.cpp marshals the driver callback, which
+        // may fire on the engine thread or on a raster worker). Rate-limits and schedules one
+        // composite; never touches the engine itself.
+        void OnPresentWake();
 
     private:
         // ---- 工具栏 ----
@@ -256,6 +261,20 @@ namespace Harness {
         void StartLiveMode();
         void StopLiveMode();
         void OnLiveTick(Platform::Object^ sender, Platform::Object^ e);
+        // Apotheosis (event-driven present, THREADED-COMPOSITOR-PLAN.md C5): the tick body, shared
+        //   by the old 200 ms timer and the wake path — one WebCoreLiveTick on the engine thread
+        //   plus the UI-thread continuation that presents it. Sets m_liveBusy; UI thread only.
+        void DispatchLiveFrame();
+        // Dispatch one composite if the rate limit allows, otherwise arm m_wakeTimer for the
+        //   remainder. Called by OnPresentWake, the wake timer and the frame continuation.
+        void ScheduleWakeComposite();
+        void OnWakeTimer(Platform::Object^ sender, Platform::Object^ e);
+        // 1 s safety net: composites what no wake signalled, self-heals a lost m_liveBusy and
+        //   keeps the memory sampling of the old tick going. Slows to 5 s while nothing changes.
+        void OnFallbackTick(Platform::Object^ sender, Platform::Object^ e);
+        // Register/unregister the driver wake callback (engine-thread post) and swap the live
+        //   loop between the event-driven path and the old fixed 200 ms timer.
+        void ApplyEventPresentSetting();
         // 输入法:点中可编辑元素后唤起屏幕键盘;键入转发给引擎活会话。
         void OnImeTextChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::TextChangedEventArgs^ e);
         void OnImeKeyDown(Platform::Object^ sender, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e);
@@ -450,5 +469,15 @@ namespace Harness {
         unsigned m_lastFrameHash { 0 };      // 上一帧哈希(判断画面是否变化)
         int m_liveStaticTicks { 0 };         // 连续静止帧数,达阈值停帧
         int m_liveTotalTicks { 0 };          // 连续动画的累计帧数;超阈值降帧率(防永久动画耗电)
+        // Apotheosis (event-driven present): the live loop is driven by engine wake-ups instead of
+        //   the 200 ms timer. m_wakeTimer is the one-shot that enforces the ~16 ms minimum gap
+        //   between presents, m_fallbackTimer the 1 s safety net. All of these are UI-thread only.
+        Windows::UI::Xaml::DispatcherTimer^ m_wakeTimer;
+        Windows::UI::Xaml::DispatcherTimer^ m_fallbackTimer;
+        bool m_wakePending { false };            // a wake arrived that no composite has served yet
+        unsigned long long m_lastPresentMs { 0 };// GetTickCount64() when the last frame came back
+        unsigned m_lastPresentDurMs { 0 };       // its engine-side cost — the rate limit follows it
+        int m_fallbackStaticTicks { 0 };         // consecutive frames with nothing new (200 ms -> 1 s -> 5 s)
+        bool m_eventPresent { true };            // settings.ini eventpresent, DEVELOPER toggle, default on
     };
 }

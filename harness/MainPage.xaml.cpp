@@ -2228,6 +2228,47 @@ void MainPage::ApplyThreadedRasterSetting()
     WebEngine::instance().post([en]() { try { WebCoreSetThreadedRaster(en); } catch (...) {} });
 }
 
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
+//   The engine calls PresentWakeThunk whenever something wants to be presented. It may run on the
+//   ENGINE thread (every WebCore invalidation) or on a RASTER WORKER (a tile replay landing), so
+//   all it is allowed to do is post: CoreDispatcher is agile, RunAsync is fire-and-forget, and the
+//   whole live-loop state (m_liveBusy, the timers, the rate limit) lives on the UI thread where
+//   OnPresentWake then runs. No engine call, no wait — 线程铁律 intact in both directions.
+//   Both globals are written on the UI thread before the callback is registered on the engine one.
+static Platform::Agile<Windows::UI::Core::CoreDispatcher^> g_wakeDispatcher;
+static Platform::Agile<Harness::MainPage^> g_wakePage;
+
+static void PresentWakeThunk(void*)
+{
+    Windows::UI::Core::CoreDispatcher^ disp = g_wakeDispatcher.Get();
+    if (!disp) return;
+    Platform::Agile<Harness::MainPage^> self = g_wakePage;
+    try {
+        disp->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self]() {
+            Harness::MainPage^ s = self.Get();
+            if (s) s->OnPresentWake();
+        }));
+    } catch (...) {}
+}
+
+// DEVELOPER toggle "Event-driven present" (default ON). On: the driver wakes us and the 200 ms
+//   live tick is replaced by wake + 1 s fallback. Off: the callback is unregistered (the engine
+//   then does not even arm its atomic) and StartLiveMode goes back to the fixed timer — the old
+//   code path is kept intact on purpose, it is the fallback if the event path misbehaves on device.
+//   UI thread; the registration itself is posted to the engine thread as the ABI demands.
+void MainPage::ApplyEventPresentSetting()
+{
+    g_wakeDispatcher = this->Dispatcher;
+    g_wakePage = this;
+    const bool on = m_eventPresent;
+    WebEngine::instance().post([on]() {
+        try { WebCoreSetPresentRequestCallback(on ? &PresentWakeThunk : nullptr, nullptr); } catch (...) {}
+    });
+    // Re-arm the loop in the new mode (StartLiveMode picks the timers apart); if no session is
+    // live it is a no-op and the next StartLiveMode does it.
+    if (m_sessionActive) { StopLiveMode(); StartLiveMode(); }
+}
+
 // 自由滚动:内容区 ManipulationDelta(去掉 ScrollViewer 后,触摸不再被吞)。单指拖拽的累计 ΔY → 引擎滚动。
 // TranslateInertia 让松手后继续惯性滚(ManipulationDelta 在惯性期持续触发)。点击经 Tapped 走(手势识别器
 // 区分点按 vs 拖拽,小位移=Tapped、越阈值=Manipulation,不会冲突)。
@@ -2813,7 +2854,12 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
     });
 }
 
-// ---- 实时渲染循环:低帧率驱动引擎推进动画/SPA 渐进挂载 ----
+// ---- 实时渲染循环:唤醒驱动(默认)/ 低帧率定时器(回退)推进动画/SPA 渐进挂载 ----
+// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): the loop used to be a fixed 200 ms DispatcherTimer
+//   that composited whether or not anything had changed. It now runs on engine wake-ups
+//   (WebCoreSetPresentRequestCallback -> PresentWakeThunk -> OnPresentWake), rate-limited to one
+//   present per ~16 ms, with a 1 s fallback tick as the safety net for anything not signalled.
+//   The old timer path is kept and is used when the DEVELOPER toggle is off.
 void MainPage::StartLiveMode()
 {
     if (!m_sessionActive || !m_appForeground) return;
@@ -2825,6 +2871,26 @@ void MainPage::StartLiveMode()
     m_liveBusyAge = 0;
     m_liveStaticTicks = 0;
     m_liveTotalTicks = 0;
+    if (m_eventPresent) {
+        // 事件驱动:没有固定帧率。兜底 tick 负责自愈 + 内存采样 + 补没被信号覆盖的变化,
+        // 刚有活动时按 200ms(=旧 tick,给 setTimeout 动画/在途图片留出 RunLoop::cycle),
+        // 画面静下来后 1s,再静下来 5s(见 OnFallbackTick)。
+        if (m_liveTimer) m_liveTimer->Stop();
+        m_fallbackStaticTicks = 0;
+        if (!m_fallbackTimer) {
+            m_fallbackTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+            m_fallbackTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnFallbackTick);
+        }
+        Windows::Foundation::TimeSpan fb; fb.Duration = 2000000LL;   // 200ms
+        m_fallbackTimer->Interval = fb;
+        m_fallbackTimer->Start();
+        // 交互/导航之后立刻出一帧(旧路径要等 200ms),限流仍然生效。
+        m_wakePending = true;
+        ScheduleWakeComposite();
+        return;
+    }
+    if (m_fallbackTimer) m_fallbackTimer->Stop();
+    if (m_wakeTimer) m_wakeTimer->Stop();
     if (!m_liveTimer) {
         m_liveTimer = ref new Windows::UI::Xaml::DispatcherTimer();
         m_liveTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnLiveTick);
@@ -2837,7 +2903,88 @@ void MainPage::StartLiveMode()
 void MainPage::StopLiveMode()
 {
     if (m_liveTimer) m_liveTimer->Stop();
+    if (m_fallbackTimer) m_fallbackTimer->Stop();
+    if (m_wakeTimer) m_wakeTimer->Stop();
+    m_wakePending = false;
 }
+
+// 引擎说"有东西要呈现"(UI 线程,PresentWakeThunk 转投而来)。只做限流 + 排帧,绝不碰引擎。
+void MainPage::OnPresentWake()
+{
+    if (!m_eventPresent) return;
+    m_fallbackStaticTicks = 0;   // 有活动 → 兜底 tick 回到快节奏(OnFallbackTick 里定档)
+    m_wakePending = true;
+    ScheduleWakeComposite();
+}
+
+// 排一帧:满足最小间隔就立刻投引擎,否则用一次性定时器补齐剩下的时间。UI 线程。
+void MainPage::ScheduleWakeComposite()
+{
+    if (!m_eventPresent || !m_wakePending) return;
+    if (m_liveBusy) return;                 // 上一帧还没回;它回来时会重新排
+    if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
+    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
+    if (m_wakeTimer && m_wakeTimer->IsEnabled) return;   // 已经排好队了
+    // 最小间隔 16ms(≈60Hz)。上一帧比这贵 → 按上一帧的耗时来(占空比 ≤50%,别把这台机器打满:
+    // github 那种"每帧都请求渲染更新"的页面否则会从 5fps 直接变成背靠背合成)。上限 200ms = 旧 tick。
+    // 连续动画 150 帧(≈30s)无交互 → 至少 1s 一帧,搬的是旧 tick 的防永久动画降速。
+    unsigned minGap = 16;
+    if (m_lastPresentDurMs > minGap) minGap = (m_lastPresentDurMs > 200) ? 200 : m_lastPresentDurMs;
+    if (m_liveTotalTicks >= 150) minGap = 1000;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG since = (now >= m_lastPresentMs) ? (now - m_lastPresentMs) : 0;
+    if (since >= minGap) {
+        m_wakePending = false;
+        DispatchLiveFrame();
+        return;
+    }
+    if (!m_wakeTimer) {
+        m_wakeTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        m_wakeTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnWakeTimer);
+    }
+    Windows::Foundation::TimeSpan ts; ts.Duration = (long long)(minGap - since) * 10000LL;
+    m_wakeTimer->Interval = ts;
+    m_wakeTimer->Start();
+}
+
+void MainPage::OnWakeTimer(Platform::Object^, Platform::Object^)
+{
+    if (m_wakeTimer) m_wakeTimer->Stop();   // 一次性
+    ScheduleWakeComposite();
+}
+
+// 1s 兜底:没被信号覆盖的变化、丢掉的 RunAsync(自愈)、内存采样都靠它。静止久了降到 5s。
+void MainPage::OnFallbackTick(Platform::Object^, Platform::Object^)
+{
+    if (!m_eventPresent) { if (m_fallbackTimer) m_fallbackTimer->Stop(); return; }
+    if (!m_sessionActive || !m_appForeground) return;
+    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
+        || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) { StopLiveMode(); return; }
+    if (m_loading || m_interacting) return;
+    if (m_liveBusy) {
+        // 30 × 1s = 旧 tick 的 30s 自愈(150 × 200ms):真丢了的 RunAsync,不是慢帧。
+        if (++m_liveBusyAge < 30) return;
+        m_liveBusy = false;
+    }
+    m_liveBusyAge = 0;
+    // 节奏阶梯。唤醒覆盖不到的东西只有这条路:WTF 定时器(setTimeout 动画)、在途图片/子资源的
+    // 完成回调 —— 它们都要靠 WebCoreLiveTick 里的 RunLoop::cycle 才被取走。所以刚有变化时按
+    // 200ms(和旧 tick 一样),连续 5 帧没变化降到 1s,再 10 帧没变化降到 5s(近乎全静默)。
+    const long long want = (m_fallbackStaticTicks < 5) ? 2000000LL
+                         : ((m_fallbackStaticTicks < 15) ? 10000000LL : 50000000LL);
+    if (m_fallbackTimer && m_fallbackTimer->Interval.Duration != want) {
+        Windows::Foundation::TimeSpan iv; iv.Duration = want;
+        m_fallbackTimer->Interval = iv;   // 重设会重启计时,正是想要的
+    }
+    m_wakePending = true;
+    ScheduleWakeComposite();
+}
+
 void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
 {
     if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
@@ -2855,6 +3002,12 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
         m_liveBusy = false;                // 卡过久 → RunAsync 很可能丢了,自愈不死循环
     }
     m_liveBusyAge = 0;
+    DispatchLiveFrame();
+}
+
+// 一帧:引擎线程 WebCoreLiveTick + UI 线程呈现。两条路(固定 tick / 唤醒)共用,调用方负责守卫与限流。
+void MainPage::DispatchLiveFrame()
+{
     m_liveBusy = true;
     unsigned long long mySeq = m_opSeq;    // 只读不自增:实时帧是被动的,绝不能作废正在进行的真操作
     bool present = m_gpuPresent;
@@ -2865,7 +3018,9 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
         if (!s0 || !s0->m_appForeground) return;   // 已切后台:别在 PLM 冻结风险下跑 JS+绘制(m_liveBusy 由恢复时 StartLiveMode 清)
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999; unsigned hash = 0; int pending = 0;
+        const ULONGLONG t0 = GetTickCount64();
         try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
+        const unsigned durMs = (unsigned)(GetTickCount64() - t0);   // 事件驱动的限流按它走
         // Apotheosis (MEMORY-PLAN.md §3/§4): sample here, on the engine thread, not in the UI
         // continuation below — WebCoreGetMemoryStats()/WebCoreSetMemoryPressure() must never be
         // called from the UI thread, and the UI thread must never wait on the engine.
@@ -2875,9 +3030,11 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
         int rcCopy = rc; unsigned hashCopy = hash; int pendingCopy = pending;
         try {
             disp->RunAsync(CoreDispatcherPriority::Low,
-                ref new DispatchedHandler([self, rgba, rcCopy, hashCopy, pendingCopy, mySeq, present]() {
+                ref new DispatchedHandler([self, rgba, rcCopy, hashCopy, pendingCopy, mySeq, present, durMs]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     s->m_liveBusy = false;
+                    s->m_lastPresentMs = GetTickCount64();
+                    s->m_lastPresentDurMs = durMs;
                     if (s->m_opSeq != mySeq) return;   // 期间发生了导航/滚动/点击/超时 → 丢弃这帧旧像素(防闪回旧页)
                     if (!s->m_sessionActive || s->m_loading || s->m_interacting || !s->m_appForeground) return;
                     if (rcCopy != 0) {
@@ -2891,7 +3048,12 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                     // Apotheosis (M4): the mem-tick line moved to the engine-thread part of this
                     // tick, where the engine-side numbers can be read (EngineMemStats()).
                     if (hashCopy == s->m_lastFrameHash) {        // 画面没变:连续静止则停帧省电
-                        if (pendingCopy > 0) {
+                        if (s->m_eventPresent) {
+                            // 事件驱动:静止不停循环——唤醒随时会来,只让兜底 tick 逐步降速。
+                            // 还有图片/子资源在途 → 保持快节奏,它们的完成回调要 RunLoop::cycle 取。
+                            if (pendingCopy > 0) s->m_fallbackStaticTicks = 0;
+                            else ++s->m_fallbackStaticTicks;
+                        } else if (pendingCopy > 0) {
                             s->m_liveStaticTicks = 0;            // 仍有图片/子资源在途:继续 tick,等待完成回调和解码
                             int ticks = ++s->m_liveTotalTicks;
                             if (ticks == 150 && s->m_liveTimer) {
@@ -2900,20 +3062,23 @@ void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
                             }
                             if (ticks >= 300)
                                 s->StopLiveMode();
-                            return;
+                        } else if (++s->m_liveStaticTicks >= 40)
+                            s->StopLiveMode();                   // ~8s 静止 → 停,给慢图片/解码留余量
+                    } else {
+                        s->m_liveStaticTicks = 0;
+                        s->m_fallbackStaticTicks = 0;
+                        s->m_lastFrameHash = hashCopy;
+                        s->PresentSoftwareFrame(rgba);
+                        // 永久动画防失控:连续动画超 ~150 帧(旧路径 30s)无交互 → 降到 ~1fps(不硬停,免得
+                        // 动画卡死;事件驱动路径由 ScheduleWakeComposite 的 minGap 实现同一条规则);
+                        // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复快帧率。
+                        if (++s->m_liveTotalTicks == 150 && !s->m_eventPresent && s->m_liveTimer) {
+                            Windows::Foundation::TimeSpan slow; slow.Duration = 10000000LL;   // 1s ≈ 1fps
+                            s->m_liveTimer->Interval = slow;
                         }
-                        if (++s->m_liveStaticTicks >= 40) s->StopLiveMode();   // ~8s 静止 → 停,给慢图片/解码留余量
-                        return;
                     }
-                    s->m_liveStaticTicks = 0;
-                    s->m_lastFrameHash = hashCopy;
-                    s->PresentSoftwareFrame(rgba);
-                    // 永久动画防失控:连续动画超 ~150 帧(30s)无交互 → 降到 ~1fps(不硬停,免得动画卡死);
-                    // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复 200ms。
-                    if (++s->m_liveTotalTicks == 150 && s->m_liveTimer) {
-                        Windows::Foundation::TimeSpan slow; slow.Duration = 10000000LL;   // 1s ≈ 1fps
-                        s->m_liveTimer->Interval = slow;
-                    }
+                    // 事件驱动:这一帧跑的时候又来了唤醒(动画页每帧都会) → 按限流排下一帧。
+                    if (s->m_eventPresent && s->m_wakePending) s->ScheduleWakeComposite();
                 }));
         } catch (...) {}
     });
@@ -3513,6 +3678,7 @@ void MainPage::ApplySettings()
     UpdateScrollFab();
     ApplyPrefetchSetting();
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
+    ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     if (!m_instantPan) InstantPanReset();    // Apotheosis: switching it off must clear a live preview
     if (UaBtn) {
@@ -3546,6 +3712,7 @@ void MainPage::LoadSettings()
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
+            else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
@@ -3573,6 +3740,7 @@ void MainPage::SaveSettings()
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
+    s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
@@ -3597,6 +3765,7 @@ void MainPage::ShowSettings()
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
     if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
+    if (SetEventPresentSwitch) SetEventPresentSwitch->IsOn = m_eventPresent;
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
@@ -3636,6 +3805,7 @@ void MainPage::HideSettings()
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
     if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
+    if (SetEventPresentSwitch) m_eventPresent = SetEventPresentSwitch->IsOn;
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetUaCustomBox) {
@@ -3681,6 +3851,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
+    { L"事件驱动呈现", L"Event-driven present" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
