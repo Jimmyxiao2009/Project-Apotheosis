@@ -178,6 +178,9 @@ namespace Harness {
         // Apotheosis: fix the pinch anchor (once per gesture) from a ContentArea DIP position;
         //   fills m_focalX/Y (transform centre) and m_focalPx/Py (engine pixels for the commit).
         void SetPinchAnchor(double dipX, double dipY);
+        // Apotheosis: ease the preview from where the fingers left it to the scale we commit
+        //   (overview below 1:1, ±6 % snap), then call PinchCommit. Composition-thread animation.
+        void SpringBackZoom(float targetLive, float commitScale);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
@@ -279,6 +282,10 @@ namespace Harness {
         // 捏合锚点。手势开始时固定一次(SetPinchAnchor),期间不再跟随焦点移动。
         double m_focalX { 360 }, m_focalY { 540 };  // 显示层 DIP(= ScaleTransform 中心)
         int    m_focalPx { 360 }, m_focalPy { 540 };// 同一点的引擎视口像素(= WebCoreSetPageScale 焦点)
+        // 预览缩放变换(每次手势新建;松手后的回弹动画作用在它上面)+ 回弹 Storyboard/目标尺度。
+        Windows::UI::Xaml::Media::ScaleTransform^ m_zoomTransform;
+        Windows::UI::Xaml::Media::Animation::Storyboard^ m_zoomSpring;
+        float m_springTargetLive { 1.0f };
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)
         double m_dragLastY { 0 };     // 上次指针 Y(算增量)

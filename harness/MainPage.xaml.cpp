@@ -531,6 +531,14 @@ static const int kW = 720, kH = 1080;
 //   只是把同一张页面从左上角画小 —— 右边永远是空白。和手机浏览器一样，fit-to-width 即最小缩放。
 static const float kMinPageScale = 1.0f;
 static const float kMaxPageScale = 6.0f;
+// Apotheosis: the LIVE preview may go below the committed minimum — pinching out past 1:1 shows
+//   the page smaller for orientation ("where am I on this page?"). Nothing is committed there:
+//   on release the preview springs back to kMinPageScale (SpringBackZoom) and 1.0 goes to the
+//   engine, so the rule above (fit-to-width is the smallest rendered scale) still holds.
+static const float kMinLiveScale = 0.5f;
+// Spring-back animation on the preview transform. Short enough to feel like a release, long
+//   enough to read as a movement rather than a jump; runs on the composition thread.
+static const int kZoomSpringMs = 180;
 // 松手后 |scale − 1| ≤ 6 % 直接吸附到精确 1.0：捏合是浮点乘积的累积，靠手指几乎不可能正好回到
 //   1:1，实机表现为“怎么捏都回不到原始大小、总停在某个缩放级别”。
 static const float kPageScaleSnapTol = 0.06f;
@@ -1440,9 +1448,9 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             SetPinchAnchor(e->Position.X, e->Position.Y);
         }
         if (ds > 0.0f) m_liveScale *= ds;
-        float total = m_pageScale * m_liveScale;          // 钳总缩放到 [kMinPageScale,kMaxPageScale]
+        float total = m_pageScale * m_liveScale;          // 钳总缩放到 [kMinLiveScale,kMaxPageScale]
         if (m_pageScale > 0.0f) {
-            if (total < kMinPageScale) m_liveScale = kMinPageScale / m_pageScale;
+            if (total < kMinLiveScale) m_liveScale = kMinLiveScale / m_pageScale;
             if (total > kMaxPageScale) m_liveScale = kMaxPageScale / m_pageScale;
         }
         ApplyLiveZoom();
@@ -1497,8 +1505,17 @@ void MainPage::SetPinchAnchor(double dipX, double dipY)
 {
     auto layer = PresentLayer();
     double lx = dipX, ly = dipY;
+    // A spring-back may still be running (pinch again within kZoomSpringMs): stop it, keep the
+    //   scale it was heading for, and drop its pending commit — this gesture will commit instead.
+    if (m_zoomSpring != nullptr) {
+        try { m_zoomSpring->Stop(); } catch (...) {}   // Stop() does not raise Completed
+        m_zoomSpring = nullptr;
+        m_liveScale = m_springTargetLive;
+    }
     // TransformToVisual would fold in a RenderTransform still sitting on the layer, so drop it
-    //   first — at pinch start m_liveScale is 1.0, i.e. that transform is the identity anyway.
+    //   first. A fresh transform per gesture also keeps a finished animation from holding its
+    //   value on the old one (FillBehavior=HoldEnd would swallow later writes to ScaleX).
+    m_zoomTransform = nullptr;
     GpuPanel->RenderTransform = nullptr;
     RenderImage->RenderTransform = nullptr;
     if (layer != nullptr && layer != static_cast<Windows::UI::Xaml::FrameworkElement^>(ContentArea)) {
@@ -1525,11 +1542,59 @@ void MainPage::SetPinchAnchor(double dipX, double dipY)
 //   只变换已渲染像素 → 捏合期间 60fps 丝滑,不调引擎。
 void MainPage::ApplyLiveZoom()
 {
-    auto t = ref new Windows::UI::Xaml::Media::ScaleTransform();
-    t->ScaleX = m_liveScale; t->ScaleY = m_liveScale;
-    t->CenterX = m_focalX; t->CenterY = m_focalY;
-    if (m_gpuPresent) GpuPanel->RenderTransform = t;
-    else RenderImage->RenderTransform = t;
+    // Apotheosis: one transform per gesture, kept as a member — SpringBackZoom animates it.
+    if (m_zoomTransform == nullptr) m_zoomTransform = ref new Windows::UI::Xaml::Media::ScaleTransform();
+    m_zoomTransform->ScaleX = m_liveScale; m_zoomTransform->ScaleY = m_liveScale;
+    m_zoomTransform->CenterX = m_focalX; m_zoomTransform->CenterY = m_focalY;
+    if (m_gpuPresent) { GpuPanel->RenderTransform = m_zoomTransform; RenderImage->RenderTransform = nullptr; }
+    else              { RenderImage->RenderTransform = m_zoomTransform; GpuPanel->RenderTransform = nullptr; }
+}
+
+// Apotheosis: ease the preview from the scale the fingers left it at to the scale we are about to
+//   commit, then commit. Two cases produce a gap: pinching out below 1:1 (overview — the engine
+//   never renders below fit-to-width, so the preview must come back up) and the ±6 % snap to 1.0.
+//   Committing straight away would show that gap as a jump; a short ease-out reads as a release.
+//   The animation targets a RenderTransform, so it runs on the composition thread — the UI thread
+//   is free and the engine is called exactly once, when the animation is done.
+void MainPage::SpringBackZoom(float targetLive, float commitScale)
+{
+    using namespace Windows::UI::Xaml::Media::Animation;
+    m_springTargetLive = targetLive;
+    auto sb = ref new Storyboard();
+    Windows::Foundation::TimeSpan ts; ts.Duration = (long long)kZoomSpringMs * 10000;   // 100 ns units
+    for (int i = 0; i < 2; ++i) {
+        auto a = ref new DoubleAnimation();
+        a->To = ref new Platform::Box<double>((double)targetLive);   // IReference<double>
+
+        a->Duration = Windows::UI::Xaml::Duration(ts);
+        a->EnableDependentAnimation = true;
+        auto ease = ref new QuadraticEase();
+        ease->EasingMode = EasingMode::EaseOut;
+        a->EasingFunction = ease;
+        Storyboard::SetTarget(a, m_zoomTransform);
+        Storyboard::SetTargetProperty(a, i == 0 ? "ScaleX" : "ScaleY");
+        sb->Children->Append(a);
+    }
+    m_zoomSpring = sb;
+    Platform::Agile<MainPage^> self(this);
+    sb->Completed += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+        [self, targetLive, commitScale](Platform::Object^, Platform::Object^) {
+            MainPage^ s = self.Get(); if (!s) return;
+            if (s->m_zoomSpring == nullptr) return;         // stopped by a new pinch
+            try { s->m_zoomSpring->Stop(); } catch (...) {} // release HoldEnd on ScaleX/ScaleY
+            s->m_zoomSpring = nullptr;
+            s->m_liveScale = 1.0f;
+            if (s->m_zoomTransform != nullptr) {            // Stop() snapped it back — hold the target
+                s->m_zoomTransform->ScaleX = targetLive;
+                s->m_zoomTransform->ScaleY = targetLive;
+            }
+            s->PinchCommit(commitScale, s->m_focalPx, s->m_focalPy);
+        });
+    try { sb->Begin(); } catch (...) {                      // no animation? commit right away
+        m_zoomSpring = nullptr;
+        m_liveScale = 1.0f;
+        PinchCommit(commitScale, m_focalPx, m_focalPy);
+    }
 }
 
 // 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
@@ -1537,13 +1602,20 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
 {
     if (!m_pinching) return;
     m_pinching = false;
-    float live = m_liveScale; m_liveScale = 1.0f;
+    float live = m_liveScale;
     // 钳到引擎区间 + 吸附 1:1（见 SnapAndClampPageScale）。没有吸附时，捏回去总差百分之几，
     //   页面永远停在“差不多但不是原始大小”的状态上，且误差每次捏合继续累积。
     float newScale = SnapAndClampPageScale(m_pageScale * live);
     // The focal was converted to engine pixels once, when the anchor was fixed (SetPinchAnchor):
     //   it is the very point the preview transform is centred on, so the engine frame lands
     //   exactly where the preview showed it.
+    float targetLive = (m_pageScale > 0.0f) ? newScale / m_pageScale : 1.0f;
+    float gap = (targetLive > live) ? (targetLive - live) : (live - targetLive);
+    if (m_zoomTransform != nullptr && gap > 0.005f) {
+        SpringBackZoom(targetLive, newScale);   // commits when the animation is done
+        return;
+    }
+    m_liveScale = 1.0f;
     PinchCommit(newScale, m_focalPx, m_focalPy);
 }
 
