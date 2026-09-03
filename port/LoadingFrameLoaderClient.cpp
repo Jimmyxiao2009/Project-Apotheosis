@@ -19,6 +19,7 @@
 #include <WebCore/FrameLoaderTypes.h>             // PolicyAction enum
 #include <WebCore/FrameNetworkingContext.h>
 #include <WebCore/HistoryItem.h>
+#include <WebCore/LayoutMilestone.h>          // Apotheosis (M4): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/LocalFrame.h>
 #include <WebCore/NetworkStorageSession.h>
 #include "PortNetworkStorageSession.h"   // cookie 持久化:真 storageSession
@@ -351,8 +352,16 @@ void LoadingFrameLoaderClient::dispatchDidFinishDocumentLoad()
     perfNavDocumentReady();   // Apotheosis (M4): DOM ready (ms_net_load fallback)
 }
 
-void LoadingFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone>)
+// Apotheosis (M4 load timeline): t_firstpaint. Only the milestones a client requested via
+// Page::addLayoutMilestones ever reach here - WebCoreDriver::buildSession asks for
+// DidFirstVisuallyNonEmptyLayout, which LocalFrameView fires the first time the laid-out
+// content qualifies as visually non-empty. That is the engine-side "something readable is on
+// screen" mark, and it costs nothing when perf logging is off (perfNavVisuallyNonEmpty
+// returns on the g_perfOn branch).
+void LoadingFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone> milestones)
 {
+    if (milestones.contains(LayoutMilestone::DidFirstVisuallyNonEmptyLayout))
+        perfNavVisuallyNonEmpty();
 }
 
 void LoadingFrameLoaderClient::dispatchDidReachVisuallyNonEmptyState()

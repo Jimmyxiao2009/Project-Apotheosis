@@ -121,6 +121,7 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
 #include "PortChromeClient.h"            // WebCorePort::PortChromeClient(开合成,捕获根图层)
+#include <WebCore/LayoutMilestone.h>     // Apotheosis (M4 load timeline): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
 #include <WebCore/LocalFrame.h>          // WebCore::LocalFrame
@@ -506,6 +507,10 @@ static void presentWakeDisarm()
 // 子资源加载诊断计数(主文档 + CSS/JS/图片全经 ResourceHandle 桥)。由 ResourceHandle.cpp
 // 的 WebCorePortBumpLoad 累加;在 WebCoreLoadUrl 开头清零,结束并入 g_lastDiag,真机定位"子资源不加载"。
 static int g_loadStarted = 0, g_loadResponse = 0, g_loadComplete = 0, g_loadFail = 0;
+// Apotheosis (M4 load timeline): <script> elements in the document at the last writeDiag()
+// - the cheapest proxy for "how much script did this page bring" (this tree has no counter of
+// executed scripts, and adding one would mean a hook in JSC). Read by perfEnd() into n_scripts.
+static int g_lastScriptCount = -1;
 extern "C" void WebCorePortBumpLoad(int kind)
 {
     switch (kind) {
@@ -1038,6 +1043,10 @@ static void __cdecl crashLogPureCallHandler()
 // only at phase boundaries, never inside the per-pixel loops.
 // Engine thread only, like the g_last* diagnostics above (deliberately lock-free).
 static std::string g_perfPath;
+// Apotheosis (M4 load timeline): LocalState\stage.txt, derived from crash.txt's directory in
+// WebCoreSetCrashLogPath (the same trick console.txt uses below). One human-readable
+// "timeline ..." line per navigation, so the load breakdown is legible without perf.csv.
+static std::string g_stagePath;
 static bool g_perfOn = false;
 static bool g_perfHeaderDone = false;
 
@@ -1046,7 +1055,11 @@ static const char* const kPerfHeader =
     "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
     "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
     "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver,"
-    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked,wake_count\n";
+    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked,wake_count,"
+    // Apotheosis (M4 load timeline): ms since dispatchDidStartProvisionalLoad, empty = never
+    // reached; the n_* pair is cumulative at t_load. ms_style_layout / ms_paint above already
+    // are the per-navigation sums, so the timeline does not duplicate them.
+    "t_firstbyte,t_commit,t_dcl,t_firstpaint,t_load,t_settle,n_scripts,n_subres\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1085,6 +1098,16 @@ struct PerfRow {
     // animating one; a number much larger than 1 means the arming atomic stopped collapsing bursts.
     // -1 = the operation was not a tick (only WebCoreLiveTick reads and resets the counter).
     int wakes = -1;
+    // Apotheosis (M4 load timeline): milestones of one navigation, in ms since the provisional
+    // load started (perfSinceNavStart); -1 = never reached -> empty CSV cell. t_commit and t_dcl
+    // get no fields of their own: the CSV prints netCommit and domReady in those columns.
+    //   t_firstbyte  main-resource response headers (WebCorePortNetTiming, curl didReceiveHeader)
+    //   t_firstpaint DidFirstVisuallyNonEmptyLayout  (dispatchDidReachLayoutMilestone)
+    //   t_load       load event                      (dispatchDidFinishLoad)
+    //   t_settle     pumpLoop returned               (buildSession: the driver calls it done)
+    double tFirstByte = -1, tFirstPaint = -1, tLoad = -1, tSettle = -1;
+    // Cumulative at t_load: <script> elements in the document, subresources completed.
+    int nScripts = -1, nSubres = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1202,12 +1225,23 @@ static void perfFlushLocked()
             perfFmtI(rs[k], sizeof rs[k], rasterVals[k]);
         char wk[12];
         perfFmtI(wk, sizeof wk, r.wakes);
-        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        // M4 load timeline (t_commit = netCommit, t_dcl = domReady - no second copy is kept).
+        const double tlVals[6] = { r.tFirstByte, r.netCommit, r.domReady, r.tFirstPaint,
+                                   r.tLoad, r.tSettle };
+        char tl[6][16];
+        for (int k = 0; k < 6; ++k)
+            perfFmtD(tl[k], sizeof tl[k], tlVals[k]);
+        char nsc[12], nsr[12];
+        perfFmtI(nsc, sizeof nsc, r.nScripts);
+        perfFmtI(nsr, sizeof nsr, r.nSubres);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                         "%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
             nt[0], nt[1], nt[2], nt[3], hv,
-            rs[0], rs[1], rs[2], rs[3], rs[4], wk);
+            rs[0], rs[1], rs[2], rs[3], rs[4], wk,
+            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1220,6 +1254,33 @@ static void perfFlush()
         return;
     perfFlushLocked();
     g_perfFlushBusy.store(0);
+}
+
+// Apotheosis (M4 load timeline): the same navigation timeline as one readable line in
+// LocalState\stage.txt - the file the device scripts already pull and a human can read on the
+// phone. One open/append/close per navigation (never per frame), so the cost is irrelevant.
+// "-" means the milestone was never reached, which is itself the interesting case: a load that
+// never paints has fp=-, one that never fires a load event has load=-.
+static void perfWriteStageTimeline(const PerfRow& r)
+{
+    if (g_stagePath.empty())
+        return;
+    const double vals[6] = { r.tFirstByte, r.netCommit, r.domReady, r.tFirstPaint, r.tLoad, r.tSettle };
+    char t[6][16];
+    for (int k = 0; k < 6; ++k) {
+        if (vals[k] < 0)
+            std::snprintf(t[k], sizeof t[k], "-");
+        else
+            std::snprintf(t[k], sizeof t[k], "%.0f", vals[k]);
+    }
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "timeline url=%s firstbyte=%s commit=%s dcl=%s fp=%s load=%s settle=%s"
+                     " total=%.0f subres=%d/%d scripts=%d\n",
+        r.url, t[0], t[1], t[2], t[3], t[4], t[5],
+        r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts);
+    std::fclose(fp);
 }
 
 static void perfBegin(const char* kind, const char* url, int w, int h)
@@ -1256,6 +1317,12 @@ static void perfEnd()
         g_perfCur.subStarted = g_loadStarted;
         g_perfCur.subOk = g_loadComplete;
         g_perfCur.subFail = g_loadFail;
+        // M4 load timeline: n_subres is the count at t_load (set in perfNavLoadEvent); a
+        // navigation that never fired a load event falls back to the final count so the column
+        // is not blank for a page that did render. n_scripts comes from the last writeDiag().
+        if (g_perfCur.nSubres < 0)
+            g_perfCur.nSubres = g_loadComplete;
+        g_perfCur.nScripts = g_lastScriptCount;
     } else
         g_perfCur.frames = 1;
     g_perfCur.gpu = g_gpuActive ? 1 : 0;
@@ -1264,6 +1331,8 @@ static void perfEnd()
         g_perfCur.w = g_session->w;
         g_perfCur.h = g_session->h;
     }
+    if (g_perfOpIsNav)
+        perfWriteStageTimeline(g_perfCur);
     if (g_perfRows < kPerfRingSize)
         g_perfRing[g_perfRows++] = g_perfCur;
     // Flush on nav completion, and every 32 rows so a crash mid-session (seen
@@ -1284,6 +1353,16 @@ struct PerfOpGuard {
 static double perfSinceNavStart()
 {
     return (MonotonicTime::now() - (g_perfNavT0Set ? g_perfNavT0 : g_perfOpStart)).milliseconds();
+}
+
+// Apotheosis (M4 load timeline): t_settle - the moment the driver itself calls the navigation
+// done, i.e. pumpLoop returned in buildSession (load event, settle cap or watchdog). Whatever
+// is left between it and ms_total is the final layout, link extraction and first paint.
+static void perfMarkNavSettled()
+{
+    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav || g_perfCur.tSettle >= 0)
+        return;
+    g_perfCur.tSettle = perfSinceNavStart();
 }
 
 // Navigation phase marks — LoadingFrameLoaderClient is the only observer of these
@@ -1322,6 +1401,21 @@ void perfNavLoadEvent()
     if (!g_perfOn || !g_perfInOp || g_perfCur.netLoad >= 0)
         return;
     g_perfCur.netLoad = perfSinceNavStart();
+    // M4 load timeline: t_load, plus the subresource count reached by the load event.
+    g_perfCur.tLoad = g_perfCur.netLoad;
+    g_perfCur.nSubres = g_loadComplete;
+}
+
+// t_firstpaint. WebCore fires DidFirstVisuallyNonEmptyLayout from
+// LocalFrameView::fireLayoutRelatedMilestonesIfNeeded as soon as the content qualifies as
+// visually non-empty - the engine-side answer to "when did something readable appear", and far
+// cheaper than scanning pixels. buildSession asks for it via Page::addLayoutMilestones (WebCore
+// only tracks milestones a client requested).
+void perfNavVisuallyNonEmpty()
+{
+    if (!g_perfOn || !g_perfInOp || g_perfCur.tFirstPaint >= 0)
+        return;
+    g_perfCur.tFirstPaint = perfSinceNavStart();
 }
 
 } // namespace WebCorePort
@@ -1340,6 +1434,11 @@ extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double co
         return;
     if (g_perfCur.netTtfb >= 0)   // first main-resource report of this navigation wins
         return;
+    // M4 load timeline: t_firstbyte. The response headers of the main resource are in hand
+    // right now, so the wall clock since the provisional load started IS time-to-first-byte as
+    // the navigation experienced it - net_ttfb below is curl's own per-transfer number and
+    // excludes everything WebKit did before the request reached curl.
+    g_perfCur.tFirstByte = perfSinceNavStart();
     g_perfCur.netDns = dnsMs;
     g_perfCur.netConnect = connectMs;
     g_perfCur.netTls = tlsMs;
@@ -1900,6 +1999,7 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     int jsEnabled = document.settings().isScriptEnabled() ? 1 : 0;
     int canExec = view.frame().script().canExecuteScripts(ReasonForCallingCanExecuteScripts::NotAboutToExecuteScript) ? 1 : 0;
     unsigned scriptCount = document.scripts()->length();
+    g_lastScriptCount = static_cast<int>(scriptCount);   // Apotheosis (M4): n_scripts column
     // SPA 挂载判据(纯 DOM 读,不依赖 JS eval):#root 子元素数>0 = React/Vue 挂载了;=0 = 没挂(白屏);
     // bodyKids = body 子元素数。配合 loads=/js= 分清:模块没下来(loads.F 高)vs 下来没执行(rootKids=0)vs 挂了。
     int rootKids = -1;
@@ -2114,6 +2214,10 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setMediaEnabled(false);
 #endif
     page->setIsVisible(true);
+    // Apotheosis (M4 load timeline): opt in to the visually-non-empty milestone. WebCore only
+    // computes and dispatches the milestones a client asked for (Page::requestedLayoutMilestones),
+    // and this is the mark behind the t_firstpaint column and the stage.txt timeline line.
+    page->addLayoutMilestones({ LayoutMilestone::DidFirstVisuallyNonEmptyLayout });
 
     RefPtr<LocalFrame> localMainFrame = page->localMainFrame();
     if (!localMainFrame)
@@ -2149,6 +2253,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
         pumpLoop(*localMainFrame, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ false,
                  /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
     }
+    perfMarkNavSettled();   // Apotheosis (M4 load timeline): t_settle
 
     // Apotheosis (M3): "no load event" is not "nothing loaded". An ImageDocument (main
     // frame navigated to an image URL) and, occasionally, an HTML page hit by the
@@ -2466,6 +2571,9 @@ void WebCoreSetCrashLogPath(const char* path)
         g_consolePath = (slash == std::string::npos) ? std::string("console.txt")
             : crashPath.substr(0, slash + 1) + "console.txt";
         g_consolePathReady = true;
+        // Apotheosis (M4 load timeline): stage.txt lives in the same LocalState directory.
+        g_stagePath = (slash == std::string::npos) ? std::string("stage.txt")
+            : crashPath.substr(0, slash + 1) + "stage.txt";
         FILE* probe = nullptr;
         if (fopen_s(&probe, g_consolePath.c_str(), "rb") == 0 && probe) {
             g_consoleFileExisted = true;   // opt-in: console.txt already exists on disk

@@ -145,12 +145,21 @@ static void SetupRuntimeEnv()
     } catch (...) {}
 }
 
+// Apotheosis (M4 load timeline): stage.txt used to be truncated on every write ("where are we
+// now"). The driver now appends one "timeline url=... firstbyte=... commit=... " line per
+// navigation to the same file (WebCoreDriver.cpp perfWriteStageTimeline), which a truncating
+// writer would wipe on the very next after-load line. So: truncate ONCE per process, append
+// afterwards. The file stays small - two harness lines plus one driver line per navigation -
+// and the device scripts that tail it keep working, now with history instead of one line.
 static void WriteStage(const char* stage)
 {
     try {
+        static bool truncated = false;
         std::wstring d = LocalStateDir();
         if (d.empty()) return;
-        std::ofstream f(WideToUtf8(d) + "\\stage.txt", std::ios::binary | std::ios::trunc);
+        auto mode = truncated ? std::ios::app : std::ios::trunc;
+        truncated = true;
+        std::ofstream f(WideToUtf8(d) + "\\stage.txt", std::ios::binary | mode);
         if (f) f << stage << "\n";
     } catch (...) {}
 }

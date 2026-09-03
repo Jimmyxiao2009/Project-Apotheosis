@@ -20,5 +20,7 @@ void perfNavStart();         // dispatchDidStartProvisionalLoad — starts the n
 void perfNavCommit();        // dispatchDidCommitLoad          — ms_net_commit
 void perfNavDocumentReady(); // dispatchDidFinishDocumentLoad   — DOM ready (ms_net_load fallback)
 void perfNavLoadEvent();     // dispatchDidFinishLoad           — ms_net_load
+void perfNavVisuallyNonEmpty(); // dispatchDidReachLayoutMilestone(DidFirstVisuallyNonEmptyLayout)
+                                // = t_firstpaint (the load timeline: something readable is on screen)
 
 } // namespace WebCorePort
