@@ -565,13 +565,13 @@ static const float kMinLiveScale = 0.5f;
 // Spring-back animation on the preview transform. Short enough to feel like a release, long
 //   enough to read as a movement rather than a jump; runs on the composition thread.
 static const int kZoomSpringMs = 180;
-// Apotheosis: snap band around 1:1. Generous (±20 %) on purpose — 1:1 is the one scale that
-//   matters (fit-to-width, crisp text), a pinch is an accumulating product of float deltas, and
-//   without a wide band the page ends up parked at 0.94 or 1.07 forever, with the error growing
-//   on every gesture. Below 0.8 (and above 1.2) the user clearly wants a different scale, so the
-//   real value is committed. The 180 ms spring animates the preview across the snap gap so it
-//   reads as a release rather than a jump (SpringBackZoom).
-static const float kPageScaleSnapTol = 0.20f;
+// Apotheosis: snap band around 1:1. Generous (±33 %, package 7 feedback widened it from ±20 %) on
+//   purpose — 1:1 is the one scale that matters (fit-to-width, crisp text), a pinch is an
+//   accumulating product of float deltas, and without a wide band the page ends up parked at 0.94
+//   or 1.07 forever, with the error growing on every gesture. Below 0.67 (and above 1.33) the user
+//   clearly wants a different scale, so the real value is committed. The 180 ms spring animates the
+//   preview across the snap gap so it reads as a release rather than a jump (SpringBackZoom).
+static const float kPageScaleSnapTol = 0.33f;
 
 // 钳到引擎接受的区间，并把接近 1:1 的结果吸附成精确 1.0。
 static float SnapAndClampPageScale(float s)
