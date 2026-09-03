@@ -628,7 +628,8 @@
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>
                     <Button Tag="checkupdate" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="检查更新(GitHub Releases)"/>
 
-                    <TextBlock Text="EdgeHTML Reborn / Apotheosis — WebKit (WebCore) 2.52.4 — ARM32 UWP"
+                    <!-- App 版本由 ShowSettings 从包清单填进来(见 code-behind)。 -->
+                    <TextBlock x:Name="AboutFooterText" Text="EdgeHTML Reborn / Apotheosis — WebKit (WebCore) 2.52.4 — ARM32 UWP"
                                Foreground="#FF80868B" FontSize="12" TextWrapping="Wrap" Margin="0,22,0,24"/>
                 </StackPanel>
             </ScrollViewer>

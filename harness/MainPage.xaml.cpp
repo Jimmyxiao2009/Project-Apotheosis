@@ -2565,12 +2565,16 @@ void MainPage::ShowSettings()
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
-    if (VersionText) {
-        auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
-        std::wstring v = (g_lang == L"en" ? L"Version " : L"版本 ") + std::to_wstring(pv.Major) + L"." + std::to_wstring(pv.Minor)
-                       + L"." + std::to_wstring(pv.Build) + L"." + std::to_wstring(pv.Revision);
-        VersionText->Text = ref new String(v.c_str());
-    }
+    // Apotheosis: app version comes from the package manifest, so it can never drift from what
+    //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
+    //   version in the footer is the one the port is pinned to.
+    auto pv = Windows::ApplicationModel::Package::Current->Id->Version;
+    std::wstring ver = std::to_wstring(pv.Major) + L"." + std::to_wstring(pv.Minor)
+                     + L"." + std::to_wstring(pv.Build) + L"." + std::to_wstring(pv.Revision);
+    if (VersionText) VersionText->Text = ref new String((W8(L"版本 ", L"Version ") + ver).c_str());
+    if (AboutFooterText)
+        AboutFooterText->Text = ref new String((L"EdgeHTML Reborn / Apotheosis — App " + ver
+                                                + L" — WebKit (WebCore) 2.52.4 — ARM32 UWP").c_str());
     SettingsPage->Visibility = Windows::UI::Xaml::Visibility::Visible;
     StopLiveMode();
 }
