@@ -567,6 +567,44 @@ static float SnapAndClampPageScale(float s)
     return s;
 }
 
+// Apotheosis (package 7 feedback: "clamp the live preview to the document edges like
+//   Safari/Chrome — content never leaves the viewport at >=1, centred below 1, small rubber-band
+//   allowed"): how far the live pinch preview is allowed to drift from a clean anchor-only scale,
+//   in DIP, before ClampZoomAxis below starts pulling it back. Eased to 0 by SpringBackZoom on
+//   release, exactly like the ±33% page-scale snap band above is eased.
+static const double kZoomRubberBandDip = 40.0;
+
+// One axis of the live-pinch clamp (ApplyLiveZoom). Works entirely in engine px (WebCoreGetScrollState
+//   units), like ClampPanRemainder/InstantPanBy — the caller converts the result to DIP.
+//
+//   ScaleTransform(center=anchor, scale=live) with no translate shows document range
+//   [scrollPos + anchor*(1-1/live), scrollPos + anchor + (viewSize-anchor)/live] (T=0 baseline;
+//   see the derivation in ApplyLiveZoom's comment). For live>=1 that range is provably a SUBSET of
+//   what the anchor-only scale already covers for any anchor position — scaling a rect up about an
+//   interior point never shrinks it — so this only has to catch the case the pure geometry cannot
+//   see: the *document* itself runs out (scrollPos/contentSize say so) before the raster does, e.g.
+//   already scrolled to an edge. For live<1 there is no way to avoid a gap (the image is genuinely
+//   smaller than the viewport), so instead of leaving it wherever the anchor happens to sit
+//   (asymmetric, package-7's "right side never fills"), just recentre it.
+static double ClampZoomAxis(double scrollPos, double contentSize, double anchor, double viewSize,
+                             double live, double rubberBandPx, bool haveScroll)
+{
+    if (!(viewSize > 1.0) || !(live > 0.0))
+        return 0.0;
+    if (live < 1.0)   // overview: centre the shrunk frame instead of tracking the document
+        return (viewSize / 2.0 - anchor) * (1.0 - live);
+    if (!haveScroll || !(contentSize > 0.0))
+        return 0.0;   // no WebCoreGetScrollState answer yet this gesture: nothing to clamp against
+    const double lo = scrollPos + anchor * (1.0 - 1.0 / live);
+    const double hi = scrollPos + anchor + (viewSize - anchor) / live;
+    double corrDoc = 0.0;
+    if (lo < -rubberBandPx) corrDoc = (-rubberBandPx) - lo;                        // pull the window forward
+    else if (hi > contentSize + rubberBandPx) corrDoc = (contentSize + rubberBandPx) - hi;  // pull it back
+    if (corrDoc == 0.0)
+        return 0.0;
+    return -corrDoc * live;   // a screen translate T shifts the shown doc window by -T/live
+}
+
 // 取一块引擎渲染输出缓冲(kW*kH*4)。直呈现模式:UI 从不读这块 RGBA(BlitToBitmap 空转、各回调按
 // m_gpuPresent 跳过贴图),且引擎线程严格串行 → 全程复用同一块,免去热路径(实时 tick/拖拽滚动/
 // 逐键重绘)每帧 3MB 的分配+清零。软件模式必须每次新分配:UI 线程可能还拿着上一帧在读。
@@ -2058,7 +2096,32 @@ void MainPage::ApplyLiveZoom()
     if (m_zoomTransform == nullptr) m_zoomTransform = ref new Windows::UI::Xaml::Media::ScaleTransform();
     m_zoomTransform->ScaleX = m_liveScale; m_zoomTransform->ScaleY = m_liveScale;
     m_zoomTransform->CenterX = m_focalX; m_zoomTransform->CenterY = m_focalY;
-    ApplyPresentTransform();   // Apotheosis: composes with the instant-pan translation (normally identity here)
+
+    // Apotheosis (package 7): clamp/centre the preview against the document edges (ClampZoomAxis).
+    //   Reuses m_panTranslate — InstantPanBy() never touches it while m_pinching is set, and
+    //   ApplyPresentTransform already composes it after the scale ("145b29f", scale first so the
+    //   translation stays screen-space) — so a pinch can borrow it for the whole gesture and
+    //   PinchCommit()/SpringBackZoom already know how to zero it back out on release.
+    auto layer = PresentLayer();
+    double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
+    double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
+    if (!(lw > 1.0)) lw = ContentArea->ActualWidth;
+    if (!(lh > 1.0)) lh = ContentArea->ActualHeight;
+    const double fx = (lw > 1.0) ? lw / (double)kW : 1.0;
+    const double fy = (lh > 1.0) ? lh / (double)kH : 1.0;
+    const double viewW = (m_scrollStateValid && m_viewW > 0) ? (double)m_viewW : (double)kW;
+    const double viewH = (m_scrollStateValid && m_viewH > 0) ? (double)m_viewH : (double)kH;
+    const double rbX = kZoomRubberBandDip / (fx > 0.0001 ? fx : 1.0);
+    const double rbY = kZoomRubberBandDip / (fy > 0.0001 ? fy : 1.0);
+    const double tx = ClampZoomAxis((double)m_scrollX, (double)m_contentW, (double)m_focalPx, viewW,
+                                     (double)m_liveScale, rbX, m_scrollStateValid);
+    const double ty = ClampZoomAxis((double)m_scrollY, (double)m_contentH, (double)m_focalPy, viewH,
+                                     (double)m_liveScale, rbY, m_scrollStateValid);
+    if (m_panTranslate == nullptr) m_panTranslate = ref new Windows::UI::Xaml::Media::TranslateTransform();
+    m_panTranslate->X = tx * fx;
+    m_panTranslate->Y = ty * fy;
+
+    ApplyPresentTransform();   // composes m_zoomTransform (scale) + m_panTranslate (clamp) in order
 }
 
 // Apotheosis: ease the preview from the scale the fingers left it at to the scale we are about to
@@ -2086,18 +2149,40 @@ void MainPage::SpringBackZoom(float targetLive, float commitScale)
         Storyboard::SetTargetProperty(a, i == 0 ? "ScaleX" : "ScaleY");
         sb->Children->Append(a);
     }
+    // Apotheosis (package 7 rubber-band): ease whatever ClampZoomAxis left on m_panTranslate back
+    //   to 0 in the same spring — the committed frame lands with no translate at all (PinchCommit
+    //   zeroes it), so anything left over here must be gone before that swap or the release reads
+    //   as a jump instead of a settle.
+    if (m_panTranslate != nullptr && (m_panTranslate->X != 0.0 || m_panTranslate->Y != 0.0)) {
+        for (int i = 0; i < 2; ++i) {
+            auto a = ref new DoubleAnimation();
+            a->To = ref new Platform::Box<double>(0.0);
+            a->Duration = Windows::UI::Xaml::Duration(ts);
+            a->EnableDependentAnimation = true;
+            auto ease = ref new QuadraticEase();
+            ease->EasingMode = EasingMode::EaseOut;
+            a->EasingFunction = ease;
+            Storyboard::SetTarget(a, m_panTranslate);
+            Storyboard::SetTargetProperty(a, i == 0 ? "X" : "Y");
+            sb->Children->Append(a);
+        }
+    }
     m_zoomSpring = sb;
     Platform::Agile<MainPage^> self(this);
     sb->Completed += ref new Windows::Foundation::EventHandler<Platform::Object^>(
         [self, targetLive, commitScale](Platform::Object^, Platform::Object^) {
             MainPage^ s = self.Get(); if (!s) return;
             if (s->m_zoomSpring == nullptr) return;         // stopped by a new pinch
-            try { s->m_zoomSpring->Stop(); } catch (...) {} // release HoldEnd on ScaleX/ScaleY
+            try { s->m_zoomSpring->Stop(); } catch (...) {} // release HoldEnd on ScaleX/ScaleY/X/Y
             s->m_zoomSpring = nullptr;
             s->m_liveScale = 1.0f;
             if (s->m_zoomTransform != nullptr) {            // Stop() snapped it back — hold the target
                 s->m_zoomTransform->ScaleX = targetLive;
                 s->m_zoomTransform->ScaleY = targetLive;
+            }
+            if (s->m_panTranslate != nullptr) {             // same — the rubber-band always ends at 0
+                s->m_panTranslate->X = 0.0;
+                s->m_panTranslate->Y = 0.0;
             }
             s->PinchCommit(commitScale, s->m_focalPx, s->m_focalPy);
         });
