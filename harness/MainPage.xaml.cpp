@@ -551,21 +551,27 @@ static const int kW = 720, kH = 1080;
 // Apotheosis (M4): 页面缩放边界不能超出引擎侧 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
 //   自己把 scale 钳到 [0.5, 6.0]；harness 若用更宽的上下界，超界的捏合会被引擎悄悄改成别的值，
 //   harness 记的 m_pageScale 就和 Page::pageScaleFactor() 对不上（下次捏合基准错）。子区间是安全的。
-// 下界取 1.0（而非引擎允许的 0.5）：布局按视口宽度做，缩到 1 以下并不会重排出更多内容，
-//   只是把同一张页面从左上角画小 —— 右边永远是空白。和手机浏览器一样，fit-to-width 即最小缩放。
-static const float kMinPageScale = 1.0f;
+// Apotheosis: the committed minimum is the engine's own minimum, 0.5 — pinching out past 1:1
+//   and letting go now really zooms out, so a long page can be surveyed at a glance.
+//   NOTE what "below 1:1" does and does not do: layout still happens at the engine viewport
+//   width (kW), so zooming out does NOT reflow a wider desktop layout into the extra room —
+//   the same fit-to-width page is simply drawn smaller from the top-left and the right side
+//   stays blank. A real wide-viewport "desktop layout" mode (lay out at, say, 980 px and let
+//   the page scale be the fit-to-width ratio) is a separate feature; see PERF-OPTIONS.md.
+static const float kMinPageScale = 0.5f;
 static const float kMaxPageScale = 6.0f;
-// Apotheosis: the LIVE preview may go below the committed minimum — pinching out past 1:1 shows
-//   the page smaller for orientation ("where am I on this page?"). Nothing is committed there:
-//   on release the preview springs back to kMinPageScale (SpringBackZoom) and 1.0 goes to the
-//   engine, so the rule above (fit-to-width is the smallest rendered scale) still holds.
+// The live preview never needs to go below what we can commit any more.
 static const float kMinLiveScale = 0.5f;
 // Spring-back animation on the preview transform. Short enough to feel like a release, long
 //   enough to read as a movement rather than a jump; runs on the composition thread.
 static const int kZoomSpringMs = 180;
-// 松手后 |scale − 1| ≤ 6 % 直接吸附到精确 1.0：捏合是浮点乘积的累积，靠手指几乎不可能正好回到
-//   1:1，实机表现为“怎么捏都回不到原始大小、总停在某个缩放级别”。
-static const float kPageScaleSnapTol = 0.06f;
+// Apotheosis: snap band around 1:1. Generous (±20 %) on purpose — 1:1 is the one scale that
+//   matters (fit-to-width, crisp text), a pinch is an accumulating product of float deltas, and
+//   without a wide band the page ends up parked at 0.94 or 1.07 forever, with the error growing
+//   on every gesture. Below 0.8 (and above 1.2) the user clearly wants a different scale, so the
+//   real value is committed. The 180 ms spring animates the preview across the snap gap so it
+//   reads as a release rather than a jump (SpringBackZoom).
+static const float kPageScaleSnapTol = 0.20f;
 
 // 钳到引擎接受的区间，并把接近 1:1 的结果吸附成精确 1.0。
 static float SnapAndClampPageScale(float s)
