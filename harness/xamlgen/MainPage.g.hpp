@@ -314,18 +314,29 @@ static ::Platform::String^ __MainPageXaml() {
                  bottom-anchored right above the nav bar (visually exactly where it was), and the
                  code-behind reveals it while a page is loading / for ~2 s aft)APO",
         LR"APO(er any TitleText write
-                 (the code uses TitleText as a toast in ~25 places) and fades it away when idle —
-                 see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
+                 (the code uses TitleText as a toast in ~25 places), then, after idle, SLIDES IT DOWN
+                 behind the URL bar — see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
+                 TitleRowShift is the row's own TranslateTransform (Y: 0 = resting/visible, +Height =
+                 fully tucked under the bottom chrome); the nav bar Grid (Grid.Row="1" below) is
+                 declared AFTER this content Grid as a RootGrid child, so it paints on top and covers
+                 the row the moment the slide carries it past the row/row boundary — no separate
+                 z-index needed, just this declaration order.
                  ★ Overlay and not a chrome row ON PURPOSE: a bottom chrome that shrinks would grow
                  the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
                  the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
                  AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
                  strip it covers is handed back to the page exactly like the loading strip's at the
                  top edge — ApplyViewInsets() gives ContentBorder a bottom margin for the software
-                 path, while the GPU panel keeps its size and simply has that strip covered.
+                 path, while the GPU panel keeps its size and simply has that strip covered. The inset
+                 (titleH in ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide
+                 position, so it flips exactly when the row is fully shown/hidden — same as before,
+                 unaffected by swapping the fade for a slide.
                  Explicit Height so ApplyViewInsets' titleH is deterministic before the first
                  arrange (same technique as Progress/stripH). -->
             <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch" Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="TitleRowShift" Y="0" />
+                </Border.RenderTransform>
                 <Grid Margin="14,0,14,0">
                     <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                     <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0" />
@@ -379,13 +390,13 @@ static ::Platform::String^ __MainPageXaml() {
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
-                    <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0" />
+                    <)APO",
+        LR"APO(TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0" />
                     <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent" Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8" InputScope="Url" Text="" PlaceholderText="搜索或输入网址" />
                     <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
                          plain Button.Content centred on the font's line box, not its glyph ink, which
                          sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
-          )APO",
-        LR"APO(               2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
+                         2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
                          own ink still sits ~2px low inside it (font-specific) — nudge up. -->
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="42" Height="40" Padding="0" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
                         <TextBlock x:Name="UrlActionGlyph" Text="↻" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource Accent}" Margin="0,-2,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" />
@@ -440,7 +451,8 @@ static ::Platform::String^ __MainPageXaml() {
                             </Button>
                             <Button x:Name="FwdBtn" Grid.Column="1" Style="{StaticResource QuickBtn}" IsEnabled="False">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
+                                    <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSi)APO",
+        LR"APO(ze="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
                                     <TextBlock Text="前进" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
                             </Button>
@@ -449,8 +461,7 @@ static ::Platform::String^ __MainPageXaml() {
                                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
                                     <TextBlock Text="刷新" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
-                        )APO",
-        LR"APO(    </Button>
+                            </Button>
                             <Button Grid.Column="3" Tag="bookmark" Style="{StaticResource QuickBtn}" x:Name="_ev5">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
                                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Warm}" />
@@ -512,7 +523,8 @@ static ::Platform::String^ __MainPageXaml() {
                                 <TextBlock Text="书签" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Button Tag="history" Style="{StaticResource MenuRow}" x:Name="_ev14">
+                        <Button Tag="history" Style="{StaticRes)APO",
+        LR"APO(ource MenuRow}" x:Name="_ev14">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="历史记录" VerticalAlignment="Center" />
@@ -523,8 +535,7 @@ static ::Platform::String^ __MainPageXaml() {
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载内容" VerticalAlignment="Center" />
                             </StackPanel>
-                  )APO",
-        LR"APO(      </Button>
+                        </Button>
 
                         <Border Height="1" Background="{StaticResource Sep}" Margin="16,10,16,5" />
 
@@ -602,7 +613,8 @@ static ::Platform::String^ __MainPageXaml() {
                 <StackPanel Margin="16,14">
                     <!-- 界面语言:首启 OOBE 选定,这里可随时改(离开设置页即生效,见 HideSettings)。 -->
                     <TextBlock Text="LANGUAGE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,6,0,7" />
-                    <TextBlock Text="界面语言" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4" />
+                    <TextBlock Text="界面语言" Fo)APO",
+        LR"APO(reground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4" />
                     <ComboBox x:Name="SetLangCombo" HorizontalAlignment="Stretch">
                         <ComboBoxItem Content="中文" />
                         <ComboBoxItem Content="English" />
@@ -615,8 +627,7 @@ static ::Platform::String^ __MainPageXaml() {
                         <ComboBoxItem Content="Google" />
                         <ComboBoxItem Content="DuckDuckGo" />
                         <ComboBoxItem Content="百度" />
-                        <ComboBoxI)APO",
-        LR"APO(tem Content="Qwant" />
+                        <ComboBoxItem Content="Qwant" />
                     </ComboBox>
 
                     <TextBlock Text="主页(URL,留空用内置主页)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4" />
@@ -670,7 +681,8 @@ static ::Platform::String^ __MainPageXaml() {
                         <ComboBoxItem Content="仅 Wi-Fi" />
                         <ComboBoxItem Content="始终" />
                     </ComboBox>
-                    <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <TextBlock Text="网站可提前加载你还没点击的链接" Foreground="{StaticResource TxtLo}" FontSiz)APO",
+        LR"APO(e="13" TextWrapping="Wrap" Margin="0,4,0,0" />
 
                     <TextBlock Text="DIAGNOSTICS" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <Button Tag="export" Style="{StaticResource SetRow}" Content="导出调试日志 / 崩溃 dump" x:Name="_ev25" />
@@ -680,8 +692,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="开发者选项" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4" />
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
-                    <Togg)APO",
-        LR"APO(leSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis: 呈现线程独占交换链(引擎离屏合成 + 呈现线程平移显示),默认开;改后需重启。 -->
                     <ToggleSwitch x:Name="SetPresenterSwitch" Header="呈现线程(重启生效)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 引擎有变化才合成，代替固定 200ms tick，默认开。 -->
@@ -734,7 +745,8 @@ static ::Platform::String^ __MainPageXaml() {
                 <TextBlock Text="EdgeHTML Reborn" Foreground="{StaticResource TxtHi}" FontSize="30" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,6,0,0" />
                 <TextBlock Text="Modern web, reborn on Windows Phone" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0" />
                 <TextBlock Text="让被放弃的 Windows Phone 重新跑现代网页" Foreground="{StaticResource TxtLo}" FontSize="13" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,2,0,0" />
-                <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
+                <TextBlock Text="Choose your language · 选择语言" Foreground="{StaticResource TxtHi}" FontSize)APO",
+        LR"APO(="16" HorizontalAlignment="Center" Margin="0,44,0,18" />
                 <Border Background="{StaticResource Accent}" CornerRadius="4" Margin="0,0,0,12">
                     <Button Tag="en" Background="Transparent" Foreground="#FF07110F" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="0,16" FontSize="18" Content="English" x:Name="_ev28" />
                 </Border>
@@ -811,6 +823,7 @@ void MainPage::InitializeComponent() {
     GpuPanel = safe_cast<::Windows::UI::Xaml::Controls::SwapChainPanel^>(__root->FindName(L"GpuPanel"));
     ImeBox = safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"));
     TitleRow = safe_cast<::Windows::UI::Xaml::Controls::Border^>(__root->FindName(L"TitleRow"));
+    TitleRowShift = safe_cast<::Windows::UI::Xaml::Media::TranslateTransform^>(__root->FindName(L"TitleRowShift"));
     TitleText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"TitleText"));
     Progress = safe_cast<::Windows::UI::Xaml::Controls::ProgressBar^>(__root->FindName(L"Progress"));
     ScrollFab = safe_cast<::Windows::UI::Xaml::Controls::StackPanel^>(__root->FindName(L"ScrollFab"));
@@ -825,24 +838,24 @@ void MainPage::InitializeComponent() {
     ContentArea = safe_cast<::Windows::UI::Xaml::Controls::Grid^>(__root->FindName(L"ContentArea"));
     RenderImage = safe_cast<::Windows::UI::Xaml::Controls::Image^>(__root->FindName(L"RenderImage"));
     // ---- 挂事件 ----
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev1"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollUp);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev2"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollDown);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindPrev"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindPrev);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"MenuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnMenu);

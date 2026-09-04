@@ -359,19 +359,30 @@
                  repeats what the address bar already says. It is an OVERLAY in the content row now,
                  bottom-anchored right above the nav bar (visually exactly where it was), and the
                  code-behind reveals it while a page is loading / for ~2 s after any TitleText write
-                 (the code uses TitleText as a toast in ~25 places) and fades it away when idle —
-                 see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
+                 (the code uses TitleText as a toast in ~25 places), then, after idle, SLIDES IT DOWN
+                 behind the URL bar — see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
+                 TitleRowShift is the row's own TranslateTransform (Y: 0 = resting/visible, +Height =
+                 fully tucked under the bottom chrome); the nav bar Grid (Grid.Row="1" below) is
+                 declared AFTER this content Grid as a RootGrid child, so it paints on top and covers
+                 the row the moment the slide carries it past the row/row boundary — no separate
+                 z-index needed, just this declaration order.
                  ★ Overlay and not a chrome row ON PURPOSE: a bottom chrome that shrinks would grow
                  the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
                  the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
                  AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
                  strip it covers is handed back to the page exactly like the loading strip's at the
                  top edge — ApplyViewInsets() gives ContentBorder a bottom margin for the software
-                 path, while the GPU panel keeps its size and simply has that strip covered.
+                 path, while the GPU panel keeps its size and simply has that strip covered. The inset
+                 (titleH in ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide
+                 position, so it flips exactly when the row is fully shown/hidden — same as before,
+                 unaffected by swapping the fade for a slide.
                  Explicit Height so ApplyViewInsets' titleH is deterministic before the first
                  arrange (same technique as Progress/stripH). -->
             <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
                     Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
+                <Border.RenderTransform>
+                    <TranslateTransform x:Name="TitleRowShift" Y="0"/>
+                </Border.RenderTransform>
                 <Grid Margin="14,0,14,0">
                     <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                     <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0"/>

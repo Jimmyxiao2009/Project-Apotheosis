@@ -514,10 +514,14 @@ namespace Harness {
         double m_lastTitleH { 0.0 };
         bool   m_insetsValid { false };
         // Apotheosis (2837ce0 review item 1): auto-hide of the title/toast row. The timer is the
-        //   one-shot "idle for ~2 s → fade out"; the token drops a fade that a later Reveal()
-        //   overtook (Storyboard::Completed still fires after Stop()).
+        //   one-shot "idle for ~2 s → slide away"; the token drops a slide-up/slide-down that a later
+        //   Reveal()/Collapse() overtook (Storyboard::Completed still fires after Stop()).
+        // Apotheosis (title row slide, review 2026-09-04): renamed from m_titleFade — the row no
+        //   longer fades (Opacity), it slides on TitleRowShift (its TranslateTransform.Y); the same
+        //   single Storyboard^ slot is reused for whichever direction is currently running (Reveal
+        //   stops a live Collapse and vice versa, so only one is ever active).
         Windows::UI::Xaml::DispatcherTimer^ m_titleHideTimer;
-        Windows::UI::Xaml::Media::Animation::Storyboard^ m_titleFade;
+        Windows::UI::Xaml::Media::Animation::Storyboard^ m_titleAnim;
         unsigned long long m_titleRowToken { 0 };
         bool m_titleRowShown { true };   // matches the XAML (TitleRow starts visible)
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;

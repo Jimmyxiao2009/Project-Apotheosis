@@ -110,6 +110,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::SwapChainPanel^ GpuPanel;
         private: ::Windows::UI::Xaml::Controls::TextBox^ ImeBox;
         private: ::Windows::UI::Xaml::Controls::Border^ TitleRow;
+        private: ::Windows::UI::Xaml::Media::TranslateTransform^ TitleRowShift;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TitleText;
         private: ::Windows::UI::Xaml::Controls::ProgressBar^ Progress;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ ScrollFab;

@@ -608,10 +608,11 @@ static const float kMinLiveScale = 0.5f;
 static const int kZoomSpringMs = 180;
 // Apotheosis (2837ce0 review item 1): the title/toast row shows while a page loads and for this
 //   long after the load finishes (or after any other TitleText write — the code uses it as a toast
-//   bar), then fades out and gives its strip back to the page. Long enough to read a page title or
-//   a "Bookmarked" toast, short enough that the row is gone by the time the user starts reading.
+//   bar), then slides down behind the URL bar and gives its strip back to the page. Long enough to
+//   read a page title or a "Bookmarked" toast, short enough that the row is gone by the time the
+//   user starts reading.
 static const int kTitleRowIdleMs = 2000;
-static const int kTitleRowFadeMs = 200;
+static const int kTitleRowSlideMs = 200;   // Apotheosis (title row slide): was kTitleRowFadeMs
 // Apotheosis: snap band around 1:1. Generous (±33 %, package 7 feedback widened it from ±20 %) on
 //   purpose — 1:1 is the one scale that matters (fit-to-width, crisp text), a pinch is an
 //   accumulating product of float deltas, and without a wide band the page ends up parked at 0.94
@@ -1138,20 +1139,62 @@ void MainPage::ShiftSuggestPanel(double y)
 }
 
 // Apotheosis (2837ce0 review item 1): show the title/toast row and, unless a page is loading, arm
-//   the grace period after which it fades away again. Called from SetLoading() and — through the
+//   the grace period after which it slides away again. Called from SetLoading() and — through the
 //   TitleText::Text property-changed callback registered in the constructor — from every one of the
 //   ~25 places that write a page title or a toast into TitleText, so none of them had to change.
 //   UI THREAD ONLY.
 void MainPage::RevealTitleRow()
 {
     if (!TitleRow) return;
-    ++m_titleRowToken;                 // a fade still running (or its Completed) is stale now
-    if (m_titleFade != nullptr) { try { m_titleFade->Stop(); } catch (...) {} m_titleFade = nullptr; }
-    TitleRow->Opacity = 1.0;
+    ++m_titleRowToken;                 // a slide still running (or its Completed) is stale now
+    if (m_titleAnim != nullptr) { try { m_titleAnim->Stop(); } catch (...) {} m_titleAnim = nullptr; }
     if (!m_titleRowShown) {
         m_titleRowShown = true;
         TitleRow->Visibility = Windows::UI::Xaml::Visibility::Visible;
         ApplyViewInsets();             // the row takes its strip back from the content area
+        // Slide up from behind the URL bar. Row height first (ActualHeight -> declared Height ->
+        //   literal, same fallback chain ApplyViewInsets uses for titleH): jump TitleRowShift there
+        //   so there is no visible pop, then animate back to rest (Y=0).
+        if (TitleRowShift) {
+            double rowH = TitleRow->ActualHeight;
+            if (!(rowH > 0.0)) {
+                const double declared = TitleRow->Height;
+                rowH = (declared > 0.0 && declared < 1.0e6) ? declared : 24.0;
+            }
+            TitleRowShift->Y = rowH;
+            try {
+                using namespace Windows::UI::Xaml::Media::Animation;
+                auto sb = ref new Storyboard();
+                auto a = ref new DoubleAnimation();
+                a->To = ref new Platform::Box<double>(0.0);
+                Windows::Foundation::TimeSpan ts; ts.Duration = (long long)kTitleRowSlideMs * 10000;
+                a->Duration = Windows::UI::Xaml::Duration(ts);
+                auto ease = ref new QuadraticEase();
+                ease->EasingMode = EasingMode::EaseOut;
+                a->EasingFunction = ease;
+                Storyboard::SetTarget(a, TitleRowShift);
+                Storyboard::SetTargetProperty(a, "Y");
+                sb->Children->Append(a);
+                const unsigned long long token = m_titleRowToken;
+                Platform::Agile<MainPage^> self(this);
+                sb->Completed += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                    [self, token](Platform::Object^, Platform::Object^) {
+                        MainPage^ s = self.Get(); if (!s) return;
+                        if (s->m_titleRowToken != token) return;   // overtaken by another Reveal/Collapse
+                        s->m_titleAnim = nullptr;
+                    });
+                m_titleAnim = sb;
+                sb->Begin();
+            } catch (...) {
+                m_titleAnim = nullptr;
+                TitleRowShift->Y = 0.0;   // land in the resting position even if the storyboard failed
+            }
+        }
+    } else if (TitleRowShift) {
+        // Defensive: Stop() above may have interrupted a slide-down mid-flight. Storyboard::Stop()
+        //   is expected to restore the pre-animation local value (Y=0, the row's resting position),
+        //   but the row is staying shown either way, so make sure of it rather than trust that.
+        TitleRowShift->Y = 0.0;
     }
     if (m_titleHideTimer == nullptr) {
         m_titleHideTimer = ref new Windows::UI::Xaml::DispatcherTimer();
@@ -1180,10 +1223,16 @@ void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
     CollapseTitleRow();
 }
 
-// Fade out over kTitleRowFadeMs, then leave the layout entirely (Visibility=Collapsed) so
-//   ApplyViewInsets' titleH drops to 0 and the page gets the strip. Opacity is an independently
-//   animatable property, so the fade runs on the composition thread — no UI-thread work per frame,
-//   which matters on this device. If the Storyboard cannot start, collapse right away.
+// Apotheosis (title row slide, review 2026-09-04): slide TitleRowShift's Y from 0 to +rowHeight
+//   over kTitleRowSlideMs with an ease-in (starts slow, accelerates away — reads as the row being
+//   pulled down out of sight rather than just stopping), then leave the layout entirely
+//   (Visibility=Collapsed) so ApplyViewInsets' titleH drops to 0 and the page gets the strip back.
+//   TranslateTransform.Y is an independently animatable property, so this runs on the composition
+//   thread — no UI-thread work per frame, which matters on this device. Row height comes from the
+//   same ActualHeight -> declared Height -> literal fallback chain ApplyViewInsets uses for titleH,
+//   so the row always ends up fully behind the URL bar (nav Grid, Grid.Row="1", painted after this
+//   content Grid — see the XAML comment) regardless of whether layout has run an arrange pass yet.
+//   If the Storyboard cannot start, collapse right away.
 void MainPage::CollapseTitleRow()
 {
     if (!TitleRow || !m_titleRowShown) return;
@@ -1193,29 +1242,38 @@ void MainPage::CollapseTitleRow()
     auto finish = [self, token]() {
         MainPage^ s = self.Get(); if (!s) return;
         if (s->m_titleRowToken != token) return;                 // overtaken by a Reveal()
-        s->m_titleFade = nullptr;
+        s->m_titleAnim = nullptr;
         s->m_titleRowShown = false;
         if (s->TitleRow) {
             s->TitleRow->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
-            s->TitleRow->Opacity = 1.0;                          // ready for the next Reveal()
+            if (s->TitleRowShift) s->TitleRowShift->Y = 0.0;     // ready for the next Reveal()
         }
         s->ApplyViewInsets();                                    // hand the strip to the content area
     };
+    if (!TitleRowShift) { finish(); return; }   // no transform to animate -> collapse right away
     try {
+        double rowH = TitleRow->ActualHeight;
+        if (!(rowH > 0.0)) {
+            const double declared = TitleRow->Height;
+            rowH = (declared > 0.0 && declared < 1.0e6) ? declared : 24.0;
+        }
         auto sb = ref new Storyboard();
         auto a = ref new DoubleAnimation();
-        a->To = ref new Platform::Box<double>(0.0);
-        Windows::Foundation::TimeSpan ts; ts.Duration = (long long)kTitleRowFadeMs * 10000;
+        a->To = ref new Platform::Box<double>(rowH);
+        Windows::Foundation::TimeSpan ts; ts.Duration = (long long)kTitleRowSlideMs * 10000;
         a->Duration = Windows::UI::Xaml::Duration(ts);
-        Storyboard::SetTarget(a, TitleRow);
-        Storyboard::SetTargetProperty(a, "Opacity");
+        auto ease = ref new QuadraticEase();
+        ease->EasingMode = EasingMode::EaseIn;
+        a->EasingFunction = ease;
+        Storyboard::SetTarget(a, TitleRowShift);
+        Storyboard::SetTargetProperty(a, "Y");
         sb->Children->Append(a);
         sb->Completed += ref new Windows::Foundation::EventHandler<Platform::Object^>(
             [finish](Platform::Object^, Platform::Object^) { finish(); });
-        m_titleFade = sb;
+        m_titleAnim = sb;
         sb->Begin();
     } catch (...) {
-        m_titleFade = nullptr;
+        m_titleAnim = nullptr;
         finish();
     }
 }
