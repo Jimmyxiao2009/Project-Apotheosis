@@ -4775,25 +4775,15 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
 // pages stop scrolling. (x,y) = viewport/bitmap px, same convention as
 // WebCoreClickAt/WebCoreScrollBy/WebCoreIsScrollableAt. No session, no hit, or a
 // concurrent engine op all answer 0 — the harness then keeps its scroll routing.
-int WebCoreWantsDragAt(int x, int y)
+// Apotheosis (2026-09-04): the walk itself, factored out of WebCoreWantsDragAt() so WebCoreDragAt()
+// can ask the same question about the same point. Requires current layout (both callers run
+// updateLayoutIgnorePendingStylesheets() first) and dispatches nothing.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
 {
     using namespace WebCore;
-    if (!g_session || !g_session->mainFrame)
-        return 0;
-    if (g_inPump)
-        return 0;
-    g_inPump = true;
-    PumpGuard guard;
-
-    RefPtr<LocalFrame> lf = g_session->mainFrame;
-    RefPtr<Document> doc = lf->document();
-    if (!doc)
-        return 0;
-    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
-
-    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    RefPtr<Element> hit = doc.elementFromPoint(static_cast<double>(x), static_cast<double>(y));
     if (!hit)
-        return 0;
+        return false;
 
     // Same open-shadow descent as WebCoreIsScrollableAt: TreeScope::elementFromPoint retargets its
     // result to the scope it was called on, so on the document scope a point inside a web component
@@ -4809,26 +4799,44 @@ int WebCoreWantsDragAt(int x, int y)
         hit = WTF::move(inner);
     }
 
-    Element* root = doc->documentElement();
+    Element* root = doc.documentElement();
     const auto& names = eventNames();
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (e.get() == root || is<HTMLBodyElement>(*e))
             break;   // page-wide handlers are not a drag widget — see the comment above
         if (is<HTMLCanvasElement>(*e))
-            return 1;
+            return true;
         if (e->hasEventListeners(names.pointerdownEvent)
             || e->hasEventListeners(names.mousedownEvent)
             || e->hasEventListeners(names.touchstartEvent)
             || e->hasEventListeners(names.pointermoveEvent)
             || e->hasEventListeners(names.touchmoveEvent))
-            return 1;
+            return true;
         if (RenderObject* r = e->renderer()) {
             auto touchAction = r->style().touchAction();
             if (!touchAction.isAuto() && !touchAction.isManipulation())
-                return 1;   // none / pan-x / pan-y: the element claims the gesture
+                return true;   // none / pan-x / pan-y: the element claims the gesture
         }
     }
-    return 0;
+    return false;
+}
+
+int WebCoreWantsDragAt(int x, int y)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+    return dragWidgetAtPoint(*doc, x, y) ? 1 : 0;
 }
 
 // Apotheosis (drag as pointer events): drive one touch pan through WebCore as a left-button mouse
@@ -4837,12 +4845,15 @@ int WebCoreWantsDragAt(int x, int y)
 // internally). Returns 1 while the page owns the gesture, 0 to tell the harness to route the rest
 // of it down its normal scroll path.
 //
-// The press is the decision point. handleMousePressEvent() reports handled both when a DOM listener
-// called preventDefault() and when WebCore's own default action took the press (starting a text
-// selection, grabbing a scrollbar), so on its own it is far too eager — plain body text would claim
-// every gesture. That is why the harness only ever calls this after WebCoreWantsDragAt() has already
-// said the point belongs to a drag widget; the press result then means what it should ("something
-// took it"), and a 0 is the honest signal that nothing did.
+// The press is the decision point, and (2026-09-04) it is NOT decided by handleMousePressEvent()'s
+// result alone. That result is only true when a listener called preventDefault() or a WebCore
+// default action took the press, and the widgets this export exists for do neither: Google Maps
+// listens for pointerdown, stores the anchor and lets the event through. On device every press on
+// maps.google.com answered `handled=0`, so the gesture was handed back before a single mousemove was
+// sent. The press is therefore owned when EITHER it was handled OR the point still looks like a drag
+// widget (dragWidgetAtPoint(), the same walk WebCoreWantsDragAt() runs - the harness has already
+// asked it once at gesture start, and asking again here costs one hit test and keeps the two
+// answers from drifting apart across the press).
 //
 // Phases 1–3 are inert unless the press was taken (g_dragActive). That keeps the contract simple for
 // the caller — once the press answers 0 the whole gesture is the harness' again, and no half-drag can
@@ -4860,7 +4871,7 @@ int WebCoreWantsDragAt(int x, int y)
 // the only writable path the driver knows. Same plain-line channel as presenter-stats/pan-swap-drop
 // (no crash record, no crash-entry budget), capped so a session of panning cannot fill the file.
 // Grep for "drag-press".
-static void dragPressNote(int x, int y, bool handled, bool unwound)
+static void dragPressNote(int x, int y, bool handled, bool wants, bool own)
 {
     static int notes = 0;
     if (!g_crashLogPath[0] || notes >= 12)
@@ -4871,9 +4882,9 @@ static void dragPressNote(int x, int y, bool handled, bool unwound)
         return;
     SYSTEMTIME st;
     GetLocalTime(&st);
-    std::fprintf(fp, "drag-press %02u:%02u:%02u.%03u at=%d,%d handled=%d move buttons=%u unwound=%d\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, x, y, handled ? 1 : 0,
-        static_cast<unsigned>(handled ? kButtonsLeftDown : 0), unwound ? 1 : 0);
+    std::fprintf(fp, "drag-press %02u:%02u:%02u.%03u at=%d,%d handled=%d wants=%d own=%d move buttons=%u unwound=%d\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, x, y, handled ? 1 : 0, wants ? 1 : 0,
+        own ? 1 : 0, static_cast<unsigned>(own ? kButtonsLeftDown : 0), own ? 0 : 1);
     std::fclose(fp);
 }
 
@@ -4915,21 +4926,43 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
     bool handled = false;
 
     if (phase == 0) {
+        // Apotheosis (2026-09-04): a press left over from a gesture that was abandoned without a
+        // release turns this mousedown into a pointermove (the chorded-button rules see the pointer
+        // as already pressed), so the page would never see a press at all. Same guard, same reason,
+        // as at the top of WebCoreClickAt.
+        if (lf->eventHandler().mousePressed())
+            releaseDanglingPress(*lf, p, mods);
+        // Apotheosis (Google Maps, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
+        // the same point and the layout we just updated, BEFORE dispatching - the press itself can
+        // run script that changes the tree. See the decision below.
+        const bool wants = dragWidgetAtPoint(*doc, x, y);
         // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
         // what several widgets key their pointerdown handling off.
         DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
         lf->eventHandler().handleMouseMoveEvent(hover);
         DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
         handled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
-        g_dragActive = handled;
-        // Apotheosis (2026-09-04): a press nothing consumed still left the engine pressed. The
-        // harness stops calling us for this gesture the moment the press answers 0 (MainPage::
-        // PumpDrag drops the queued move/release), so no phase 2 ever arrives to undo it - and the
-        // stuck press then breaks every later click on the page (see releaseDanglingPress). Unwind
-        // it here, where we are the only one who knows the release will never come.
-        if (!handled)
+        // Apotheosis (Google Maps, 2026-09-04): "the press was handled" was the WRONG criterion for
+        // owning the gesture. handleMousePressEvent() reports handled only when a listener called
+        // preventDefault() or a WebCore default action took the press - and a map does neither: it
+        // listens for pointerdown, records the anchor and returns without preventing anything
+        // (preventing it would break its own click handling). Device evidence: every single
+        // drag-press line on maps.google.com read `handled=0 unwound=1`, so not one mousemove was
+        // ever dispatched, while the canvas visibly grew on first contact - the events did arrive,
+        // we just threw the gesture away one event in. The honest question is the one
+        // WebCoreWantsDragAt already answers ("does this point belong to something that drags
+        // itself?"), and the harness only calls us after it has said yes; so own the gesture when
+        // EITHER the press was handled OR the point is still a drag widget. Everything else is
+        // unchanged: phases 1-3 stay gated on g_dragActive, and a press nothing wanted is still
+        // unwound here (the harness drops the queued move/release the moment we answer 0, so no
+        // phase 2 would ever arrive to undo it, and a stuck press breaks every later click on the
+        // page - see releaseDanglingPress).
+        const bool own = handled || wants;
+        g_dragActive = own;
+        if (!own)
             releaseDanglingPress(*lf, p, mods);
-        dragPressNote(x, y, handled, !handled);
+        dragPressNote(x, y, handled, wants, own);
+        handled = own;
     } else if (phase == 1) {
         // Button held: EventHandler's m_mousePressed is still set from the press, so this is a drag
         // move, not a hover move. clickCount 0 is what a real platform move carries, and buttons=1

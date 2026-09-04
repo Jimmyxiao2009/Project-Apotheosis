@@ -223,7 +223,11 @@ int WebCoreWantsDragAt(int x, int y);
 // the page owns the gesture, 0 when it does not (the harness then routes the rest of the gesture
 // down its normal scroll path). Only the press decides: phases 1-3 are inert — and answer 0 —
 // unless the press was consumed, so an individual mousemove that the page ignores never yanks the
-// gesture away mid-pan. On a 1 return the frame is already composited/presented into outRGBA the
+// gesture away mid-pan. Apotheosis (2026-09-04): the press is owned when EITHER the engine reported
+// it handled OR the point is still a drag widget (the WebCoreWantsDragAt walk, re-run here). A map
+// that listens for pointerdown without calling preventDefault - Google Maps does exactly that -
+// answers "not handled" and would otherwise lose the whole gesture on its first event. On a 1
+// return the frame is already composited/presented into outRGBA the
 // way WebCoreWheelAt does it; outRGBA may be null (no present attempted).
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA);
 

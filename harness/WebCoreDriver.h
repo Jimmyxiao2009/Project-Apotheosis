@@ -209,6 +209,10 @@ int WebCoreWantsDragAt(int x, int y);
 // phase:0=按下 / 1=移动 / 2=抬起 / 3=取消;(x,y)=视口/位图像素,同 WebCoreClickAt/WebCoreScrollBy。
 // 返回 1 = 这次手势归页面所有,0 = 不归(harness 把余下手势走回正常滚动路径)。只有按下这一步做决定:
 // 按下未被消费时 phase 1-3 直接返回 0 且不派发,故某个页面不理会的 mousemove 不会在拖拽中途把手势夺走。
+// Apotheosis (2026-09-04): the press is owned when EITHER the engine reported it handled OR the
+// point is still a drag widget (the WebCoreWantsDragAt walk, re-run here). A map that listens for
+// pointerdown without calling preventDefault - Google Maps does exactly that - answers "not
+// handled" and would otherwise lose the whole gesture on its first event.
 // 返回 1 时已按 WebCoreWheelAt 的方式合成/呈现到 outBuf;outBuf 可为 null(则不呈现)。
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outBuf);
 
