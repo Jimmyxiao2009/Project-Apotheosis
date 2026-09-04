@@ -275,6 +275,10 @@ namespace Harness {
         // Apotheosis (review 2026-09-04 item 3): the ONE exit from a gesture - see the comment on the
         //   definition. Resets pinch, pan, nested-scroll and drag state together, whatever ended it.
         void EndGesture(GestureEnd reason);
+        // Apotheosis (review 2026-09-04 item 4): complete the suspend deferral, exactly once, on the
+        //   UI thread. Called by the engine flush's UI hop and by the 2 s guard timer, whichever
+        //   gets there first.
+        void CompleteSuspendDeferral();
         // Apotheosis (review 2026-09-03): status-bar / software-nav-bar insets from
         //   ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid bottom padding + top
         //   margin of the top-anchored chrome. UI thread only.
@@ -437,6 +441,10 @@ namespace Harness {
         //   presenter=1 keeps it - LoadSettings only ever overwrites the key it finds.
         bool m_presenterThread { false };  // settings.ini presenter
         bool m_presenterActive { false };  // WebCorePresenterActive() after WebCoreGpuInit
+        // Apotheosis (review 2026-09-04 item 4): the suspend deferral in flight, and the timer that
+        //   bounds how long the engine may keep the shell waiting for it. Both UI thread only.
+        Windows::ApplicationModel::SuspendingDeferral^ m_suspendDeferral { nullptr };
+        Windows::UI::Xaml::DispatcherTimer^ m_suspendTimer { nullptr };
         // Apotheosis (drag as pointer events): route a pan that starts over a drag widget (map,
         //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is
         //   the only way those pages can be panned at all. settings.ini dragpointer

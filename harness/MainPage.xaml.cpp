@@ -523,13 +523,57 @@ void MainPage::FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDefer
     // Apotheosis (review 2026-09-04 item 3): suspend is the last edge that can swallow a
     //   manipulation whole. VisibilityChanged normally fires first, but nothing guarantees it.
     EndGesture(GestureEnd::Suspend);
-    WebEngine::instance().post([deferral]() {
+    // Apotheosis (review 2026-09-04 item 8): stop the presenter swapping before the shell starts
+    //   tearing its swap chain down. App::OnSuspending relied on VisibilityChanged having fired
+    //   first; nothing guarantees that ordering. UI-thread export by contract (WebCoreDriver.h) -
+    //   one uncontended lock in the driver, never a WebCore call, never a wait.
+    try { WebCoreSetPresenterSuspended(1); } catch (...) {}
+
+    // Apotheosis (review 2026-09-04 item 4): the deferral is completed HERE, on the UI thread,
+    //   either when the engine's flush comes back or when a 2 s guard timer fires - whichever is
+    //   first. It used to be completed from inside the engine job, so an engine that was mid-load
+    //   (a navigation or a scroll job ahead of us in the FIFO queue) held the deferral until PLM's
+    //   few seconds ran out and the app was killed with no crash.txt - which is exactly what the
+    //   "kill without a dump" reports look like. Nothing here waits on the engine: the flush is
+    //   still posted and still runs, it just no longer decides when we answer the shell. If the
+    //   timer wins, the process is frozen mid-flush - the same outcome as today, minus the kill.
+    m_suspendDeferral = deferral;
+    if (!m_suspendTimer) {
+        m_suspendTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        m_suspendTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+            [this](Platform::Object^, Platform::Object^) { CompleteSuspendDeferral(); });
+    }
+    Windows::Foundation::TimeSpan iv; iv.Duration = 2LL * 10000000LL;   // 2 s, in 100 ns units
+    m_suspendTimer->Stop();
+    m_suspendTimer->Interval = iv;
+    m_suspendTimer->Start();
+
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    WebEngine::instance().post([disp, self]() {
         try { WebCoreFlushCookiesToDisk(); } catch (...) {}
         // Apotheosis (M4): 同理落盘性能日志 —— 环形缓冲平时只在导航完成时写盘,挂起后进程可能被
         // 系统直接终止,未落盘的行就丢了。关闭时为 no-op。
         try { WebCorePerfFlush(); } catch (...) {}
-        deferral->Complete();
+        try {
+            disp->RunAsync(CoreDispatcherPriority::High, ref new DispatchedHandler([self]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                s->CompleteSuspendDeferral();
+            }));
+        } catch (...) {}
     });
+}
+
+// Apotheosis (review 2026-09-04 item 4): idempotent, UI thread only. Whoever gets here first -
+//   the engine flush's UI hop or the 2 s guard timer - answers the shell; the other one finds the
+//   deferral gone and does nothing.
+void MainPage::CompleteSuspendDeferral()
+{
+    if (m_suspendTimer) { try { m_suspendTimer->Stop(); } catch (...) {} }
+    if (m_suspendDeferral == nullptr) return;
+    auto d = m_suspendDeferral;
+    m_suspendDeferral = nullptr;
+    try { d->Complete(); } catch (...) {}
 }
 
 // GPU 直呈现模式:引擎已 swapBuffers 到可见 GpuPanel,无需把 rgba blit 进 WriteableBitmap(RenderImage 已隐藏)。
