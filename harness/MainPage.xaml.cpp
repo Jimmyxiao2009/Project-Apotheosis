@@ -848,6 +848,11 @@ MainPage::MainPage()
         ip->Showing += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
+                // Apotheosis (2026-09-04): the title row must stay visible for as long as the
+                //   on-screen keyboard is up - it rides above the address bar through
+                //   ShiftSuggestPanel(), so hiding it while typing is what leaves the strip empty.
+                m_titleRowPinned = true;
+                RevealTitleRow();
                 if (m_urlFocused && NavBarShift) {
                     NavBarShift->Y = -e->OccludedRect.Height;
                     // Apotheosis (review 2026-09-03): the suggestion dropdown is anchored to the
@@ -861,6 +866,10 @@ MainPage::MainPage()
         ip->Hiding += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
             [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
+                // Apotheosis (2026-09-04): keyboard gone - unless the address bar still has focus
+                //   (it keeps its own pin, OnUrlLostFocus clears that), hand the row back to the
+                //   usual grace period.
+                if (!m_urlFocused) { m_titleRowPinned = false; RevealTitleRow(); }
                 if (NavBarShift && NavBarShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
                     NavBarShift->Y = 0;
                     ShiftSuggestPanel(0.0);
@@ -1206,13 +1215,16 @@ void MainPage::RevealTitleRow()
     try { m_titleHideTimer->Stop(); } catch (...) {}
     // While a page is loading the row stays put (the title is the progress readout). SetLoading(false)
     //   calls back in here and only then does the grace period start.
-    if (!m_loading) { try { m_titleHideTimer->Start(); } catch (...) {} }
+    // Apotheosis (2026-09-04): so does the keyboard/URL-editing pin - see m_titleRowPinned. The
+    //   handlers that clear it call back in here, which is where the grace period then starts.
+    if (!m_loading && !m_titleRowPinned) { try { m_titleHideTimer->Start(); } catch (...) {} }
 }
 
 void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
 {
     if (m_titleHideTimer) { try { m_titleHideTimer->Stop(); } catch (...) {} }   // one-shot
     if (m_loading) return;             // a load started while the grace period ran — keep it up
+    if (m_titleRowPinned) return;      // Apotheosis: the keyboard came up while the grace period ran
     // Apotheosis (2837ce0 review item 2): collapsing changes the content area's bottom inset, i.e.
     //   ContentArea's size — the one thing a frozen pinch anchor must not have move under it. Wait
     //   the gesture out instead of dropping the collapse, or the row would stay up for good.
@@ -4421,6 +4433,11 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
     HideUrlBoxDeleteButton();
     SetUrlEditingChrome(true);
     ++m_suggestHideToken;   // cancel any deferred collapse still queued from a previous LostFocus
+    // Apotheosis (2026-09-04): keep the page title above the address bar while it is being edited -
+    //   RevealTitleRow() brings the row back if the grace period already took it away, and the pin
+    //   stops the timer from taking it away again while the field has focus.
+    m_titleRowPinned = true;
+    RevealTitleRow();
 }
 // Apotheosis (review 2026-09-04 item 4): the collapse used to happen only from explicit callers
 //   (tap the page / open the menu-settings-etc — still true, see the other HideSuggestions() call
@@ -4443,6 +4460,11 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
 void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
 {
     m_urlFocused = false;
+    // Apotheosis (2026-09-04): editing is over - let the row go back to its usual ~2 s grace period.
+    //   The InputPane Hiding handler does the same for a keyboard dismissed without losing focus;
+    //   whichever runs last re-arms the timer, and RevealTitleRow() is idempotent.
+    m_titleRowPinned = false;
+    RevealTitleRow();
     if (UrlBox) {
         std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
         std::wstring want = (m_currentUrl == L"about:home") ? std::wstring() : m_currentUrl;

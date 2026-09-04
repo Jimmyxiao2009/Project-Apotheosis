@@ -550,6 +550,12 @@ namespace Harness {
         Windows::UI::Xaml::Media::Animation::Storyboard^ m_titleAnim;
         unsigned long long m_titleRowToken { 0 };
         bool m_titleRowShown { true };   // matches the XAML (TitleRow starts visible)
+        // Apotheosis (2026-09-04): the row hides itself ~2 s after a load, which is right while the
+        //   user is reading and wrong while they are typing - the address bar is the thing they are
+        //   looking at and the row sits right above it. Pinned = no hide timer, no collapse: set
+        //   while UrlBox has focus and while the on-screen keyboard is up, cleared on blur/hide,
+        //   which re-arms the usual grace period.
+        bool m_titleRowPinned { false };
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         // Apotheosis (pan snap decay): GetTickCount64() by which the remainder must be gone. The
         //   snap tick recomputes and decays instead of zeroing the translation outright; this is the
