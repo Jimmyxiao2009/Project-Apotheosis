@@ -1562,7 +1562,8 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
 //  allowEarlyStopWithoutNav: 若未发生导航完成,连续 ~0.5s 无加载活动即停(点击/滚动用)。
-//  settleCapTicks: 导航完成后的最大额外轮询数(×50ms)。
+//  settleCapTicks: 导航完成后的最大额外轮询数(×50ms)。Apotheosis (M4 settle): 一旦 load 事件到达,
+//    内部再收紧到 20 tick(1s)并只要 300ms 静默即停 —— 见下方 quietNeeded/capTicks。
 //  pageForRendering: 非空则每 tick 调 isolatedUpdateRendering 驱动 rAF/IntersectionObserver(懒加载/SPA 必需)。
 static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allowEarlyStopWithoutNav,
                      int settleCapTicks, double watchdogSeconds, WebCore::Page* pageForRendering)
@@ -1611,13 +1612,34 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             // stays false forever and only the watchdog ends the pump (30 s of dead UI,
             // then kErrLoadTimeout). Accept "committed document loader, no longer
             // loading, parser finished" as a second readiness signal. It only opens the
-            // *gate*: the 16-quiet-tick hysteresis below still has to be satisfied, so a
+            // *gate*: the quiet-tick hysteresis below still has to be satisfied, so a
             // live load (which keeps the loader busy) cannot be cut short by this.
             RefPtr<DocumentLoader> committedLoader = frameRef->loader().documentLoader();
             RefPtr<Document> frameDoc = frameRef->document();
-            bool loaderIdle = committedLoader && committedLoader->isCommitted()
-                && !committedLoader->isLoading() && frameDoc && !frameDoc->parsing();
-            bool ready = navDone || allowEarlyStopWithoutNav || loaderIdle;
+            // Apotheosis (M4 settle): "parser finished on a committed document" = DOMContentLoaded.
+            // The loader may still be pulling subresources; the quiet-tick hysteresis below decides.
+            bool domReady = committedLoader && committedLoader->isCommitted()
+                && frameDoc && !frameDoc->parsing();
+            bool ready = navDone || allowEarlyStopWithoutNav || domReady;
+
+            // Apotheosis (M4 settle): how long the pump keeps the UI hostage after the page is
+            // usable. It used to be one rule for everything - "the loader has been quiet for 16
+            // ticks (0.8 s)", capped at settleCapTicks (160 = 8 s) after the load event. A page
+            // with hundreds of subresources never gives us 0.8 s of quiet in a row (ntv.de: 255
+            // subresources), so every navigation ran to the cap: stage.txt showed load at 1.4 s
+            // and settle at 4.8-6.0 s, i.e. ~4 s of spinner after the page was done. The load
+            // event is the point at which the *page* calls itself loaded, so make it ours too:
+            //   load event fired  -> 300 ms of idle, hard cap 1 s after the event
+            //   no load event yet -> DOMContentLoaded + 500 ms without any loading activity
+            //   neither (click/type pumps with allowEarlyStopWithoutNav) -> unchanged 0.8 s
+            // Everything still in flight keeps streaming into the live tick and repaints there.
+            int quietNeeded = 16;                                    // 0.8 s (unchanged default)
+            int capTicks = settleCapTicks;
+            if (navDone) {
+                quietNeeded = 6;                                     // 300 ms of idle after load
+                capTicks = settleCapTicks < 20 ? settleCapTicks : 20; // and 1 s hard cap
+            } else if (domReady)
+                quietNeeded = 10;                                    // 500 ms after DOMContentLoaded
 
             // ★ 关键:绝不在 isLoadingInAPISense 一转 false 就停。模块求值(<script type=module>)和
             //   重定向后最终文档的样式表应用都发生在"加载器空闲之后",经 ScriptRunner/WindowEventLoop 的
@@ -1629,11 +1651,11 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
                 ++quietTicks;
             if (navDone)
                 ++settleTicks;
-            if (ready && quietTicks >= 16) {            // 加载器静默 ~0.8s → 异步级联已跑完,停
+            if (ready && quietTicks >= quietNeeded) {    // 加载器静默 → 异步级联已跑完,停
                 stopLoop();
                 return;
             }
-            if (navDone && settleTicks > settleCapTicks)  // 硬封顶(8s),防长连接/永久活动拖到看门狗
+            if (navDone && settleTicks > capTicks)        // 硬封顶,防长连接/永久活动拖到看门狗
                 stopLoop();
         } });
     settle.startRepeating(0.05_s);
