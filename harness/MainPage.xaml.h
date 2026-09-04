@@ -460,6 +460,12 @@ namespace Harness {
         //   yet. The transform shows -m_panRem*, converted to presenting-layer DIPs.
         Windows::UI::Xaml::Media::TranslateTransform^ m_panTranslate;
         Windows::UI::Xaml::Media::TransformGroup^ m_presentGroup;
+        // Apotheosis (review 2026-09-04 item 1): the status-bar/title-row inset of the direct
+        //   present surface. GpuPanel's SIZE must never change once ANGLE has a swap chain on it
+        //   (a resize rebuilds the swap chain on the engine thread's next swap, which is the
+        //   libGLESv2 AV class), so the panel is translated instead of given a top margin. Always
+        //   the outermost transform on GpuPanel — see ApplyPresentTransform().
+        Windows::UI::Xaml::Media::TranslateTransform^ m_gpuInset;
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         int  m_panRemX { 0 }, m_panRemY { 0 };
         // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Only used to

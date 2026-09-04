@@ -1129,7 +1129,21 @@ void MainPage::ApplyViewInsets()
     const double kTitleBarHeight = 26.0;
     if (TitleBar) TitleBar->Margin = topPad;
     if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + kTitleBarHeight + 6, 6, 0);
-    if (GpuPanel) GpuPanel->Margin = Windows::UI::Xaml::Thickness(0, top + kTitleBarHeight, 0, 0);
+    // Apotheosis (review 2026-09-04 item 1): NEVER touch GpuPanel's size here. A margin shrinks the
+    //   SwapChainPanel; XAML then reports a new size to ANGLE, which rebuilds the swap chain from
+    //   the engine thread's next eglSwapBuffers (the libGLESv2 SEH-AV class of the first-launch
+    //   crash) while the driver keeps compositing at a fixed kW x kH — the surviving frames come
+    //   out cropped/banded. The panel is TRANSLATED instead: ActualWidth/Height stay exactly what
+    //   they were when the surface was created, so the kW/ActualWidth mapping in MapTapToEngine()
+    //   and SetPinchAnchor() stays valid, and TransformToVisual(ContentArea -> GpuPanel) folds the
+    //   translation in on its own (the target space is the panel's own pre-RenderTransform space).
+    //   Cost: the bottom `top + title` DIPs of the composited frame fall off the screen edge.
+    if (GpuPanel) {
+        if (m_gpuInset == nullptr) m_gpuInset = ref new Windows::UI::Xaml::Media::TranslateTransform();
+        m_gpuInset->X = 0.0;
+        m_gpuInset->Y = top + kTitleBarHeight;
+        ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
+    }
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
 }
 
@@ -1253,9 +1267,9 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     if (m_panSnapTimer) m_panSnapTimer->Stop();
     m_scrollStateValid = false;
     ++m_scrollStateGen;
-    if (m_presentGroup != nullptr) m_presentGroup->Children->Clear();
-    if (GpuPanel) GpuPanel->RenderTransform = nullptr;
-    if (RenderImage) RenderImage->RenderTransform = nullptr;
+    // Apotheosis (review 2026-09-04 item 1): go through ApplyPresentTransform() rather than nulling
+    //   the RenderTransforms by hand — the view inset must survive, only the preview is dropped.
+    ApplyPresentTransform();
 
     if (pushHistory) {
         if (m_navIndex >= 0 && m_navIndex < (int)m_navStack.size() - 1)
@@ -2464,6 +2478,12 @@ void MainPage::ReleasePanPresent()
 // still compose rather than have one silently replace the other.
 // Both elements are cleared and the group emptied before anything is (re)attached: a XAML Transform
 // may only have one parent, and re-appending one that still has its old parent throws.
+//
+// Apotheosis (review 2026-09-04 item 1): the view inset (m_gpuInset, set by ApplyViewInsets) is a
+// third, permanent member of the stack and belongs to GpuPanel ONLY — the software path is inset by
+// layout, on ContentBorder. It goes LAST: preview scale and pan translation are expressed in the
+// panel's own space and must be shifted by the inset, not the other way round. It also stays on the
+// panel while the software path presents, so the panel never jumps when the two swap over.
 void MainPage::ApplyPresentTransform()
 {
     // ApplySettings() can reach this before the XAML tree exists (settings.ini with instantpan=0
@@ -2472,20 +2492,28 @@ void MainPage::ApplyPresentTransform()
         return;
     const bool haveZoom = (m_zoomTransform != nullptr);
     const bool havePan = (m_panTranslate != nullptr) && (m_panTranslate->X != 0.0 || m_panTranslate->Y != 0.0);
+    const bool haveInset = (m_gpuInset != nullptr) && (m_gpuInset->Y != 0.0);
     GpuPanel->RenderTransform = nullptr;
     RenderImage->RenderTransform = nullptr;
     if (m_presentGroup != nullptr) m_presentGroup->Children->Clear();
-    if (!haveZoom && !havePan)
+
+    Windows::UI::Xaml::Media::Transform^ parts[3];
+    int n = 0;
+    if (haveZoom) parts[n++] = m_zoomTransform;
+    if (havePan)  parts[n++] = m_panTranslate;
+    if (m_gpuPresent && haveInset) parts[n++] = m_gpuInset;
+    // Software present: the preview goes on RenderImage, the panel keeps the bare inset.
+    if (!m_gpuPresent && haveInset) GpuPanel->RenderTransform = m_gpuInset;
+    if (n == 0)
         return;
     Windows::UI::Xaml::Media::Transform^ t;
-    if (haveZoom && havePan) {
+    if (n == 1)
+        t = parts[0];
+    else {
         if (m_presentGroup == nullptr) m_presentGroup = ref new Windows::UI::Xaml::Media::TransformGroup();
-        m_presentGroup->Children->Append(m_zoomTransform);
-        m_presentGroup->Children->Append(m_panTranslate);
+        for (int i = 0; i < n; ++i) m_presentGroup->Children->Append(parts[i]);
         t = m_presentGroup;
-    } else
-        t = haveZoom ? static_cast<Windows::UI::Xaml::Media::Transform^>(m_zoomTransform)
-                     : static_cast<Windows::UI::Xaml::Media::Transform^>(m_panTranslate);
+    }
     if (m_gpuPresent) GpuPanel->RenderTransform = t;
     else              RenderImage->RenderTransform = t;
 }
@@ -2684,13 +2712,16 @@ void MainPage::SetPinchAnchor(double dipX, double dipY)
         m_zoomSpring = nullptr;
         m_liveScale = m_springTargetLive;
     }
-    // TransformToVisual would fold in a RenderTransform still sitting on the layer, so drop it
+    // TransformToVisual would fold in a PREVIEW transform still sitting on the layer, so drop it
     //   first. A fresh transform per gesture also keeps a finished animation from holding its
     //   value on the old one (FillBehavior=HoldEnd would swallow later writes to ScaleX).
+    //   Apotheosis (review 2026-09-04 item 1): the view inset (m_gpuInset) deliberately stays —
+    //   it is a genuine visual offset of the panel, and TransformToVisual folding it in is exactly
+    //   right: the target space is GpuPanel's own pre-RenderTransform space, the same space the
+    //   ScaleTransform centre below lives in. ApplyPresentTransform() re-attaches just the inset.
     m_zoomTransform = nullptr;
-    GpuPanel->RenderTransform = nullptr;
-    RenderImage->RenderTransform = nullptr;
-    if (m_presentGroup != nullptr) m_presentGroup->Children->Clear();   // release the old parents too
+    if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
+    ApplyPresentTransform();
     if (layer != nullptr && layer != static_cast<Windows::UI::Xaml::FrameworkElement^>(ContentArea)) {
         try {
             auto tv = ContentArea->TransformToVisual(layer);
@@ -2884,9 +2915,9 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 s->m_panRemX = 0; s->m_panRemY = 0;
                 if (s->m_panTranslate != nullptr) { s->m_panTranslate->X = 0.0; s->m_panTranslate->Y = 0.0; }
                 s->m_scrollStateValid = false;
-                if (s->m_presentGroup != nullptr) s->m_presentGroup->Children->Clear();
-                s->GpuPanel->RenderTransform = nullptr;
-                s->RenderImage->RenderTransform = nullptr;
+                // Apotheosis (review 2026-09-04 item 1): drop the preview through the one place
+                //   that knows about the view inset, so the panel keeps its translation.
+                s->ApplyPresentTransform();
                 s->StartLiveMode();
             }));
         } catch (...) {}
