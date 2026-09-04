@@ -2445,6 +2445,18 @@ void MainPage::InstantPanBy(int dx, int dy)
         return;
     if (dx == 0 && dy == 0)
         return;
+    // Apotheosis (2026-09-04, device package 13): with the presenter OFF this used to fall through
+    // to the XAML preview - a TranslateTransform on GpuPanel, the engine fed in coarse steps
+    // (PanFlushDue) and every composite held back until the harness acknowledges the frame it
+    // belongs to (ArmPanPresentAck / WebCorePresentFrame). On device that path stopped scrolling the
+    // page altogether: nothing but a pinch moved the view. It is not deleted - it is the only way to
+    // keep the transform and the engine in step if we ever go back to it - but it is off unless
+    // settings.ini says instantpanxaml=1. Returning HERE, before PanGestureBegin(), is what makes
+    // the fallback the package-10 behaviour the user preferred: m_panGestureOn stays false, so
+    // FreeScrollBy() sends every coalesced delta to the engine at once and the engine swaps it
+    // immediately (no g_panGesture, no owed frame, no acknowledgement).
+    if (!m_presenterActive && !m_instantPanXaml)
+        return;
     // Apotheosis (pan present handshake): this is the first thing that happens on the main-frame
     // pan route (and only on it - the nested-scroll and drag routes never come through here), so it
     // is where the gesture is declared to the engine.
@@ -4660,6 +4672,7 @@ void MainPage::LoadSettings()
             else if (k == "prefetch") m_prefetch = atoi(v.c_str());
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
+            else if (k == "instantpanxaml") m_instantPanXaml = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
             else if (k == "presenter") m_presenterThread = (atoi(v.c_str()) != 0);
             else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
@@ -4691,6 +4704,7 @@ void MainPage::SaveSettings()
     s += "prefetch=" + std::to_string(m_prefetch) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
+    s += "instantpanxaml=" + std::to_string(m_instantPanXaml ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
     s += "presenter=" + std::to_string(m_presenterThread ? 1 : 0) + "\n";
     s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";

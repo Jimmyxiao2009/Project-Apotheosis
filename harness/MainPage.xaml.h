@@ -398,6 +398,15 @@ namespace Harness {
         // Apotheosis: DEVELOPER toggles. Instant pan is on by default (it is what makes a pan feel
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
+        // Apotheosis (2026-09-04, device package 13): the XAML half of instant pan - the
+        //   TranslateTransform preview plus the coarse-step/owed-frame handshake it needs - only runs
+        //   when the presenter thread is NOT the one presenting, and on device that path stopped
+        //   scrolling the page at all. It is kept, but behind its own switch, default OFF: with the
+        //   presenter off the harness goes back to the package-10 behaviour (every coalesced delta is
+        //   a WebCoreScrollBy that swaps immediately), which the user rated "much better". With the
+        //   presenter ON this flag is irrelevant - m_presenterActive picks the presenter's own pan
+        //   path in InstantPanBy. settings.ini instantpanxaml
+        bool m_instantPanXaml { false };
         bool m_threadedRaster { false };// settings.ini threadraster
         // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
         //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles

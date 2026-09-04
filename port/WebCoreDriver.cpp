@@ -4801,7 +4801,17 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
 // Apotheosis (2026-09-04): the walk itself, factored out of WebCoreWantsDragAt() so WebCoreDragAt()
 // can ask the same question about the same point. Requires current layout (both callers run
 // updateLayoutIgnorePendingStylesheets() first) and dispatches nothing.
-static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
+// Apotheosis (2026-09-04, device package 13): `strict` separates the two questions this walk
+// answers. Loose (the routing probe, WebCoreWantsDragAt) asks "might this point belong to a widget"
+// and a bare pointerdown/mousedown/touchstart listener is enough - being wrong only costs one
+// engine hop, because the press then answers 0 and the harness routes the gesture back to
+// scrolling. Strict (the OWNERSHIP decision in WebCoreDragAt's press phase) may not use listeners:
+// practically every interactive container on a normal page has one, so 037eef0's `handled || wants`
+// handed EVERY gesture on such a page to the document as a mouse drag and the page stopped
+// scrolling altogether (only pinch still worked - it never reaches this route). What is left is the
+// evidence that actually means "this element drags itself": a canvas (Google Maps, the widget
+// 037eef0 was written for, is one) or a touch-action that claims the gesture.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y, bool strict)
 {
     using namespace WebCore;
     RefPtr<Element> hit = doc.elementFromPoint(static_cast<double>(x), static_cast<double>(y));
@@ -4829,11 +4839,12 @@ static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
             break;   // page-wide handlers are not a drag widget — see the comment above
         if (is<HTMLCanvasElement>(*e))
             return true;
-        if (e->hasEventListeners(names.pointerdownEvent)
-            || e->hasEventListeners(names.mousedownEvent)
-            || e->hasEventListeners(names.touchstartEvent)
-            || e->hasEventListeners(names.pointermoveEvent)
-            || e->hasEventListeners(names.touchmoveEvent))
+        if (!strict
+            && (e->hasEventListeners(names.pointerdownEvent)
+                || e->hasEventListeners(names.mousedownEvent)
+                || e->hasEventListeners(names.touchstartEvent)
+                || e->hasEventListeners(names.pointermoveEvent)
+                || e->hasEventListeners(names.touchmoveEvent)))
             return true;
         if (RenderObject* r = e->renderer()) {
             auto touchAction = r->style().touchAction();
@@ -4859,7 +4870,7 @@ int WebCoreWantsDragAt(int x, int y)
     if (!doc)
         return 0;
     doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
-    return dragWidgetAtPoint(*doc, x, y) ? 1 : 0;
+    return dragWidgetAtPoint(*doc, x, y, /*strict*/ false) ? 1 : 0;
 }
 
 // Apotheosis (drag as pointer events): drive one touch pan through WebCore as a left-button mouse
@@ -4958,7 +4969,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // Apotheosis (Google Maps, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
         // the same point and the layout we just updated, BEFORE dispatching - the press itself can
         // run script that changes the tree. See the decision below.
-        const bool wants = dragWidgetAtPoint(*doc, x, y);
+        const bool wants = dragWidgetAtPoint(*doc, x, y, /*strict*/ true);
         // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
         // what several widgets key their pointerdown handling off.
         DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
