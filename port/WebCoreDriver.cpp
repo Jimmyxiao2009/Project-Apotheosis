@@ -115,6 +115,11 @@ unsigned wkWinUWPTexmapPendingRasterTiles();
 unsigned wkWinUWPTexmapTakeFinishedRasterTiles();          // engine thread; reading resets
 void wkWinUWPSetRasterCompletionHandler(void (*)());       // called ON A WORKER thread
 void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& blockingWaits);
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): keep the tiles a layer drops out of its cover rect
+// and re-draw them, scaled, until fresh ones exist (TextureMapperTiledBackingStore). Default ON;
+// the switch is here so the device can A/B it without a rebuild. Declared by hand for the same
+// reason as everything above - the texmap header would drag in TextureMapperGLHeaders.h.
+void wkWinUWPSetStaleTiles(bool);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -4549,6 +4554,17 @@ void WebCoreSetThreadedRaster(int enabled)
     // no worker can call into a driver that has stopped expecting it. Both calls are engine thread.
     WebCore::wkWinUWPSetRasterCompletionHandler(enabled ? &rasterCompletedOnWorker : nullptr);
     WebCore::wkWinUWPSetThreadedRaster(enabled != 0);
+}
+
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): stale tiles on/off. ON (the default) a backing
+// store keeps the tiles it drops out of its cover rect and keeps drawing them - scaled to the
+// current content rect - until real ones have been rasterised, so a fast-path composite whose tiles
+// have moved on paints the old pixels instead of nothing. OFF is the pre-2026-09-04 behaviour and
+// exists so the device can A/B the two without a rebuild. Takes effect from the next composite.
+// Engine thread only.
+void WebCoreSetStaleTiles(int enabled)
+{
+    WebCore::wkWinUWPSetStaleTiles(enabled != 0);
 }
 
 // Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
