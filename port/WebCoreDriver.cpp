@@ -2286,6 +2286,9 @@ static void presenterThreadMain()
 // Then wait for the presenter's fence: inUse clearing only means it has stopped ISSUING, its quad
 // may still be reading the texture on the GPU, and this is a double buffer, so a slot comes back
 // round to the engine while the other one is still on screen.
+// Returns -1 when the 50 ms are up and the presenter is still in the slot: there is no safe buffer
+// to composite into, so the caller drops this frame rather than drawing into the one being
+// sampled (which is what the old code did - it returned the slot anyway).
 static int presenterAcquireSlot()
 {
     PresenterState& P = *g_pres.load(std::memory_order_acquire);
@@ -2297,7 +2300,7 @@ static int presenterAcquireSlot()
         const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
         while (P.inUse == idx) {
             if (!P.cond.waitUntil(P.lock, deadline))
-                break;
+                return -1;
         }
         presentFence = P.slot[idx].presentFence;
         P.slot[idx].presentFence = nullptr;   // consumed exactly once
@@ -2428,6 +2431,15 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     PresenterState* const pres = g_pres.load(std::memory_order_acquire);
     if (g_presenterActive.load() && pres) {
         const int idx = presenterAcquireSlot();
+        if (idx < 0) {
+            // Apotheosis: 50 ms and the presenter is still sampling the only free slot. Drop this
+            // frame - the previous one stays on screen, which is right for a composite that is by
+            // definition late - and ask for another present so nothing that was flushed above is
+            // lost. Painting anyway would tear the frame the user is looking at.
+            if (g_session && g_session->chrome)
+                g_session->chrome->setNeedsPresent();
+            return kOK;
+        }
         BitmapTexture& target = *pres->slot[idx].texture;
         Color docBg = view.documentBackgroundColor();
         if (!docBg.isValid())
