@@ -268,6 +268,11 @@ namespace Harness {
         void RevealTitleRow();
         void CollapseTitleRow();
         void OnTitleRowHideTick(Platform::Object^ sender, Platform::Object^ e);
+        // Apotheosis (2837ce0 review item 2): is the cached scroll/bounds state still about the
+        //   page we are looking at? The cache is engine px at ONE page scale — content size in
+        //   engine px scales with m_pageScale — so a commit-time scale change makes every field
+        //   stale. Drops the cache (and logs once) instead of clamping against pre-zoom bounds.
+        bool ScrollStateUsable();
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();
@@ -524,6 +529,16 @@ namespace Harness {
         int  m_contentW { 0 }, m_contentH { 0 }, m_viewW { 0 }, m_viewH { 0 };
         bool m_scrollStateValid { false };
         unsigned long long m_scrollStateGen { 0 };   // drops answers from a superseded gesture
+        // Apotheosis (2837ce0 review item 2): the page scale the cache above was captured at. The
+        //   cached content/view size and scroll position are engine px, and engine px per CSS px
+        //   is exactly m_pageScale — so a pinch commit invalidates all six fields at once, whether
+        //   or not anything remembered to say so. See ScrollStateUsable().
+        float m_scrollStateScale { 1.0f };
+        // Apotheosis (2837ce0 review item 2): ApplyViewInsets() was skipped because a pinch was in
+        //   flight; re-run it once the commit lands. Moving the content edges mid-gesture would
+        //   resize ContentArea under a pinch anchor that was frozen against the old size, and
+        //   ApplyPresentTransform() would rebuild the very transform group SpringBackZoom animates.
+        bool m_insetsPending { false };
         // ---- Apotheosis (pan present handshake) ----
         bool m_panGestureOn { false };   // a main-frame instant pan (incl. inertia) is in progress
         bool m_panDefer { false };       // engine is in "present only when we ask" mode

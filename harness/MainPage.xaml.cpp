@@ -1170,6 +1170,13 @@ void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
 {
     if (m_titleHideTimer) { try { m_titleHideTimer->Stop(); } catch (...) {} }   // one-shot
     if (m_loading) return;             // a load started while the grace period ran — keep it up
+    // Apotheosis (2837ce0 review item 2): collapsing changes the content area's bottom inset, i.e.
+    //   ContentArea's size — the one thing a frozen pinch anchor must not have move under it. Wait
+    //   the gesture out instead of dropping the collapse, or the row would stay up for good.
+    if (m_pinching || m_zoomSpring != nullptr) {
+        if (m_titleHideTimer) { try { m_titleHideTimer->Start(); } catch (...) {} }
+        return;
+    }
     CollapseTitleRow();
 }
 
@@ -1224,6 +1231,15 @@ void MainPage::CollapseTitleRow()
 //   UI THREAD ONLY. Cheap and idempotent — safe to call from every event that may change the edges.
 void MainPage::ApplyViewInsets()
 {
+    // Apotheosis (2837ce0 review item 2): never move the content edges while a pinch (or its
+    //   spring-back) is in flight. Two things would break at once: ContentArea would be resized
+    //   under a pinch anchor that SetPinchAnchor froze against the old size (every DIP↔engine-px
+    //   factor in ApplyLiveZoom/MapTapToEngine is read off that size), and ApplyPresentTransform()
+    //   below rebuilds the transform group — Clear() + re-Append — that the running SpringBackZoom
+    //   Storyboard is animating. Since the title row's auto-hide (item 1) is a ~2 s timer, this is
+    //   no longer theoretical: a pinch shortly after a load would land right on top of it.
+    //   PinchCommit's continuation flushes the deferred call.
+    if (m_pinching || m_zoomSpring != nullptr) { m_insetsPending = true; return; }
     double top = 0.0, bottom = 0.0;
     try {
         auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
@@ -2397,6 +2413,7 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
             m_scrollX = newScrollX;
             m_scrollY = newScrollY;
             m_scrollStateValid = true;
+            m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
         } else
             m_scrollStateValid = false;
         return;
@@ -2423,6 +2440,7 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     m_scrollX = newScrollX;
     m_scrollY = newScrollY;
     m_scrollStateValid = true;
+    m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
     ClampPanRemainder();
     ApplyPanTransform();
 }
@@ -2445,11 +2463,29 @@ void MainPage::InstantPanReset()
     ApplyPanTransform();
 }
 
+// Apotheosis (2837ce0 review item 2): the last line of defence for the post-pinch jump. The cache
+//   (m_scrollX/Y, m_contentW/H, m_viewW/H) is engine px, and engine px per CSS px IS m_pageScale —
+//   so the instant a pinch commits, all six fields describe a document that no longer exists.
+//   PinchCommit invalidates them explicitly now, but every future path that forgets to would again
+//   feed pre-zoom bounds to the two clamps below, and a clamp is precisely a function that turns a
+//   zero offset into a non-zero one. Comparing the stamp against the committed scale makes that
+//   structurally impossible, and leaves one line in mem.txt whenever it catches something.
+bool MainPage::ScrollStateUsable()
+{
+    if (!m_scrollStateValid) return false;
+    if (m_scrollStateScale == m_pageScale) return true;
+    m_scrollStateValid = false;
+    WriteMemLog("post-pinch correction: dropped scroll cache from scale "
+                + std::to_string(m_scrollStateScale) + " (page is now " + std::to_string(m_pageScale)
+                + ") before clamping");
+    return false;
+}
+
 // Keep the previewed position inside the document, and never show more than one screen of
 // background. m_scroll* + m_panRem* is the position the user is looking at.
 void MainPage::ClampPanRemainder()
 {
-    if (m_scrollStateValid) {
+    if (ScrollStateUsable()) {
         int maxX = m_contentW - m_viewW; if (maxX < 0) maxX = 0;
         int maxY = m_contentH - m_viewH; if (maxY < 0) maxY = 0;
         const int loX = -m_scrollX, hiX = maxX - m_scrollX;
@@ -2475,7 +2511,7 @@ void MainPage::ClampPanRemainder()
 //   [0, content - view]. No-op until the first scroll-state reply, same as ClampPanRemainder.
 void MainPage::ClampPanAbs()
 {
-    if (!m_scrollStateValid) return;
+    if (!ScrollStateUsable()) return;   // Apotheosis (2837ce0 review item 2): never against pre-zoom bounds
     int maxX = m_contentW - m_viewW; if (maxX < 0) maxX = 0;
     int maxY = m_contentH - m_viewH; if (maxY < 0) maxY = 0;
     const int loX = -m_scrollX, hiX = maxX - m_scrollX;
@@ -2545,6 +2581,7 @@ void MainPage::RequestScrollState()
                 if (!s->m_scrollStateValid) {
                     s->m_scrollX = sx; s->m_scrollY = sy;
                     s->m_scrollStateValid = true;
+                    s->m_scrollStateScale = s->m_pageScale;   // Apotheosis (2837ce0 review item 2)
                 }
                 s->ClampPanRemainder();
                 s->ApplyPanTransform();
@@ -2873,6 +2910,13 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             // Order matters: ApplyPanTransform now refuses to touch the transform while m_pinching
             // is set (it belongs to the zoom clamp then), so this reset must run before the flag.
             InstantPanReset();
+            // Apotheosis (2837ce0 review item 2): this gesture began as a pan, so
+            //   OnImageManipStarted posted a RequestScrollState() for it. Its answer is engine px
+            //   at the CURRENT scale and will land while (or after) we zoom — bump the generation
+            //   so it is dropped instead of re-validating the cache with pre-zoom bounds, which is
+            //   what a later ClampPanAbs()/ClampPanRemainder() would then translate the view by.
+            ++m_scrollStateGen;
+            m_scrollStateValid = false;
             m_pinching = true;
             SetPinchAnchor(e->Position.X, e->Position.Y);
         }
@@ -3178,22 +3222,51 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, newScale, mySeq, present]() {
                 MainPage^ s = self.Get(); if (!s) return;
-                if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
-                if (rcCopy == 0) {
-                    s->m_pageScale = newScale;
-                    s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
-                }
-                // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
-                // Apotheosis (instant pan): the page scale changed, so the cached scroll bounds are
-                // stale — and the pan remainder was already dropped when the pinch started.
-                s->m_zoomTransform = nullptr;
+                // Apotheosis (2837ce0 review item 2) — "the view jumps somewhere else a few seconds
+                //   after a pinch". Everything below used to sit BEHIND the m_opSeq guard, i.e. a
+                //   commit whose frame was superseded left all of it standing. But the engine has
+                //   applied the new scale by the time we get here regardless of who owns the frame,
+                //   and from that moment every number expressed in pre-zoom engine px is a lie:
+                //     · the pan residual (m_panAbs*, and the presenter's own copy) is subtracted
+                //       against a scroll position measured before the scale change — the presenter
+                //       keeps compositing it for up to a second after the finger is gone, so it
+                //       surfaces late, exactly as reported;
+                //     · the scroll/bounds cache (m_scrollX/Y, m_contentW/H, m_viewW/H) is engine px
+                //       and content size scales with m_pageScale, so the next ClampPanAbs() or
+                //       ClampPanRemainder() clamps to a document that no longer exists and
+                //       manufactures a translation out of a zero offset;
+                //     · a RequestScrollState() answer still in flight would re-validate that cache
+                //       (m_scrollStateGen was never bumped here — only RequestScrollState bumps it).
+                //   So the reset runs unconditionally now, and the generation is bumped with it.
+                const bool hadResidual = (s->m_panRemX || s->m_panRemY || s->m_panAbsX || s->m_panAbsY);
                 s->m_panRemX = 0; s->m_panRemY = 0;
                 // Apotheosis (presenter thread): the scale changed under the presenter's last
                 //   frame - drop its offset too, the engine frame that follows is the truth.
                 s->m_panAbsX = 0; s->m_panAbsY = 0;
                 if (s->m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
                 if (s->m_panTranslate != nullptr) { s->m_panTranslate->X = 0.0; s->m_panTranslate->Y = 0.0; }
+                // The 1 s "the engine wins" timer would call InstantPanReset() long after the fact;
+                //   there is nothing left for it to reset and it must not fire into the new scale.
+                if (s->m_panSnapTimer) { try { s->m_panSnapTimer->Stop(); } catch (...) {} }
                 s->m_scrollStateValid = false;
+                ++s->m_scrollStateGen;
+                // (m_scrollStateScale is stamped where the cache is VALIDATED, not here — the next
+                //  RequestScrollState answer/engine frame re-seeds it against the committed scale.)
+                // The insets deferred while the gesture ran (ApplyViewInsets' pinch guard) — e.g.
+                //   the title row's auto-hide landing mid-pinch — are safe to apply now.
+                if (s->m_insetsPending) { s->m_insetsPending = false; s->ApplyViewInsets(); }
+                if (hadResidual)
+                    WriteMemLog("pinch-commit scale=" + std::to_string(newScale)
+                                + " rc=" + std::to_string(rcCopy)
+                                + " current=" + std::to_string(s->m_opSeq == mySeq ? 1 : 0)
+                                + " dropped pan residual + pre-zoom scroll cache");
+                if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
+                if (rcCopy == 0) {
+                    s->m_pageScale = newScale;
+                    s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
+                }
+                // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
+                s->m_zoomTransform = nullptr;
                 // Apotheosis (review 2026-09-04 item 1): drop the preview through the one place
                 //   that knows about the view inset, so the panel keeps its translation.
                 s->ApplyPresentTransform();
