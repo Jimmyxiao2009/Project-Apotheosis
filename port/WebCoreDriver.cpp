@@ -2265,6 +2265,39 @@ static void panSwapDropNote(int nowX, int nowY)
     std::fclose(fp);
 }
 
+// Apotheosis (pinch vs. pan residual, 2026-09-04): drop the presenter's pan base and offset.
+//
+// What the presenter draws during a gesture is  residual = pan - (scrollAtComposite - panBase),
+// with panBase latched ONCE from the frame on screen when the gesture began (WebCoreSetPanOffset,
+// or presenterPublish for a gesture that started before the first frame) and never touched again.
+// Every one of those numbers lives in the engine px of ONE page scale. A pinch changes the scale
+// AND re-anchors the scroll position under it (WebCoreSetPageScale), so panBase and pan now
+// describe a layout that no longer exists: the residual computed from them is meaningless, and if
+// the pan was still "ending" the presenter keeps translating the freshly zoomed frame by it until
+// the one second deadline snaps it to zero - the page drifting away for a second after a pinch.
+// Nothing else invalidated this: teardownSession() clears it for a new page, and
+// WebCoreSetPanOffset(0,0,0) is the harness' own hard reset, but a scale change went unnoticed.
+//
+// Engine-thread callable (takes the presenter lock like every other writer), no-op when the
+// presenter is not running or has no pan state. Deliberately does NOT drop P.published: the frame
+// on screen is still the right pixels, only the translation applied to it is wrong.
+static void presenterResetPan()
+{
+    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
+    if (!pres)
+        return;
+    PresenterState& P = *pres;
+    Locker locker { P.lock };
+    if (!P.panActive && !P.panEnding && !P.panBaseValid && P.panX == 0.0f && P.panY == 0.0f)
+        return;
+    P.panActive = false;
+    P.panEnding = false;
+    P.panBaseValid = false;
+    P.panX = P.panY = 0.0f;
+    P.wake = true;      // redraw the frame on screen untranslated instead of waiting for a publish
+    P.cond.notifyAll();
+}
+
 static void presenterThreadMain()
 {
     using namespace WebCore;
@@ -4962,6 +4995,11 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     int nsy = static_cast<int>(ny < 0 ? ny - 0.5 : ny + 0.5);
     IntPoint wanted = view->constrainedScrollPosition(IntPoint(nsx, nsy));
 
+    // Apotheosis (2026-09-04): the presenter's pan base is about to become meaningless - the scale
+    // and the scroll position it was measured against both change on the next line. See
+    // presenterResetPan(); without this the residual of the pan that led into the pinch keeps
+    // moving the zoomed frame around until its one second deadline expires.
+    presenterResetPan();
     g_session->page->setPageScaleFactor(scale, wanted);
     g_session->page->isolatedUpdateRendering();
     // Apotheosis: re-apply the anchor AFTER the relayout at the new scale. setPageScaleFactor
