@@ -289,7 +289,12 @@ static void SampleMemoryPressure()
 
     const int cur = g_engMemPressure;
     int pct = 0;
-    int wantPct = cur, wantVirt = cur;
+    // Apotheosis (review 2026-09-04 item 4): start both wishes at 0, not at cur. The two signals are
+    //   combined with max(), so a signal that is unavailable this tick (MemoryManager threw, or
+    //   VirtualQuery failed) used to keep voting for the current level and veto every de-escalation
+    //   -- the engine would then stay at pressure 2 for the rest of the session. Only an available
+    //   signal raises the level now; each still de-escalates through its own hysteresis below.
+    int wantPct = 0, wantVirt = 0;
     if (haveBudget && limit) {
         pct = (int)((used * 100ULL) / limit);
         if (cur <= 0) {
@@ -297,9 +302,9 @@ static void SampleMemoryPressure()
             else if (pct >= 65) wantPct = 1;
         } else if (cur == 1) {
             if (pct >= 80) wantPct = 2;
-            else if (pct < 60) wantPct = 0;
+            else if (pct >= 60) wantPct = 1;   // inside the hysteresis band: hold this signal's vote
         } else {
-            if (pct < 75) wantPct = 1;
+            wantPct = (pct >= 75) ? 2 : 1;     // never straight from 2 back to 0
         }
     }
     if (haveVirt) {
@@ -308,9 +313,9 @@ static void SampleMemoryPressure()
             else if (availVirt < 400) wantVirt = 1;
         } else if (cur == 1) {
             if (availVirt < 250) wantVirt = 2;
-            else if (availVirt > 450) wantVirt = 0;
+            else if (availVirt <= 450) wantVirt = 1;   // inside the band: hold
         } else {
-            if (availVirt > 300) wantVirt = 1;
+            wantVirt = (availVirt <= 300) ? 2 : 1;
         }
     }
     const int want = (wantPct > wantVirt) ? wantPct : wantVirt;
