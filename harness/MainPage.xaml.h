@@ -261,6 +261,12 @@ namespace Harness {
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
         //   presenting element (TransformGroup, scale first so the translation stays screen-space).
         void ApplyPresentTransform();
+        // Apotheosis (review 2026-09-04 item 2): m_presenterActive used to be latched once, from the
+        //   WebCoreGpuInit reply. The presenter retires ITSELF on a lost surface, and the harness
+        //   went on routing every pan to WebCoreSetPanOffset - into a driver that had stopped
+        //   listening. Re-asks the driver (posted, the ABI wants the engine thread) and routes pan
+        //   the engine way again if the answer changed. Called at every gesture end.
+        void RefreshPresenterActive();
         // Apotheosis (review 2026-09-03): status-bar / software-nav-bar insets from
         //   ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid bottom padding + top
         //   margin of the top-anchored chrome. UI thread only.

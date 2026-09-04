@@ -588,6 +588,12 @@ static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动
 // MainPage.xaml.h; a settings.ini that already carries "presenter=1" still wins for that install.
 static bool g_presenterWanted = false;                 // switch, read once per WebCoreGpuInit
 static std::atomic<bool> g_presenterActive { false };  // the presenter really owns the swap chain
+// Apotheosis (review 2026-09-04 item 2): the presenter can retire ITSELF, mid-session, on a swap
+// that fails for good. It clears g_presenterActive from its own thread, where it may not touch
+// WebCore, so it leaves this behind instead: the next gpuPresent on the ENGINE thread consumes it,
+// force-dirties the whole tree and re-arms needsPresent, so the engine goes back to compositing
+// and swapping on its own context - the only thing left that can still put pixels anywhere.
+static std::atomic<int> g_presenterRetired { 0 };
 static void* g_presenterWindow = nullptr;              // native window handed to the presenter thread
 static EGLDisplay g_presenterEglDisplay = nullptr;
 
@@ -2577,10 +2583,29 @@ static void presenterThreadMain()
             presenterStatsDump("periodic");
         if (swapErr == EGL_CONTEXT_LOST || swapErr == EGL_BAD_SURFACE || swapErr == EGL_BAD_NATIVE_WINDOW) {
             g_presenterActive.store(false);
+            // Apotheosis (review 2026-09-04 item 2): hand the engine back its own present path in
+            // the same breath. g_presenterRetired is consumed by the next gpuPresent (engine
+            // thread) and turns it into a full, force-dirtied composite + eglSwapBuffers on
+            // g_glContext; presentRequested() makes sure such a composite is actually asked for,
+            // because in event-driven mode nothing else would wake the loop again. Both are
+            // atomics-only, which is all this thread is allowed to touch.
+            //
+            // HONEST LIMIT: in presenter mode g_glContext was created with a PBUFFER surface
+            // (GpuInit gave the window surface to the presenter), and a window surface cannot be
+            // moved or recreated on another thread's context - ANGLE binds it to the thread that
+            // created it. So the engine's eglSwapBuffers goes to an offscreen buffer and the SCREEN
+            // STAYS FROZEN until the session is rebuilt. What this buys is that the engine keeps a
+            // correct, fully painted frame ready (no half-dirty tree left over from the fast path),
+            // that the harness' WebCorePresenterActive() poll flips back to 0 and it stops routing
+            // pan to WebCoreSetPanOffset, and that the reason is in crash.txt.
+            g_presenterRetired.store(1, std::memory_order_release);
             presenterStatsDump("swap-lost");
             WebCoreCrashNote(swapErr == EGL_CONTEXT_LOST
-                ? "presenter: EGL_CONTEXT_LOST on swap, presenter stopped"
-                : "presenter: surface lost on swap, presenter stopped");
+                ? "presenter: EGL_CONTEXT_LOST on swap, presenter stopped - engine presents again "
+                  "(offscreen context: screen frozen until the session is rebuilt)"
+                : "presenter: surface lost on swap, presenter stopped - engine presents again "
+                  "(offscreen context: screen frozen until the session is rebuilt)");
+            WebCorePort::presentRequested();   // atomics only: legal from this thread
             Locker locker { P.lock };
             P.stop = true;
             break;
@@ -2735,6 +2760,16 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         return kErrNoView;
     g_glContext->makeContextCurrent();
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
+    // Apotheosis (review 2026-09-04 item 2): the presenter retired itself since the last composite.
+    // Nothing below has run on the engine's own default framebuffer since GpuInit, and the last
+    // composites went into presenter slots that nobody samples any more, so this one must be a
+    // full one - the fast path would draw a tree that was last force-dirtied minutes ago. Re-arm
+    // needsPresent too, so the loop keeps coming back rather than judging the frame static.
+    if (g_presenterRetired.exchange(0, std::memory_order_acq_rel)) {
+        g_gpuForceFullNext = true;              // consumed by the gpuPrepare below
+        if (g_session && g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+    }
     gpuPrepare(view, glRoot);
 
     // Apotheosis (presenter thread): the window surface belongs to the presenter now. Composite

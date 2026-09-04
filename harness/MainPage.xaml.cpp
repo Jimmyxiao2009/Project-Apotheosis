@@ -3444,6 +3444,39 @@ void MainPage::SpringBackZoom(float targetLive, float commitScale)
     }
 }
 
+// Apotheosis (review 2026-09-04 item 2): ask the driver again whether the presenter is still the
+//   one that puts pixels on the screen. It can retire itself mid-session (a swap that fails for
+//   good: lost device, or a surface the shell tore down) and the harness has no other way of
+//   hearing about it - the old code latched the answer once, from the WebCoreGpuInit reply, and
+//   kept feeding WebCoreSetPanOffset to a presenter that had stopped. Cheap (one atomic read in
+//   the driver), posted because WebCorePresenterActive() is declared engine-thread, and only ever
+//   asked when we currently believe the presenter IS active - it never turns itself back on.
+//   On a change: drop the offset the presenter was showing, put the transform back to identity and
+//   let InstantPanBy() fall through to the engine-present route (package-10 behaviour).
+void MainPage::RefreshPresenterActive()
+{
+    if (!m_presenterActive) return;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    WebEngine::instance().post([disp, self]() {
+        int active = 0;
+        try { active = WebCorePresenterActive(); } catch (...) { active = 0; }
+        if (active) return;   // nothing changed - do not even wake the UI thread
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (!s->m_presenterActive) return;
+                s->m_presenterActive = false;
+                s->m_panAbsX = 0; s->m_panAbsY = 0;
+                if (s->m_panTranslate != nullptr) { s->m_panTranslate->X = 0.0; s->m_panTranslate->Y = 0.0; }
+                s->ApplyPresentTransform();
+                WriteMemLog("presenter retired: pan routed to the engine again");
+                s->StartLiveMode();   // the driver re-armed needsPresent; keep the loop coming back
+            }));
+        } catch (...) {}
+    });
+}
+
 // 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
 void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^)
 {
@@ -3464,6 +3497,9 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // coarse gate held back in one step and let its frame release the last swap, so the final
     // present and the snap of the translation to identity happen in the same UI frame.
     PanGestureEnd();
+    // Apotheosis (review 2026-09-04 item 2): a gesture just ended - the cheapest moment to notice
+    //   that the presenter gave up while it ran.
+    RefreshPresenterActive();
     // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count
     //   as part of the gesture. From here on nothing may re-enter pan-gesture mode: a late engine
     //   completion (PumpDrag's fallback) would arm m_panGestureOn/m_panDefer with no gesture left to
