@@ -1133,43 +1133,41 @@ void MainPage::ApplyViewInsets()
     //   several of them repeatedly for one user action. Everything below writes layout properties
     //   and rebuilds the presenting element's transform stack, so do none of it while the edges are
     //   where we last left them.
-    // Apotheosis (review 2026-09-04 item 5): the title row's height is XAML's to decide — read it
-    //   back instead of duplicating the literal here, where the two silently drift apart. Before the
-    //   first arrange ActualHeight is still 0; TitleBar->Height carries the value the markup set
-    //   (NaN only if the markup ever drops it, hence the guard and the last-resort literal).
-    double titleH = 0.0;
-    if (TitleBar) {
-        titleH = TitleBar->ActualHeight;
-        if (!(titleH > 0.0)) {
-            const double declared = TitleBar->Height;
-            if (declared > 0.0 && declared < 1.0e6) titleH = declared;   // false for NaN
+    // Apotheosis (2026-09-04 review, title row reverted to the bottom): TitleBar is gone from up
+    //   here — the only thing left at the top edge is Progress, the loading-dots strip, and only
+    //   while a page is actually loading. Read its height back from XAML instead of duplicating the
+    //   literal (same technique the old titleH used): before the first arrange ActualHeight is still
+    //   0, so fall back to the declared Height, then to a literal if that's ever unset.
+    double stripH = 0.0;
+    if (Progress && Progress->Visibility == Windows::UI::Xaml::Visibility::Visible) {
+        stripH = Progress->ActualHeight;
+        if (!(stripH > 0.0)) {
+            const double declared = Progress->Height;
+            if (declared > 0.0 && declared < 1.0e6) stripH = declared;   // false for NaN
         }
-        if (!(titleH > 0.0)) titleH = 26.0;
+        if (!(stripH > 0.0)) stripH = 8.0;
     }
-    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && titleH == m_lastTitleH)
+    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH)
         return;
     m_insetsValid = true;
     m_lastInsetTop = top;
     m_lastInsetBottom = bottom;
-    m_lastTitleH = titleH;
+    m_lastStripH = stripH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
-    // Apotheosis (review 2026-09-04 item 5): Progress is declared after TitleBar, so at topPad it
-    //   painted its 3 DIP over the title row's top edge. It belongs under the row — the 6 DIP gap
-    //   between TitleBar's bottom and ContentBorder's top, where it covers neither.
-    if (Progress) Progress->Margin = Windows::UI::Xaml::Thickness(0, top + titleH, 0, 0);
+    if (Progress) Progress->Margin = topPad;
     if (FindBar) FindBar->Margin = topPad;
     if (Drawer) Drawer->Padding = topPad;
     if (SettingsPage) SettingsPage->Padding = topPad;
     if (TabSwitcher) TabSwitcher->Padding = topPad;
     if (OobePanel) OobePanel->Padding = topPad;
-    // Apotheosis (review 2026-09-04 item 2a/3): the elements that actually show engine output — the
-    //   white content Border in software mode, GpuPanel in direct-present mode — used to start at
-    //   y=0 inside their row, so the page ran under the shell's clock. They now get the same top
-    //   inset as the chrome above, plus the height of TitleBar (the status/loading row, moved here
-    //   from the bottom chrome — see MainPage.xaml): TitleBar sits right under the inset, content
-    //   starts right under TitleBar. titleH is read back from TitleBar above, not duplicated.
-    if (TitleBar) TitleBar->Margin = topPad;
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + titleH + 6, 6, 0);
+    // Apotheosis (review 2026-09-04 item 2a/3, updated for the title-row revert): the elements that
+    //   actually show engine output — the white content Border in software mode, GpuPanel in
+    //   direct-present mode — used to start at y=0 inside their row, so the page ran under the
+    //   shell's clock. They get the status-bar inset always, plus the loading strip's height only
+    //   while it is visible (stripH is 0 once SetLoading(false) collapses it, called from there so
+    //   this re-evaluates on every loading start/stop) — an idle page gets that space back instead
+    //   of permanently losing it to a strip nothing is drawing in.
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + 6, 6, 0);
     // Apotheosis (review 2026-09-04 item 1): NEVER touch GpuPanel's size here. A margin shrinks the
     //   SwapChainPanel; XAML then reports a new size to ANGLE, which rebuilds the swap chain from
     //   the engine thread's next eglSwapBuffers (the libGLESv2 SEH-AV class of the first-launch
@@ -1178,11 +1176,11 @@ void MainPage::ApplyViewInsets()
     //   they were when the surface was created, so the kW/ActualWidth mapping in MapTapToEngine()
     //   and SetPinchAnchor() stays valid, and TransformToVisual(ContentArea -> GpuPanel) folds the
     //   translation in on its own (the target space is the panel's own pre-RenderTransform space).
-    //   Cost: the bottom `top + title` DIPs of the composited frame fall off the screen edge.
+    //   Cost: the bottom `top + stripH` DIPs of the composited frame fall off the screen edge.
     if (GpuPanel) {
         if (m_gpuInset == nullptr) m_gpuInset = ref new Windows::UI::Xaml::Media::TranslateTransform();
         m_gpuInset->X = 0.0;
-        m_gpuInset->Y = top + titleH;
+        m_gpuInset->Y = top + stripH;
         ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
     }
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
@@ -1263,6 +1261,10 @@ void MainPage::SetLoading(bool loading)
     Progress->IsIndeterminate = loading;
     Progress->Visibility = loading ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
     UpdateUrlActionGlyph();   // 加载态切到 ✕ 停止 / 结束回 → 或 ⟳
+    // Apotheosis (2026-09-04 review item 2): the loading strip's visibility is now part of the
+    //   content/GpuPanel top-inset math (ApplyViewInsets' stripH) — re-run it here so the inset
+    //   actually follows the strip appearing/collapsing instead of only the next unrelated call.
+    ApplyViewInsets();
 }
 
 void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)

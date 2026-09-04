@@ -484,9 +484,11 @@ namespace Harness {
         // Apotheosis (review 2026-09-04 item 2): last insets ApplyViewInsets() actually applied.
         //   It is called from every source that could move an edge, so most calls are no-ops.
         double m_lastInsetTop { 0.0 }, m_lastInsetBottom { 0.0 };
-        // TitleBar's height as XAML reports it (review 2026-09-04 item 5): part of the cache key,
-        //   because it goes 0 -> its real value at the first arrange.
-        double m_lastTitleH { 0.0 };
+        // Apotheosis (2026-09-04 review, title row reverted to the bottom): Progress's height while
+        //   the loading strip is visible, as XAML reports it — part of the cache key, both because it
+        //   goes 0 -> its real value at the first arrange and because it now flips between 0 and that
+        //   value every time SetLoading() shows/hides the strip.
+        double m_lastStripH { 0.0 };
         bool   m_insetsValid { false };
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         int  m_panRemX { 0 }, m_panRemY { 0 };
