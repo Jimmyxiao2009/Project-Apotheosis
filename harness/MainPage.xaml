@@ -415,22 +415,31 @@
                                  GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
                         <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
                              plain Button.Content centred on the font's line box, not its glyph ink, which
-                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now. -->
+                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
+                             2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
+                             own ink still sits ~2px low inside it (font-specific) — nudge up. -->
                         <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
                                 Width="42" Height="40" Padding="0"
                                 VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                                 Click="OnUrlAction">
                             <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
-                                       Foreground="{StaticResource Accent}"
+                                       Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
                                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Button>
                         <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
-                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。 -->
+                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
+                             2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
+                             same technique as UrlActionGlyph above — plain Button.Content centred on the
+                             ✕'s full font line box sat ~2px high. -->
                         <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                                Foreground="{StaticResource TxtHi}" Width="44" Height="40" Padding="0" FontSize="17"
+                                Width="44" Height="40" Padding="0"
                                 IsTabStop="False" Visibility="Collapsed"
-                                VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
-                                Content="&#x2715;" Click="OnUrlClear"/>
+                                VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                                Click="OnUrlClear">
+                            <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
+                                       Foreground="{StaticResource TxtHi}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Button>
                     </Grid>
                 </Border>
 

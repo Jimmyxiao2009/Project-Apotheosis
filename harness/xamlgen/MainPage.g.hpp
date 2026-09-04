@@ -361,13 +361,20 @@ static ::Platform::String^ __MainPageXaml() {
                         <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent" Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8" InputScope="Url" Text="" PlaceholderText="搜索或输入网址" />
                         <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
                              plain Button.Content centred on the font's line box, not its glyph ink, which
-                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now. -->
+                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
+                             2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
+                             own ink still sits ~2px low inside it (font-specific) — nudge up. -->
                         <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="42" Height="40" Padding="0" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
-                            <TextBlock x:Name="UrlActionGlyph" Text="↻" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            <TextBlock x:Name="UrlActionGlyph" Text="↻" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource Accent}" Margin="0,-2,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" />
                         </Button>
                         <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
-                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。 -->
-                        <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Foreground="{StaticResource TxtHi}" Width="44" Height="40" Padding="0" FontSize="17" IsTabStop="False" Visibility="Collapsed" VerticalAlignment="Center" VerticalContentAlignment="Center" HorizontalContentAlignment="Center" Content="✕" />
+                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
+                             2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
+                             same technique as UrlActionGlyph above — plain Button.Content centred on the
+                             ✕'s full font line box sat ~2px high. -->
+                        <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="44" Height="40" Padding="0" IsTabStop="False" Visibility="Collapsed" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
+                            <TextBlock Text="✕" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource TxtHi}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Button>
                     </Grid>
                 </Border>
 
@@ -380,15 +387,15 @@ static ::Platform::String^ __MainPageXaml() {
              ============================================================================ -->
 
         <!-- ===== 动作面板(⋯ 弹出的底部 sheet)===== -->
-        <Grid x:Name="ActionMenu" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource Scrim}" Visibility="Collapsed">
+        <Grid x:Name="ActionMenu" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource Scrim}" Visibility=")APO",
+        LR"APO(Collapsed">
             <Border VerticalAlignment="Bottom" Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1,1,1,0" CornerRadius="20,20,0,0" Margin="6,0" x:Name="_ev3">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="520">
                     <StackPanel Margin="0,12,0,18">
                         <Grid Margin="18,0,18,10">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                             <StackPanel Grid.Column="0">
-                                <TextBlock Text="PAGE COMMA)APO",
-        LR"APO(NDS" Foreground="{StaticResource Accent}" FontSize="11" CharacterSpacing="120" />
+                                <TextBlock Text="PAGE COMMANDS" Foreground="{StaticResource Accent}" FontSize="11" CharacterSpacing="120" />
                                 <TextBlock Text="当前页面" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="SemiBold" Margin="0,3,0,0" />
                             </StackPanel>
                             <Border Grid.Column="1" Width="34" Height="4" CornerRadius="2" Background="{StaticResource Sep}" VerticalAlignment="Top" Margin="0,3,0,0" />
@@ -446,7 +453,8 @@ static ::Platform::String^ __MainPageXaml() {
                         <Button Tag="ua" Style="{StaticResource MenuRow}" x:Name="_ev8">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
-                                <TextBlock x:Name="ActUaLabel" Text="桌面版网站" VerticalAlignment="Center" />
+                                <TextBlock x:Name=)APO",
+        LR"APO("ActUaLabel" Text="桌面版网站" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
                         <Button Tag="find" Style="{StaticResource MenuRow}" x:Name="_ev9">
@@ -455,8 +463,7 @@ static ::Platform::String^ __MainPageXaml() {
                                 <TextBlock Text="页内查找" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
-                        <Bu)APO",
-        LR"APO(tton Tag="share" Style="{StaticResource MenuRow}" x:Name="_ev10">
+                        <Button Tag="share" Style="{StaticResource MenuRow}" x:Name="_ev10">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="分享" VerticalAlignment="Center" />
@@ -529,7 +536,8 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="浏览资料库" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="SemiBold" Margin="0,2,0,0" />
                 </StackPanel>
                 <Button x:Name="GpuBtn" Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource TxtLo}" Content="🖥 GPU" VerticalAlignment="Center" />
-                <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="📱 手机UA" VerticalAlignment="Center" />
+                <Button x:Name="UaBtn" Grid.Column="2" Style="{StaticResource TabBtn}" Foreground="{StaticRes)APO",
+        LR"APO(ource Accent}" Content="📱 手机UA" VerticalAlignment="Center" />
                 <Button Grid.Column="3" Style="{StaticResource IconBtn}" Content="✕" x:Name="_ev17" />
             </Grid>
 
@@ -540,8 +548,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <Button x:Name="TabFav" Grid.Column="0" Style="{StaticResource TabBtn})APO",
-        LR"APO(" Content="★ 收藏" />
+                <Button x:Name="TabFav" Grid.Column="0" Style="{StaticResource TabBtn}" Content="★ 收藏" />
                 <Button x:Name="TabHist" Grid.Column="1" Style="{StaticResource TabBtn}" Content="🕑 历史" />
                 <Button x:Name="TabDl" Grid.Column="2" Style="{StaticResource TabBtn}" Content="↓ 下载" />
                 <Button x:Name="ActionBtn" Grid.Column="3" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="★ 收藏此页" />
@@ -610,15 +617,15 @@ static ::Platform::String^ __MainPageXaml() {
                     <TextBlock Text="DISPLAY" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <ToggleSwitch x:Name="SetHideNavBarSwitch" Header="隐藏系统导航栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2" />
                     <TextBlock Text="从屏幕底部向上轻扫可临时唤回" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,6" />
-                    <!-- Apotheosis (2026-09-04 review item 2b): fully hide the status bar (StatusBar::
+                    <!-- Apotheosis (2026-09-04 review item 2b): fully hide the status bar (StatusBar:)APO",
+        LR"APO(:
                          HideAsync/ShowAsync) instead of just the translucent-over-content treatment above.
                          Default off — hiding it moves VisibleBounds, so ApplyViewInsets()'s top inset drops
                          to 0 on its own (VisibleBoundsChanged is already wired). -->
                     <ToggleSwitch x:Name="SetHideStatusBarSwitch" Header="隐藏状态栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2" />
                     <TextBlock Text="隐藏顶部状态栏(时钟/信号),内容区随之上移" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,6" />
 
-                    <TextBlock Text="RENDERING" Foreground=)APO",
-        LR"APO("{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
+                    <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <Button Tag="gpu" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)" x:Name="_ev19" />
 
@@ -677,15 +684,15 @@ static ::Platform::String^ __MainPageXaml() {
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Margin="8,0" VerticalAlignment="Center">
                     <TextBlock Text="WORKSPACE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="140" />
-                    <TextBlock x:Name="TabSwitcherTitle" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="SemiBold" Margin="0,2,0,0" />
+                    <TextBlock x:Name="TabSwitcherTitle" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="Sem)APO",
+        LR"APO(iBold" Margin="0,2,0,0" />
                 </StackPanel>
                 <Button Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="完成" x:Name="_ev26" />
             </Grid>
             <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="TabList" Margin="12,12" />
             </ScrollViewer>
-            <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Background="{StaticResource AccentDim}" Foreground="{StaticResource Accent}" BorderBrush="{StaticResource Accent}" BorderThickness="0,1,0,0" Padding="0,16" x:Name="_ev27">)APO",
-        LR"APO(
+            <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Background="{StaticResource AccentDim}" Foreground="{StaticResource Accent}" BorderBrush="{StaticResource Accent}" BorderThickness="0,1,0,0" Padding="0,16" x:Name="_ev27">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
                     <TextBlock Text="新建标签页" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
@@ -807,8 +814,8 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
