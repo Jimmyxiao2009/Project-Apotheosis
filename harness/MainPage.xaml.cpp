@@ -3760,8 +3760,18 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
     m_urlFocused = true;
     HideUrlBoxDeleteButton();
     SetUrlEditingChrome(true);
+    ++m_suggestHideToken;   // cancel any deferred collapse still queued from a previous LostFocus
 }
-// 不在 LostFocus 里收建议:点建议项会先夺焦再触发其 Click,提前收会取消点击。改由点页面(OnPageTapped)/导航收。
+// Apotheosis (review 2026-09-04 item 4): the collapse used to happen only from explicit callers
+//   (tap the page / open the menu-settings-etc — still true, see the other HideSuggestions() call
+//   sites) because doing it synchronously here would fire before a suggestion's own Click: tapping
+//   a suggestion button unfocuses UrlBox first (this handler), Click follows after: collapsing the
+//   panel here would make that button hit-test-invisible before its own tap lands. Deferring the
+//   collapse to a Low-priority dispatch fixes that — Click runs at Normal priority, i.e. as part of
+//   the same input sequence, strictly before a queued Low item gets its turn — while still catching
+//   every other way the field loses focus (tap outside, hardware Back, an overlay opening). The
+//   token lets a focus that comes back before the deferred item runs (OnUrlGotFocus above) cancel
+//   it instead of hiding a panel the user is still looking at.
 //
 // Apotheosis: leaving the field WITHOUT committing (tapped the page, hardware Back, keyboard
 //   dismissed) has to undo the edit. Otherwise the box keeps half-typed text that no longer
@@ -3784,6 +3794,13 @@ void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
     }
     SetUrlEditingChrome(false);
     UpdateUrlActionGlyph();
+    ++m_suggestHideToken;
+    unsigned long long token = m_suggestHideToken;
+    Platform::Agile<MainPage^> self(this);
+    this->Dispatcher->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, token]() {
+        MainPage^ s = self.Get(); if (!s) return;
+        if (s->m_suggestHideToken == token) s->HideSuggestions();
+    }));
 }
 
 // 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。

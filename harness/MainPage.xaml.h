@@ -383,6 +383,10 @@ namespace Harness {
         //   StatusBar::HideAsync(), and the top inset in ApplyViewInsets() follows VisibleBounds to 0.
         //   settings.ini hidestatusbar
         bool m_hideStatusBar { false };
+        // Apotheosis (review 2026-09-04 item 4): token for the deferred suggestion-dropdown collapse
+        //   scheduled from OnUrlLostFocus — see its definition for why the collapse cannot be
+        //   synchronous. Bumped on every LostFocus/GotFocus so a stale deferred hide is a no-op.
+        unsigned long long m_suggestHideToken { 0 };
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };
