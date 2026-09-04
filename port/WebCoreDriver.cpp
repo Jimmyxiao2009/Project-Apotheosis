@@ -4801,17 +4801,24 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
 // Apotheosis (2026-09-04): the walk itself, factored out of WebCoreWantsDragAt() so WebCoreDragAt()
 // can ask the same question about the same point. Requires current layout (both callers run
 // updateLayoutIgnorePendingStylesheets() first) and dispatches nothing.
-// Apotheosis (2026-09-04, device package 13): `strict` separates the two questions this walk
-// answers. Loose (the routing probe, WebCoreWantsDragAt) asks "might this point belong to a widget"
-// and a bare pointerdown/mousedown/touchstart listener is enough - being wrong only costs one
-// engine hop, because the press then answers 0 and the harness routes the gesture back to
-// scrolling. Strict (the OWNERSHIP decision in WebCoreDragAt's press phase) may not use listeners:
-// practically every interactive container on a normal page has one, so 037eef0's `handled || wants`
-// handed EVERY gesture on such a page to the document as a mouse drag and the page stopped
-// scrolling altogether (only pinch still worked - it never reaches this route). What is left is the
-// evidence that actually means "this element drags itself": a canvas (Google Maps, the widget
-// 037eef0 was written for, is one) or a touch-action that claims the gesture.
-static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y, bool strict)
+// Apotheosis (2026-09-04, device package 14): ONE criterion, used by both callers. There used to be
+// a loose variant for the routing probe (WebCoreWantsDragAt) that accepted a bare
+// pointerdown/mousedown/touchstart listener, on the theory that being wrong only costs one engine
+// hop. It costs more than that - practically every interactive container on a normal page has such
+// a listener, so every pan on such a page was routed as a drag first, and the press round trip put
+// a visible hitch at the start of each gesture even when it was unwound. And because the routing
+// probe and the ownership decision must agree anyway (the harness only calls WebCoreDragAt after
+// the probe said yes), a criterion that only one of them applies is a bug generator: 037eef0's
+// `handled || wants` with the loose walk handed EVERY gesture on an ordinary page to the document
+// as a mouse drag and the page stopped scrolling altogether.
+//
+// What is left is the evidence that actually means "this element drags itself": a canvas (Google
+// Maps, the widget 037eef0 was written for, is one), or touch-action: none. Note that pan-x/pan-y
+// deliberately do NOT count: they say the page wants the BROWSER to pan in the other axis, which is
+// the opposite of claiming the gesture, and a `touch-action: pan-y` wrapper (an extremely common
+// way to suppress horizontal overscroll - ntv.de has one) is exactly what stole every vertical pan
+// on device package 14 with `wants=1 own=1` on ordinary article text.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
 {
     using namespace WebCore;
     RefPtr<Element> hit = doc.elementFromPoint(static_cast<double>(x), static_cast<double>(y));
@@ -4833,23 +4840,14 @@ static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y, bool strict)
     }
 
     Element* root = doc.documentElement();
-    const auto& names = eventNames();
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (e.get() == root || is<HTMLBodyElement>(*e))
             break;   // page-wide handlers are not a drag widget — see the comment above
         if (is<HTMLCanvasElement>(*e))
             return true;
-        if (!strict
-            && (e->hasEventListeners(names.pointerdownEvent)
-                || e->hasEventListeners(names.mousedownEvent)
-                || e->hasEventListeners(names.touchstartEvent)
-                || e->hasEventListeners(names.pointermoveEvent)
-                || e->hasEventListeners(names.touchmoveEvent)))
-            return true;
         if (RenderObject* r = e->renderer()) {
-            auto touchAction = r->style().touchAction();
-            if (!touchAction.isAuto() && !touchAction.isManipulation())
-                return true;   // none / pan-x / pan-y: the element claims the gesture
+            if (r->style().touchAction().isNone())
+                return true;   // none: the element takes the whole gesture, in both axes
         }
     }
     return false;
@@ -4870,7 +4868,7 @@ int WebCoreWantsDragAt(int x, int y)
     if (!doc)
         return 0;
     doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
-    return dragWidgetAtPoint(*doc, x, y, /*strict*/ false) ? 1 : 0;
+    return dragWidgetAtPoint(*doc, x, y) ? 1 : 0;
 }
 
 // Apotheosis (drag as pointer events): drive one touch pan through WebCore as a left-button mouse
@@ -4969,7 +4967,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // Apotheosis (Google Maps, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
         // the same point and the layout we just updated, BEFORE dispatching - the press itself can
         // run script that changes the tree. See the decision below.
-        const bool wants = dragWidgetAtPoint(*doc, x, y, /*strict*/ true);
+        const bool wants = dragWidgetAtPoint(*doc, x, y);
         // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
         // what several widgets key their pointerdown handling off.
         DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
