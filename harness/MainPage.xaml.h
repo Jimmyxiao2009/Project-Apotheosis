@@ -418,7 +418,10 @@ namespace Harness {
         //   the pre-presenter behaviour. m_presenterActive is what actually happened - GpuInit
         //   falls back to the engine-owned window surface silently, and every pan route asks this,
         //   never the setting.
-        bool m_presenterThread { true };   // settings.ini presenter
+        //   Default OFF (review 2026-09-04 item 1): 0.1.9.14 on device showed background-only frames
+        //   at the end of a scroll with the presenter on. An install whose settings.ini already says
+        //   presenter=1 keeps it - LoadSettings only ever overwrites the key it finds.
+        bool m_presenterThread { false };  // settings.ini presenter
         bool m_presenterActive { false };  // WebCorePresenterActive() after WebCoreGpuInit
         // Apotheosis (drag as pointer events): route a pan that starts over a drag widget (map,
         //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is

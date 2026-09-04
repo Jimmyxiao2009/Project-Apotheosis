@@ -582,7 +582,11 @@ static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动
 // Everything here is behind WebCoreSetPresenterThread(); with it off WebCoreGpuInit takes exactly
 // the path it took before and g_presenterActive stays false, so every branch below is skipped.
 // ===========================================================================
-static bool g_presenterWanted = true;                  // switch, read once per WebCoreGpuInit
+// Apotheosis (review 2026-09-04 item 1): DEFAULT OFF. 0.1.9.14 on device showed background-only
+// frames at the end of a scroll with the presenter on, so the shipping default is the engine-owned
+// window surface (the pre-presenter behaviour). The harness mirrors this default in
+// MainPage.xaml.h; a settings.ini that already carries "presenter=1" still wins for that install.
+static bool g_presenterWanted = false;                 // switch, read once per WebCoreGpuInit
 static std::atomic<bool> g_presenterActive { false };  // the presenter really owns the swap chain
 static void* g_presenterWindow = nullptr;              // native window handed to the presenter thread
 static EGLDisplay g_presenterEglDisplay = nullptr;
@@ -5516,9 +5520,10 @@ int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long lon
     return owed ? 1 : 0;
 }
 
-// Apotheosis (presenter thread): pick the presentation model. ON (the default) = a presenter thread
-// owns the swap chain; OFF = exactly the behaviour before it existed, the engine thread presents
-// into the window surface itself and the harness does its pan preview with a XAML transform.
+// Apotheosis (presenter thread): pick the presentation model. ON = a presenter thread owns the
+// swap chain; OFF (the default since the 2026-09-04 review) = exactly the behaviour before it
+// existed, the engine thread presents into the window surface itself and the harness does its pan
+// preview with a XAML transform.
 // Read once, inside WebCoreGpuInit - flipping it afterwards cannot move a live EGL window surface
 // between threads, so the harness persists it and it applies at the next start.
 void WebCoreSetPresenterThread(int enabled)

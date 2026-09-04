@@ -315,7 +315,9 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 // eglSwapBuffers lands at once) and keeps the page moving while the engine thread is busy with JS
 // or layout. See the long comment in WebCoreDriver.cpp for the full design.
 //
-//   WebCoreSetPresenterThread   pick the model. Default ON. Read once, inside WebCoreGpuInit - a
+//   WebCoreSetPresenterThread   pick the model. Default OFF (2026-09-04 review: the presenter
+//                               showed background-only frames at scroll end on device). Read once,
+//                               inside WebCoreGpuInit - a
 //                               live EGL window surface cannot change threads afterwards, so the
 //                               harness persists the setting and it takes effect at the next start.
 //                               OFF = exactly the pre-presenter behaviour. Engine thread.
