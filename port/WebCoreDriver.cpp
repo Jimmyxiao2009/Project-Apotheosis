@@ -478,6 +478,20 @@ static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyT
 // translation. Engine thread only, like every other flag here.
 static bool g_panGesture = false;
 static bool g_swapOwed = false;       // a composite ran whose swap was deferred and is still owed
+// Apotheosis (stale deferred swap, 2026-09-04): a deferred swap is only correct for the scroll
+// position it was composited at. The harness releases it two XAML frames after the completion of
+// the scroll job it belongs to, and a newer scroll frame may supersede that wait and release both
+// at once (MainPage::DisarmPanAck) - so the WebCorePresent() that arrives can be the acknowledgement
+// of a job that is no longer the newest one the engine has applied. Swapping then puts the older
+// composite on screen underneath a translation that has already been reduced by the newer delta,
+// i.e. the content jumps back towards where the gesture started for one frame. Tag every owed swap
+// with the scroll generation (and position) it was composited at; WebCorePresent() releases it only
+// if it still belongs to the newest applied scroll, and otherwise drops the frame and asks for a
+// fresh composite. Engine thread only, like every other flag here.
+static uint64_t g_scrollGen = 0;      // bumped by every main-frame scroll the engine applies
+static uint64_t g_swapOwedGen = 0;    // g_scrollGen as it was when the owed composite ran
+static int g_swapOwedScrollX = 0;     // scroll position that composite is showing (diagnostics)
+static int g_swapOwedScrollY = 0;
 // Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
 // consumed is still in flight — moves/releases only reach the page while this is set, and
 // teardownSession() clears it. Engine thread only, like every other flag here.
@@ -2229,6 +2243,28 @@ static void presenterStatsDump(const char* why)
     std::fclose(fp);
 }
 
+// Apotheosis (stale deferred swap): confirmation on device that the guard in WebCorePresent()
+// actually fires, and by how much the dropped frame was out of date. Same plain-line channel as
+// presenter-stats (crash.txt, no crash record, no crash-entry budget), capped so a long pan cannot
+// fill the file. Grep for "pan-swap-drop".
+static void panSwapDropNote(int nowX, int nowY)
+{
+    static int notes = 0;
+    if (!g_crashLogPath[0] || notes >= 8)
+        return;
+    ++notes;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "pan-swap-drop %02u:%02u:%02u.%03u owed_gen=%llu scroll_gen=%llu owed=%d,%d now=%d,%d\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        static_cast<unsigned long long>(g_swapOwedGen), static_cast<unsigned long long>(g_scrollGen),
+        g_swapOwedScrollX, g_swapOwedScrollY, nowX, nowY);
+    std::fclose(fp);
+}
+
 static void presenterThreadMain()
 {
     using namespace WebCore;
@@ -2636,6 +2672,13 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     // TranslateTransform on screen, or the two disagree for a frame. WebCorePresent() does the swap.
     if (g_panGesture) {
         g_swapOwed = true;
+        // Apotheosis (stale deferred swap): remember which scroll this frame is showing, so
+        // WebCorePresent() can tell "the frame the harness is acknowledging" from "a frame the
+        // engine has already moved past". See the block at g_scrollGen.
+        g_swapOwedGen = g_scrollGen;
+        const IntPoint owedScroll = view.scrollPosition();
+        g_swapOwedScrollX = owedScroll.x();
+        g_swapOwedScrollY = owedScroll.y();
         return kOK;
     }
     {
@@ -2939,6 +2982,10 @@ static void teardownSession()
     // buffer is about to be redrawn by the next session anyway.
     g_panGesture = false;
     g_swapOwed = false;
+    // Apotheosis (stale deferred swap): the scroll ledger belonged to the page that is going away.
+    ++g_scrollGen;
+    g_swapOwedGen = g_scrollGen;
+    g_swapOwedScrollX = g_swapOwedScrollY = 0;
     // Apotheosis (presenter thread): the frames in the presenter's slots were composited from the
     // layer tree that is about to be destroyed. Mark them stale, or the 8 ms pan heartbeat (and
     // any pan offset that arrives before the next session publishes) would keep re-swapping a
@@ -4178,6 +4225,10 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     if (ty < minP.y()) ty = minP.y();
     if (ty > maxP.y()) ty = maxP.y();
     view->setScrollPosition(ScrollPosition(tx, ty));
+    // Apotheosis (stale deferred swap): this job's composite, further down, is the only frame that
+    // shows this scroll position - anything composited before this line is now out of date. See
+    // the block at g_scrollGen.
+    ++g_scrollGen;
 
     // ★ M3 快滚:不再每帧跑 pumpLoop(8s 看门狗的多轮 rendering-update)+ 重取帧 + resize + 二次 layout
     //   —— 那是"很卡"的元凶。这里只一次 isolatedUpdateRendering(驱动 scroll steps/IntersectionObserver 注册,
@@ -5016,6 +5067,26 @@ int WebCorePresent()
     g_swapOwed = false;
     if (!g_gpuActive || !g_gpuPresentMode || !g_glContext)
         return kOK;
+    // Apotheosis (stale deferred swap, 2026-09-04): only release a frame that still belongs to the
+    // newest scroll the engine has applied. If a newer WebCoreScrollBy has already run, this
+    // acknowledgement belongs to a job the engine has moved past: its composite shows the OLD
+    // scroll position, while the harness' translation has already been reduced by the newer delta,
+    // and swapping it puts the content back where the gesture came from for one frame. Drop it
+    // instead - the back buffer is about to be redrawn anyway - and arm a present so the next
+    // composite (at the current position) reaches the screen without waiting for a wake-up.
+    if (g_swapOwedGen != g_scrollGen) {
+        int nowX = 0, nowY = 0;
+        if (g_session && g_session->mainFrame) {
+            if (WebCore::LocalFrameView* v = g_session->mainFrame->view()) {
+                nowX = v->scrollPosition().x();
+                nowY = v->scrollPosition().y();
+            }
+        }
+        panSwapDropNote(nowX, nowY);
+        if (g_session && g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+        return kOK;
+    }
     g_glContext->makeContextCurrent();
     g_glContext->swapBuffers();
     return kOK;
