@@ -518,6 +518,10 @@ static bool g_swapOwed = false;       // a composite ran whose swap was deferred
 // is still owed to its own acknowledgement, and nothing would ever recomposite it during a gesture
 // (WebCoreLiveTick skips its composite while g_panGesture is set).
 static uint64_t g_scrollGen = 0;      // bumped by every main-frame scroll the engine applies
+// Apotheosis (review 2026-09-04 item 6): g_scrollGen as WebCoreLiveTick last saw it. Engine thread
+// only. A tick may take the scroll fast path only when a scroll job has run since the previous
+// tick - see the block at the bottom of WebCoreLiveTick.
+static uint64_t g_lastTickScrollGen = 0;
 static uint64_t g_swapOwedGen = 0;    // g_scrollGen as it was when the owed composite ran
 static uint64_t g_swapOwedId = 0;     // identity of the owed frame; what WebCorePresentFrame matches on
 static uint64_t g_swapIdNext = 1;     // 0 stays reserved for "no frame" / "any frame" (legacy WebCorePresent)
@@ -6017,14 +6021,25 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // take the scroll fast path and keep the uploaded tiles. Any invalidation
     // (JS/DOM change, image decode, new layers) sets needsPresent through
     // triggerRenderingUpdate and still gets the full dirty-tree composite.
-    // Experiment F (2026-09-02): on github.com not one of 84 ticks took the fast
-    // path - the page requests a rendering update every tick, so each tick still
-    // re-rasterised the whole tree (0.8-1.1 s). Scroll frames prove the retained
-    // tiles are correct: take the fast path on every tick. WebCore's own dirty
-    // rects (setNeedsDisplayInRect via RenderLayerBacking) still repaint what
-    // changed; navigation/click/type keep the full force-dirty composite.
-    if (g_gpuActive)
-        g_gpuScrollFast = true;
+    // Experiment F (2026-09-02) then set it on EVERY tick, because on github.com not
+    // one of 84 ticks took the fast path - the page requests a rendering update every
+    // tick, so each tick still re-rasterised the whole tree (0.8-1.1 s).
+    //
+    // Apotheosis (review 2026-09-04 item 6): that is what MANUFACTURES the empty light
+    // composites gpuPresent now has to detect (unpainted visible tiles) and redo in
+    // full - two full composites where one would have done, plus a visible white frame
+    // whenever the repair does not catch it. A tick is entitled to the fast path only
+    // when it is riding on a scroll the engine has just applied (the tiles are painted,
+    // only the scroll layer moved) AND nothing has asked for a rendering update since
+    // the last present. Either condition failing means content may have changed, and
+    // forceDirtyTree is exactly the answer to that. An idle tick on a static page is
+    // cheap either way: the dirty tree it force-dirties has nothing new to upload.
+    if (g_gpuActive) {
+        const bool afterScroll = (g_scrollGen != g_lastTickScrollGen);
+        g_lastTickScrollGen = g_scrollGen;
+        const bool dirty = g_session->chrome && g_session->chrome->peekNeedsPresent();
+        g_gpuScrollFast = afterScroll && !dirty;
+    }
     const int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
     // Apotheosis (event-driven present): belt and braces for the "still dirty when the tick ended"
     // case - a repaint request that landed after gpuPresent() consumed takeNeedsPresent(), or one

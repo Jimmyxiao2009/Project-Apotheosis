@@ -3733,6 +3733,17 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 if (s->m_panSnapTimer) { try { s->m_panSnapTimer->Stop(); } catch (...) {} }
                 s->m_scrollStateValid = false;
                 ++s->m_scrollStateGen;
+                // Apotheosis (review 2026-09-04 item 6): record the committed scale HERE, with the
+                //   rest of the unconditional reset, not behind the m_opSeq guard below. The engine
+                //   has applied the new scale by the time we get here regardless of who owns the
+                //   frame - the same argument the block above makes for the pan residual and the
+                //   scroll cache. Behind the guard, a superseded commit left m_pageScale describing
+                //   the pre-pinch document, and every consumer of it worked in the wrong units:
+                //   ScrollStateUsable() compared the wrong stamp (and so trusted a stale cache),
+                //   MapTapToEngine mapped taps at the wrong scale, and the next pinch took its base
+                //   from it. Only the frame itself is dropped when superseded.
+                if (rcCopy == 0)
+                    s->m_pageScale = newScale;
                 // (m_scrollStateScale is stamped where the cache is VALIDATED, not here — the next
                 //  RequestScrollState answer/engine frame re-seeds it against the committed scale.)
                 // The insets deferred while the gesture ran (ApplyViewInsets' pinch guard) — e.g.
@@ -3744,10 +3755,8 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                                 + " current=" + std::to_string(s->m_opSeq == mySeq ? 1 : 0)
                                 + " dropped pan residual + pre-zoom scroll cache");
                 if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
-                if (rcCopy == 0) {
-                    s->m_pageScale = newScale;
+                if (rcCopy == 0)
                     s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
-                }
                 // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
                 s->m_zoomTransform = nullptr;
                 // Apotheosis (review 2026-09-04 item 1): drop the preview through the one place
