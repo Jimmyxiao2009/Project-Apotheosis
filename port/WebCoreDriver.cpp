@@ -2167,6 +2167,10 @@ static void presenterThreadMain()
         P.cond.notifyAll();
     }
     if (!ok) {
+        // The context (and with it the window surface, which holds COM references to the panel)
+        // must go before the apartment it was created in - releasing COM objects after
+        // RoUninitialize is undefined. Same order on the way out of the loop below.
+        ctx = nullptr;
         if (roOwned)
             RoUninitialize();
         return;
@@ -2364,6 +2368,7 @@ static void presenterThreadMain()
         drawnAnything = true;
     }
 
+    ctx = nullptr;              // before RoUninitialize: it releases the panel's COM references
     if (roOwned)
         RoUninitialize();
 }
