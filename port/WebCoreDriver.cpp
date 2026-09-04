@@ -582,7 +582,14 @@ struct PresenterState {
     bool suspended { false };
     int initState { 0 };           // 0 = starting, 1 = ready, -1 = failed
 };
-static PresenterState* g_pres = nullptr;    // allocated in presenterStart, never freed once running
+// Apotheosis: written exactly once, by the engine thread in presenterStart(), and read by the
+// presenter thread and - the reason this is an atomic - by the UI thread in WebCoreSetPanOffset /
+// WebCoreSetPresenterSuspended. The release store publishes the fully built PresenterState (its
+// lock, its textures) to whoever acquire-loads a non-null pointer; a plain pointer gave the
+// compiler and the ARMv7 memory model every right to hand out a half-initialised object. It is
+// never freed and never reset to null once non-null, so an acquire-load that saw it stays valid
+// for the life of the process (see presenterStart's detach path).
+static std::atomic<PresenterState*> g_pres { nullptr };
 static RefPtr<WTF::Thread> g_presenterThread;
 
 // ---------------------------------------------------------------------------
@@ -2109,7 +2116,7 @@ static bool presenterBuildGL(PresenterGL& gl)
 static void presenterThreadMain()
 {
     using namespace WebCore;
-    PresenterState& P = *g_pres;
+    PresenterState& P = *g_pres.load(std::memory_order_acquire);
 
     // Apotheosis: this thread must be a WinRT/COM thread before it touches EGL. ANGLE's
     // SwapChainPanel path QIs ISwapChainPanelNative off the IInspectable* we hand it, on the
@@ -2260,7 +2267,7 @@ static void presenterThreadMain()
 // its quad from that very slot. Bounded at 50 ms so a wedged presenter can never wedge the engine.
 static int presenterAcquireSlot()
 {
-    PresenterState& P = *g_pres;
+    PresenterState& P = *g_pres.load(std::memory_order_acquire);
     Locker locker { P.lock };
     const int idx = (P.published == 0) ? 1 : 0;
     const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
@@ -2274,7 +2281,7 @@ static int presenterAcquireSlot()
 // Engine thread: the composite into slot `idx` is issued - hand it to the presenter.
 static void presenterPublish(int idx, int scrollX, int scrollY, const WebCore::Color& background)
 {
-    PresenterState& P = *g_pres;
+    PresenterState& P = *g_pres.load(std::memory_order_acquire);
     EGLSyncKHR fence = nullptr;
     if (g_eglCreateSyncKHR)
         fence = g_eglCreateSyncKHR(g_presenterEglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
@@ -2319,7 +2326,7 @@ static bool presenterStart(void* nativeWindow, int w, int h)
         g_eglClientWaitSyncKHR = nullptr;   // presenterPublish falls back to glFinish()
     }
 
-    if (g_pres)
+    if (g_pres.load(std::memory_order_acquire))
         return false;   // one presenter per process; a second attempt would orphan the first
 
     // Built locally and only published into g_pres once it is complete: from the moment the
@@ -2334,7 +2341,7 @@ static bool presenterStart(void* nativeWindow, int w, int h)
     }
     g_presenterWindow = nativeWindow;
     PresenterState& P = *pres;
-    g_pres = pres.release();
+    g_pres.store(pres.release(), std::memory_order_release);
     g_presenterThread = WTF::Thread::create("ApotheosisPresenter"_s, [] { presenterThreadMain(); },
         WTF::ThreadType::Graphics);   // 1 MB reserved stack (WTF stackSize(), WK_WINUWP branch)
 
@@ -2384,9 +2391,10 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     // into one of the two offscreen render targets and publish it; the presenter decides when and
     // with which pan offset it reaches the screen. Nothing below this branch runs in that mode -
     // no default framebuffer, no g_panGesture handshake, no eglSwapBuffers on this thread.
-    if (g_presenterActive.load() && g_pres) {
+    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
+    if (g_presenterActive.load() && pres) {
         const int idx = presenterAcquireSlot();
-        BitmapTexture& target = *g_pres->slot[idx].texture;
+        BitmapTexture& target = *pres->slot[idx].texture;
         Color docBg = view.documentBackgroundColor();
         if (!docBg.isValid())
             docBg = Color::white;
@@ -4824,9 +4832,10 @@ int WebCorePresenterActive(void)
 // No-op when the presenter is not running, so the harness may call it unconditionally.
 void WebCoreSetPanOffset(float x, float y, int gestureActive)
 {
-    if (!g_pres)
+    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
+    if (!pres)
         return;
-    PresenterState& P = *g_pres;
+    PresenterState& P = *pres;
     Locker locker { P.lock };
     const bool on = (gestureActive != 0);
     if (!on && x == 0.0f && y == 0.0f) {
@@ -4868,9 +4877,10 @@ void WebCoreSetPanOffset(float x, float y, int gestureActive)
 // down. UI thread callable, same contract as WebCoreSetPanOffset.
 void WebCoreSetPresenterSuspended(int suspended)
 {
-    if (!g_pres)
+    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
+    if (!pres)
         return;
-    PresenterState& P = *g_pres;
+    PresenterState& P = *pres;
     Locker locker { P.lock };
     P.suspended = (suspended != 0);
     P.wake = true;
