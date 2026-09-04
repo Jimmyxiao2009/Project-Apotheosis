@@ -750,6 +750,16 @@ MainPage::MainPage()
             // its ManipulationCompleted may never arrive - hand the presents back on both edges, or
             // the engine would stay silent on the way back in.
             PanDeferOff();
+            // Apotheosis (presenter thread): drop any pan offset still on screen and stop the
+            // presenter's swaps while we are in the background. UWP freezes every thread once the
+            // suspend deferral completes, but between this event and that moment the presenter
+            // would happily keep swapping a swap chain the shell is tearing down. UI-thread safe
+            // by design (see WebCoreDriver.h) - both calls are one uncontended lock in the driver.
+            if (m_presenterActive) {
+                m_panAbsX = 0; m_panAbsY = 0;
+                try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {}
+                try { WebCoreSetPresenterSuspended(e->Visible ? 0 : 1); } catch (...) {}
+            }
             if (e->Visible) StartLiveMode();
             else {
                 StopLiveMode();
@@ -1294,6 +1304,9 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     // and any pan remainder belongs to the page we are leaving.
     PanDeferOff();   // a pan of the old page must not keep the engine from presenting the new one
     m_panRemX = 0; m_panRemY = 0;
+    // Apotheosis (presenter thread): same for the offset the presenter is still showing.
+    m_panAbsX = 0; m_panAbsY = 0;
+    if (m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
     if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
     if (m_panSnapTimer) m_panSnapTimer->Stop();
     m_scrollStateValid = false;
@@ -2211,6 +2224,18 @@ void MainPage::InstantPanBy(int dx, int dy)
     // pan route (and only on it - the nested-scroll and drag routes never come through here), so it
     // is where the gesture is declared to the engine.
     PanGestureBegin();
+    // Apotheosis (presenter thread): the presenter owns the screen, so the preview is not a XAML
+    // transform any more - hand it the raw finger offset and let it do the arithmetic against the
+    // scroll position each composited frame carries. Straight from the UI thread: WebCoreSetPanOffset
+    // takes one uncontended lock in the driver and never touches WebCore (see WebCoreDriver.h).
+    // No m_panRem*, no clamping here (the presenter clamps to one screen), no snap timer (a gesture
+    // that ends decays inside the presenter and snaps to zero after at most a second).
+    if (m_presenterActive) {
+        m_panAbsX += dx;
+        m_panAbsY += dy;
+        try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 1); } catch (...) {}
+        return;
+    }
     m_panRemX += dx;
     m_panRemY += dy;
     ClampPanRemainder();
@@ -2225,6 +2250,18 @@ void MainPage::InstantPanBy(int dx, int dy)
 void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScrollState,
                                  int fallbackDx, int fallbackDy)
 {
+    // Apotheosis (presenter thread): the presenter subtracts the engine's progress itself - every
+    // published frame carries the scroll position it was composited at - so there is no remainder
+    // to correct here and no transform to rewrite. Keep the cache the rest of the UI reads.
+    if (m_presenterActive) {
+        if (haveScrollState) {
+            m_scrollX = newScrollX;
+            m_scrollY = newScrollY;
+            m_scrollStateValid = true;
+        } else
+            m_scrollStateValid = false;
+        return;
+    }
     if (!haveScrollState) {
         m_scrollStateValid = false;
         if (m_panRemX || m_panRemY) {
@@ -2257,6 +2294,12 @@ void MainPage::InstantPanReset()
     // present again. Covers every way a pan can be abandoned: a new gesture, a pinch taking over,
     // the 1 s snap timer, a superseded scroll frame, the developer toggle being switched off.
     PanDeferOff();
+    // Apotheosis (presenter thread): (0,0) with the gesture flag clear is the driver's hard reset -
+    // the next frame is drawn untranslated. This is the path a pinch, a navigation and the setting
+    // being switched off all take.
+    m_panAbsX = 0;
+    m_panAbsY = 0;
+    if (m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
     m_panRemX = 0;
     m_panRemY = 0;
     if (m_panSnapTimer) m_panSnapTimer->Stop();
@@ -2430,6 +2473,11 @@ void MainPage::PanGestureBegin()
     //   engine presents nothing at all.
     if (!m_manipActive) return;
     m_panGestureOn = true;
+    // Apotheosis (presenter thread): there is no present to take away - the engine never swaps, the
+    // presenter does, and it composes content and pan offset in the same frame by construction.
+    // m_panGestureOn is still set, because it is also the coarse-step gate in FreeScrollBy: feeding
+    // the engine a third of a viewport at a time is as right now as it was before.
+    if (m_presenterActive) return;
     if (m_panDefer) return;
     m_panDefer = true;
     WebEngine::instance().post([]() { try { WebCoreSetPanGesture(1); } catch (...) {} });
@@ -2443,6 +2491,12 @@ void MainPage::PanGestureEnd()
 {
     if (!m_panGestureOn) return;
     m_panGestureOn = false;
+    // Apotheosis (presenter thread): the finger is gone but the offset it left behind is still on
+    // screen. Tell the presenter the gesture ended and let it decay the residual as the engine
+    // catches up (and snap to zero after a second if it never does) - the offset is deliberately
+    // NOT reset to 0 here, that would put the pre-gesture frame back for one frame.
+    if (m_presenterActive)
+        try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 0); } catch (...) {}
     if (m_scrollBusy) return;                                   // its completion finishes this
     if (m_scrollAccum != 0 || m_scrollAccumX != 0) { PumpScroll(); return; }
     PanDeferOff();
@@ -2451,12 +2505,17 @@ void MainPage::PanGestureEnd()
 // Give presents back to the engine now, flushing whatever swap it may still owe. Idempotent.
 void MainPage::PanDeferOff()
 {
+    // Apotheosis (presenter thread): m_panDefer is never armed in presenter mode, but m_panGestureOn
+    // is (the coarse-step gate), and the live loop is held off for the length of a gesture either
+    // way - so the restart below has to happen for both, not just for the handshake path.
+    const bool wasPanning = m_panGestureOn || m_panDefer;
     m_panGestureOn = false;
-    if (!m_panDefer) return;
-    m_panDefer = false;
-    DisarmPanAck();
-    WebEngine::instance().post([]() { try { WebCorePresent(); WebCoreSetPanGesture(0); } catch (...) {} });
-    if (!m_loading) StartLiveMode();   // the live loop was held off while the gesture owned the screen
+    if (m_panDefer) {
+        m_panDefer = false;
+        DisarmPanAck();
+        WebEngine::instance().post([]() { try { WebCorePresent(); WebCoreSetPanGesture(0); } catch (...) {} });
+    }
+    if (wasPanning && !m_loading) StartLiveMode();   // the live loop was held off during the gesture
 }
 
 // Stop waiting for a commit: either a newer scroll frame has superseded the composite we were
@@ -2964,6 +3023,10 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 // stale — and the pan remainder was already dropped when the pinch started.
                 s->m_zoomTransform = nullptr;
                 s->m_panRemX = 0; s->m_panRemY = 0;
+                // Apotheosis (presenter thread): the scale changed under the presenter's last
+                //   frame - drop its offset too, the engine frame that follows is the truth.
+                s->m_panAbsX = 0; s->m_panAbsY = 0;
+                if (s->m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
                 if (s->m_panTranslate != nullptr) { s->m_panTranslate->X = 0.0; s->m_panTranslate->Y = 0.0; }
                 s->m_scrollStateValid = false;
                 // Apotheosis (review 2026-09-04 item 1): drop the preview through the one place
@@ -4100,6 +4163,7 @@ void MainPage::LoadSettings()
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
+            else if (k == "presenter") m_presenterThread = (atoi(v.c_str()) != 0);
             else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
@@ -4129,6 +4193,7 @@ void MainPage::SaveSettings()
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
+    s += "presenter=" + std::to_string(m_presenterThread ? 1 : 0) + "\n";
     s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
@@ -4155,6 +4220,7 @@ void MainPage::ShowSettings()
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
     if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
+    if (SetPresenterSwitch) SetPresenterSwitch->IsOn = m_presenterThread;
     if (SetEventPresentSwitch) SetEventPresentSwitch->IsOn = m_eventPresent;
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
@@ -4196,6 +4262,10 @@ void MainPage::HideSettings()
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
     if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
+    // Apotheosis (presenter thread): WebCoreGpuInit reads this once, so a change only takes
+    //   effect at the next start - deliberately not applied to the live session, a live EGL
+    //   window surface cannot be moved between threads.
+    if (SetPresenterSwitch) m_presenterThread = SetPresenterSwitch->IsOn;
     if (SetEventPresentSwitch) m_eventPresent = SetEventPresentSwitch->IsOn;
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
@@ -4242,6 +4312,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
+    { L"呈现线程(重启生效)", L"Presenter thread (needs restart)" },
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
     { L"事件驱动呈现", L"Event-driven present" },
     { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
@@ -4862,22 +4933,31 @@ void MainPage::EnableGpu()
                   Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
     m_gpuProps = props;
     void* win = reinterpret_cast<void*>(reinterpret_cast<IInspectable*>(props));
+    const bool wantPresenter = m_presenterThread;   // read once; WebCoreGpuInit does the same
     // 崩溃环路保护:开 GPU 前落 gpu-crash.flag;回调(成功或优雅失败)删它。GpuInit 硬崩则无回调→标记残留→下次启动检测到→关默认GPU。
     {
         std::wstring fd = LocalStateDir();
         if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
     }
-    WebEngine::instance().post([disp, self, win]() {
+    WebEngine::instance().post([disp, self, win, wantPresenter]() {
+        // Apotheosis (presenter thread): WebCoreGpuInit reads this once and decides there whether
+        // the engine gets an offscreen context and a presenter thread owns the window surface, or
+        // whether the engine owns it as before. It may silently fall back, so the answer comes back
+        // from WebCorePresenterActive() rather than from the setting.
+        try { WebCoreSetPresenterThread(wantPresenter ? 1 : 0); } catch (...) {}
         int rc = -999;
         try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
+        int presenter = 0;
+        try { presenter = WebCorePresenterActive(); } catch (...) { presenter = 0; }
         try {
             std::wstring d = LocalStateDir();
-            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
+            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + " presenter=" + std::to_string(presenter) + "\n"; f.write(s.data(), s.size()); } }
         } catch (...) {}
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rcCopy]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rcCopy, presenter]() {
                 MainPage^ s = self.Get(); if (!s) return;
+                s->m_presenterActive = (rcCopy == 0 && presenter != 0);
                 std::wstring d2 = LocalStateDir();   // 回调到达=没硬崩 → 删崩溃标记
                 if (!d2.empty()) { try { DeleteFileW((d2 + L"\\gpu-crash.flag").c_str()); } catch (...) {} }
                 if (rcCopy == 0) {

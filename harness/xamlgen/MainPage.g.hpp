@@ -659,6 +659,8 @@ static ::Platform::String^ __MainPageXaml() {
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <!-- Apotheosis: 呈现线程独占交换链(引擎离屏合成 + 呈现线程平移显示),默认开;改后需重启。 -->
+                    <ToggleSwitch x:Name="SetPresenterSwitch" Header="呈现线程(重启生效)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 引擎有变化才合成，代替固定 200ms tick，默认开。 -->
                     <ToggleSwitch x:Name="SetEventPresentSwitch" Header="事件驱动呈现" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis: 地图/画布类控件自己处理指针事件平移内容，默认开。 -->
@@ -683,9 +685,9 @@ static ::Platform::String^ __MainPageXaml() {
             <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="10,10" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Margin="8,0" VerticalAlignment="Center">
-                    <TextBlock Text="WORKSPACE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="140" />
-                    <TextBlock x:Name="TabSwitcherTitle" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="Sem)APO",
-        LR"APO(iBold" Margin="0,2,0,0" />
+                    <TextBlock Text=")APO",
+        LR"APO(WORKSPACE" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="140" />
+                    <TextBlock x:Name="TabSwitcherTitle" Text="标签" Foreground="{StaticResource TxtHi}" FontSize="21" FontWeight="SemiBold" Margin="0,2,0,0" />
                 </StackPanel>
                 <Button Grid.Column="1" Style="{StaticResource TabBtn}" Foreground="{StaticResource Accent}" Content="完成" x:Name="_ev26" />
             </Grid>
@@ -756,6 +758,7 @@ void MainPage::InitializeComponent() {
     SetScrollFabSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetScrollFabSwitch"));
     SetInstantPanSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetInstantPanSwitch"));
     SetThreadedRasterSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetThreadedRasterSwitch"));
+    SetPresenterSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetPresenterSwitch"));
     SetEventPresentSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetEventPresentSwitch"));
     SetDragPointerSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetDragPointerSwitch"));
     SetHideNavBarSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetHideNavBarSwitch"));
@@ -804,19 +807,19 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev1"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollUp);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev2"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollDown);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindPrev"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindPrev);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);

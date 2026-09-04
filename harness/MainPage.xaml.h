@@ -370,6 +370,15 @@ namespace Harness {
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
         bool m_threadedRaster { false };// settings.ini threadraster
+        // Apotheosis (presenter thread): ON = a presenter thread inside the driver owns the swap
+        //   chain, the engine composites offscreen and the pan preview is a translation the
+        //   presenter applies (WebCoreSetPanOffset) instead of a XAML transform on GpuPanel.
+        //   Read once by WebCoreGpuInit, so the switch only takes effect at the next start; OFF is
+        //   the pre-presenter behaviour. m_presenterActive is what actually happened - GpuInit
+        //   falls back to the engine-owned window surface silently, and every pan route asks this,
+        //   never the setting.
+        bool m_presenterThread { true };   // settings.ini presenter
+        bool m_presenterActive { false };  // WebCorePresenterActive() after WebCoreGpuInit
         // Apotheosis (drag as pointer events): route a pan that starts over a drag widget (map,
         //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is
         //   the only way those pages can be panned at all. settings.ini dragpointer
@@ -481,6 +490,10 @@ namespace Harness {
         bool   m_insetsValid { false };
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         int  m_panRemX { 0 }, m_panRemY { 0 };
+        // Apotheosis (presenter thread): what the finger has asked for since this gesture started,
+        //   in engine px, cumulative. The presenter needs the absolute offset (it subtracts the
+        //   engine's own progress itself), not the remainder m_panRem* carries for the XAML path.
+        int  m_panAbsX { 0 }, m_panAbsY { 0 };
         // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Only used to
         //   clamp the preview to the document and to measure how far the engine really got.
         int  m_scrollX { 0 }, m_scrollY { 0 };

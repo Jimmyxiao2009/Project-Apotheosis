@@ -723,6 +723,8 @@
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <!-- Apotheosis: 呈现线程独占交换链(引擎离屏合成 + 呈现线程平移显示),默认开;改后需重启。 -->
+                    <ToggleSwitch x:Name="SetPresenterSwitch" Header="呈现线程(重启生效)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <!-- Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 引擎有变化才合成，代替固定 200ms tick，默认开。 -->
                     <ToggleSwitch x:Name="SetEventPresentSwitch" Header="事件驱动呈现" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <!-- Apotheosis: 地图/画布类控件自己处理指针事件平移内容，默认开。 -->
