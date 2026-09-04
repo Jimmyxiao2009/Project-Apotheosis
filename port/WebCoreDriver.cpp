@@ -485,6 +485,12 @@ static bool g_dragActive = false;
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
+// Apotheosis (presenter thread): RoInitialize/RoUninitialize for the presenter thread. WinRT
+// apartment bring-up, not WRL - nothing here uses C++/CX or WRL types, ANGLE only needs the
+// calling thread to have an apartment when it QIs the SwapChainPanel. Declared in the App
+// partition of the SDK, imported from WindowsApp.lib, which the driver already links.
+#include <roapi.h>
+
 // ===========================================================================
 // Apotheosis (presenter thread) - the swap chain gets exactly one owner.
 //
@@ -2105,6 +2111,19 @@ static void presenterThreadMain()
     using namespace WebCore;
     PresenterState& P = *g_pres;
 
+    // Apotheosis: this thread must be a WinRT/COM thread before it touches EGL. ANGLE's
+    // SwapChainPanel path QIs ISwapChainPanelNative off the IInspectable* we hand it, on the
+    // CALLING thread - on a thread that never initialised the apartment that QI fails with
+    // CO_E_NOTINITIALIZED, eglCreateWindowSurface fails, and the only symptom is the silent
+    // fallback to the engine-owned window surface. Multi-threaded (MTA), never STA: an STA would
+    // need a message pump this thread does not run, and the presenter must not be re-entered.
+    // RO_INIT_MULTITHREADED is CoInitializeEx(COINIT_MULTITHREADED) plus the WinRT metadata
+    // bring-up; RoInitialize/RoUninitialize are App-Container APIs and come from WindowsApp.lib.
+    // S_FALSE (already initialised) is a success, RPC_E_CHANGED_MODE is not - in both cases the
+    // apartment exists, so only a hard failure is worth giving up on.
+    const HRESULT roHr = RoInitialize(RO_INIT_MULTITHREADED);
+    const bool roOwned = SUCCEEDED(roHr);
+
     // The window surface is created HERE, on the thread that will own it. ANGLE marshals the
     // SwapChainPanel work inside eglCreateWindowSurface to the panel's dispatcher, so this blocks
     // until the (idle) UI thread has run it - which is why WebCoreGpuInit only ever waits for this
@@ -2118,8 +2137,11 @@ static void presenterThreadMain()
         P.initState = ok ? 1 : -1;
         P.cond.notifyAll();
     }
-    if (!ok)
+    if (!ok) {
+        if (roOwned)
+            RoUninitialize();
         return;
+    }
 
     uint64_t drawnGeneration = 0;
     float drawnTx = 0.0f, drawnTy = 0.0f;
@@ -2228,6 +2250,9 @@ static void presenterThreadMain()
         drawnTy = ty;
         drawnAnything = true;
     }
+
+    if (roOwned)
+        RoUninitialize();
 }
 
 // Engine thread: pick the slot to composite into. Never the one that is published (the presenter
