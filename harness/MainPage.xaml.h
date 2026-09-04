@@ -414,6 +414,12 @@ namespace Harness {
         bool m_scrollBusy { false };  // 有 WebCoreScrollBy 任务在引擎线程飞行
         // Apotheosis: nested-scroll routing state (WebCoreIsScrollableAt/WebCoreWheelAt, d982774).
         NestedScrollState m_nestedScrollState { NestedScrollState::Unknown };  // this gesture's answer
+        // Apotheosis (review 2026-09-04 item 3): a finger is on the glass (or its inertia is still
+        // running) — set at ManipulationStarted, cleared at ManipulationCompleted. Only a live
+        // manipulation may take the presents away from the engine (PanGestureBegin): async engine
+        // completions can land after the gesture ended, and there would be no gesture left to end
+        // the pan mode they re-armed.
+        bool m_manipActive { false };
         unsigned long long m_nestedScrollGen { 0 };   // bumped at ManipulationStarted; a late hit-test
                                                        // answer whose gen no longer matches is dropped
         int  m_nestedAccumX { 0 };    // 未冲刷的累积横向位移(嵌套滚动路径,同 m_scrollAccumX 但走 wheel)

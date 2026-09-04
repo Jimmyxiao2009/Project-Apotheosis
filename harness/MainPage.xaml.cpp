@@ -2014,7 +2014,16 @@ void MainPage::PumpDrag()
                         s->m_dragBusy = false;
                         int fdx = s->m_dragFallbackDx, fdy = s->m_dragFallbackDy;
                         s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;
-                        if (fdx != 0 || fdy != 0) { s->InstantPanBy(fdx, fdy); s->FreeScrollBy(fdx, fdy); }
+                        // Apotheosis (review 2026-09-04 item 3): this completion is asynchronous and
+                        //   can land AFTER OnImageManipCompleted. Entering pan-gesture mode then
+                        //   (InstantPanBy -> PanGestureBegin -> WebCoreSetPanGesture(1)) would stop
+                        //   the engine presenting with no gesture left to hand the presents back,
+                        //   and the swallowed delta would jump in on the next touch. If the gesture
+                        //   is over, the buffered movement goes to the engine as a plain scroll.
+                        if (fdx != 0 || fdy != 0) {
+                            if (s->m_manipActive) s->InstantPanBy(fdx, fdy);
+                            s->FreeScrollBy(fdx, fdy);
+                        }
                         return;
                     }
                     s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;   // the page owns it now
@@ -2074,6 +2083,7 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
 {
     unsigned long long gen = ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
+    m_manipActive = true;   // a finger is on the glass until ManipulationCompleted (incl. inertia)
     m_pendingPanX = 0; m_pendingPanY = 0;
     // Apotheosis (drag as pointer events): a new gesture — drop whatever the previous one left
     // behind before the probe below can answer Drag for this one.
@@ -2393,6 +2403,11 @@ bool MainPage::PanFlushDue() const
 // before the WebCoreScrollBy this same delta is about to queue.
 void MainPage::PanGestureBegin()
 {
+    // Apotheosis (review 2026-09-04 item 3): only a live manipulation may own the presents. Every
+    //   caller reaches here from an engine completion that may land after ManipulationCompleted;
+    //   arming the mode then leaves nothing to disarm it but the 1 s snap timer, during which the
+    //   engine presents nothing at all.
+    if (!m_manipActive) return;
     m_panGestureOn = true;
     if (m_panDefer) return;
     m_panDefer = true;
@@ -2877,6 +2892,11 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // coarse gate held back in one step and let its frame release the last swap, so the final
     // present and the snap of the translation to identity happen in the same UI frame.
     PanGestureEnd();
+    // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count
+    //   as part of the gesture. From here on nothing may re-enter pan-gesture mode: a late engine
+    //   completion (PumpDrag's fallback) would arm m_panGestureOn/m_panDefer with no gesture left to
+    //   end them, and the engine would stay silent until the 1 s snap timer fired.
+    m_manipActive = false;
     ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     if (!m_pinching) return;
