@@ -100,6 +100,11 @@ namespace Harness {
         //   ApplicationView::SuppressSystemOverlays (phone only, ApiInformation-guarded).
         void OnHideNavBarToggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void ApplyHideNavBarSetting();
+        // Apotheosis (review 2026-09-04 item 2b): DISPLAY toggle "Hide status bar" — full
+        //   StatusBar::HideAsync()/ShowAsync(), on top of (not instead of) the always-on translucent
+        //   treatment near ApplyViewInsets() in the constructor.
+        void OnHideStatusBarToggled(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+        void ApplyHideStatusBarSetting();
         void LoadSettings();
         void SaveSettings();
         void ApplySettings();
@@ -373,6 +378,11 @@ namespace Harness {
         //   back/Windows/search bar; on = SuppressSystemOverlays hands that strip to us and the
         //   bottom inset in ApplyViewInsets() goes to 0. settings.ini hidenavbar
         bool m_hideNavBar { false };
+        // Apotheosis (review 2026-09-04 item 2b): DISPLAY toggle. Off = status bar shown (translucent,
+        //   clock stays readable via the ForegroundColor set in the constructor); on = fully hidden via
+        //   StatusBar::HideAsync(), and the top inset in ApplyViewInsets() follows VisibleBounds to 0.
+        //   settings.ini hidestatusbar
+        bool m_hideStatusBar { false };
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };

@@ -282,7 +282,11 @@
 
         <!-- ===== 内容区:网页渲染 + 浮层 ===== -->
         <Grid Grid.Row="0">
-            <Border Background="White" Margin="6,6,6,0" CornerRadius="10">
+            <!-- Apotheosis (2026-09-04 review item 2a): named so ApplyViewInsets() can push its top
+                 margin down by the status-bar inset — the rendered page used to start at y=0 inside
+                 this row (only the chrome above it, Progress/FindBar/overlays, got the inset), so
+                 the content ran under the shell's clock. -->
+            <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10">
                 <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖→引擎滚动+惯性,捏合→Scale)。
                      点击走 Tapped;坐标用 GetPosition(ContentArea) 映回引擎像素(MapTapToEngine)。 -->
                 <Grid x:Name="ContentArea" Background="White"
@@ -295,7 +299,8 @@
                 </Grid>
             </Border>
 
-            <!-- GPU 直呈现面(SwapChainPanel);GPU 起来后承载 TextureMapper 合成输出。 -->
+            <!-- GPU 直呈现面(SwapChainPanel);GPU 起来后承载 TextureMapper 合成输出。
+                 同上,顶边距由 ApplyViewInsets 设置——否则合成输出画到状态栏时钟底下。 -->
             <SwapChainPanel x:Name="GpuPanel" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
                             IsHitTestVisible="False" Visibility="Collapsed" Loaded="OnGpuPanelLoaded"/>
 
@@ -670,6 +675,12 @@
                     <TextBlock Text="DISPLAY" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetHideNavBarSwitch" Header="隐藏系统导航栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2"/>
                     <TextBlock Text="从屏幕底部向上轻扫可临时唤回" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                    <!-- Apotheosis (2026-09-04 review item 2b): fully hide the status bar (StatusBar::
+                         HideAsync/ShowAsync) instead of just the translucent-over-content treatment above.
+                         Default off — hiding it moves VisibleBounds, so ApplyViewInsets()'s top inset drops
+                         to 0 on its own (VisibleBoundsChanged is already wired). -->
+                    <ToggleSwitch x:Name="SetHideStatusBarSwitch" Header="隐藏状态栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2"/>
+                    <TextBlock Text="隐藏顶部状态栏(时钟/信号),内容区随之上移" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,6"/>
 
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>

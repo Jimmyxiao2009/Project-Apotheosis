@@ -851,6 +851,11 @@ MainPage::MainPage()
     if (SetHideNavBarSwitch)
         SetHideNavBarSwitch->Toggled += ref new Windows::UI::Xaml::RoutedEventHandler(
             this, &MainPage::OnHideNavBarToggled);
+    // Apotheosis (review 2026-09-04 item 2b): same reason as above — the hand-rolled generator has
+    //   no Toggled event to wire from a XAML attribute.
+    if (SetHideStatusBarSwitch)
+        SetHideStatusBarSwitch->Toggled += ref new Windows::UI::Xaml::RoutedEventHandler(
+            this, &MainPage::OnHideStatusBarToggled);
     // Apotheosis: status bar like Edge — extend the app under it (translucent, page content may
     //   run behind it), but keep our own chrome clear of the shell's own furniture.
     //   Review 2026-09-03: SetDesiredBoundsMode(UseCoreWindow) extends the window under the
@@ -1036,6 +1041,37 @@ void MainPage::OnHideNavBarToggled(Platform::Object^, RoutedEventArgs^)
     ApplyHideNavBarSetting();
 }
 
+// Apotheosis (review 2026-09-04 item 2b): DISPLAY toggle "Hide status bar". The constructor already
+//   makes the bar translucent and extends content under it (BackgroundOpacity 0, ForegroundColor
+//   set so the clock stays readable) — that treatment stays on regardless. This toggle goes further
+//   and removes the strip entirely via StatusBar::HideAsync()/ShowAsync(), which is expected to move
+//   ApplicationView::VisibleBounds the same way SuppressSystemOverlays does for the bottom strip, so
+//   the top inset ApplyViewInsets() computes drops to (near) 0 on its own once VisibleBoundsChanged
+//   fires; called here too so the freed strip is used in the same frame.
+//   UI THREAD ONLY.
+void MainPage::ApplyHideStatusBarSetting()
+{
+    try {
+        if (!Windows::Foundation::Metadata::ApiInformation::IsTypePresent(L"Windows.UI.ViewManagement.StatusBar"))
+            return;
+        auto sb = Windows::UI::ViewManagement::StatusBar::GetForCurrentView();
+        if (sb == nullptr) return;
+        if (m_hideStatusBar) sb->HideAsync();
+        else sb->ShowAsync();
+    } catch (...) { return; }
+    ApplyViewInsets();
+}
+
+// Takes effect while the settings page is still open, same as OnHideNavBarToggled; HideSettings()
+//   re-reads it anyway and persists it.
+void MainPage::OnHideStatusBarToggled(Platform::Object^, RoutedEventArgs^)
+{
+    if (!SetHideStatusBarSwitch) return;
+    if (m_hideStatusBar == SetHideStatusBarSwitch->IsOn) return;
+    m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
+    ApplyHideStatusBarSetting();
+}
+
 // Apotheosis (review 2026-09-03): move the URL suggestion dropdown together with the nav bar when
 //   the soft keyboard comes up. SuggestPanel lives in the content row (bottom-anchored) while
 //   NavBarShift only covers the bottom chrome, so it needs its own translation by the same Y.
@@ -1084,6 +1120,12 @@ void MainPage::ApplyViewInsets()
     if (SettingsPage) SettingsPage->Padding = topPad;
     if (TabSwitcher) TabSwitcher->Padding = topPad;
     if (OobePanel) OobePanel->Padding = topPad;
+    // Apotheosis (review 2026-09-04 item 2a): the elements that actually show engine output — the
+    //   white content Border in software mode, GpuPanel in direct-present mode — used to start at
+    //   y=0 inside their row, so the page ran under the shell's clock; only the chrome above them
+    //   got the inset. Push them down by it too (their own static side/bottom margins are untouched).
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + 6, 6, 0);
+    if (GpuPanel) GpuPanel->Margin = topPad;
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
 }
 
@@ -3916,6 +3958,7 @@ void MainPage::ApplySettings()
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
+    ApplyHideStatusBarSetting();             // Apotheosis: DISPLAY toggle, UI thread only
     if (!m_instantPan) InstantPanReset();    // Apotheosis: switching it off must clear a live preview
     if (UaBtn) {
         bool en = (g_lang == L"en");
@@ -3951,6 +3994,7 @@ void MainPage::LoadSettings()
             else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
+            else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -3979,6 +4023,7 @@ void MainPage::SaveSettings()
     s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
+    s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -4004,6 +4049,7 @@ void MainPage::ShowSettings()
     if (SetEventPresentSwitch) SetEventPresentSwitch->IsOn = m_eventPresent;
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
+    if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -4044,6 +4090,7 @@ void MainPage::HideSettings()
     if (SetEventPresentSwitch) m_eventPresent = SetEventPresentSwitch->IsOn;
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
+    if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -4091,6 +4138,9 @@ static const wchar_t* const kI18n[][2] = {
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
+    { L"隐藏状态栏", L"Hide status bar" },
+    { L"隐藏顶部状态栏(时钟/信号),内容区随之上移",
+      L"Hide the top status bar (clock/signal); the content area moves up" },
     { L"关于 / 更新", L"About / Update" }, { L"版本 —", L"Version —" },
     { L"自动检查更新", L"Check for updates automatically" },
     { L"开启后每次启动会连接 api.github.com 一次",

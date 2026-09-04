@@ -82,6 +82,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetEventPresentSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetDragPointerSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideNavBarSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideStatusBarSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ AboutFooterText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ SetZoomLabel;
@@ -104,6 +105,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::TextBlock^ UrlActionGlyph;
         private: ::Windows::UI::Xaml::Controls::Button^ UrlClearBtn;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TabCountText;
+        private: ::Windows::UI::Xaml::Controls::Border^ ContentBorder;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TitleText;
         private: ::Windows::UI::Xaml::Controls::SwapChainPanel^ GpuPanel;
         private: ::Windows::UI::Xaml::Controls::TextBox^ ImeBox;
