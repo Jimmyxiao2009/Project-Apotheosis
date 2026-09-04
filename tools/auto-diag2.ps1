@@ -6,14 +6,17 @@ param(
     [string]$Ver='0.1.7.10',
     [string]$Pub='x0rqga78m2mgc',
     [int]$UrlCount=3,
-    [string]$OutDir='E:\Apotheosis\crash'
+    [string]$OutDir='',
+    # Apotheosis: repo root, defaults to the parent of tools\ so the script works from any checkout location.
+    [string]$Root = (Split-Path -Parent $PSScriptRoot)
 )
 $ErrorActionPreference='Stop'
+if(-not $OutDir){ $OutDir = Join-Path $Root 'crash' }
 Add-Type -AssemblyName System.Net.Http
 $base="https://${Ip}:443"
 $FN="EdgeHTMLReborn.Harness_${Ver}_arm__${Pub}"
 $Praid="EdgeHTMLReborn.Harness_${Pub}!App"
-$appxDir="E:\Apotheosis\harness\AppPackages\Harness\Harness_${Ver}_ARM_Test"
+$appxDir=Join-Path $Root "harness\AppPackages\Harness\Harness_${Ver}_ARM_Test"
 $appx="$appxDir\Harness_${Ver}_ARM.appx"; $cer="$appxDir\Harness_${Ver}_ARM.cer"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $h=[System.Net.Http.HttpClientHandler]::new()

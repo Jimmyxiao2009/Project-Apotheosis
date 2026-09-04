@@ -4,14 +4,16 @@
 param(
     [string]$Ip='192.168.3.51',
     [string]$Ver='0.1.7.23',
-    [string]$Pub='x0rqga78m2mgc'
+    [string]$Pub='x0rqga78m2mgc',
+    # Apotheosis: repo root, defaults to the parent of tools\ so the script works from any checkout location.
+    [string]$Root = (Split-Path -Parent $PSScriptRoot)
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Net.Http
 $base="https://${Ip}:443"
 $FN="EdgeHTMLReborn.Harness_${Ver}_arm__${Pub}"
 $Praid="EdgeHTMLReborn.Harness_${Pub}!App"
-$appxDir="E:\Apotheosis\harness\AppPackages\Harness\Harness_${Ver}_ARM_Test"
+$appxDir=Join-Path $Root "harness\AppPackages\Harness\Harness_${Ver}_ARM_Test"
 $appx="$appxDir\Harness_${Ver}_ARM.appx"; $cer="$appxDir\Harness_${Ver}_ARM.cer"
 if(-not (Test-Path $appx)){ throw "appx 不存在: $appx" }
 $h=[System.Net.Http.HttpClientHandler]::new()

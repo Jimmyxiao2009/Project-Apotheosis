@@ -153,6 +153,11 @@
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\bz2.dll"><DeploymentContent>true</DeploymentContent><Link>bz2.dll</Link></None>
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\brotlidec.dll"><DeploymentContent>true</DeploymentContent><Link>brotlidec.dll</Link></None>
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\brotlicommon.dll"><DeploymentContent>true</DeploymentContent><Link>brotlicommon.dll</Link></None>
+    <!-- Apotheosis: current vcpkg builds sqlite3 as a DLL (import lib only) and libxml2 against libiconv;
+         without these two the app fails activation with "The app didn't start" (0x8027025B). Conditional so a
+         vcpkg tree with static sqlite3 / iconv-less libxml2 keeps working. -->
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\sqlite3.dll" Condition="Exists('$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\sqlite3.dll')"><DeploymentContent>true</DeploymentContent><Link>sqlite3.dll</Link></None>
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\iconv-2.dll" Condition="Exists('$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\iconv-2.dll')"><DeploymentContent>true</DeploymentContent><Link>iconv-2.dll</Link></None>
     <!-- 网络栈(Phase 1b):curl + OpenSSL 3.6.3(TLS 1.3)。 -->
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libcurl.dll"><DeploymentContent>true</DeploymentContent><Link>libcurl.dll</Link></None>
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libssl-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libssl-3-arm.dll</Link></None>
@@ -170,7 +175,8 @@
     <None Include="Assets\fonts\times.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\times.ttf</Link></None>
     <None Include="Assets\fonts\cour.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\cour.ttf</Link></None>
     <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
-    <None Include="Assets\fonts\simhei.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
+    <!-- Apotheosis: fonts are gitignored; skip SimHei on machines that do not have it instead of failing the package step. -->
+    <None Include="Assets\fonts\simhei.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\simhei.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
   </ItemGroup>
 
   <ItemGroup>

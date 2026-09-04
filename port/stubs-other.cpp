@@ -154,19 +154,10 @@ RefPtr<DisplayRefreshMonitorWin> DisplayRefreshMonitorWin::create(PlatformDispla
     return nullptr;
 }
 
-// ============================================================================
-// PlatformKeyboardEvent (PlatformKeyboardEvent.h). Type/Modifier are aliases of
-// PlatformEventType / PlatformEventModifier (hence the mangled enum names).
-// No live keyboard state in the render path: empty modifier set, no-op disambiguate.
-// ============================================================================
-OptionSet<PlatformEvent::Modifier> PlatformKeyboardEvent::currentStateOfModifierKeys()
-{
-    return { };
-}
-
-void PlatformKeyboardEvent::disambiguateKeyDownEvent(Type, bool)
-{
-}
+// Apotheosis: PlatformKeyboardEvent::currentStateOfModifierKeys /
+// disambiguateKeyDownEvent used to be stubbed here; WebCore now compiles
+// platform/win/KeyEventWin.cpp with WK_WINUWP guards (no GetKeyState in the
+// App Container), so the stubs would collide with WebCore.lib (LNK2005).
 
 // ============================================================================
 // GraphicsLayer (graphics/GraphicsLayer.h). Type == GraphicsLayerType. The

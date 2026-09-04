@@ -40,6 +40,31 @@ index a2a6d72460..ea9ea17802 100644
  WEBKIT_EXECUTABLE(LLIntOffsetsExtractor)
  
  # The build system will execute asm.rb every time LLIntOffsetsExtractor's mtime is newer than
+diff --git a/Source/JavaScriptCore/PlatformWinUWP.cmake b/Source/JavaScriptCore/PlatformWinUWP.cmake
+new file mode 100644
+index 0000000000..8916725825
+--- /dev/null
++++ b/Source/JavaScriptCore/PlatformWinUWP.cmake
+@@ -0,0 +1,19 @@
++# Apotheosis: JavaScriptCore sources for the WinUWP port (ARM32 App Container).
++#
++# Like Source/JavaScriptCore/PlatformWin.cmake but WITHOUT JSStringRefBSTR:
++# BSTR/oleauto (wtypes.h SysAllocString*) is not declared in the App Container
++# partition, and nothing in the port consumes that COM convenience API.
++# ENABLE_REMOTE_INSPECTOR is off for this port, so the socket inspector server
++# is not built and JSGlobalObjectInspectorController drops out.
++
++list(APPEND JavaScriptCore_PUBLIC_FRAMEWORK_HEADERS
++    API/JavaScriptCore.h
++)
++
++if (ENABLE_REMOTE_INSPECTOR)
++    include(inspector/remote/Socket.cmake)
++else ()
++    list(REMOVE_ITEM JavaScriptCore_SOURCES
++        inspector/JSGlobalObjectInspectorController.cpp
++    )
++endif ()
 diff --git a/Source/JavaScriptCore/assembler/ARMv7Assembler.h b/Source/JavaScriptCore/assembler/ARMv7Assembler.h
 index 2695af3ec3..1484b1b0d5 100644
 --- a/Source/JavaScriptCore/assembler/ARMv7Assembler.h
@@ -358,6 +383,60 @@ index eea6f6f70e..266dca7682 100644
  #define SYSV_ABI __attribute__((sysv_abi))
  #else
  #define SYSV_ABI
+diff --git a/Source/WTF/wtf/PlatformWinUWP.cmake b/Source/WTF/wtf/PlatformWinUWP.cmake
+new file mode 100644
+index 0000000000..a9e3a41fcc
+--- /dev/null
++++ b/Source/WTF/wtf/PlatformWinUWP.cmake
+@@ -0,0 +1,48 @@
++# Apotheosis: WTF sources for the WinUWP port (ARM32 App Container).
++#
++# Trimmed from Source/WTF/wtf/PlatformWin.cmake:
++#   * DROP win/MainThreadWin.cpp and win/RunLoopWin.cpp -- both build a hidden
++#     HWND_MESSAGE window (RegisterClassEx/CreateWindowEx/PostMessage) to pump
++#     the run loop, which the App Container API set does not provide. The
++#     generic implementations replace them; MainThreadGeneric.cpp got a Windows
++#     branch in the WK_WINUWP patch for exactly this reason.
++#   * DROP win/DbgHelperWin.cpp -- dbghelp is desktop-only, and the WK_WINUWP
++#     patch compiles DbgHelperWin.h out entirely (StackTrace.h drops its symbol
++#     lookup to match).
++#   * DROP the DbgHelp / shlwapi / winmm link libraries -- none of them are in
++#     the App Container import set. Everything we do link comes from the
++#     WindowsApp.lib umbrella set by the toolchain file.
++
++list(APPEND WTF_SOURCES
++    generic/MainThreadGeneric.cpp
++    generic/RunLoopGeneric.cpp
++    generic/WorkQueueGeneric.cpp
++
++    text/win/StringWin.cpp
++    text/win/TextBreakIteratorInternalICUWin.cpp
++
++    win/CPUTimeWin.cpp
++    win/FileHandleWin.cpp
++    win/FileSystemWin.cpp
++    win/LanguageWin.cpp
++    win/LoggingWin.cpp
++    win/MappedFileDataWin.cpp
++    win/MemoryFootprintWin.cpp
++    win/MemoryPressureHandlerWin.cpp
++    win/OSAllocatorWin.cpp
++    win/PathWalker.cpp
++    win/SignalsWin.cpp
++    win/ThreadingWin.cpp
++    win/WTFCRTDebug.cpp
++    win/Win32Handle.cpp
++)
++
++list(APPEND WTF_PUBLIC_HEADERS
++    text/win/WCharStringExtras.h
++
++    win/GDIObject.h
++    win/PathWalker.h
++    win/SoftLinking.h
++    win/WTFCRTDebug.h
++    win/Win32Handle.h
++)
 diff --git a/Source/WTF/wtf/RandomDevice.cpp b/Source/WTF/wtf/RandomDevice.cpp
 index 95921fd376..2719111e42 100644
 --- a/Source/WTF/wtf/RandomDevice.cpp
@@ -465,14 +544,14 @@ index ec0194903f..25eb5d82a9 100644
 +// 非 HasSwitchOn 的 variant 参与重载。
 +#if defined(WK_WINUWP)
 +template<class V, class... F, std::enable_if_t<!HasSwitchOnMember<std::remove_cvref_t<V>>::value, int> = 0> WTF_VISITOR_INTERNAL decltype(auto) switchOn(V&& v, F&&... f) // Apotheosis: requires→enable_if(避 pack 墙);decltype(auto) 保留引用返回(避 Render* 等引用被 decay 成抽象/不可拷贝值)
- {
-     return WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
- }
-+#else
-+template<class V, class... F> requires (!HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f)
 +{
 +    return WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
 +}
++#else
++template<class V, class... F> requires (!HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f)
+ {
+     return WTF::visit(makeVisitor(std::forward<F>(f)...), asVariant(std::forward<V>(v)));
+ }
 +#endif
  
  #endif
@@ -480,14 +559,14 @@ index ec0194903f..25eb5d82a9 100644
 -template<class V, class... F> requires (HasSwitchOn<V>) ALWAYS_INLINE auto switchOn(V&& v, F&&... f) -> decltype(v.switchOn(std::forward<F>(f)...))
 +#if defined(WK_WINUWP)
 +template<class V, class... F, std::enable_if_t<HasSwitchOnMember<std::remove_cvref_t<V>>::value, int> = 0> WTF_VISITOR_INTERNAL decltype(auto) switchOn(V&& v, F&&... f) // Apotheosis: requires→enable_if + decltype(auto) 返回(原尾置 decltype 撞次要墙,decltype(auto) 推导出具体类型可修饰且保留引用)
- {
-     return v.switchOn(std::forward<F>(f)...);
- }
-+#else
-+template<class V, class... F> requires (HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f) -> decltype(v.switchOn(std::forward<F>(f)...))
 +{
 +    return v.switchOn(std::forward<F>(f)...);
 +}
++#else
++template<class V, class... F> requires (HasSwitchOn<V>) WTF_VISITOR_INTERNAL auto switchOn(V&& v, F&&... f) -> decltype(v.switchOn(std::forward<F>(f)...))
+ {
+     return v.switchOn(std::forward<F>(f)...);
+ }
 +#endif
  
  // Implementation of std::variant_alternative_index from https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2024/p2527r3.html.
@@ -976,6 +1055,240 @@ index 9c944ea631..9559f15dfa 100644
  
      initializeCurrentThreadEvenIfNonWTFCreated();
  }
+diff --git a/Source/WebCore/PlatformWinUWP.cmake b/Source/WebCore/PlatformWinUWP.cmake
+new file mode 100644
+index 0000000000..eeb3cbc4f5
+--- /dev/null
++++ b/Source/WebCore/PlatformWinUWP.cmake
+@@ -0,0 +1,228 @@
++# Apotheosis: WebCore platform glue for the WinUWP port (ARM32 App Container).
++#
++# Modeled on Source/WebCore/PlatformWin.cmake, stripped to the App-Container-safe
++# subset and re-pointed at the Cairo software graphics backend plus the
++# FreeType/Fontconfig/HarfBuzz font backend.
++#
++# Rules applied against PlatformWin.cmake:
++#   * KEEP    compiler-only flags; the coordinate/struct conversion *Win.cpp files;
++#             Curl/OpenSSL/ImageDecoders/Cairo glue; portable text and locale code;
++#             read-only Win helpers (SystemInfo/UserAgent/MIME/Logging).
++#   * DROP    MSAA/oleacc accessibility; clipboard/drag/OLE pasteboard; the native
++#             <select> popup; CreateWindow fullscreen and overlays; cursors;
++#             GDI image/icon/DIB painting; MediaFoundation video; SharedMemoryWin;
++#             Uniscribe and the win/win-cairo GDI+DirectWrite font backend.
++#   * REPLACE the font block with platform/FreeType.cmake.
++#   * DROP    the usp10 link library (Uniscribe -> HarfBuzz) and the whole
++#             MediaFoundation INTERFACE library (ENABLE_VIDEO and
++#             USE_MEDIA_FOUNDATION are forced off, so that block never runs).
++#
++# Files marked "STUB:" compile but call desktop-only APIs; they need a
++# NotImplemented or WinRT replacement before the driver links and runs. That
++# link error surface is milestone M1c, not this file's problem.
++
++add_definitions(/bigobj -D__STDC_CONSTANT_MACROS)
++
++# --- Form-control theming ---------------------------------------------------
++# Adwaita paints controls purely through Cairo (no UxTheme/GDI), so it is the
++# App-Container-safe RenderTheme. We deliberately do not take the RenderThemeWin
++# path.
++include(platform/Adwaita.cmake)
++
++# --- Networking, crypto, image decoding -------------------------------------
++include(platform/Curl.cmake)
++include(platform/ImageDecoders.cmake)
++include(platform/OpenSSL.cmake)
++
++# --- Graphics backend: Cairo software image surfaces ------------------------
++# Cairo.cmake's unified list still contains GraphicsContextGLCairo.cpp, but that
++# file is self-guarded by '#if ENABLE(WEBGL) && USE(CAIRO)' and compiles to
++# nothing here. The GdkPixbuf branch in ImageBufferUtilitiesCairo.cpp is inert
++# because PLATFORM(GTK) is undefined for PORT=WinUWP.
++if (USE_CAIRO)
++    include(platform/Cairo.cmake)
++endif ()
++
++# --- Accelerated compositing (APOTHEOSIS_GPU only) --------------------------
++# TextureMapper with the synchronous GraphicsLayerTextureMapper backend
++# (USE_COORDINATED_GRAPHICS off, USE_GRAPHICS_LAYER_WC off). The driver owns the
++# EGL surface and presents into a SwapChainPanel; WebCore only needs to be able
++# to paint the layer tree through ANGLE's GLES2.
++if (USE_TEXTURE_MAPPER)
++    include(platform/TextureMapper.cmake)
++
++    # UWP-TODO: PlatformDisplayWin.cpp still resolves an HWND for the EGL native
++    # window. The driver supplies the SwapChainPanel surface itself, so this may
++    # have to become a WK_WINUWP-guarded stub once M1c reaches it.
++    list(APPEND WebCore_SOURCES
++        platform/graphics/PlatformDisplay.cpp
++
++        platform/graphics/angle/PlatformDisplayANGLE.cpp
++
++        platform/graphics/egl/GLContext.cpp
++        platform/graphics/egl/GLContextWrapper.cpp
++        platform/graphics/egl/GLDisplay.cpp
++        # Apotheosis: no GLFence* here - the prebuilt ANGLE 2.1.13 (ms-master)
++        # eglext.h predates EGL_KHR_fence_sync, nothing on the synchronous
++        # TextureMapper path uses fences, and the author's draft omits them too.
++
++        platform/graphics/win/PlatformDisplayWin.cpp
++    )
++
++    list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
++        platform/graphics/win/PlatformDisplayWin.h
++    )
++endif ()
++
++# --- Font/text backend: FreeType + Fontconfig + HarfBuzz --------------------
++# This replaces the entire win/win-cairo GDI + DirectWrite + Uniscribe + MLang
++# font stack and SystemFontDatabaseWin. FreeType.cmake also pulls in
++# platform/graphics/cairo/FontCairoHarfbuzzNG.cpp, which is the Cairo glyph-draw
++# glue the dropped Font*WinCairo files used to provide.
++# UWP-TODO (runtime, not cmake): Fontconfig needs a writable cache directory or a
++# baked-in fonts.conf inside the App Container sandbox.
++include(platform/FreeType.cmake)
++
++# --- Private include directories --------------------------------------------
++# Dropped versus PlatformWin.cmake: accessibility/win (MSAA) and
++# platform/video-codecs (no media). platform/graphics/egl is NOT added by
++# WebCore/CMakeLists.txt for this option set (texmap includes GLContext.h
++# unqualified), so list it here.
++list(APPEND WebCore_PRIVATE_INCLUDE_DIRECTORIES
++    "${WEBCORE_DIR}/accessibility/win" # headers only (AXCoreObject.h includes the wrapper); MSAA sources stay out
++    "${WEBCORE_DIR}/page/win"
++    "${WEBCORE_DIR}/platform/graphics/egl"
++    "${WEBCORE_DIR}/platform/graphics/opentype"
++    "${WEBCORE_DIR}/platform/graphics/win"
++    "${WEBCORE_DIR}/platform/mediacapabilities"
++    "${WEBCORE_DIR}/platform/video-codecs" # headers only (AV1/VP9Utilities include BitReader.h); codec sources stay out
++    "${WEBCORE_DIR}/platform/network/win"
++    "${WEBCORE_DIR}/platform/win"
++)
++
++list(APPEND WebCore_SOURCES
++    # --- page/win: event and frame glue (no HWND message pump involved) ---
++    page/win/EventHandlerWin.cpp
++    page/win/FrameWin.cpp
++
++    # --- portable platform bits ---
++    platform/LocalizedStrings.cpp
++
++    platform/generic/KeyedDecoderGeneric.cpp
++    platform/generic/KeyedEncoderGeneric.cpp
++
++    # --- OpenType / custom-font table parsing (no GDI) ---
++    platform/graphics/opentype/OpenTypeUtilities.cpp
++
++    # --- graphics/win: struct <-> Float/Int conversions only ---
++    platform/graphics/win/FloatPointWin.cpp
++    platform/graphics/win/FloatRectWin.cpp
++    platform/graphics/win/IntPointWin.cpp
++    platform/graphics/win/IntRectWin.cpp
++    platform/graphics/win/IntSizeWin.cpp
++    platform/graphics/win/TransformationMatrixWin.cpp
++
++    # --- network/win: CA certificate load through crypt32 ---
++    # DROPPED NetworkStateNotifierWin.cpp: the overlapped NotifyAddrChange
++    # notification is not in the App Container API set. UWP-TODO: either a WinRT
++    # connectivity-backed notifier or a link stub.
++    platform/network/win/CurlSSLHandleWin.cpp
++
++    # --- text ---
++    platform/text/Hyphenation.cpp
++    platform/text/LocaleICU.cpp
++
++    # --- platform/win: read-only and struct helpers ---
++    platform/win/BString.cpp
++    platform/win/BitmapInfo.cpp
++    platform/win/KeyEventWin.cpp
++    platform/win/LoggingWin.cpp
++    platform/win/MIMETypeRegistryWin.cpp
++    platform/win/SystemInfo.cpp
++    platform/win/UserAgentWin.cpp
++    platform/win/WebCoreTextRenderer.cpp
++    platform/win/WindowsKeyNames.cpp
++
++    # --- sources that build but need a non-desktop reimplementation ---
++    # STUB: stores the HINSTANCE via DllMain, which a UWP app never runs.
++    platform/win/WebCoreInstanceHandle.cpp
++    # STUB: resolves WebKit.resources through GetModuleFileName; repoint at the
++    # UWP package install location.
++    platform/win/WebCoreBundleWin.cpp
++    # STUB: SQLite-backed search autosave; repoint the database at the app-data
++    # sandbox path or make it in-memory.
++    platform/win/SearchPopupMenuDB.cpp
++
++    # DROPPED platform/win/MainThreadSharedTimerWin.cpp: it drives the shared
++    # timer from a hidden HWND_MESSAGE window. The WK_WINUWP patch widens the
++    # generic RunLoop::Timer branch of MainThreadSharedTimer to USE(FREETYPE),
++    # so the portable implementation is active and the Win one would be a
++    # duplicate definition.
++)
++
++list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
++    page/win/FrameWin.h
++
++    # RAII wrapper for an in-memory font resource. The header is kept (the
++    # WK_WINUWP patch makes its destructor a no-op outside the desktop
++    # partition); the AddFontMemResourceEx creator lives in an excluded file.
++    platform/graphics/opentype/FontMemoryResource.h
++
++    platform/graphics/win/DIBPixelData.h
++    platform/graphics/win/LocalWindowsContext.h
++    platform/graphics/win/SharedGDIObject.h
++
++    platform/win/BString.h
++    platform/win/BitmapInfo.h
++    platform/win/COMPtr.h
++    platform/win/HWndDC.h
++    platform/win/SearchPopupMenuDB.h
++    platform/win/SystemInfo.h
++    platform/win/WebCoreBundleWin.h
++    platform/win/WebCoreTextRenderer.h
++    platform/win/WindowsKeyNames.h
++)
++
++# crypt32 (certificate store for OpenSSL/curl) and iphlpapi (adapter info) are
++# in the App Container import set. usp10 (Uniscribe) is replaced by HarfBuzz,
++# which FreeType.cmake links.
++list(APPEND WebCore_LIBRARIES
++    crypt32
++    iphlpapi
++)
++
++# Broken-image and resize-corner icons used during paint, plus the modern
++# media-control images.
++set(iconFiles
++    Resources/missingImage.png
++    Resources/missingImage@2x.png
++    Resources/missingImage@3x.png
++    Resources/panIcon.png
++    Resources/textAreaResizeCorner.png
++    Resources/textAreaResizeCorner@2x.png
++)
++
++file(COPY ${iconFiles} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/WebKit.resources/icons)
++
++file(COPY ${ModernMediaControlsImageFiles}
++    DESTINATION
++    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/WebKit.resources/media-controls
++)
++
++# The non-font survivors of PlatformWin.cmake's USE_CAIRO block are dropped
++# after all: both files are pure GDI interop (cairo_win32_surface from HDC /
++# HBITMAP) and require the cairo-win32 backend, which cannot exist in an App
++# Container - our cairo is built without it (see local patch skipping the GDI
++# win32 surface/font backends under WINAPI_FAMILY_APP). If the driver link
++# misses GraphicsContext::getWindowsContext/releaseWindowsContext or
++# ImageAdapter symbols, stub them NotImplemented in the driver instead of
++# reintroducing GDI.
++
++# Kept verbatim from PlatformWin.cmake so that flipping USE_WOFF2 on later works
++# unchanged. USE_WOFF2 is off for the minimal bring-up configuration.
++if (USE_WOFF2)
++    list(APPEND WebCore_LIBRARIES
++        Brotli::dec
++        WOFF2::common
++    )
++endif ()
 diff --git a/Source/WebCore/accessibility/AccessibilityObject.cpp b/Source/WebCore/accessibility/AccessibilityObject.cpp
 index e16097e52e..9d379aca7c 100644
 --- a/Source/WebCore/accessibility/AccessibilityObject.cpp
@@ -1065,6 +1378,140 @@ index aa6287821c..bfd9ea9415 100644
  namespace WebCore {
  
  class CryptoKeyRSAComponents;
+diff --git a/Source/WebCore/crypto/openssl/CryptoAlgorithmECDSAOpenSSL.cpp b/Source/WebCore/crypto/openssl/CryptoAlgorithmECDSAOpenSSL.cpp
+index e3f9841c72..82665c08b7 100644
+--- a/Source/WebCore/crypto/openssl/CryptoAlgorithmECDSAOpenSSL.cpp
++++ b/Source/WebCore/crypto/openssl/CryptoAlgorithmECDSAOpenSSL.cpp
+@@ -45,7 +45,9 @@ ExceptionOr<Vector<uint8_t>> CryptoAlgorithmECDSA::platformSign(const CryptoAlgo
+     if (!digest)
+         return Exception { ExceptionCode::OperationError };
+ 
+-    EC_KEY* ecKey = EVP_PKEY_get0_EC_KEY(key.platformKey().get());
++    // Apotheosis: OpenSSL 3 returns const from EVP_PKEY_get0_EC_KEY; the
++    // legacy ECDSA_do_sign/do_verify APIs still take a mutable pointer.
++    EC_KEY* ecKey = const_cast<EC_KEY*>(EVP_PKEY_get0_EC_KEY(key.platformKey().get()));
+     if (!ecKey)
+         return Exception { ExceptionCode::OperationError };
+ 
+@@ -89,7 +91,9 @@ ExceptionOr<bool> CryptoAlgorithmECDSA::platformVerify(const CryptoAlgorithmEcds
+     if (!digest)
+         return Exception { ExceptionCode::OperationError };
+ 
+-    EC_KEY* ecKey = EVP_PKEY_get0_EC_KEY(key.platformKey().get());
++    // Apotheosis: OpenSSL 3 returns const from EVP_PKEY_get0_EC_KEY; the
++    // legacy ECDSA_do_sign/do_verify APIs still take a mutable pointer.
++    EC_KEY* ecKey = const_cast<EC_KEY*>(EVP_PKEY_get0_EC_KEY(key.platformKey().get()));
+     if (!ecKey)
+         return Exception { ExceptionCode::OperationError };
+ 
+diff --git a/Source/WebCore/crypto/openssl/CryptoAlgorithmHKDFOpenSSL.cpp b/Source/WebCore/crypto/openssl/CryptoAlgorithmHKDFOpenSSL.cpp
+index 8b80eb4e6b..88aabfd1a9 100644
+--- a/Source/WebCore/crypto/openssl/CryptoAlgorithmHKDFOpenSSL.cpp
++++ b/Source/WebCore/crypto/openssl/CryptoAlgorithmHKDFOpenSSL.cpp
+@@ -30,7 +30,14 @@
+ #include "CryptoKeyRaw.h"
+ #include "ExceptionOr.h"
+ #include "OpenSSLUtilities.h"
++#if defined(WK_WINUWP)
++// Apotheosis: <openssl/hkdf.h> and the one-shot HKDF() only exist in
++// BoringSSL; real OpenSSL (3.x here) exposes HKDF through EVP_PKEY_derive.
++#include <openssl/evp.h>
++#include <openssl/kdf.h>
++#else
+ #include <openssl/hkdf.h>
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -41,8 +48,25 @@ ExceptionOr<Vector<uint8_t>> CryptoAlgorithmHKDF::platformDeriveBits(const Crypt
+         return Exception { ExceptionCode::NotSupportedError };
+ 
+     Vector<uint8_t> output(length / 8);
++#if defined(WK_WINUWP)
++    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
++    if (!ctx)
++        return Exception { ExceptionCode::OperationError };
++    size_t outputLength = output.size();
++    bool ok = EVP_PKEY_derive_init(ctx) > 0
++        && EVP_PKEY_CTX_set_hkdf_md(ctx, algorithm) > 0
++        && EVP_PKEY_CTX_set1_hkdf_key(ctx, key.key().span().data(), key.key().size()) > 0
++        && EVP_PKEY_CTX_set1_hkdf_salt(ctx, parameters.saltVector().span().data(), parameters.saltVector().size()) > 0
++        && EVP_PKEY_CTX_add1_hkdf_info(ctx, parameters.infoVector().span().data(), parameters.infoVector().size()) > 0
++        && EVP_PKEY_derive(ctx, output.mutableSpan().data(), &outputLength) > 0
++        && outputLength == output.size();
++    EVP_PKEY_CTX_free(ctx);
++    if (!ok)
++        return Exception { ExceptionCode::OperationError };
++#else
+     if (HKDF(output.mutableSpan().data(), output.size(), algorithm, key.key().span().data(), key.key().size(), parameters.saltVector().span().data(), parameters.saltVector().size(), parameters.infoVector().span().data(), parameters.infoVector().size()) <= 0)
+         return Exception { ExceptionCode::OperationError };
++#endif
+ 
+     return output;
+ }
+diff --git a/Source/WebCore/crypto/openssl/CryptoKeyECOpenSSL.cpp b/Source/WebCore/crypto/openssl/CryptoKeyECOpenSSL.cpp
+index b2f7b6b029..826faaff32 100644
+--- a/Source/WebCore/crypto/openssl/CryptoKeyECOpenSSL.cpp
++++ b/Source/WebCore/crypto/openssl/CryptoKeyECOpenSSL.cpp
+@@ -358,7 +358,8 @@ RefPtr<CryptoKeyEC> CryptoKeyEC::platformImportPkcs8(CryptoAlgorithmIdentifier i
+     if (!pkey || EVP_PKEY_base_id(pkey.get()) != EVP_PKEY_EC)
+         return nullptr;
+ 
+-    auto ecKey = EVP_PKEY_get0_EC_KEY(pkey.get());
++    // Apotheosis: OpenSSL 3 returns const from EVP_PKEY_get0_EC_KEY.
++    auto ecKey = const_cast<EC_KEY*>(EVP_PKEY_get0_EC_KEY(pkey.get()));
+     if (!ecKey)
+         return nullptr;
+ 
+@@ -375,7 +376,7 @@ RefPtr<CryptoKeyEC> CryptoKeyEC::platformImportPkcs8(CryptoAlgorithmIdentifier i
+ 
+ Vector<uint8_t> CryptoKeyEC::platformExportRaw() const
+ {
+-    EC_KEY* key = EVP_PKEY_get0_EC_KEY(platformKey().get());
++    EC_KEY* key = const_cast<EC_KEY*>(EVP_PKEY_get0_EC_KEY(platformKey().get())); // Apotheosis: const in OpenSSL 3
+     if (!key)
+         return { };
+     
+@@ -396,7 +397,7 @@ bool CryptoKeyEC::platformAddFieldElements(JsonWebKey& jwk) const
+ {
+     size_t keySizeInBytes = (keySizeInBits() + 7) / 8;
+ 
+-    EC_KEY* key = EVP_PKEY_get0_EC_KEY(platformKey().get());
++    EC_KEY* key = const_cast<EC_KEY*>(EVP_PKEY_get0_EC_KEY(platformKey().get())); // Apotheosis: const in OpenSSL 3
+     if (!key)
+         return false;
+ 
+diff --git a/Source/WebCore/crypto/openssl/CryptoKeyRSAOpenSSL.cpp b/Source/WebCore/crypto/openssl/CryptoKeyRSAOpenSSL.cpp
+index 2993e3bcde..67d6c1824c 100644
+--- a/Source/WebCore/crypto/openssl/CryptoKeyRSAOpenSSL.cpp
++++ b/Source/WebCore/crypto/openssl/CryptoKeyRSAOpenSSL.cpp
+@@ -164,7 +164,7 @@ bool CryptoKeyRSA::isRestrictedToHash(CryptoAlgorithmIdentifier& identifier) con
+ 
+ size_t CryptoKeyRSA::keySizeInBits() const
+ {
+-    RSA* rsa = EVP_PKEY_get0_RSA(m_platformKey.get());
++    RSA* rsa = const_cast<RSA*>(EVP_PKEY_get0_RSA(m_platformKey.get())); // Apotheosis: const in OpenSSL 3
+     if (!rsa)
+         return 0;
+ 
+@@ -297,7 +297,7 @@ ExceptionOr<Vector<uint8_t>> CryptoKeyRSA::exportPkcs8() const
+ 
+ auto CryptoKeyRSA::algorithm() const -> KeyAlgorithm
+ {
+-    RSA* rsa = EVP_PKEY_get0_RSA(platformKey());
++    RSA* rsa = const_cast<RSA*>(EVP_PKEY_get0_RSA(platformKey())); // Apotheosis: const in OpenSSL 3
+ 
+     auto modulusLength = getRSAModulusLength(rsa);
+     Vector<uint8_t> publicExponent;
+@@ -326,7 +326,7 @@ auto CryptoKeyRSA::algorithm() const -> KeyAlgorithm
+ 
+ std::unique_ptr<CryptoKeyRSAComponents> CryptoKeyRSA::exportData() const
+ {
+-    RSA* rsa = EVP_PKEY_get0_RSA(platformKey());
++    RSA* rsa = const_cast<RSA*>(EVP_PKEY_get0_RSA(platformKey())); // Apotheosis: const in OpenSSL 3
+     if (!rsa)
+         return nullptr;
+ 
 diff --git a/Source/WebCore/css/CSSFontFaceSet.cpp b/Source/WebCore/css/CSSFontFaceSet.cpp
 index 410893229d..4c2eda6544 100644
 --- a/Source/WebCore/css/CSSFontFaceSet.cpp
@@ -1206,6 +1653,32 @@ index d418cec7d5..2206a95d47 100644
      int rightAligned = 0;
  #endif
      IntPoint location { rightAligned ? view->contentsWidth() - kContextMenuMargin : kContextMenuMargin, kContextMenuMargin };
+diff --git a/Source/WebCore/platform/Curl.cmake b/Source/WebCore/platform/Curl.cmake
+index 25799e3203..680d684f17 100644
+--- a/Source/WebCore/platform/Curl.cmake
++++ b/Source/WebCore/platform/Curl.cmake
+@@ -22,7 +22,6 @@ list(APPEND WebCore_SOURCES
+     platform/network/curl/NetworkStorageSessionCurl.cpp
+     platform/network/curl/OpenSSLHelper.cpp
+     platform/network/curl/ProtectionSpaceCurl.cpp
+-    platform/network/curl/PublicSuffixStoreCurl.cpp
+     platform/network/curl/ResourceErrorCurl.cpp
+     platform/network/curl/ResourceRequestCurl.cpp
+     platform/network/curl/ResourceResponseCurl.cpp
+@@ -57,6 +56,12 @@ list(APPEND WebCore_PRIVATE_FRAMEWORK_HEADERS
+ 
+ list(APPEND WebCore_LIBRARIES
+     CURL::libcurl
+-    LibPSL::LibPSL
+     OpenSSL::SSL
+ )
++
++if (NOT PORT STREQUAL "WinUWP")
++    # Apotheosis: the WinUWP port has no libpsl; PublicSuffixStore is stubbed
++    # in the driver (port/stubs-other.cpp) instead of PublicSuffixStoreCurl.
++    list(APPEND WebCore_SOURCES platform/network/curl/PublicSuffixStoreCurl.cpp)
++    list(APPEND WebCore_LIBRARIES LibPSL::LibPSL)
++endif ()
 diff --git a/Source/WebCore/platform/FreeType.cmake b/Source/WebCore/platform/FreeType.cmake
 index 0d7cc9156b..3aa5d7e3e7 100644
 --- a/Source/WebCore/platform/FreeType.cmake
@@ -1463,6 +1936,27 @@ index a74b717fa2..90acedc242 100644
  }
  
  }
+diff --git a/Source/WebCore/platform/graphics/win/PlatformDisplayWin.cpp b/Source/WebCore/platform/graphics/win/PlatformDisplayWin.cpp
+index a57bc15fd9..c43a789f66 100644
+--- a/Source/WebCore/platform/graphics/win/PlatformDisplayWin.cpp
++++ b/Source/WebCore/platform/graphics/win/PlatformDisplayWin.cpp
+@@ -35,11 +35,16 @@ namespace WebCore {
+ std::unique_ptr<PlatformDisplayWin> PlatformDisplayWin::create()
+ {
+     EGLint attributes[] = {
++#if !defined(WK_WINUWP)
+         // Disable debug layers that makes some tests fail because
+         // ANGLE fills uninitialized buffers with
+         // kDebugColorInitClearValue in debug builds.
++        // Apotheosis: the prebuilt ANGLE 2.1.13 (ms-master) predates this
++        // attribute and its libEGL rejects unknown attributes, so the WinUWP
++        // build passes none.
+         EGL_PLATFORM_ANGLE_DEBUG_LAYERS_ENABLED_ANGLE,
+         EGL_FALSE,
++#endif
+         EGL_NONE,
+     };
+     auto glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY, attributes));
 diff --git a/Source/WebCore/platform/network/DNSResolveQueue.cpp b/Source/WebCore/platform/network/DNSResolveQueue.cpp
 index e7cbc7bd4c..99560c8de6 100644
 --- a/Source/WebCore/platform/network/DNSResolveQueue.cpp
@@ -1966,6 +2460,29 @@ index 6c0fa6a4af..5172ff4409 100644
  #include <wtf/URL.h>
  #include <wtf/text/AtomString.h>
  #include <wtf/text/StringView.h>
+diff --git a/Source/WebCore/platform/win/KeyEventWin.cpp b/Source/WebCore/platform/win/KeyEventWin.cpp
+index f6c0cc49e9..33111ecdf1 100644
+--- a/Source/WebCore/platform/win/KeyEventWin.cpp
++++ b/Source/WebCore/platform/win/KeyEventWin.cpp
+@@ -51,6 +51,10 @@ OptionSet<PlatformEvent::Modifier> PlatformKeyboardEvent::currentStateOfModifier
+ {
+     OptionSet<PlatformEvent::Modifier> modifiers;
+ 
++#if !defined(WK_WINUWP)
++    // Apotheosis: GetKeyState is not declared in the App Container partition.
++    // The UWP harness dispatches events with explicit modifier state instead,
++    // so the engine never needs to poll the keyboard asynchronously.
+     if (GetKeyState(VK_SHIFT) & HIGH_BIT_MASK_SHORT)
+         modifiers.add(PlatformEvent::Modifier::ShiftKey);
+     if (GetKeyState(VK_CONTROL) & HIGH_BIT_MASK_SHORT)
+@@ -60,6 +64,7 @@ OptionSet<PlatformEvent::Modifier> PlatformKeyboardEvent::currentStateOfModifier
+     // No meta key.
+     if (GetKeyState(VK_CAPITAL) & 1)
+         modifiers.add(PlatformEvent::Modifier::CapsLockKey);
++#endif
+ 
+     return modifiers;
+ }
 diff --git a/Source/WebCore/platform/win/WCDataObject.h b/Source/WebCore/platform/win/WCDataObject.h
 index 3d8b2b6d4e..3615a3432c 100644
 --- a/Source/WebCore/platform/win/WCDataObject.h
@@ -1987,6 +2504,52 @@ index 3d8b2b6d4e..3615a3432c 100644
      }
  };
  
+diff --git a/Source/WebCore/platform/win/WindowsKeyNames.cpp b/Source/WebCore/platform/win/WindowsKeyNames.cpp
+index e0d15d39d6..08c78d4005 100644
+--- a/Source/WebCore/platform/win/WindowsKeyNames.cpp
++++ b/Source/WebCore/platform/win/WindowsKeyNames.cpp
+@@ -246,6 +246,10 @@ String WindowsKeyNames::domKeyFromParams(WPARAM virtualKey, LPARAM lParam)
+ {
+     bool extended = lParam & 0x01000000;
+     KeyModifierSet modifiers;
++#if !defined(WK_WINUWP)
++    // Apotheosis: GetKeyState is not declared in the App Container partition;
++    // the harness delivers modifier state with each event, so the printable-key
++    // lookup below simply degrades to the unmodified table entry.
+     if (GetKeyState(VK_SHIFT) < 0)
+         modifiers.add(KeyModifier::Shift);
+     if (GetKeyState(VK_CONTROL) < 0)
+@@ -254,6 +258,7 @@ String WindowsKeyNames::domKeyFromParams(WPARAM virtualKey, LPARAM lParam)
+         modifiers.add(KeyModifier::Alt);
+     if (GetKeyState(VK_CAPITAL) & 1)
+         modifiers.add(KeyModifier::CapsLock);
++#endif
+ 
+     updateLayout();
+     // Windows expresses right-Alt as VK_MENU with the extended flag set.
+@@ -479,6 +484,14 @@ String WindowsKeyNames::domCodeFromLParam(LPARAM lParam)
+ 
+ void WindowsKeyNames::updateLayout()
+ {
++#if defined(WK_WINUWP)
++    // Apotheosis: GetKeyboardLayout/GetKeyboardState/ToUnicodeEx are not
++    // declared in the App Container partition. Leave the printable-key map
++    // empty: DOM key names fall back to the static virtual-key/scan-code
++    // tables, and typed text reaches the engine as char events from the
++    // harness (which owns IME and layout handling on device).
++    return;
++#else
+     HKL currentLayout = GetKeyboardLayout(0);
+     if (currentLayout == m_keyboardLayout)
+         return;
+@@ -529,6 +542,7 @@ void WindowsKeyNames::updateLayout()
+         }
+     }
+     SetKeyboardState(keyboardStateToRestore);
++#endif // !defined(WK_WINUWP)
+ }
+ 
+ } // namespace WebCore
 diff --git a/Source/WebCore/rendering/RenderLayerBacking.cpp b/Source/WebCore/rendering/RenderLayerBacking.cpp
 index 7d20685770..ec9121167d 100644
 --- a/Source/WebCore/rendering/RenderLayerBacking.cpp
@@ -2033,6 +2596,394 @@ index ac073d1c93..0335ee4533 100644
  #include "WebResourceLoadScheduler.h"
  
  #include "PingHandle.h"
+diff --git a/Source/cmake/OptionsWinUWP.cmake b/Source/cmake/OptionsWinUWP.cmake
+new file mode 100644
+index 0000000000..f332819823
+--- /dev/null
++++ b/Source/cmake/OptionsWinUWP.cmake
+@@ -0,0 +1,382 @@
++# Apotheosis: port options for WinUWP (Windows 10 Mobile ARM32, UWP App Container).
++#
++# Reconstructed from the author's drafts (port/draft-OptionsWinUWP-webcore-block.cmake)
++# and modeled on Source/cmake/OptionsWin.cmake. This port builds WTF + JavaScriptCore +
++# WebCore as STATIC libraries only; the UWP host links them through the out-of-tree
++# WebCoreDriver (port/*.cpp) over a stable C ABI. There is no WebKit/WebKitLegacy UI
++# process, no Tools, no tests.
++#
++# Two graphics configurations share this file:
++#   * software (default)      : Cairo image surfaces -> WriteableBitmap
++#   * -DAPOTHEOSIS_GPU=ON     : + TextureMapper on prebuilt (NuGet) ANGLE -> SwapChainPanel
++#
++# Every deviation from OptionsWin.cmake is either an App Container restriction
++# (no GDI/user32/MediaFoundation/desktop CryptoAPI) or an ARM32 restriction
++# (no FTL, no in-tree ANGLE build for thumbv7).
++
++# -----------------------------------------------------------------------------
++# Compiler flags. NOT include(OptionsMSVC): that module hard-requires
++# clang_rt.builtins-x86_64, which does not exist for thumbv7. Everything else
++# from it is replicated below.
++# -----------------------------------------------------------------------------
++if (MSVC)
++    function(MSVC_ADD_COMPILE_OPTIONS)
++        foreach (_option ${ARGV})
++            add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:${_option}>)
++        endforeach ()
++    endfunction()
++
++    # Use AT&T syntax for inline asm
++    MSVC_ADD_COMPILE_OPTIONS(/clang:-masm=att)
++
++    # Create pdb files for debugging purposes, also for Release builds
++    MSVC_ADD_COMPILE_OPTIONS(/Zi /GS)
++
++    add_link_options(/DEBUG /OPT:NOICF /OPT:REF)
++
++    # Apotheosis: exceptions must stay off. clang's thumbv7-windows-msvc backend
++    # cannot lower cleanupret (Windows unwinding), see CLAUDE.md.
++    add_definitions(-D_HAS_EXCEPTIONS=0)
++    string(REGEX REPLACE "/EH[-a-z]+" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
++    MSVC_ADD_COMPILE_OPTIONS(/EHa- /EHc- /EHs- /fp:except-)
++
++    # Disable RTTI
++    string(REGEX REPLACE "/GR-?" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
++    MSVC_ADD_COMPILE_OPTIONS(/GR-)
++
++    MSVC_ADD_COMPILE_OPTIONS(/analyze- /bigobj)
++
++    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
++    add_definitions(-D_ENABLE_EXTENDED_ALIGNED_STORAGE)
++
++    MSVC_ADD_COMPILE_OPTIONS(/utf-8 /validate-charset)
++
++    if (NOT ${CMAKE_GENERATOR} MATCHES "Ninja")
++        MSVC_ADD_COMPILE_OPTIONS(/MP)
++    endif ()
++
++    string(REGEX REPLACE "/W3" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
++    string(REGEX REPLACE "/W3" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
++    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(/W4)
++    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(/Zc:dllexportInlines-)
++
++    add_link_options(/INCREMENTAL:NO)
++
++    # Apotheosis: the LLVM Windows installer ships only clang_rt.builtins-x86_64.
++    # A thumbv7 builtins library is optional here (the MSVC ARM CRT provides the
++    # __rt_*/__aeabi_* helpers); link it only if someone cross-built one.
++    string(REGEX MATCH "^[0-9]+" CLANG_CL_MAJOR_VERSION ${CMAKE_CXX_COMPILER_VERSION})
++    cmake_path(REMOVE_FILENAME CMAKE_CXX_COMPILER OUTPUT_VARIABLE CLANG_CL_DIR)
++    cmake_path(APPEND CLANG_CL_DIR "../lib/clang" ${CLANG_CL_MAJOR_VERSION} "lib/windows")
++    find_library(CLANG_BUILTINS_LIBRARY
++        NAMES clang_rt.builtins-arm clang_rt.builtins-armhf
++        PATHS ${CLANG_CL_DIR}
++        NO_DEFAULT_PATH
++    )
++    if (CLANG_BUILTINS_LIBRARY)
++        link_libraries(${CLANG_BUILTINS_LIBRARY})
++    endif ()
++endif ()
++
++# -----------------------------------------------------------------------------
++# Windows / App Container preprocessor environment.
++# WINAPI_FAMILY, WK_WINUWP and the UWP umbrella import library come from
++# port/Toolchain-ARM32-UWP-clang.cmake; only the port-neutral bits live here.
++# -----------------------------------------------------------------------------
++add_definitions(-D_WINDOWS -DNTDDI_VERSION=0x0A000006 -D_WIN32_WINNT=0x0A00)
++add_definitions(-DNOMINMAX)
++add_definitions(-DUNICODE -D_UNICODE)
++add_definitions(-DNOCRYPT)
++add_definitions(-D_CRT_NONSTDC_NO_DEPRECATE)
++add_definitions(-D_SILENCE_CXX23_DENORM_DEPRECATION_WARNING)
++add_definitions(-D_WINSOCKAPI_=)
++
++if (DEFINED ENV{WEBKIT_IGNORE_PATH})
++    list(APPEND CMAKE_IGNORE_PATH $ENV{WEBKIT_IGNORE_PATH})
++endif ()
++
++set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
++set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
++set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
++set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
++
++# Apotheosis: PCHs are of no use to us (the driver compiles out of tree) and they
++# multiply the ARM32 build cost.
++set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
++
++# -----------------------------------------------------------------------------
++# What gets built. Engine only: no UI process, no legacy WebKit, no inspector
++# front end, no Tools (DumpRenderTree/WebKitTestRunner are desktop-only).
++# -----------------------------------------------------------------------------
++set(ENABLE_WEBCORE ON)
++set(ENABLE_WEBKIT OFF)
++set(ENABLE_WEBKIT_LEGACY OFF)
++set(ENABLE_WEBINSPECTORUI OFF)
++set(ENABLE_TOOLS OFF)
++set(ENABLE_API_TESTS OFF)
++
++# -----------------------------------------------------------------------------
++# Feature options
++# -----------------------------------------------------------------------------
++WEBKIT_OPTION_BEGIN()
++
++# JavaScriptCore is linked statically into WebCoreDriver-*.dll.
++WEBKIT_OPTION_DEFINE(ENABLE_STATIC_JSC "Whether to build JavaScriptCore as a static library." PUBLIC ON)
++
++# --- JSC: ARMv7/Thumb-2 baseline JIT only. FTL is impossible on ARM32, and DFG
++#     is off in the author's shipping configuration (see PLAN.md M4).
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_C_LOOP             PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_JIT                PRIVATE ON)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DFG_JIT            PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_FTL_JIT            PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SAMPLING_PROFILER  PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBASSEMBLY        PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_REMOTE_INSPECTOR   PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_SYSTEM_MALLOC         PRIVATE ON)
++
++# --- test / tooling targets that have no meaning on a phone ---
++# ENABLE_JAVASCRIPT_SHELL builds the jsc executable, which cannot run on the
++# build host anyway (thumbv7 App Container). It also trips over
++# _WEBKIT_TARGET_LINK_FRAMEWORK: with every framework STATIC no target ever
++# records a *_LINKED_INTO property, and the empty right-hand side of its
++# STREQUAL is a hard parse error on CMake 4.x.
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_JAVASCRIPT_SHELL   PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_API_TESTS          PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_LAYOUT_TESTS       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MINIBROWSER        PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBDRIVER          PRIVATE OFF)
++
++# --- graphics / GPU ---
++# WebGL stays off in both configurations: the GPU path composites through
++# TextureMapper, it does not expose a WebGL context to content.
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBGL              PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBGPU             PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBXR              PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_GPU_PROCESS        PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_OFFSCREEN_CANVAS   PRIVATE OFF)
++
++# --- media: none. This is also how the whole MediaFoundation link block and
++#     the only DirectWrite reference are dropped.
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_VIDEO                  PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEB_AUDIO              PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_SOURCE           PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_STREAM           PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEB_RTC                PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_LEGACY_ENCRYPTED_MEDIA PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_ENCRYPTED_MEDIA        PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_STATISTICS       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SPEECH_SYNTHESIS       PRIVATE OFF)
++
++# --- desktop-shell features that the App Container cannot provide ---
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DRAG_SUPPORT            PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_CONTEXT_MENUS           PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_FULLSCREEN_API          PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_GAMEPAD                 PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_GEOLOCATION             PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DEVICE_ORIENTATION      PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_NOTIFICATIONS           PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SPELLCHECK              PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_RESOURCE_USAGE          PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_PERIODIC_MEMORY_MONITOR PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_CURSOR_VISIBILITY       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MOUSE_CURSOR_SCALE      PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_POINTER_LOCK            PRIVATE OFF)
++
++# --- heavy / optional subsystems trimmed for first bring-up ---
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_XSLT                  PRIVATE OFF)  # drops LibXslt
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MATHML                PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SMOOTH_SCROLLING      PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_ASYNC_SCROLLING       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DARK_MODE_CSS         PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_VARIATION_FONTS       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_TOUCH_EVENTS          PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_PAYMENT_REQUEST       PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEB_AUTHN             PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SERVICE_CONTROLS      PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_CONTENT_EXTENSIONS    PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MHTML                 PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_ATTACHMENT_ELEMENT    PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_APPLICATION_MANIFEST  PRIVATE OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_FTPDIR                PRIVATE OFF)
++
++# --- backend selection (these are WEBKIT_OPTION entries, not plain variables) ---
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_SKIA   PRIVATE OFF)  # CRITICAL: selects the Cairo branch
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_WOFF2  PRIVATE OFF)  # drops the WOFF2 + Brotli requirement
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_AVIF   PRIVATE OFF)  # drops the libavif requirement
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_JPEGXL PRIVATE OFF)  # drops the libjxl requirement
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_LCMS   PRIVATE OFF)  # drops the lcms2 requirement
++# NOTE: USE_AVIF, USE_JPEGXL and USE_LCMS all default to ON in 2.52.4. Leaving
++# any of them at its default makes WebCore link AVIF::/JPEGXL::/LCMS2:: targets
++# that this port never finds a package for.
++
++WEBKIT_OPTION_END()
++
++# -----------------------------------------------------------------------------
++# USE_* build-time facts.
++# We do not include OptionsWin.cmake, so everything OptionsWin exposes and we
++# still need has to be repeated here.
++# -----------------------------------------------------------------------------
++SET_AND_EXPOSE_TO_BUILD(USE_CAIRO          ON)   # software raster + the GPU path's tile paint
++SET_AND_EXPOSE_TO_BUILD(USE_FREETYPE       ON)
++SET_AND_EXPOSE_TO_BUILD(USE_FONTCONFIG     ON)
++SET_AND_EXPOSE_TO_BUILD(USE_HARFBUZZ       ON)
++SET_AND_EXPOSE_TO_BUILD(USE_CURL           ON)   # the only ResourceLoader backend wired up
++SET_AND_EXPOSE_TO_BUILD(USE_OPENSSL        ON)   # curl's TLS/crypto backend
++SET_AND_EXPOSE_TO_BUILD(USE_THEME_ADWAITA  ON)   # Cairo-painted RenderTheme, never UxTheme/GDI
++# Apotheosis: the Windows event loop (RunLoopWin) drives a hidden HWND message
++# window, which an App Container cannot create. Use the condition-variable
++# based generic event loop instead, like JSCOnly does (WTF_DEFAULT_EVENT_LOOP=0
++# stops PlatformUse.h from auto-selecting USE_WINDOWS_EVENT_LOOP on OS(WINDOWS));
++# matches PlatformWinUWP.cmake shipping generic/RunLoopGeneric.cpp.
++SET_AND_EXPOSE_TO_BUILD(USE_GENERIC_EVENT_LOOP 1)
++SET_AND_EXPOSE_TO_BUILD(WTF_DEFAULT_EVENT_LOOP 0)
++SET_AND_EXPOSE_TO_BUILD(USE_MEDIA_FOUNDATION OFF)
++SET_AND_EXPOSE_TO_BUILD(USE_GRAPHICS_LAYER_WC OFF)
++SET_AND_EXPOSE_TO_BUILD(USE_COORDINATED_GRAPHICS OFF)
++SET_AND_EXPOSE_TO_BUILD(ENABLE_DEVELOPER_MODE ${DEVELOPER_MODE})
++
++option(APOTHEOSIS_GPU "Build the accelerated compositing path (TextureMapper on prebuilt ANGLE)" OFF)
++
++if (APOTHEOSIS_GPU)
++    # GPU recipe: synchronous GraphicsLayerTextureMapper (no coordinated graphics,
++    # no WC layer tree); the driver drives ANGLE/EGL itself and presents into a
++    # SwapChainPanel.
++    SET_AND_EXPOSE_TO_BUILD(USE_TEXTURE_MAPPER ON)
++    SET_AND_EXPOSE_TO_BUILD(USE_GRAPHICS_LAYER_TEXTURE_MAPPER ON)
++    SET_AND_EXPOSE_TO_BUILD(USE_ANGLE ON)
++    # Apotheosis: no GLFence - the prebuilt ANGLE 2.1.13 (ms-master) eglext.h
++    # predates EGL_KHR_fence_sync and the synchronous TextureMapper never
++    # fences; the GLFence* sources are omitted in PlatformWinUWP.cmake.
++    SET_AND_EXPOSE_TO_BUILD(HAVE_GL_FENCE OFF)
++    set(USE_ANGLE_EGL ON)
++    # The old eglext.h only declares the EXT entry points (like
++    # eglGetPlatformDisplayEXT, used by PlatformDisplayWin) behind this macro.
++    add_definitions(-DEGL_EGLEXT_PROTOTYPES=1)
++else ()
++    # Software-only: keep the accelerated compositor symbols out entirely.
++    SET_AND_EXPOSE_TO_BUILD(USE_TEXTURE_MAPPER OFF)
++    SET_AND_EXPOSE_TO_BUILD(USE_GRAPHICS_LAYER_TEXTURE_MAPPER OFF)
++    SET_AND_EXPOSE_TO_BUILD(USE_ANGLE OFF)
++    set(USE_ANGLE_EGL OFF)
++endif ()
++
++# -----------------------------------------------------------------------------
++# Prebuilt ANGLE (NuGet ANGLE.WindowsStore, ARM32).
++# Source/CMakeLists.txt skips add_subdirectory(ThirdParty/ANGLE) when
++# APOTHEOSIS_GPU is on -- cross-building in-tree ANGLE for thumbv7 is not
++# viable -- so the ANGLE::EGL / ANGLE::GLES targets must be provided here.
++# -----------------------------------------------------------------------------
++if (APOTHEOSIS_GPU)
++    set(APOTHEOSIS_ANGLE_ROOT "" CACHE PATH
++        "Root of the prebuilt ANGLE drop: <root>/include headers, <root>/arm import libraries")
++
++    if (NOT APOTHEOSIS_ANGLE_ROOT)
++        foreach (_candidate
++            "${CMAKE_SOURCE_DIR}/../angle"
++            "${CMAKE_SOURCE_DIR}/../Project-Apotheosis/angle"
++        )
++            if (EXISTS "${_candidate}/include/EGL/egl.h")
++                get_filename_component(APOTHEOSIS_ANGLE_ROOT "${_candidate}" ABSOLUTE)
++                break ()
++            endif ()
++        endforeach ()
++    endif ()
++
++    if (NOT APOTHEOSIS_ANGLE_ROOT)
++        message(FATAL_ERROR
++            "APOTHEOSIS_GPU is ON but no prebuilt ANGLE was found. Pass "
++            "-DAPOTHEOSIS_ANGLE_ROOT=<dir> pointing at a directory with include/ and arm/.")
++    endif ()
++
++    set(APOTHEOSIS_ANGLE_INCLUDE_DIR "${APOTHEOSIS_ANGLE_ROOT}/include")
++    set(APOTHEOSIS_ANGLE_LIBRARY_DIR "${APOTHEOSIS_ANGLE_ROOT}/arm")
++
++    find_library(APOTHEOSIS_ANGLE_EGL_LIBRARY libEGL
++        PATHS "${APOTHEOSIS_ANGLE_LIBRARY_DIR}" NO_DEFAULT_PATH)
++    find_library(APOTHEOSIS_ANGLE_GLES_LIBRARY libGLESv2
++        PATHS "${APOTHEOSIS_ANGLE_LIBRARY_DIR}" NO_DEFAULT_PATH)
++
++    if (NOT APOTHEOSIS_ANGLE_EGL_LIBRARY OR NOT APOTHEOSIS_ANGLE_GLES_LIBRARY)
++        message(FATAL_ERROR
++            "Prebuilt ANGLE import libraries (libEGL.lib, libGLESv2.lib) not found in "
++            "${APOTHEOSIS_ANGLE_LIBRARY_DIR}. Extract the ARM payload of the "
++            "ANGLE.WindowsStore NuGet package there.")
++    endif ()
++
++    if (NOT TARGET ANGLE::EGL)
++        add_library(ANGLE::EGL UNKNOWN IMPORTED)
++        set_target_properties(ANGLE::EGL PROPERTIES
++            IMPORTED_LOCATION "${APOTHEOSIS_ANGLE_EGL_LIBRARY}"
++            INTERFACE_INCLUDE_DIRECTORIES "${APOTHEOSIS_ANGLE_INCLUDE_DIR}"
++            INTERFACE_COMPILE_DEFINITIONS "GL_GLEXT_PROTOTYPES;EGL_EGL_PROTOTYPES=1"
++        )
++    endif ()
++    if (NOT TARGET ANGLE::GLES)
++        add_library(ANGLE::GLES UNKNOWN IMPORTED)
++        set_target_properties(ANGLE::GLES PROPERTIES
++            IMPORTED_LOCATION "${APOTHEOSIS_ANGLE_GLES_LIBRARY}"
++            INTERFACE_INCLUDE_DIRECTORIES "${APOTHEOSIS_ANGLE_INCLUDE_DIR}"
++            INTERFACE_COMPILE_DEFINITIONS "GL_GLEXT_PROTOTYPES;GL_GLES_PROTOTYPES=1"
++        )
++    endif ()
++endif ()
++
++# -----------------------------------------------------------------------------
++# External dependencies. All of these come from the vcpkg arm-uwp triplet, from
++# C:\icu-arm-uwp, or from the hand-cross-built libraries under deps-build; they
++# are located through CMAKE_PREFIX_PATH.
++#
++# Kept last on purpose: everything above is port structure, so a failure here is
++# an environment problem, not a port problem.
++# -----------------------------------------------------------------------------
++find_package(ICU 70.1 REQUIRED COMPONENTS data i18n uc)
++find_package(ZLIB 1.2.11 REQUIRED)
++
++if (ENABLE_WEBCORE)
++    find_package(Cairo 1.18.0 REQUIRED)
++    find_package(Freetype 2.9.0 REQUIRED)
++    find_package(Fontconfig 2.13.0 REQUIRED)
++    # Apotheosis: no COMPONENTS ICU -- our harfbuzz is built without hb-icu, and
++    # the single hb_icu_script_to_script() call was rewritten onto plain ICU
++    # (see the WK_WINUWP patch to LocaleICU.cpp / ComplexTextControllerHarfBuzz.cpp).
++    find_package(HarfBuzz 1.4.2 REQUIRED)
++    find_package(JPEG 1.5.2 REQUIRED)
++    find_package(PNG 1.6.34 REQUIRED)
++    find_package(WebP REQUIRED COMPONENTS demux)
++    find_package(LibXml2 2.9.7 REQUIRED)
++    find_package(SQLite3 3.23.1 REQUIRED)
++    find_package(CURL 7.87.0 REQUIRED)
++    find_package(OpenSSL REQUIRED)
++    # Apotheosis: no LibPSL on this port. The author's shipped builds link
++    # without it (PublicSuffixStoreCurl.cpp is not in the WinUWP source list;
++    # the port stubs that area), so unlike WinCairo we do not require it.
++
++    if (NOT TARGET SQLite3::SQLite3) # CMake < 4.3
++        add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
++    endif ()
++
++    # See if the OpenSSL implementation is BoringSSL
++    cmake_push_check_state()
++    set(CMAKE_REQUIRED_INCLUDES "${OPENSSL_INCLUDE_DIR}")
++    set(CMAKE_REQUIRED_LIBRARIES "${OPENSSL_LIBRARIES}")
++    WEBKIT_CHECK_HAVE_SYMBOL(USE_BORINGSSL OPENSSL_IS_BORINGSSL openssl/ssl.h)
++    cmake_pop_check_state()
++
++    if (USE_WOFF2)
++        find_package(WOFF2 1.0.2 REQUIRED COMPONENTS dec)
++        find_package(Brotli REQUIRED COMPONENTS dec)
++    endif ()
++endif ()
++
++# -----------------------------------------------------------------------------
++# Library types. Everything is static: the UWP host links one DLL
++# (WebCoreDriver-*.dll) built out of tree from port/*.cpp plus these archives.
++# -----------------------------------------------------------------------------
++set(bmalloc_LIBRARY_TYPE STATIC)
++set(WTF_LIBRARY_TYPE STATIC)
++set(JavaScriptCore_LIBRARY_TYPE STATIC)
++set(PAL_LIBRARY_TYPE STATIC)
++set(WebCore_LIBRARY_TYPE STATIC)
++set(WebCoreTestSupport_LIBRARY_TYPE STATIC)
 diff --git a/Source/cmake/WebKitCommon.cmake b/Source/cmake/WebKitCommon.cmake
 index 639b7e5d1e..a3c4ec1774 100644
 --- a/Source/cmake/WebKitCommon.cmake

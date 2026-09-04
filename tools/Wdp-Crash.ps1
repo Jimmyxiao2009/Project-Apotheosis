@@ -31,15 +31,18 @@ param(
     [switch]$Pull,
     [switch]$Clear,
     [string]$Match = 'Harness|EdgeHTML',
-    [string]$OutDir = 'E:\Apotheosis\crash',
+    [string]$OutDir = '',
     [string]$DeviceIp = '192.168.3.51',
     [ValidateSet('https','http')][string]$Scheme = 'https',
     [int]$Port = 443,
     [pscredential]$Credential,
-    [string]$AnalyzeFile   # 跳过设备,直接分析本地某个 .dmp
+    [string]$AnalyzeFile,   # 跳过设备,直接分析本地某个 .dmp
+    # Apotheosis: repo root, defaults to the parent of tools\ so the script works from any checkout location.
+    [string]$Root = (Split-Path -Parent $PSScriptRoot)
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $OutDir) { $OutDir = Join-Path $Root 'crash' }
 if ($Scheme -eq 'http' -and -not $PSBoundParameters.ContainsKey('Port')) { $Port = 80 }
 $BaseUri = "${Scheme}://${DeviceIp}:${Port}"
 $script:Session = $null
