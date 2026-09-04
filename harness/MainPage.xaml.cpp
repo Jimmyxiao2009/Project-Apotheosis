@@ -520,6 +520,9 @@ private:
 // 切后台重开后 cookie 没保住,应是没跑完就被冻结)。
 void MainPage::FlushCookiesForSuspend(Windows::ApplicationModel::SuspendingDeferral^ deferral)
 {
+    // Apotheosis (review 2026-09-04 item 3): suspend is the last edge that can swallow a
+    //   manipulation whole. VisibilityChanged normally fires first, but nothing guarantees it.
+    EndGesture(GestureEnd::Suspend);
     WebEngine::instance().post([deferral]() {
         try { WebCoreFlushCookiesToDisk(); } catch (...) {}
         // Apotheosis (M4): 同理落盘性能日志 —— 环形缓冲平时只在导航完成时写盘,挂起后进程可能被
@@ -769,6 +772,13 @@ MainPage::MainPage()
             }
             if (e->Visible) StartLiveMode();
             else {
+                // Apotheosis (review 2026-09-04 item 3): a manipulation cannot survive going to the
+                //   background, and its ManipulationCompleted may never arrive. Before this, the
+                //   handler cleared m_panDefer and the presenter offset but left m_pinching,
+                //   m_manipActive, the nested-scroll state and the drag state set - and with
+                //   m_pinching stuck, InstantPanBy() and ApplyPanTransform() return early for the
+                //   rest of the session, i.e. nothing scrolls again until the app is restarted.
+                EndGesture(GestureEnd::Visibility);
                 StopLiveMode();
                 // cookie 落盘(JSON Lines 快照):UWP 挂起的应用可能被系统直接终止、不会再回调任何
                 // 生命周期事件,切后台这一刻是最后的安全落盘时机。引擎线程异步(线程铁律:UI 线程
@@ -1522,17 +1532,14 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     m_currentUrl = isHome ? L"about:home" : wurl;
 
     // M4:导航=新页面,引擎 pageScaleFactor 复位 1.0 → harness 缩放状态/显示变换同步复位(否则下次捏合基准错)。
-    m_pinching = false; m_liveScale = 1.0f; m_pageScale = 1.0f;
+    // Apotheosis (review 2026-09-04 items 3 + 6b): one exit. This used to clear the pinch flag, the
+    //   pan deferral, both pan offsets and the snap timer by hand and forget the rest - in
+    //   particular the ZOOM SPRING, whose Completed handler then ran PinchCommit() on the NEW
+    //   document (the old page's zoom applied to the new page), and the nested-scroll/drag state.
+    EndGesture(GestureEnd::Navigate);
+    m_pageScale = 1.0f;
     m_zoomTransform = nullptr;
-    // Apotheosis (instant pan): a new document invalidates the cached scroll position and bounds,
-    // and any pan remainder belongs to the page we are leaving.
-    PanDeferOff();   // a pan of the old page must not keep the engine from presenting the new one
-    m_panRemX = 0; m_panRemY = 0;
-    // Apotheosis (presenter thread): same for the offset the presenter is still showing.
-    m_panAbsX = 0; m_panAbsY = 0;
-    if (m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
     if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
-    if (m_panSnapTimer) m_panSnapTimer->Stop();
     m_scrollStateValid = false;
     ++m_scrollStateGen;
     // Apotheosis (review 2026-09-04 item 1): go through ApplyPresentTransform() rather than nulling
@@ -3516,6 +3523,65 @@ void MainPage::RefreshPresenterActive()
     });
 }
 
+// Apotheosis (review 2026-09-04 item 3): THE ONE EXIT FROM A GESTURE.
+//   Five paths used to end a gesture and each cleared a different subset of the state. The one
+//   that mattered most - m_pinching - was cleared only by OnImageManipCompleted and NavigateTo, so
+//   a manipulation ended by a visibility change, a tab switch or a session teardown left it set;
+//   InstantPanBy() and ApplyPanTransform() both return early while it is, and nothing scrolled for
+//   the rest of the session. Everything that says "a finger owns the page" is reset here instead.
+//
+//   NOT hooked, deliberately: PointerCaptureLost / PointerCanceled. They fire when the finger
+//   leaves the glass, which is exactly where INERTIA begins - ending the gesture there would kill
+//   inertia scrolling. ManipulationCompleted is the event that arrives once inertia has run out
+//   (ManipulationMode carries TranslateInertia, see MainPage.xaml), and it is the normal exit.
+//   XAML raises no ManipulationCanceled for this element, so the abort reasons below are the
+//   lifecycle edges that can swallow a manipulation: background, navigation, tab switch, suspend.
+//
+//   The zoom spring is stopped for every reason EXCEPT Completed: on Completed the caller
+//   (OnImageManipCompleted) still owns the pinch commit and is about to start the spring itself.
+void MainPage::EndGesture(GestureEnd reason)
+{
+    const bool abort = (reason != GestureEnd::Completed);
+    // --- pinch. Cleared for every reason; this is the flag whose absence froze scrolling.
+    m_pinching = false;
+    m_liveScale = 1.0f;
+    if (abort && m_zoomSpring != nullptr) {
+        try { m_zoomSpring->Stop(); } catch (...) {}   // Stop() does not raise Completed
+        m_zoomSpring = nullptr;
+        m_zoomTransform = nullptr;
+    }
+    // --- main-frame pan. PanGestureEnd() is the ORDERLY end (it hands the presents back and lets
+    //     the presenter decay the residual it is still showing) and runs for every reason; the hard
+    //     reset below - drop the residual now, stop the snap timer - is right only for an abort.
+    //     On Completed the residual is supposed to decay against the frames the engine is still
+    //     catching up with, and the snap timer is what bounds that.
+    PanGestureEnd();
+    if (abort) {
+        InstantPanReset();
+        if (m_panSnapTimer) { try { m_panSnapTimer->Stop(); } catch (...) {} }
+        m_panSnapDeadline = 0;
+        m_pendingPanX = 0; m_pendingPanY = 0;
+    }
+    // --- nested scroll: bump the generation so a hit-test answer still in flight is dropped.
+    //     (Completed flushes the buffered deltas first, through ReplayPendingPan.)
+    ++m_nestedScrollGen;
+    m_nestedScrollState = NestedScrollState::Unknown;
+    // --- drag as pointer events. NOT on Completed: the mouseup for a drag that the page owns is
+    //     posted asynchronously (m_dragReleasePending + PumpDrag) and DragReset() would swallow it,
+    //     while bumping m_dragGen would make the in-flight answer be dropped and leave m_dragBusy
+    //     set for ever. The next ManipulationStarted resets it, as it always did. An abort has no
+    //     such completion to wait for.
+    if (abort) {
+        ++m_dragGen;
+        DragReset();
+    }
+    // --- and the master flag: no finger owns the page any more. After this, PanGestureBegin()
+    //     refuses to re-arm pan-gesture mode from a late engine completion.
+    m_manipActive = false;
+    if (abort)
+        ApplyPresentTransform();   // whatever preview transform is left goes with the gesture
+}
+
 // 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
 void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input::ManipulationCompletedRoutedEventArgs^)
 {
@@ -3543,12 +3609,13 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     //   as part of the gesture. From here on nothing may re-enter pan-gesture mode: a late engine
     //   completion (PumpDrag's fallback) would arm m_panGestureOn/m_panDefer with no gesture left to
     //   end them, and the engine would stay silent until the 1 s snap timer fired.
-    m_manipActive = false;
-    ++m_nestedScrollGen;
-    m_nestedScrollState = NestedScrollState::Unknown;
-    if (!m_pinching) return;
-    m_pinching = false;
-    float live = m_liveScale;
+    // Apotheosis (review 2026-09-04 item 3): one exit, shared with every abort path. Capture what
+    //   the pinch commit below needs BEFORE the reset - EndGesture() clears m_pinching/m_liveScale
+    //   like every other caller, and leaves the zoom spring alone because this path owns it.
+    const bool wasPinching = m_pinching;
+    const float live = m_liveScale;
+    EndGesture(GestureEnd::Completed);
+    if (!wasPinching) return;
     // 钳到引擎区间 + 吸附 1:1（见 SnapAndClampPageScale）。没有吸附时，捏回去总差百分之几，
     //   页面永远停在“差不多但不是原始大小”的状态上，且误差每次捏合继续累积。
     float newScale = SnapAndClampPageScale(m_pageScale * live);
@@ -5384,6 +5451,10 @@ void MainPage::SaveActiveTab()
 void MainPage::RestoreTab(int i)
 {
     if (i < 0 || i >= (int)m_tabs.size()) return;
+    // Apotheosis (review 2026-09-04 item 3): the gesture that opened the switcher belongs to the
+    //   tab we are leaving. NavigateTo() below ends it too, but not before ShowTabSnapshot()/the
+    //   scale restore have run against gesture state from another page.
+    EndGesture(GestureEnd::TabSwitch);
     m_activeTab = i;
     const Tab& t = m_tabs[i];
     m_navStack = t.navStack;
@@ -5408,6 +5479,7 @@ void MainPage::RestoreTab(int i)
 
 void MainPage::NewTab()
 {
+    EndGesture(GestureEnd::TabSwitch);   // Apotheosis (review 2026-09-04 item 3): see RestoreTab
     SaveActiveTab();
     CaptureActiveTabSnapshot();   // Apotheosis: 离开的标签留一帧,切回来时秒出画面
     Tab t; t.currentUrl = g_homeUrl;

@@ -21,6 +21,11 @@ namespace Harness {
     // Unknown = hit test still in flight (or none posted this gesture): existing main-frame fast
     // path. Yes/No = the async answer for the point the current gesture started at.
     enum class NestedScrollState { Unknown, Yes, No, Drag };
+    // Apotheosis (review 2026-09-04 item 3): why a gesture is ending. Only Completed is the normal
+    //   exit (ManipulationCompleted, i.e. after inertia); every other reason is an abort, and an
+    //   abort also stops the zoom spring - on Completed the caller owns the pinch commit and is
+    //   about to start that spring itself.
+    enum class GestureEnd { Completed, Visibility, Navigate, TabSwitch, Suspend };
 
     // 网页链接命中矩形(位图坐标)+ URL,用于点击交互。
     struct PageLink { int x, y, w, h; std::wstring url; };
@@ -267,6 +272,9 @@ namespace Harness {
         //   listening. Re-asks the driver (posted, the ABI wants the engine thread) and routes pan
         //   the engine way again if the answer changed. Called at every gesture end.
         void RefreshPresenterActive();
+        // Apotheosis (review 2026-09-04 item 3): the ONE exit from a gesture - see the comment on the
+        //   definition. Resets pinch, pan, nested-scroll and drag state together, whatever ended it.
+        void EndGesture(GestureEnd reason);
         // Apotheosis (review 2026-09-03): status-bar / software-nav-bar insets from
         //   ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid bottom padding + top
         //   margin of the top-anchored chrome. UI thread only.
