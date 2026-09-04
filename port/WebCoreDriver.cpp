@@ -542,12 +542,23 @@ static std::atomic<bool> g_presenterActive { false };  // the presenter really o
 static void* g_presenterWindow = nullptr;              // native window handed to the presenter thread
 static EGLDisplay g_presenterEglDisplay = nullptr;
 
-typedef EGLSyncKHR (EGLAPIENTRYP ApoCreateSyncKHRProc)(EGLDisplay, EGLenum, const EGLint*);
-typedef EGLBoolean (EGLAPIENTRYP ApoDestroySyncKHRProc)(EGLDisplay, EGLSyncKHR);
-typedef EGLint (EGLAPIENTRYP ApoClientWaitSyncKHRProc)(EGLDisplay, EGLSyncKHR, EGLint, EGLTimeKHR);
-static ApoCreateSyncKHRProc g_eglCreateSyncKHR = nullptr;
-static ApoDestroySyncKHRProc g_eglDestroySyncKHR = nullptr;
-static ApoClientWaitSyncKHRProc g_eglClientWaitSyncKHR = nullptr;
+// Apotheosis (presenter thread, WHITE-SCREEN fix 2026-09-04): the cross-context EGL fence
+// handshake is GONE. Both halves of it - the engine's eglCreateSyncKHR + the presenter's
+// eglClientWaitSyncKHR, and the presenter's fence the engine waited on before reusing a slot -
+// were waits on an EGLSync created by ANOTHER context on ANOTHER thread. ANGLE 2.1.13 (the
+// WindowsStore NuGet we ship) implements EGL_KHR_fence_sync on D3D11 as an ID3D11Query(EVENT)
+// whose End()/GetData() run on the ONE immediate device context the whole display shares; asking
+// for it from the presenter thread does not order anything against the engine thread's command
+// stream, and it came back EGL_CONDITION_SATISFIED_KHR straight away. The presenter therefore
+// sampled the slot texture while the engine's composite had only got as far as
+// TextureMapper::clearColor(documentBackgroundColor) - i.e. an all-white texture - and swapped
+// that. On device: the page shows up once (the last composite of a load lands while the presenter
+// is asleep) and then goes white for the rest of the session, flashing in whenever the race is
+// won. The synchronisation is now a plain glFinish() on the producing side of each handover:
+// the engine finishes before it publishes, the presenter finishes before it releases the slot.
+// That is what the no-extension branch always did; it is simply the only branch left. The
+// extension string is still queried, but only so the diagnostics can say what the display claims.
+static bool g_presFenceAdvertised = false;
 
 // One published frame. `texture` is set once at start-up and never replaced, so the presenter may
 // read `texture->id()` under the lock and sample it outside; BitmapTexture is ThreadSafeRefCounted
@@ -555,15 +566,25 @@ static ApoClientWaitSyncKHRProc g_eglClientWaitSyncKHR = nullptr;
 // destroyed - a cross-thread glDeleteTextures at exit is what we are avoiding everywhere here).
 struct PresenterFrame {
     RefPtr<WebCore::BitmapTexture> texture;
-    EGLSyncKHR fence { nullptr };   // engine-side fence; the presenter consumes and destroys it
-    // The other half of the handshake: the presenter leaves this behind when it has ISSUED a quad
-    // sampling this slot, and the engine waits for it before it composites into the slot again.
-    // Consumed and destroyed by the engine (presenterAcquireSlot).
-    EGLSyncKHR presentFence { nullptr };
     int scrollX { 0 };
     int scrollY { 0 };
     float bg[4] { 1.0f, 1.0f, 1.0f, 1.0f };
 };
+
+// Apotheosis (presenter diagnostics): counted on the presenter thread (and one on the engine
+// thread), dumped into crash.txt every kPresStatsEvery draws and on the first one. A device run
+// that is still wrong must be able to say WHY without another guess - see presenterStatsDump().
+static const unsigned kPresStatsEvery = 240;
+static std::atomic<unsigned> g_presDraws { 0 };          // quads issued
+static std::atomic<unsigned> g_presSwaps { 0 };          // eglSwapBuffers done
+static std::atomic<unsigned> g_presSkipNoPub { 0 };      // woke with nothing published
+static std::atomic<unsigned> g_presSkipDedupe { 0 };     // same generation and same translation
+static std::atomic<unsigned> g_presSkipSuspended { 0 };  // app suspended
+static std::atomic<unsigned> g_presSkipNoTex { 0 };      // published slot had texture id 0 -> clear only
+static std::atomic<unsigned> g_presEngineDrops { 0 };    // engine dropped a composite: no free slot in 50 ms
+static std::atomic<int> g_presLastEglError { 0 };        // eglGetError() after the last swap
+static std::atomic<int> g_presProbeContent { -1 };       // pixels != clear colour in the last probe block
+static std::atomic<int> g_presProbeTotal { 0 };
 
 struct PresenterState {
     WTF::Lock lock;
@@ -2066,6 +2087,7 @@ struct PresenterGL {
     GLint aPos { -1 };
     GLint uTrans { -1 };
     GLint uTex { -1 };
+    GLuint probeFbo { 0 };   // diagnostics only, created on the first probe (see presenterProbe)
 };
 
 // Apotheosis: whole-token search in a space-separated EGL/GL extension string. eglGetProcAddress
@@ -2135,6 +2157,78 @@ static bool presenterBuildGL(PresenterGL& gl)
     return gl.program != 0 && gl.vbo != 0 && gl.aPos >= 0;
 }
 
+// Apotheosis (presenter diagnostics): is what the presenter is about to swap actually the page, or
+// an empty frame? Attach the slot texture the presenter has just drawn from to a throwaway FBO in
+// the PRESENTER's context and read a small block out of its middle. The count of pixels that
+// differ from the frame's own clear colour is the one number that separates "the engine composited
+// nothing" from "the presenter is not showing what the engine composited": non-zero here with a
+// white screen means the bug is on this side of the handover, zero means it is on the engine's.
+// Expensive (a full pipeline stall plus a readback), so it runs once every kPresStatsEvery draws.
+static void presenterProbe(PresenterGL& gl, GLuint texId, const float bg[4])
+{
+    if (!texId)
+        return;
+    if (!gl.probeFbo) {
+        glGenFramebuffers(1, &gl.probeFbo);
+        if (!gl.probeFbo)
+            return;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, gl.probeFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texId, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        const int side = 16;
+        const int x = (g_gpuW > side) ? (g_gpuW - side) / 2 : 0;
+        const int y = (g_gpuH > side) ? (g_gpuH - side) / 2 : 0;
+        uint8_t px[16 * 16 * 4] = { 0 };
+        glReadPixels(x, y, side, side, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        const int br = static_cast<int>(bg[0] * 255.0f + 0.5f);
+        const int bgc = static_cast<int>(bg[1] * 255.0f + 0.5f);
+        const int bb = static_cast<int>(bg[2] * 255.0f + 0.5f);
+        int differ = 0;
+        for (int i = 0; i < side * side; ++i) {
+            const int dr = static_cast<int>(px[i * 4 + 0]) - br;
+            const int dg = static_cast<int>(px[i * 4 + 1]) - bgc;
+            const int db = static_cast<int>(px[i * 4 + 2]) - bb;
+            if (std::abs(dr) + std::abs(dg) + std::abs(db) > 24)
+                ++differ;
+        }
+        g_presProbeContent.store(differ, std::memory_order_relaxed);
+        g_presProbeTotal.store(side * side, std::memory_order_relaxed);
+    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Apotheosis (presenter diagnostics): one line into crash.txt - the file the device tooling always
+// pulls (local\pull-lumia-logs.ps1) and the only writable path the driver knows. Deliberately NOT
+// routed through WebCoreCrashNote/crashLogWrite: those write a full crash record and are capped at
+// kMaxCrashLogEntries, which a periodic stats line would exhaust. Grep for "presenter-stats".
+static void presenterStatsDump(const char* why)
+{
+    if (!g_crashLogPath[0])
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    const int probe = g_presProbeContent.load(std::memory_order_relaxed);
+    std::fprintf(fp,
+        "presenter-stats %02u:%02u:%02u.%03u %s fence_adv=%d sync=glFinish draws=%u swaps=%u "
+        "skip_nopub=%u skip_dedupe=%u skip_susp=%u skip_notex=%u engine_drops=%u "
+        "probe=%d/%d eglerr=0x%04x size=%dx%d\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, why ? why : "-",
+        g_presFenceAdvertised ? 1 : 0,
+        g_presDraws.load(std::memory_order_relaxed), g_presSwaps.load(std::memory_order_relaxed),
+        g_presSkipNoPub.load(std::memory_order_relaxed), g_presSkipDedupe.load(std::memory_order_relaxed),
+        g_presSkipSuspended.load(std::memory_order_relaxed), g_presSkipNoTex.load(std::memory_order_relaxed),
+        g_presEngineDrops.load(std::memory_order_relaxed),
+        probe, g_presProbeTotal.load(std::memory_order_relaxed),
+        static_cast<unsigned>(g_presLastEglError.load(std::memory_order_relaxed)),
+        g_gpuW, g_gpuH);
+    std::fclose(fp);
+}
+
 static void presenterThreadMain()
 {
     using namespace WebCore;
@@ -2184,7 +2278,6 @@ static void presenterThreadMain()
     for (;;) {
         int idx = -1;
         GLuint texId = 0;
-        EGLSyncKHR fence = nullptr;
         uint64_t generation = 0;
         float tx = 0.0f, ty = 0.0f;
         float bg[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -2201,6 +2294,7 @@ static void presenterThreadMain()
             P.wake = false;
             if (P.suspended) {
                 wasSuspended = true;
+                g_presSkipSuspended.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (wasSuspended) {
@@ -2214,8 +2308,10 @@ static void presenterThreadMain()
                 drawnGeneration = 0;
                 drawnTx = drawnTy = 0.0f;
             }
-            if (P.published < 0)
+            if (P.published < 0) {
+                g_presSkipNoPub.fetch_add(1, std::memory_order_relaxed);
                 continue;
+            }
             idx = P.published;
             PresenterFrame& f = P.slot[idx];
             generation = P.generation;
@@ -2251,46 +2347,22 @@ static void presenterThreadMain()
             tx = (g_gpuW > 0) ? (-2.0f * rx / static_cast<float>(g_gpuW)) : 0.0f;
             ty = (g_gpuH > 0) ? ( 2.0f * ry / static_cast<float>(g_gpuH)) : 0.0f;
 
-            if (drawnAnything && generation == drawnGeneration && tx == drawnTx && ty == drawnTy)
+            if (drawnAnything && generation == drawnGeneration && tx == drawnTx && ty == drawnTy) {
+                g_presSkipDedupe.fetch_add(1, std::memory_order_relaxed);
                 continue;   // nothing moved and no new frame: do not burn a swap
+            }
 
             P.inUse = idx;
             texId = f.texture ? f.texture->id() : 0;
-            fence = f.fence;
-            f.fence = nullptr;          // consumed exactly once; a redraw of the same frame needs no wait
             bg[0] = f.bg[0]; bg[1] = f.bg[1]; bg[2] = f.bg[2]; bg[3] = f.bg[3];
         }
+        if (!texId)
+            g_presSkipNoTex.fetch_add(1, std::memory_order_relaxed);
 
-        // Outside the lock: make sure the engine's composite has actually landed in the shared
-        // texture before sampling it. eglClientWaitSync with FLUSH_COMMANDS is the cheap way; with
-        // no fence extension the engine did a glFinish() before publishing instead.
-        if (fence && g_eglClientWaitSyncKHR) {
-            const EGLint waited = g_eglClientWaitSyncKHR(g_presenterEglDisplay, fence,
-                EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ll /* 50 ms */);
-            if (waited != EGL_CONDITION_SATISFIED_KHR) {
-                // Apotheosis: the wait timed out (or failed) - the engine's composite has NOT
-                // landed in this texture, and drawing it now would put exactly the half-composited
-                // frame on screen that the fence exists to prevent. Skip the draw: put the fence
-                // back so the retry waits for the same composite (an EGL sync may be waited on
-                // any number of times), release the slot so the engine is not blocked meanwhile,
-                // and do not advance drawnGeneration, so this frame is still owed. Each retry
-                // costs another wait, so a GPU that never finishes throttles this loop to ~20
-                // attempts a second instead of spinning it.
-                Locker locker { P.lock };
-                PresenterFrame& pending = P.slot[idx];
-                if (!pending.fence)
-                    pending.fence = fence;
-                else if (g_eglDestroySyncKHR)
-                    g_eglDestroySyncKHR(g_presenterEglDisplay, fence);   // a newer publish replaced it
-                P.inUse = -1;
-                P.wake = true;
-                P.cond.notifyAll();
-                continue;
-            }
-            if (g_eglDestroySyncKHR)
-                g_eglDestroySyncKHR(g_presenterEglDisplay, fence);
-        }
-
+        // Apotheosis (WHITE-SCREEN fix): nothing to wait for here any more. presenterPublish()
+        // glFinish()es on the engine thread before it sets P.published, so by the time this slot
+        // can be read the composite is complete on the GPU - not merely submitted, and not merely
+        // "an EGLSync from another context said so". See the comment at g_presFenceAdvertised.
         glViewport(0, 0, g_gpuW, g_gpuH);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_DEPTH_TEST);
@@ -2316,28 +2388,24 @@ static void presenterThreadMain()
         }
         // Apotheosis: releasing inUse only says "no longer ISSUING from this slot". The quad above
         // may still be executing, and the engine is free to composite into the slot the moment it
-        // sees inUse clear - straight into the texture this draw is sampling. Leave a fence behind
-        // for it to wait on; without the extension the only correct answer is a glFinish() here.
-        EGLSyncKHR presentFence = nullptr;
-        if (g_eglCreateSyncKHR)
-            presentFence = g_eglCreateSyncKHR(g_presenterEglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
-        if (presentFence)
-            glFlush();      // the fence is only reached once the commands before it are submitted
-        else
-            glFinish();     // no EGL_KHR_fence_sync: pay for correctness instead
+        // sees inUse clear - straight into the texture this draw is sampling. glFinish() closes
+        // that window on the only side that can: this one. (The EGL fence that used to be handed
+        // to the engine here was a cross-context sync object and did not order anything - see
+        // g_presFenceAdvertised.)
+        const unsigned drawCount = g_presDraws.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (drawCount == 1 || (drawCount % kPresStatsEvery) == 0)
+            presenterProbe(gl, texId, bg);   // reads the slot back BEFORE it is released
+        glFinish();
 
         {
             // Released before the swap: the engine may start overwriting the other buffer while
             // this one is on its way to DWM, so a vsync-blocked eglSwapBuffers never stalls it.
             Locker locker { P.lock };
-            PresenterFrame& drawn = P.slot[idx];
-            if (drawn.presentFence && g_eglDestroySyncKHR)
-                g_eglDestroySyncKHR(g_presenterEglDisplay, drawn.presentFence);   // engine never waited on the last one
-            drawn.presentFence = presentFence;
             P.inUse = -1;
             P.cond.notifyAll();
         }
         ctx->swapBuffers();
+        g_presSwaps.fetch_add(1, std::memory_order_relaxed);
         // Apotheosis: a swap can fail for good. On a lost device (EGL_CONTEXT_LOST) or a surface
         // the shell has pulled out from under us (EGL_BAD_SURFACE / EGL_BAD_NATIVE_WINDOW) every
         // further swap fails too, and the loop would spin on a dead swap chain for the rest of the
@@ -2353,8 +2421,12 @@ static void presenterThreadMain()
         // has just been lost is not either, so this is a soft landing, not a recovery. It is
         // recorded in crash.txt so a frozen screen can be told apart from a hung engine.
         const EGLint swapErr = eglGetError();
+        g_presLastEglError.store(static_cast<int>(swapErr), std::memory_order_relaxed);
+        if (drawCount == 1 || (drawCount % kPresStatsEvery) == 0)
+            presenterStatsDump("periodic");
         if (swapErr == EGL_CONTEXT_LOST || swapErr == EGL_BAD_SURFACE || swapErr == EGL_BAD_NATIVE_WINDOW) {
             g_presenterActive.store(false);
+            presenterStatsDump("swap-lost");
             WebCoreCrashNote(swapErr == EGL_CONTEXT_LOST
                 ? "presenter: EGL_CONTEXT_LOST on swap, presenter stopped"
                 : "presenter: surface lost on swap, presenter stopped");
@@ -2376,9 +2448,9 @@ static void presenterThreadMain()
 // Engine thread: pick the slot to composite into. Never the one that is published (the presenter
 // would sample a half-drawn frame), and wait out the short window in which the presenter is issuing
 // its quad from that very slot. Bounded at 50 ms so a wedged presenter can never wedge the engine.
-// Then wait for the presenter's fence: inUse clearing only means it has stopped ISSUING, its quad
-// may still be reading the texture on the GPU, and this is a double buffer, so a slot comes back
-// round to the engine while the other one is still on screen.
+// The presenter glFinish()es before it clears inUse, so "no longer in use" now also means "its
+// quad has finished reading the texture" - no second, cross-context fence is needed (and the one
+// that used to be here never ordered anything: see g_presFenceAdvertised).
 // Returns -1 when the 50 ms are up and the presenter is still in the slot: there is no safe buffer
 // to composite into, so the caller drops this frame rather than drawing into the one being
 // sampled (which is what the old code did - it returned the slot anyway).
@@ -2386,24 +2458,14 @@ static int presenterAcquireSlot()
 {
     PresenterState& P = *g_pres.load(std::memory_order_acquire);
     int idx = 0;
-    EGLSyncKHR presentFence = nullptr;
-    {
-        Locker locker { P.lock };
-        idx = (P.published == 0) ? 1 : 0;
-        const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
-        while (P.inUse == idx) {
-            if (!P.cond.waitUntil(P.lock, deadline))
-                return -1;
+    Locker locker { P.lock };
+    idx = (P.published == 0) ? 1 : 0;
+    const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
+    while (P.inUse == idx) {
+        if (!P.cond.waitUntil(P.lock, deadline)) {
+            g_presEngineDrops.fetch_add(1, std::memory_order_relaxed);
+            return -1;
         }
-        presentFence = P.slot[idx].presentFence;
-        P.slot[idx].presentFence = nullptr;   // consumed exactly once
-    }
-    // Outside the lock (it can block, and the presenter needs the lock to make progress).
-    if (presentFence) {
-        if (g_eglClientWaitSyncKHR)
-            g_eglClientWaitSyncKHR(g_presenterEglDisplay, presentFence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ll /* 50 ms */);
-        if (g_eglDestroySyncKHR)
-            g_eglDestroySyncKHR(g_presenterEglDisplay, presentFence);
     }
     return idx;
 }
@@ -2412,20 +2474,15 @@ static int presenterAcquireSlot()
 static void presenterPublish(int idx, int scrollX, int scrollY, const WebCore::Color& background)
 {
     PresenterState& P = *g_pres.load(std::memory_order_acquire);
-    EGLSyncKHR fence = nullptr;
-    if (g_eglCreateSyncKHR)
-        fence = g_eglCreateSyncKHR(g_presenterEglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
-    if (fence)
-        glFlush();      // the fence is only reached once the commands before it are submitted
-    else
-        glFinish();     // no EGL_KHR_fence_sync: pay for correctness instead
+    // Apotheosis (WHITE-SCREEN fix 2026-09-04): the composite must be COMPLETE, not merely
+    // submitted, before P.published names this slot - the presenter thread is on another EGL
+    // context and there is no working cross-context sync on this ANGLE (see g_presFenceAdvertised).
+    // glFinish() before the lock, so the presenter is not waiting on us while the GPU drains.
+    glFinish();
 
     auto [r, g, b, a] = background.toColorTypeLossy<WebCore::SRGBA<float>>().resolved();
     Locker locker { P.lock };
     PresenterFrame& f = P.slot[idx];
-    if (f.fence && g_eglDestroySyncKHR)
-        g_eglDestroySyncKHR(g_presenterEglDisplay, f.fence);   // presenter never got to this one
-    f.fence = fence;
     f.scrollX = scrollX;
     f.scrollY = scrollY;
     f.bg[0] = r; f.bg[1] = g; f.bg[2] = b; f.bg[3] = a;
@@ -2448,18 +2505,12 @@ static bool presenterStart(void* nativeWindow, int w, int h)
 {
     using namespace WebCore;
     g_presenterEglDisplay = PlatformDisplay::sharedDisplay().eglDisplay();
-    g_eglCreateSyncKHR = reinterpret_cast<ApoCreateSyncKHRProc>(eglGetProcAddress("eglCreateSyncKHR"));
-    g_eglDestroySyncKHR = reinterpret_cast<ApoDestroySyncKHRProc>(eglGetProcAddress("eglDestroySyncKHR"));
-    g_eglClientWaitSyncKHR = reinterpret_cast<ApoClientWaitSyncKHRProc>(eglGetProcAddress("eglClientWaitSyncKHR"));
-    // The entry points alone are not permission to call them: eglGetProcAddress hands out
-    // addresses for extensions the display does not expose, and calling eglCreateSyncKHR on such a
-    // display returns EGL_NO_SYNC_KHR at best. Ask the display's extension string as well.
-    const bool hasFenceSync = presenterHasExtension(eglQueryString(g_presenterEglDisplay, EGL_EXTENSIONS),
+    // Apotheosis: recorded for the diagnostics only. Whatever the display advertises, we do NOT
+    // use EGL fences across the two contexts any more - on ANGLE 2.1.13/D3D11 the wait returned
+    // immediately and the presenter swapped half-composited (i.e. just-cleared, white) frames.
+    // See the comment at g_presFenceAdvertised; both handovers are glFinish()-ordered now.
+    g_presFenceAdvertised = presenterHasExtension(eglQueryString(g_presenterEglDisplay, EGL_EXTENSIONS),
         "EGL_KHR_fence_sync");
-    if (!hasFenceSync || !g_eglCreateSyncKHR || !g_eglClientWaitSyncKHR) {
-        g_eglCreateSyncKHR = nullptr;
-        g_eglClientWaitSyncKHR = nullptr;   // both sides fall back to glFinish()
-    }
 
     if (g_pres.load(std::memory_order_acquire))
         return false;   // one presenter per process; a second attempt would orphan the first
@@ -2543,9 +2594,17 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         if (!docBg.isValid())
             docBg = Color::white;
         glViewport(0, 0, w, h);
-        // A reused surface keeps the clip stack the previous paint left behind; give it the same
-        // full-surface state a freshly created BitmapTexture gets in clearIfNeeded().
-        target.clipStack().reset(IntRect(0, 0, w, h), ClipStack::YAxisMode::Default);
+        // Apotheosis: these two render targets live for the whole process, which no other
+        // TextureMapper client does - everywhere else a BitmapTexture is taken from the pool,
+        // which reset()s it, or is freshly created. A reused one keeps the clip stack the previous
+        // paint left behind AND, because m_shouldClear is only true once, its depth and stencil
+        // buffers keep the previous frame's contents while beginPainting/bindAsSurface re-enable
+        // GL_DEPTH_TEST (the Flags::DepthBuffer branch) with glDepthFunc(GL_LEQUAL). reset() with
+        // the same size and flags is the cheap, upstream way to say "treat this as fresh": it
+        // returns early at `m_size == size` (no reallocation, same texture id, same FBO) and only
+        // re-arms m_shouldClear, so bindAsSurface() clears colour+depth+stencil and resets the clip
+        // stack exactly as it does for a pool texture.
+        target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
         g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
         g_textureMapper->clearColor(docBg);
         {
