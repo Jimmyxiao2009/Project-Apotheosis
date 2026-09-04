@@ -2294,44 +2294,54 @@ static bool presenterStart(void* nativeWindow, int w, int h)
         g_eglClientWaitSyncKHR = nullptr;   // presenterPublish falls back to glFinish()
     }
 
-    g_pres = new PresenterState();
+    if (g_pres)
+        return false;   // one presenter per process; a second attempt would orphan the first
+
+    // Built locally and only published into g_pres once it is complete: from the moment the
+    // pointer is visible, the presenter thread and the UI-thread exports may touch it, and from
+    // that moment on it is never freed again (see the timeout below).
+    std::unique_ptr<PresenterState> pres = std::make_unique<PresenterState>();
     for (int i = 0; i < 2; ++i) {
-        g_pres->slot[i].texture = BitmapTexture::create(IntSize(w, h),
+        pres->slot[i].texture = BitmapTexture::create(IntSize(w, h),
             { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
-        if (!g_pres->slot[i].texture) {
-            delete g_pres;
-            g_pres = nullptr;
-            return false;
-        }
+        if (!pres->slot[i].texture)
+            return false;   // nothing published yet, nothing to clean up but this object
     }
     g_presenterWindow = nativeWindow;
+    PresenterState& P = *pres;
+    g_pres = pres.release();
     g_presenterThread = WTF::Thread::create("ApotheosisPresenter"_s, [] { presenterThreadMain(); },
         WTF::ThreadType::Graphics);   // 1 MB reserved stack (WTF stackSize(), WK_WINUWP branch)
 
     bool up = false;
     {
-        Locker locker { g_pres->lock };
+        Locker locker { P.lock };
         const MonotonicTime deadline = MonotonicTime::now() + Seconds(5);
-        while (!g_pres->initState) {
-            if (!g_pres->cond.waitUntil(g_pres->lock, deadline))
+        while (!P.initState) {
+            if (!P.cond.waitUntil(P.lock, deadline))
                 break;
         }
-        up = (g_pres->initState == 1);
+        up = (P.initState == 1);
         if (!up)
-            g_pres->stop = true;
-        g_pres->cond.notifyAll();
+            P.stop = true;      // it leaves its loop as soon as it is able to
+        P.cond.notifyAll();
     }
     if (up)
         return true;
 
-    if (g_presenterThread)
-        g_presenterThread->waitForCompletion();
+    // Apotheosis: the timeout DETACHES the presenter, it does not tear it down. The one reason
+    // initState is still 0 after five seconds is that the thread is stuck inside
+    // eglCreateWindowSurface (ANGLE marshals that to the panel dispatcher, and a UI thread that is
+    // busy or waiting makes it arbitrarily slow) - so the thread is alive, holds a reference to
+    // this PresenterState and will still write to it. Joining it here would block the engine
+    // thread for exactly as long as the thing the timeout exists to escape, and deleting the
+    // state (the old code) left it writing to freed memory, as did every later
+    // WebCoreSetPanOffset / WebCoreSetPresenterSuspended from the UI thread. So: leave the thread,
+    // the state and the two render targets alive for the life of the process, drop our own
+    // reference to the thread (WTF::Thread keeps itself alive while it runs) and fall back to the
+    // engine-owned window surface. g_presenterActive stays false, so nothing is ever published
+    // into those slots and the detached thread finds stop=true and exits the moment it unblocks.
     g_presenterThread = nullptr;
-    g_pres->slot[0].texture = nullptr;    // engine context is still current here
-    g_pres->slot[1].texture = nullptr;
-    delete g_pres;
-    g_pres = nullptr;
-    g_presenterWindow = nullptr;
     return false;
 }
 
