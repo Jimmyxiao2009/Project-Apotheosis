@@ -4156,6 +4156,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
     { L"事件驱动呈现", L"Event-driven present" },
+    { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
