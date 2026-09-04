@@ -490,6 +490,41 @@ static std::atomic<void*> g_presentCbCtx { nullptr };
 static std::atomic<int> g_presentWakeArmed { 0 };
 static std::atomic<unsigned> g_presentWakes { 0 };
 
+// Apotheosis (M4 load throttle): while the main document is loading, every arriving stylesheet,
+// script and image invalidates layout, and each invalidation used to become its own wake-up and
+// therefore a full composite on the engine thread - the same thread the parser, the scripts and
+// the image decodes run on. During a load those composites show a half-built page nobody is
+// looking at yet, and they cost more than the work they display. So between
+// dispatchDidStartProvisionalLoad and the load event, engine-initiated presents are limited to
+// one per 250 ms. Exempt: the first visually-non-empty layout (the frame the user is waiting
+// for) goes out immediately. Untouched: scroll, pinch and pan presents, which do not travel
+// through presentRequested() at all, and a suppressed wake is never lost - the next allowed one
+// (or navLoadEnd(), at the load event) delivers it.
+static std::atomic<int> g_navLoading { 0 };             // provisional start .. load event
+static std::atomic<int> g_navWakeSuppressed { 0 };      // a wake was dropped by the throttle
+static std::atomic<int> g_navFirstPaintPending { 0 };   // DidFirstVisuallyNonEmptyLayout, not yet shown
+static std::atomic<double> g_navWakeLastSec { 0 };      // MonotonicTime of the last wake let through
+static std::atomic<double> g_navLoadStartSec { 0 };
+static double g_navTickCompositeSec = 0;                // engine thread only (WebCoreLiveTick)
+static constexpr double kNavWakeIntervalSec = 0.25;
+// Safety valve: a provisional load that never reaches a load event and never reaches a pump
+// (an SPA navigation started from a timer, say) must not throttle presents forever.
+static constexpr double kNavThrottleMaxSec = 20.0;
+
+static double monotonicSeconds()
+{
+    return MonotonicTime::now().secondsSinceEpoch().value();
+}
+
+static bool navLoadThrottleActive()
+{
+    if (!g_navLoading.load(std::memory_order_acquire))
+        return false;
+    if (g_navFirstPaintPending.load(std::memory_order_acquire))
+        return false;   // the first readable frame is never held back
+    return monotonicSeconds() - g_navLoadStartSec.load(std::memory_order_relaxed) < kNavThrottleMaxSec;
+}
+
 namespace WebCorePort {
 
 void presentRequested()
@@ -497,14 +532,42 @@ void presentRequested()
     void (*cb)(void*) = g_presentCb.load(std::memory_order_acquire);
     if (!cb)
         return;   // fixed-tick mode: nobody registered, the flag alone does the work
+    if (navLoadThrottleActive()) {
+        const double now = monotonicSeconds();
+        if (now - g_navWakeLastSec.load(std::memory_order_relaxed) < kNavWakeIntervalSec) {
+            g_navWakeSuppressed.store(1, std::memory_order_release);
+            return;   // covered by the next allowed wake, or by navLoadEnd()
+        }
+        g_navWakeLastSec.store(now, std::memory_order_relaxed);
+    }
     int expected = 0;
     if (!g_presentWakeArmed.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
         return;   // a wake is already on its way; it will cover this request too
+    g_navWakeSuppressed.store(0, std::memory_order_release);
     g_presentWakes.fetch_add(1, std::memory_order_relaxed);
     cb(g_presentCbCtx.load(std::memory_order_acquire));
 }
 
 } // namespace WebCorePort
+
+// Apotheosis (M4 load throttle): the main document started / finished loading. navLoadEnd() also
+// hands over a wake the throttle swallowed, so the finished page is presented even if nothing
+// else invalidates afterwards. Both are engine-thread only.
+static void navLoadBegin()
+{
+    g_navLoadStartSec.store(monotonicSeconds(), std::memory_order_relaxed);
+    g_navFirstPaintPending.store(0, std::memory_order_release);
+    g_navLoading.store(1, std::memory_order_release);
+}
+
+static void navLoadEnd()
+{
+    if (!g_navLoading.exchange(0, std::memory_order_acq_rel))
+        return;
+    g_navFirstPaintPending.store(0, std::memory_order_release);
+    if (g_navWakeSuppressed.exchange(0, std::memory_order_acq_rel))
+        WebCorePort::presentRequested();
+}
 
 // Called at the top of every WebCoreLiveTick: the composite the last wake asked for is happening
 // now, so the next invalidation must be able to arm a new one.
@@ -1382,6 +1445,9 @@ namespace WebCorePort {
 
 void perfNavStart()
 {
+    // Apotheosis (M4 load throttle): runs with perf logging off too — this is the
+    // "main document is loading" edge the present throttle above is keyed on.
+    navLoadBegin();
     if (!g_perfOn || !g_perfInOp || g_perfNavT0Set)
         return;
     g_perfNavT0 = MonotonicTime::now();
@@ -1408,6 +1474,7 @@ void perfNavDocumentReady()
 
 void perfNavLoadEvent()
 {
+    navLoadEnd();   // Apotheosis (M4 load throttle): full present rate from here on (perf-independent)
     if (!g_perfOn || !g_perfInOp || g_perfCur.netLoad >= 0)
         return;
     g_perfCur.netLoad = perfSinceNavStart();
@@ -1423,6 +1490,13 @@ void perfNavLoadEvent()
 // only tracks milestones a client requested).
 void perfNavVisuallyNonEmpty()
 {
+    // Apotheosis (M4 load throttle): the frame the user is waiting for. Exempt it from the
+    // throttle (navLoadThrottleActive) and ask for it right away; the flag is consumed by the
+    // composite in WebCoreLiveTick. Perf-independent, like the marks above.
+    if (g_navLoading.load(std::memory_order_acquire)) {
+        g_navFirstPaintPending.store(1, std::memory_order_release);
+        presentRequested();
+    }
     if (!g_perfOn || !g_perfInOp || g_perfCur.tFirstPaint >= 0)
         return;
     g_perfCur.tFirstPaint = perfSinceNavStart();
@@ -1665,6 +1739,11 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RunLoop::run();
     settle.stop();
     watchdog.stop();
+    // Apotheosis (M4 load throttle): catch-all end of the loading window. The load event
+    // normally ends it (perfNavLoadEvent); this covers the pump that stopped on the settle
+    // cap, the watchdog or "committed but no load event", so a page can never leave the
+    // driver with presents still throttled.
+    navLoadEnd();
 }
 
 // ★ 打字/退格专用轻量 settle:pumpLoop 的"加载器连续静默 16 tick(≈0.8s)才停"是为导航场景设计
@@ -2148,6 +2227,7 @@ static void teardownSession()
         g_glContext->makeContextCurrent();
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
+    navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
     // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
     // the deferral (a new session must present normally) and the swap it may still owe - the back
     // buffer is about to be redrawn by the next session anyway.
@@ -4494,6 +4574,22 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // first composite after the gesture is a full one.
     if (g_panGesture)
         return kOK;
+    // Apotheosis (M4 load throttle): same idea while the main document loads. Everything above has
+    // run (parser-driven layout, rAF, finished decodes), only the composite - the most expensive
+    // thing on this thread - is limited to one per 250 ms, so the arriving subresources get the
+    // engine thread instead of repeatedly rasterising a half-built page. The frame that first
+    // qualifies as visually non-empty is never skipped. needsPresent stays set, so the next tick
+    // composites everything at once. Only in event-driven mode: a fixed-tick harness stops its
+    // timer when the frame hash does not change, and nothing would restart it.
+    const bool navFirstPaintFrame = g_navFirstPaintPending.exchange(0, std::memory_order_acq_rel);
+    if (!navFirstPaintFrame && g_presentCb.load(std::memory_order_acquire) && navLoadThrottleActive()) {
+        const double nowSec = monotonicSeconds();
+        if (nowSec - g_navTickCompositeSec < kNavWakeIntervalSec) {
+            WebCorePort::presentRequested();   // throttled: comes back as the next allowed wake
+            return kOK;
+        }
+        g_navTickCompositeSec = nowSec;
+    }
     int nonWhite = 0;
     // Apotheosis (M4): perf.csv showed every idle tick paying ~1 s in
     // updateBackingStoreIncludingSubLayers because gpuPrepare force-dirties the
