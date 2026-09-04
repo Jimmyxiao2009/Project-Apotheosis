@@ -405,8 +405,11 @@ namespace Harness {
         // Apotheosis (review 2026-09-04 item 2b): DISPLAY toggle. Off = status bar shown (translucent,
         //   clock stays readable via the ForegroundColor set in the constructor); on = fully hidden via
         //   StatusBar::HideAsync(), and the top inset in ApplyViewInsets() follows VisibleBounds to 0.
-        //   settings.ini hidestatusbar
-        bool m_hideStatusBar { false };
+        //   settings.ini hidestatusbar. Default ON: this is a member initializer, so it only takes
+        //   effect for a fresh install (no "hidestatusbar" line in settings.ini yet) — same pattern as
+        //   m_dragPointer above. Anyone with a stored value (LoadSettings' "hidestatusbar" branch)
+        //   keeps whatever they already have on disk, this default never overrides it.
+        bool m_hideStatusBar { true };
         // Apotheosis (review 2026-09-04 item 4): token for the deferred suggestion-dropdown collapse
         //   scheduled from OnUrlLostFocus — see its definition for why the collapse cannot be
         //   synchronous. Bumped on every LostFocus/GotFocus so a stale deferred hide is a no-op.
