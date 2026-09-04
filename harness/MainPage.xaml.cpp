@@ -2057,21 +2057,34 @@ void MainPage::PumpScroll()
         // WebCoreGetScrollState does no layout and no paint.
         int sx = 0, sy = 0, cw = 0, ch = 0, vw = 0, vh = 0;
         bool haveState = false;
+        // Apotheosis (owed-frame identity, driver b531043): and what the frame this hop just
+        // composited actually SHOWS. WebCoreGetScrollState says where the engine is now, which is
+        // not the same thing the moment anything else scrolls between the composite and the
+        // acknowledgement; the deferred swap carries its own scroll position and an id. Read both
+        // here, in the same engine hop as the WebCoreScrollBy - equally cheap (no layout, no paint)
+        // - and let the UI thread build the pan translation from the FRAME, and name that frame
+        // when it acknowledges it (WebCorePresentFrame).
+        int swx = 0, swy = 0;
+        unsigned long long swapId = 0;
+        bool haveOwed = false;
         if (rc == 0) {
             int src = -1;
             try { src = WebCoreGetScrollState(&sx, &sy, &cw, &ch, &vw, &vh); } catch (...) { src = -1; }
             haveState = (src == 0);
+            int owed = 0;
+            try { owed = WebCoreGetOwedSwapScroll(&swx, &swy, &swapId); } catch (...) { owed = 0; }
+            haveOwed = (owed == 1);
         }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState, swx, swy, swapId, haveOwed]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; s->m_scrollAccumX = 0; s->InstantPanReset(); return; }   // 被导航/点击取代,丢弃迟到帧+全部残留位移
                 if (rcCopy == 0) {
                     if (!present) s->PresentSoftwareFrame(rgba);
                     s->m_lastFrameHash = 0;
                     if (haveState) { s->m_contentW = cw; s->m_contentH = ch; s->m_viewW = vw; s->m_viewH = vh; }
-                    s->InstantPanApplied(sx, sy, haveState, dx, dy);
+                    s->InstantPanApplied(sx, sy, haveState, dx, dy, swx, swy, swapId, haveOwed);
                 }
                 s->m_scrollBusy = false;
                 // Apotheosis (pan present handshake): the transform above was just corrected by the
@@ -2460,9 +2473,22 @@ void MainPage::InstantPanBy(int dx, int dy)
 // the engine thread in the same hop as the WebCoreScrollBy). haveScrollState=false means the call
 // failed — then fall back to "the engine applied the delta we dispatched", which is right except
 // at a document edge, where the snap timer cleans up.
+// Apotheosis (owed-frame identity, driver b531043): swapScrollX/Y + swapId describe the composite
+// that is sitting in the back buffer waiting for its acknowledgement (WebCoreGetOwedSwapScroll,
+// read in the same engine hop). haveOwedSwap=false means the engine presented on its own and there
+// is nothing to acknowledge. Remembered here; the translation that belongs to that frame is built
+// and committed at release time (ReleasePanPresent), not now.
 void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScrollState,
-                                 int fallbackDx, int fallbackDy)
+                                 int fallbackDx, int fallbackDy,
+                                 int swapScrollX, int swapScrollY,
+                                 unsigned long long swapId, bool haveOwedSwap)
 {
+    if (haveOwedSwap && !m_presenterActive) {
+        m_panSwapX = swapScrollX;
+        m_panSwapY = swapScrollY;
+        m_panSwapId = swapId;
+        m_panSwapValid = true;
+    }
     // Apotheosis (presenter thread): the presenter subtracts the engine's progress itself - every
     // published frame carries the scroll position it was composited at - so there is no remainder
     // to correct here and no transform to rewrite. Keep the cache the rest of the UI reads.
@@ -2785,6 +2811,11 @@ void MainPage::DisarmPanAck()
     if (m_panAckArmed) { CompositionTarget::Rendering -= m_panAckToken; m_panAckArmed = false; }
     if (m_panAckTimer) m_panAckTimer->Stop();
     m_panAckFrames = 0;
+    // Apotheosis (owed-frame identity, driver b531043): forget which frame we were going to name.
+    // Every caller that reaches here has either superseded that composite (PumpScroll overwrites
+    // the back buffer) or handed the presents back (PanDeferOff); ReleasePanPresent takes its copy
+    // before it disarms.
+    m_panSwapValid = false;
 }
 
 // A composite is waiting in the back buffer and the translation that goes with it has just been

@@ -229,8 +229,13 @@ namespace Harness {
         // goes to the engine exactly as before; every engine frame that lands subtracts what the
         // engine really scrolled, so the transform only ever carries the not-yet-applied remainder.
         void InstantPanBy(int dx, int dy);            // finger asked for this much more (engine px)
+        // Apotheosis (owed-frame identity, driver b531043): swapScroll*/swapId = the deferred
+        //   composite this hop left in the back buffer (WebCoreGetOwedSwapScroll), i.e. the frame
+        //   the next acknowledgement names and the position it shows.
         void InstantPanApplied(int newScrollX, int newScrollY, bool haveScrollState,
-                               int fallbackDx, int fallbackDy);   // an engine frame landed
+                               int fallbackDx, int fallbackDy,
+                               int swapScrollX, int swapScrollY,
+                               unsigned long long swapId, bool haveOwedSwap);   // an engine frame landed
         void InstantPanReset();                       // remainder → 0, transform → identity
         void ClampPanRemainder();                     // document bounds + one screen
         void ClampPanAbs();                           // same document-bounds clamp for the presenter's m_panAbsX/Y
@@ -558,6 +563,13 @@ namespace Harness {
         bool m_panGestureOn { false };   // a main-frame instant pan (incl. inertia) is in progress
         bool m_panDefer { false };       // engine is in "present only when we ask" mode
         bool m_panAckArmed { false };    // CompositionTarget::Rendering hooked for the pending swap
+        // Apotheosis (owed-frame identity, driver b531043): the deferred composite currently waiting
+        //   for its acknowledgement — the scroll position it shows and the id WebCorePresentFrame()
+        //   matches on. Dropped by DisarmPanAck(): a newer WebCoreScrollBy overwrites the back
+        //   buffer, so that frame is no longer the one an ack would release.
+        bool m_panSwapValid { false };
+        unsigned long long m_panSwapId { 0 };
+        int  m_panSwapX { 0 }, m_panSwapY { 0 };
         int  m_panAckFrames { 0 };       // frames still to pass before the swap is released
         Windows::Foundation::EventRegistrationToken m_panAckToken;
         Windows::UI::Xaml::DispatcherTimer^ m_panAckTimer;   // releases the swap if Rendering stops
