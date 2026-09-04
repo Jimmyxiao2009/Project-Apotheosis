@@ -488,9 +488,28 @@ static bool g_swapOwed = false;       // a composite ran whose swap was deferred
 // with the scroll generation (and position) it was composited at; WebCorePresent() releases it only
 // if it still belongs to the newest applied scroll, and otherwise drops the frame and asks for a
 // fresh composite. Engine thread only, like every other flag here.
+//
+// Apotheosis (XAML-path consistency review, 2026-09-04): that tag is also the frame's IDENTITY, and
+// the harness now names it when it acknowledges (WebCorePresentFrame). Two holes the "is it still
+// the newest scroll?" test alone cannot close:
+//   * the acknowledgement and a newer WebCoreScrollBy can reach the engine queue in either order.
+//     Arriving after it, an ack meant for frame N releases frame N+1 - which is exactly the frame
+//     under an older translation the whole handshake exists to prevent.
+//   * the composite the ack names need not be a scroll composite at all. Every export that paints
+//     while a gesture runs (WebCoreClickAt, WebCoreWheelAt, WebCoreDragAt, WebCoreSetPageScale,
+//     WebCoreSessionPaint, WebCoreComposite) also defers its swap and re-arms g_swapOwed with the
+//     current generation, so a pan ack could put a double-tap-zoom frame on screen under a pan
+//     translation.
+// Every owed swap therefore carries a swap id the harness reads back with
+// WebCoreGetOwedSwapScroll() and hands to WebCorePresentFrame(); an id that does not match is
+// dropped WITHOUT clearing g_swapOwed - the composite in the back buffer is newer than the ack and
+// is still owed to its own acknowledgement, and nothing would ever recomposite it during a gesture
+// (WebCoreLiveTick skips its composite while g_panGesture is set).
 static uint64_t g_scrollGen = 0;      // bumped by every main-frame scroll the engine applies
 static uint64_t g_swapOwedGen = 0;    // g_scrollGen as it was when the owed composite ran
-static int g_swapOwedScrollX = 0;     // scroll position that composite is showing (diagnostics)
+static uint64_t g_swapOwedId = 0;     // identity of the owed frame; what WebCorePresentFrame matches on
+static uint64_t g_swapIdNext = 1;     // 0 stays reserved for "no frame" / "any frame" (legacy WebCorePresent)
+static int g_swapOwedScrollX = 0;     // scroll position that composite is showing (diagnostics + harness residual)
 static int g_swapOwedScrollY = 0;
 // Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
 // consumed is still in flight — moves/releases only reach the page while this is set, and
@@ -2822,6 +2841,7 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         // WebCorePresent() can tell "the frame the harness is acknowledging" from "a frame the
         // engine has already moved past". See the block at g_scrollGen.
         g_swapOwedGen = g_scrollGen;
+        g_swapOwedId = g_swapIdNext++;   // identity the harness acknowledges (WebCorePresentFrame)
         const IntPoint owedScroll = view.scrollPosition();
         g_swapOwedScrollX = owedScroll.x();
         g_swapOwedScrollY = owedScroll.y();
@@ -3138,6 +3158,7 @@ static void teardownSession()
     // Apotheosis (stale deferred swap): the scroll ledger belonged to the page that is going away.
     ++g_scrollGen;
     g_swapOwedGen = g_scrollGen;
+    g_swapOwedId = 0;   // no frame is owed: a late ack from the old page must match nothing
     g_swapOwedScrollX = g_swapOwedScrollY = 0;
     // Apotheosis (presenter thread): the frames in the presenter's slots were composited from the
     // layer tree that is about to be destroyed. Mark them stale, or the 8 ms pan heartbeat (and
@@ -5319,22 +5340,42 @@ void WebCoreSetPanGesture(int active)
     if (g_panGesture == on)
         return;
     g_panGesture = on;
-    if (!on && g_session && g_session->chrome)
+    if (!on && g_session && g_session->chrome) {
         g_session->chrome->setNeedsPresent();
+        // Apotheosis (XAML-path consistency review, 2026-09-04): and ASK for that composite. Every
+        // tick during the gesture disarmed the present wake at its top (presentWakeDisarm) and then
+        // returned before the `peekNeedsPresent -> presentRequested` re-arm at the bottom, so in
+        // event-driven mode the loop is idle here and setNeedsPresent alone is a flag nobody reads.
+        // Without this the page stays on the last gesture frame until the user touches it again -
+        // "the flicker comes back a few seconds later" is partly this: the frame on screen is stale
+        // and the next unrelated wake finally replaces it in one jump.
+        WebCorePort::presentRequested();
+    }
 }
 
 // Apotheosis (pan present handshake): perform the swap a composite deferred while g_panGesture was
 // set. Cheap and idempotent - with nothing owed it does nothing, so the harness may post it freely
 // (it also flushes a swap left over after the gesture ended). Engine thread only.
-int WebCorePresent()
+static int presentOwedSwap(uint64_t ackId)
 {
     if (g_presenterActive.load())
         return kOK;   // Apotheosis (presenter thread): nothing is ever owed on this thread
     if (!g_swapOwed)
         return kOK;
-    g_swapOwed = false;
-    if (!g_gpuActive || !g_gpuPresentMode || !g_glContext)
+    // Apotheosis (XAML-path consistency review, 2026-09-04): an acknowledgement that names a frame
+    // other than the one in the back buffer is not this frame's acknowledgement. Releasing it puts
+    // content on screen under a translation that was committed for a different scroll position -
+    // the artefact this whole handshake exists to prevent, only in the other direction. Drop the
+    // ACK, not the frame: g_swapOwed stays set, so the composite is still released by the
+    // acknowledgement that does belong to it (or by the WebCoreLiveTick / WebCoreSetPanGesture(0)
+    // safety nets once the gesture is over). ackId 0 = "whatever is owed", the legacy
+    // WebCorePresent() contract.
+    if (ackId && ackId != g_swapOwedId)
         return kOK;
+    if (!g_gpuActive || !g_gpuPresentMode || !g_glContext) {
+        g_swapOwed = false;
+        return kOK;
+    }
     // Apotheosis (stale deferred swap, 2026-09-04): only release a frame that still belongs to the
     // newest scroll the engine has applied. If a newer WebCoreScrollBy has already run, this
     // acknowledgement belongs to a job the engine has moved past: its composite shows the OLD
@@ -5343,6 +5384,7 @@ int WebCorePresent()
     // instead - the back buffer is about to be redrawn anyway - and arm a present so the next
     // composite (at the current position) reaches the screen without waiting for a wake-up.
     if (g_swapOwedGen != g_scrollGen) {
+        g_swapOwed = false;
         int nowX = 0, nowY = 0;
         if (g_session && g_session->mainFrame) {
             if (WebCore::LocalFrameView* v = g_session->mainFrame->view()) {
@@ -5353,11 +5395,46 @@ int WebCorePresent()
         panSwapDropNote(nowX, nowY);
         if (g_session && g_session->chrome)
             g_session->chrome->setNeedsPresent();
+        // Apotheosis: setNeedsPresent() alone is a flag nobody polls in event-driven mode - the
+        // tick that would notice it is exactly the one that returns early while g_panGesture is
+        // set. Arm a real wake so the replacement composite happens.
+        WebCorePort::presentRequested();
         return kOK;
     }
+    g_swapOwed = false;
     g_glContext->makeContextCurrent();
     g_glContext->swapBuffers();
     return kOK;
+}
+
+int WebCorePresent()
+{
+    return presentOwedSwap(0);
+}
+
+// Apotheosis (XAML-path consistency review, 2026-09-04): release the owed swap only if it is still
+// the frame `swapId` names (an id from WebCoreGetOwedSwapScroll). Anything else is left owed - see
+// presentOwedSwap(). swapId 0 behaves exactly like WebCorePresent(). Engine thread only.
+int WebCorePresentFrame(unsigned long long swapId)
+{
+    return presentOwedSwap(static_cast<uint64_t>(swapId));
+}
+
+// Apotheosis (XAML-path consistency review, 2026-09-04): what the deferred frame in the back buffer
+// actually shows. Called from the same engine hop as the WebCoreScrollBy it belongs to (next to
+// WebCoreGetScrollState), it lets the harness build the pan translation from the FRAME's own scroll
+// position - offset - (swapScroll - gestureStartScroll) - instead of from "wherever the engine
+// happens to be now", which is what made a coarse engine step visible as a jump. The id comes back
+// with it and is handed to WebCorePresentFrame() when XAML has committed that translation.
+// Returns 1 when a swap is owed, 0 otherwise (also whenever the presenter thread owns the swap
+// chain - nothing is ever owed there). Cheap: no layout, no paint. Engine thread only.
+int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long long* outSwapId)
+{
+    const bool owed = g_swapOwed && !g_presenterActive.load();
+    if (outScrollX) *outScrollX = owed ? g_swapOwedScrollX : 0;
+    if (outScrollY) *outScrollY = owed ? g_swapOwedScrollY : 0;
+    if (outSwapId)  *outSwapId  = owed ? static_cast<unsigned long long>(g_swapOwedId) : 0ull;
+    return owed ? 1 : 0;
 }
 
 // Apotheosis (presenter thread): pick the presentation model. ON (the default) = a presenter thread

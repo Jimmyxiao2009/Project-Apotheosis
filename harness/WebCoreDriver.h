@@ -329,6 +329,26 @@ void WebCoreSetPresenterSuspended(int suspended);
 void WebCoreSetPanGesture(int active);
 int WebCorePresent(void);
 
+// Apotheosis (XAML-path consistency review, 2026-09-04): the deferred-swap handshake, made exact.
+// WebCorePresent() releases "whatever is owed", which is wrong twice over: an acknowledgement can
+// overtake or be overtaken by a newer scroll job, and any other export that paints during a gesture
+// (click, wheel, drag, pinch, session paint) also leaves a deferred swap behind - so the ack for
+// one frame could release a completely different one, under a translation committed for the frame
+// it was not.
+//   WebCoreGetOwedSwapScroll  1 = a swap is owed; fills the scroll position that composite is
+//                             showing and its swap id. Call it in the same engine hop as the
+//                             WebCoreScrollBy (next to WebCoreGetScrollState) and build the pan
+//                             translation from THAT position - offset - (swapScroll -
+//                             gestureStartScroll) - not from wherever the engine is now. 0 while
+//                             the presenter thread owns the swap chain (nothing is ever owed).
+//                             Cheap: no layout, no paint. Engine thread.
+//   WebCorePresentFrame       release the owed swap only if it is still the frame `swapId` names;
+//                             an id that does not match leaves the frame owed rather than showing
+//                             it under the wrong translation. swapId 0 == WebCorePresent().
+//                             Engine thread, idempotent, returns 0 (kOK).
+int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long long* outSwapId);
+int WebCorePresentFrame(unsigned long long swapId);
+
 
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
 int WebCoreEvalJS(const char* script, char* out, int len);
