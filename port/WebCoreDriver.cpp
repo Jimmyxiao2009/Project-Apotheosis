@@ -556,6 +556,10 @@ static ApoClientWaitSyncKHRProc g_eglClientWaitSyncKHR = nullptr;
 struct PresenterFrame {
     RefPtr<WebCore::BitmapTexture> texture;
     EGLSyncKHR fence { nullptr };   // engine-side fence; the presenter consumes and destroys it
+    // The other half of the handshake: the presenter leaves this behind when it has ISSUED a quad
+    // sampling this slot, and the engine waits for it before it composites into the slot again.
+    // Consumed and destroyed by the engine (presenterAcquireSlot).
+    EGLSyncKHR presentFence { nullptr };
     int scrollX { 0 };
     int scrollY { 0 };
     float bg[4] { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -2242,12 +2246,26 @@ static void presenterThreadMain()
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             glDisableVertexAttribArray(static_cast<GLuint>(gl.aPos));
         }
-        glFlush();
+        // Apotheosis: releasing inUse only says "no longer ISSUING from this slot". The quad above
+        // may still be executing, and the engine is free to composite into the slot the moment it
+        // sees inUse clear - straight into the texture this draw is sampling. Leave a fence behind
+        // for it to wait on; without the extension the only correct answer is a glFinish() here.
+        EGLSyncKHR presentFence = nullptr;
+        if (g_eglCreateSyncKHR)
+            presentFence = g_eglCreateSyncKHR(g_presenterEglDisplay, EGL_SYNC_FENCE_KHR, nullptr);
+        if (presentFence)
+            glFlush();      // the fence is only reached once the commands before it are submitted
+        else
+            glFinish();     // no EGL_KHR_fence_sync: pay for correctness instead
 
         {
             // Released before the swap: the engine may start overwriting the other buffer while
             // this one is on its way to DWM, so a vsync-blocked eglSwapBuffers never stalls it.
             Locker locker { P.lock };
+            PresenterFrame& drawn = P.slot[idx];
+            if (drawn.presentFence && g_eglDestroySyncKHR)
+                g_eglDestroySyncKHR(g_presenterEglDisplay, drawn.presentFence);   // engine never waited on the last one
+            drawn.presentFence = presentFence;
             P.inUse = -1;
             P.cond.notifyAll();
         }
@@ -2265,15 +2283,31 @@ static void presenterThreadMain()
 // Engine thread: pick the slot to composite into. Never the one that is published (the presenter
 // would sample a half-drawn frame), and wait out the short window in which the presenter is issuing
 // its quad from that very slot. Bounded at 50 ms so a wedged presenter can never wedge the engine.
+// Then wait for the presenter's fence: inUse clearing only means it has stopped ISSUING, its quad
+// may still be reading the texture on the GPU, and this is a double buffer, so a slot comes back
+// round to the engine while the other one is still on screen.
 static int presenterAcquireSlot()
 {
     PresenterState& P = *g_pres.load(std::memory_order_acquire);
-    Locker locker { P.lock };
-    const int idx = (P.published == 0) ? 1 : 0;
-    const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
-    while (P.inUse == idx) {
-        if (!P.cond.waitUntil(P.lock, deadline))
-            break;
+    int idx = 0;
+    EGLSyncKHR presentFence = nullptr;
+    {
+        Locker locker { P.lock };
+        idx = (P.published == 0) ? 1 : 0;
+        const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
+        while (P.inUse == idx) {
+            if (!P.cond.waitUntil(P.lock, deadline))
+                break;
+        }
+        presentFence = P.slot[idx].presentFence;
+        P.slot[idx].presentFence = nullptr;   // consumed exactly once
+    }
+    // Outside the lock (it can block, and the presenter needs the lock to make progress).
+    if (presentFence) {
+        if (g_eglClientWaitSyncKHR)
+            g_eglClientWaitSyncKHR(g_presenterEglDisplay, presentFence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ll /* 50 ms */);
+        if (g_eglDestroySyncKHR)
+            g_eglDestroySyncKHR(g_presenterEglDisplay, presentFence);
     }
     return idx;
 }
