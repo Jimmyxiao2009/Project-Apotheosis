@@ -310,6 +310,21 @@
                      HorizontalAlignment="Left" VerticalAlignment="Top" IsTabStop="True"
                      TextChanged="OnImeTextChanged" KeyDown="OnImeKeyDown"/>
 
+            <!-- 细状态行(标题/加载提示,code 大量写 TitleText 当 toast):贴内容区顶部,状态栏
+                 inset 之下(margin 由 ApplyViewInsets 设置)。Apotheosis(2026-09-04 review item 3):
+                 原先在底栏导航行上方,键盘弹出时得单独处理避免被顶飞;挪到这里后 NavBarShift(只移
+                 导航行)天然不影响它,内容区顶边距也已经把它的高度算进去了(ApplyViewInsets 里的
+                 kTitleBarHeight,须和这里的 Height 保持一致)。 -->
+            <Border x:Name="TitleBar" Height="26" VerticalAlignment="Top" HorizontalAlignment="Stretch"
+                    Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
+                <Grid Margin="14,0,14,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock x:Name="TitleText" Grid.Column="1" Text="APOTHEOSIS" Foreground="{StaticResource TxtLo}" FontSize="11"
+                               CharacterSpacing="90" HorizontalAlignment="Left" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                </Grid>
+            </Border>
+
             <!-- 顶部加载进度条 -->
             <ProgressBar x:Name="Progress" Height="3" VerticalAlignment="Top" Foreground="{StaticResource Accent}"
                          Background="Transparent" IsIndeterminate="False" Visibility="Collapsed"/>
@@ -353,37 +368,21 @@
             </Border>
         </Grid>
 
-        <!-- ===== 底部 chrome:状态行 + 导航栏 ===== -->
-        <Grid Grid.Row="1">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-
-            <!-- 细状态行:页面标题 / 临时提示(code 大量写 TitleText 当 toast) -->
-            <Border Grid.Row="0" Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
-                <Grid Margin="14,4,14,3">
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                    <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                    <TextBlock x:Name="TitleText" Grid.Column="1" Text="APOTHEOSIS" Foreground="{StaticResource TxtLo}" FontSize="11"
-                               CharacterSpacing="90" HorizontalAlignment="Left" TextTrimming="CharacterEllipsis"/>
-                </Grid>
-            </Border>
-
-            <!-- 导航栏:[标签数] | 🔒 地址 [Go/⟳/✕] | ⋯ -->
-            <!-- Apotheosis: 软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理) —
-                 细状态行(标题/加载点)留在原位,键盘再高也不会把它推出屏幕。 -->
-            <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
-                <Grid.RenderTransform>
-                    <TranslateTransform x:Name="NavBarShift" Y="0"/>
-                </Grid.RenderTransform>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
+        <!-- ===== 底部 chrome:导航栏(标签数/地址栏/菜单)===== -->
+        <!-- Apotheosis(2026-09-04 review item 3): 细状态行(标题/加载点)搬到内容区顶部去了
+             (见上面的 TitleBar),这里只剩导航栏本体,不再需要外层两行 Grid 包一层。
+             软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理)。 -->
+        <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
+            <Grid.RenderTransform>
+                <TranslateTransform x:Name="NavBarShift" Y="0"/>
+            </Grid.RenderTransform>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
 
                 <!-- 标签键:方框数字,点开标签切换器 -->
                 <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
@@ -435,9 +434,8 @@
                     </Grid>
                 </Border>
 
-                <!-- 菜单(More):弹出底部动作面板 -->
-                <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>
-            </Grid>
+            <!-- 菜单(More):弹出底部动作面板 -->
+            <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>
         </Grid>
 
         <!-- ============================================================================

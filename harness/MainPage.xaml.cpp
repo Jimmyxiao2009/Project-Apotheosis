@@ -1120,12 +1120,16 @@ void MainPage::ApplyViewInsets()
     if (SettingsPage) SettingsPage->Padding = topPad;
     if (TabSwitcher) TabSwitcher->Padding = topPad;
     if (OobePanel) OobePanel->Padding = topPad;
-    // Apotheosis (review 2026-09-04 item 2a): the elements that actually show engine output — the
+    // Apotheosis (review 2026-09-04 item 2a/3): the elements that actually show engine output — the
     //   white content Border in software mode, GpuPanel in direct-present mode — used to start at
-    //   y=0 inside their row, so the page ran under the shell's clock; only the chrome above them
-    //   got the inset. Push them down by it too (their own static side/bottom margins are untouched).
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + 6, 6, 0);
-    if (GpuPanel) GpuPanel->Margin = topPad;
+    //   y=0 inside their row, so the page ran under the shell's clock. They now get the same top
+    //   inset as the chrome above, plus the height of TitleBar (the status/loading row, moved here
+    //   from the bottom chrome — see MainPage.xaml): TitleBar sits right under the inset, content
+    //   starts right under TitleBar. kTitleBarHeight must match TitleBar's XAML Height.
+    const double kTitleBarHeight = 26.0;
+    if (TitleBar) TitleBar->Margin = topPad;
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + kTitleBarHeight + 6, 6, 0);
+    if (GpuPanel) GpuPanel->Margin = Windows::UI::Xaml::Thickness(0, top + kTitleBarHeight, 0, 0);
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
 }
 
