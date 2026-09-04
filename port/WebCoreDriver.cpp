@@ -2286,6 +2286,30 @@ static void presenterThreadMain()
             P.cond.notifyAll();
         }
         ctx->swapBuffers();
+        // Apotheosis: a swap can fail for good. On a lost device (EGL_CONTEXT_LOST) or a surface
+        // the shell has pulled out from under us (EGL_BAD_SURFACE / EGL_BAD_NATIVE_WINDOW) every
+        // further swap fails too, and the loop would spin on a dead swap chain for the rest of the
+        // session. Give the presenter up: stop, and clear g_presenterActive so the engine stops
+        // publishing and takes the ordinary path in gpuPresent again.
+        //
+        // What that path can do at this point, honestly: g_glContext is the OFFSCREEN context
+        // GpuInit created for presenter mode, so it composites into a pbuffer and its
+        // eglSwapBuffers is a no-op. The engine keeps loading, laying out and painting, the app
+        // stays responsive and nothing deadlocks - but the screen stops updating until the session
+        // is torn down and set up again. Moving a live window surface to the engine thread is not
+        // possible (contexts are per-thread) and creating a second one for a panel whose surface
+        // has just been lost is not either, so this is a soft landing, not a recovery. It is
+        // recorded in crash.txt so a frozen screen can be told apart from a hung engine.
+        const EGLint swapErr = eglGetError();
+        if (swapErr == EGL_CONTEXT_LOST || swapErr == EGL_BAD_SURFACE || swapErr == EGL_BAD_NATIVE_WINDOW) {
+            g_presenterActive.store(false);
+            WebCoreCrashNote(swapErr == EGL_CONTEXT_LOST
+                ? "presenter: EGL_CONTEXT_LOST on swap, presenter stopped"
+                : "presenter: surface lost on swap, presenter stopped");
+            Locker locker { P.lock };
+            P.stop = true;
+            break;
+        }
         drawnGeneration = generation;
         drawnTx = tx;
         drawnTy = ty;

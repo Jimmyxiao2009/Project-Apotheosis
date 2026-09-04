@@ -303,7 +303,11 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 //                               OFF = exactly the pre-presenter behaviour. Engine thread.
 //   WebCorePresenterActive      did the split actually come up? WebCoreGpuInit falls back to the
 //                               engine-owned window surface silently, so ask instead of assuming.
-//                               1 = presenter running. Engine thread.
+//                               1 = presenter running. Engine thread. It can also drop back to 0
+//                               later in a session: a swap that fails for good (lost device, or a
+//                               surface the shell tore down) stops the presenter, and the screen
+//                               then stops updating until the session is rebuilt - a note lands in
+//                               crash.txt. Worth re-asking after a resume if the harness cares.
 //   WebCoreSetPanOffset         * UI THREAD * - the only export that may be called off the engine
 //                               thread. x/y = what the finger has asked for since the gesture
 //                               started, in engine px, cumulative (NOT a delta); it takes one
