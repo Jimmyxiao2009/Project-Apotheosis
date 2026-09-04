@@ -2561,6 +2561,34 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
             m_scrollStateValid = false;
         return;
     }
+    // Apotheosis (review 2026-09-04 item 0) — THE SCROLL REGRESSION, root cause. InstantPanBy()
+    //   returns at its top (:2470) whenever the XAML preview is not the path in use - no presenter
+    //   and instantpanxaml off, which is the shipping default since device package 13 - so the
+    //   finger never puts anything into m_panRem*/m_panFinger*/m_panBase*. This function is the
+    //   CORRECTION half of that same XAML preview and had NO such guard: every WebCoreScrollBy
+    //   completion ran the block below and did
+    //       m_panRemY -= (newScrollY - m_scrollY);
+    //   i.e. it subtracted the distance the engine had just scrolled from a remainder the finger
+    //   had never filled, and ApplyPanTransform() then put -m_panRemY = +that distance on GpuPanel
+    //   as a TranslateTransform. The engine scrolled the content up, XAML slid the whole panel down
+    //   by exactly as much: the page stood still, and anything position:fixed - which does NOT move
+    //   inside the composite - visibly moved the wrong way. That is the reported symptom on ntv.de,
+    //   and it survived turning the presenter off because neither half of it is gated on anything.
+    //
+    //   Default path is package 10 again: OnImageManipDelta -> FreeScrollBy -> PumpScroll ->
+    //   WebCoreScrollBy, the engine composites and swaps, and nothing on the XAML side moves. Only
+    //   the scroll/bounds cache is kept, because MapTapToEngine()/ScrollStateUsable() read it.
+    if (!m_instantPan || !m_instantPanXaml) {
+        if (haveScrollState) {
+            m_scrollX = newScrollX;
+            m_scrollY = newScrollY;
+            m_scrollStateValid = true;
+            m_scrollStateScale = m_pageScale;
+        } else
+            m_scrollStateValid = false;
+        if (m_panRemX || m_panRemY) { m_panRemX = 0; m_panRemY = 0; ApplyPanTransform(); }
+        return;
+    }
     if (!haveScrollState) {
         m_scrollStateValid = false;
         if (m_panRemX || m_panRemY) {
@@ -2722,6 +2750,17 @@ void MainPage::ApplyPanTransform()
     //   InstantPanBy already refuses to run while pinching; do the same for every other caller.
     if (m_pinching || m_zoomSpring != nullptr)
         return;
+    // Apotheosis (review 2026-09-04 item 0): belt and braces for the regression documented in
+    //   InstantPanApplied(). A XAML pan preview exists in exactly one configuration - instant pan
+    //   on, no presenter (it translates inside the driver) and instantpanxaml on. In every other
+    //   one a translation on the presenting layer is a bug, not a preview: it moves the panel the
+    //   same way the engine just scrolled the content and the page appears frozen. Clear whatever
+    //   is there instead of writing a new one, whoever the caller was.
+    if (!m_instantPan || m_presenterActive || !m_instantPanXaml) {
+        if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
+        ApplyPresentTransform();
+        return;
+    }
     if (m_panRemX == 0 && m_panRemY == 0) {
         if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
         ApplyPresentTransform();
