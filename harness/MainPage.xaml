@@ -762,6 +762,9 @@
                     <ToggleSwitch x:Name="SetEventPresentSwitch" Header="事件驱动呈现" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <!-- Apotheosis: 地图/画布类控件自己处理指针事件平移内容，默认开。 -->
                     <ToggleSwitch x:Name="SetDragPointerSwitch" Header="拖拽作为指针事件（地图/画布）" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <!-- Apotheosis: 瓦片重建/失效时先垫一块陈旧占位而不是空白，默认开；下发到引擎的
+                         WebCoreSetStaleTiles(int)，启动时和这里改动时各调一次(ApplyStaleTilesSetting)。 -->
+                    <ToggleSwitch x:Name="SetStaleTilesSwitch" Header="陈旧瓦片占位符" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>

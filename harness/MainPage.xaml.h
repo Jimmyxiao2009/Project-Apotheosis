@@ -276,6 +276,11 @@ namespace Harness {
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();
+        // Apotheosis: push the "Stale tile placeholders" developer setting (WebCoreSetStaleTiles) to
+        //   the engine thread. Called once at startup (ApplySettings, via LoadSettings) and again
+        //   whenever Settings closes with the switch changed — same wiring as ApplyThreadedRasterSetting,
+        //   never called from the UI thread without a post.
+        void ApplyStaleTilesSetting();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -385,6 +390,9 @@ namespace Harness {
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
         bool m_threadedRaster { false };// settings.ini threadraster
+        // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
+        //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles
+        bool m_staleTiles { true };
         // Apotheosis (presenter thread): ON = a presenter thread inside the driver owns the swap
         //   chain, the engine composites offscreen and the pan preview is a translation the
         //   presenter applies (WebCoreSetPanOffset) instead of a XAML transform on GpuPanel.

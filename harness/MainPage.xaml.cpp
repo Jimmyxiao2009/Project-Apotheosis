@@ -2890,6 +2890,16 @@ void MainPage::ApplyThreadedRasterSetting()
     WebEngine::instance().post([en]() { try { WebCoreSetThreadedRaster(en); } catch (...) {} });
 }
 
+// Apotheosis: DEVELOPER toggle "Stale tile placeholders" (default ON). Engine-thread call — same
+//   shape as ApplyThreadedRasterSetting above. Called from ApplySettings(), i.e. once at startup
+//   (LoadSettings -> ApplySettings) and again whenever the Settings page closes with the switch
+//   having changed (HideSettings -> ApplySettings).
+void MainPage::ApplyStaleTilesSetting()
+{
+    const int en = m_staleTiles ? 1 : 0;
+    WebEngine::instance().post([en]() { try { WebCoreSetStaleTiles(en); } catch (...) {} });
+}
+
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
 //   The engine calls PresentWakeThunk whenever something wants to be presented. It may run on the
 //   ENGINE thread (every WebCore invalidation) or on a RASTER WORKER (a tile replay landing), so
@@ -4424,6 +4434,7 @@ void MainPage::ApplySettings()
     UpdateScrollFab();
     ApplyPrefetchSetting();
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
+    ApplyStaleTilesSetting();                // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     ApplyHideStatusBarSetting();             // Apotheosis: DISPLAY toggle, UI thread only
@@ -4464,6 +4475,7 @@ void MainPage::LoadSettings()
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
+            else if (k == "staletiles") m_staleTiles = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -4494,6 +4506,7 @@ void MainPage::SaveSettings()
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
+    s += "staletiles=" + std::to_string(m_staleTiles ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -4521,6 +4534,7 @@ void MainPage::ShowSettings()
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
+    if (SetStaleTilesSwitch) SetStaleTilesSwitch->IsOn = m_staleTiles;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -4566,6 +4580,7 @@ void MainPage::HideSettings()
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
+    if (SetStaleTilesSwitch) m_staleTiles = SetStaleTilesSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -4612,6 +4627,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
     { L"事件驱动呈现", L"Event-driven present" },
     { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
+    { L"陈旧瓦片占位符", L"Stale tile placeholders" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
