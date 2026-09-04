@@ -1145,7 +1145,7 @@ void MainPage::ApplyViewInsets()
             const double declared = Progress->Height;
             if (declared > 0.0 && declared < 1.0e6) stripH = declared;   // false for NaN
         }
-        if (!(stripH > 0.0)) stripH = 8.0;
+        if (!(stripH > 0.0)) stripH = 5.0;
     }
     if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH)
         return;
