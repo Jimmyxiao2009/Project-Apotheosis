@@ -4072,6 +4072,58 @@ void WebCoreCloseSession()
         wkReleaseMemoryLevel(2, /*keepResourceCache*/ false);
 }
 
+// ===========================================================================
+// Apotheosis (synthetic mouse input, 2026-09-04): PlatformMouseEvent carries TWO button fields.
+// `button` says which button this event is about; `buttons` is the W3C uievents bitmask of what is
+// held down right now (1 = primary). The public constructor takes only the first and leaves
+// m_buttons at 0, and nothing derives it later: MouseEvent::create() copies event.buttons()
+// straight through (MouseEvent.cpp:70), and PointerEvent takes both the DOM `buttons` and - for
+// the mouse pointer type - `pressure` from it (PointerEvent.cpp:202/207,
+// pressureForPressureInsensitiveInputDevices(buttons())). So every mouse event this driver
+// synthesised reached the page as `buttons: 0, pressure: 0`, i.e. a pointermove with nothing
+// pressed. Widgets that pan on pointer events (Google Maps, Leaflet, canvas apps) test exactly
+// that field to tell a drag from a hover, which is why the one-finger drag did nothing on Maps.
+// PlatformMouseEventWin.cpp is the reference for the real values: a WM_MOUSEMOVE during a left
+// drag carries button=Left AND buttons=1 (buttonsForEvent(), GDIUtilities.h:44), WM_LBUTTONDOWN
+// carries 1, and WM_LBUTTONUP carries 0 because the button being released is no longer down.
+// m_buttons is protected with no setter, so this three-line subclass is how it gets set.
+// ===========================================================================
+namespace {
+class DriverMouseEvent final : public WebCore::PlatformMouseEvent {
+public:
+    DriverMouseEvent(const WebCore::DoublePoint& position, WebCore::MouseButton button,
+                     WebCore::PlatformEvent::Type type, int clickCount,
+                     OptionSet<WebCore::PlatformEvent::Modifier> modifiers, MonotonicTime timestamp,
+                     unsigned short buttons)
+        : WebCore::PlatformMouseEvent(position, position, button, type, clickCount, modifiers, timestamp,
+                                      /*force*/ 0.0, WebCore::SyntheticClickType::NoTap)
+    {
+        m_buttons = buttons;
+    }
+};
+}
+static const unsigned short kButtonsLeftDown = 1;   // MouseEvent.buttons bit for the primary button
+
+// Apotheosis (2026-09-04): unwind a mousedown the page never got a mouseup for.
+// EventHandler::handleMousePressEvent() sets m_mousePressed (EventHandler.cpp:2030) before it even
+// hit-tests, and PointerCaptureController marks the pointer pressed when it dispatches the
+// pointerdown - both regardless of whether anything consumed the event. A press left dangling
+// therefore poisons the rest of the page's life: every later hover is treated as a drag move, and
+// the next mousedown is turned into a pointermove instead of a pointerdown, because the chorded
+// button rules see the pointer as already pressed (PointerCaptureController.cpp:425-429). That is
+// the reported "a pin can be placed on the map exactly once". invalidateClick() first: this
+// release is repair work, it must not fire a click of its own.
+static void releaseDanglingPress(WebCore::LocalFrame& frame, const WebCore::DoublePoint& at,
+                                 OptionSet<WebCore::PlatformEvent::Modifier> modifiers)
+{
+    if (!frame.eventHandler().mousePressed())
+        return;
+    frame.eventHandler().invalidateClick();
+    DriverMouseEvent up(at, WebCore::MouseButton::Left, WebCore::PlatformEvent::Type::MouseReleased,
+                        /*clickCount*/ 0, modifiers, MonotonicTime::now(), /*buttons*/ 0);
+    frame.eventHandler().handleMouseReleaseEvent(up);
+}
+
 // 在 (x,y)(位图/视口像素,无需减 scroll —— EventHandler 内部 windowToContents 会加 scrollY)派发一次
 // 完整鼠标点击 move→down→up 到活文档,经真实命中测试 + 默认动作(链接导航 / 表单提交 / 按钮 onclick /
 // SPA 交互)。之后等待可能的异步导航 settle、每 tick 驱动 rAF,然后重布局/提链接/重绘。返回 0 成功。
@@ -4095,6 +4147,23 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
+    // Apotheosis (2026-09-04): a press from an earlier gesture must not still be "down" here, or
+    // this click's mousedown becomes a pointermove and the page never sees a press at all - see
+    // releaseDanglingPress(). Normally a no-op; WebCoreDragAt now unwinds its own presses.
+    if (lf->eventHandler().mousePressed()) {
+        releaseDanglingPress(*lf, DoublePoint(static_cast<double>(x), static_cast<double>(y)), { });
+        // That release dispatches a mouseup, which runs script and in the worst case navigates.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (!lf)
+            return kErrFrameGone;
+        g_session->mainFrame = lf;
+        view = lf->view();
+        if (!view)
+            return kErrNoView;
+        doc = lf->document();
+        if (!doc)
+            return kErrNoDocument;
+    }
     {
         PerfPhase perfLayout(&g_perfCur.styleLayout);
         doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
@@ -4118,11 +4187,14 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     DoublePoint p(static_cast<double>(x), static_cast<double>(y));
     OptionSet<PlatformEvent::Modifier> mods;
     MonotonicTime t = MonotonicTime::now();
-    PlatformMouseEvent move(p, p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+    // Apotheosis (2026-09-04): the press carries buttons=1, the release buttons=0, exactly as the
+    // Windows port derives them from the WM_ message (see DriverMouseEvent). Without it the page
+    // got pointerdown/pointerup with buttons=0 and pressure=0, which is what a hover looks like.
+    DriverMouseEvent move(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
     lf->eventHandler().handleMouseMoveEvent(move);     // 设 :hover / elementUnderMouse
-    PlatformMouseEvent down(p, p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, 0.0, SyntheticClickType::NoTap);
+    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
     lf->eventHandler().handleMousePressEvent(down);    // 安装 UserGestureIndicator
-    PlatformMouseEvent up(p, p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0.0, SyntheticClickType::NoTap);
+    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0);
     lf->eventHandler().handleMouseReleaseEvent(up);    // 派发 DOM 'click' + 默认动作(导航/提交)
 
     // ★ 显式聚焦命中点的可编辑元素:headless 下合成点击对"设置焦点"的副作用不稳定(时灵时不灵 → 键盘
@@ -4610,6 +4682,27 @@ int WebCoreWantsDragAt(int x, int y)
 // then paintToRGBA. Without this the page would only reach the screen on the next live tick, i.e.
 // never during a gesture that keeps the engine busy. Deliberately NOT g_gpuScrollFast: the widget
 // repaints its own content into an ordinary backing store, so the dirty pass must run.
+// Apotheosis (drag as pointer events, diagnostics 2026-09-04): one line per gesture into crash.txt,
+// the only writable path the driver knows. Same plain-line channel as presenter-stats/pan-swap-drop
+// (no crash record, no crash-entry budget), capped so a session of panning cannot fill the file.
+// Grep for "drag-press".
+static void dragPressNote(int x, int y, bool handled, bool unwound)
+{
+    static int notes = 0;
+    if (!g_crashLogPath[0] || notes >= 12)
+        return;
+    ++notes;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "drag-press %02u:%02u:%02u.%03u at=%d,%d handled=%d move buttons=%u unwound=%d\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, x, y, handled ? 1 : 0,
+        static_cast<unsigned>(handled ? kButtonsLeftDown : 0), unwound ? 1 : 0);
+    std::fclose(fp);
+}
+
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
 {
     using namespace WebCore;
@@ -4650,21 +4743,38 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
     if (phase == 0) {
         // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
         // what several widgets key their pointerdown handling off.
-        PlatformMouseEvent hover(p, p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+        DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
         lf->eventHandler().handleMouseMoveEvent(hover);
-        PlatformMouseEvent down(p, p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, 0.0, SyntheticClickType::NoTap);
+        DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
         handled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
         g_dragActive = handled;
+        // Apotheosis (2026-09-04): a press nothing consumed still left the engine pressed. The
+        // harness stops calling us for this gesture the moment the press answers 0 (MainPage::
+        // PumpDrag drops the queued move/release), so no phase 2 ever arrives to undo it - and the
+        // stuck press then breaks every later click on the page (see releaseDanglingPress). Unwind
+        // it here, where we are the only one who knows the release will never come.
+        if (!handled)
+            releaseDanglingPress(*lf, p, mods);
+        dragPressNote(x, y, handled, !handled);
     } else if (phase == 1) {
         // Button held: EventHandler's m_mousePressed is still set from the press, so this is a drag
-        // move, not a hover move. clickCount 0 is what a real platform move carries.
-        PlatformMouseEvent move(p, p, MouseButton::Left, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+        // move, not a hover move. clickCount 0 is what a real platform move carries, and buttons=1
+        // is what makes it a drag for the page - a pointermove with buttons=0 is a hover, which is
+        // precisely what map widgets ignore (see DriverMouseEvent).
+        DriverMouseEvent move(p, MouseButton::Left, PlatformEvent::Type::MouseMoved, 0, mods, t, kButtonsLeftDown);
         lf->eventHandler().handleMouseMoveEvent(move);
         handled = true;   // see the header comment: the press decided, per-move results are noise
     } else {
         // 2 = release, 3 = cancel (and any unknown phase): both must end with a mouseup, otherwise
         // EventHandler keeps m_mousePressed set and every later hover/tap behaves like a drag.
-        PlatformMouseEvent up(p, p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, t, 0.0, SyntheticClickType::NoTap);
+        // buttons=0: the button being released is no longer down (WM_LBUTTONUP does the same), and
+        // a mouseup that still claimed a pressed button would be turned into a pointermove by the
+        // chorded-button rules (PointerCaptureController.cpp:432) - no pointerup, pointer stays
+        // pressed for ever. A cancel additionally drops the click: an aborted gesture must not
+        // activate what happens to be under the finger.
+        if (phase != 2)
+            lf->eventHandler().invalidateClick();
+        DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, phase == 2 ? 1 : 0, mods, t, 0);
         lf->eventHandler().handleMouseReleaseEvent(up);
         g_dragActive = false;
         handled = true;
