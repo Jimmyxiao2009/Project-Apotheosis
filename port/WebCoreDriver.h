@@ -239,6 +239,11 @@ int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Edge UA
 void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
 void WebCoreSetSpeculativePrefetch(int enabled);      // <script type="speculationrules"> prefetch, default off; sticky (live page + new sessions)
+// Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is being
+// typed (debounced) so the DNS lookup is done when Enter arrives. Full URL or bare host ("ntv.de");
+// anything else ignored. DNS only: libcurl cannot open a reusable connection ahead of time (see
+// WebCoreDriver.cpp). Non-blocking (work queue), idempotent per host, engine thread.
+void WebCorePreconnect(const char* url);
 int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
 int WebCoreGpuInit(void* nativeWindow, int w, int h); // M2: init GPU present (engine thread). nativeWindow=SwapChainPanel PropertySet IInspectable*; nullptr=offscreen(readback)
 int WebCoreComposite();                               // M2: composite current session layer tree to the window surface (swapBuffers)

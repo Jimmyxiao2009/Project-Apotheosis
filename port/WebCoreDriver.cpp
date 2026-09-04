@@ -431,6 +431,11 @@ extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobi
 //   Off unless the harness turns it on (Settings -> PRIVACY: Off / Wi-Fi only / Always).
 //   WebCoreSetSpeculativePrefetch() sets it; every Page created afterwards reads it.
 static bool g_apoSpecPrefetch = false;
+// Apotheosis (M4): DNS warm-up, implemented in WebKit\Source\WebKitLegacy\WebCoreSupport\
+// WebResourceLoadScheduler.cpp, which is compiled straight into the driver
+// (local\link-driver-gpu.ps1) - a plain cross-TU call, like the one in
+// LoadingFrameLoaderClient::prefetchDNS(). Used by WebCorePreconnect().
+extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
@@ -4129,6 +4134,41 @@ void WebCoreSetSpeculativePrefetch(int enabled)
     g_apoSpecPrefetch = (enabled != 0);
     if (g_session && g_session->page)
         g_session->page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);
+}
+
+// Apotheosis (M4): warm up an origin the user is about to visit - the harness calls this while
+// a URL is being typed, so the name is resolved before Enter.
+//
+// DNS is all a "preconnect" can be in this port, and that is a deliberate finding, not a stub:
+// libcurl has no preconnect primitive, and its closest relative CURLOPT_CONNECT_ONLY (including
+// =2, which does complete the TLS handshake) takes the connection *out* of the pool and binds it
+// to the one easy handle that opened it, so a warm-up would burn a TCP+TLS connection the real
+// request can never reuse. What CurlContext's CURLSH handle does share across handles is DNS,
+// TLS sessions and cookies (CURL_LOCK_DATA_DNS / SSL_SESSION / COOKIE with WTF::Lock callbacks,
+// CurlContext.cpp; every CurlHandle opts in via enableShareHandle()), which means the second
+// request to a host reuses its TLS session anyway - the resolver is the part still worth
+// warming. Same conclusion as WebResourceLoadScheduler::preconnectTo() for <link rel=preconnect>.
+//
+// Accepts a full URL or a bare host ("ntv.de"); anything else is ignored. Idempotent and cheap
+// (apotheosisPrefetchDNS resolves on a work queue and keeps a capped set of hosts it has already
+// done), and it never touches the live Page.
+void WebCorePreconnect(const char* url)
+{
+    using namespace WebCore;
+    if (!url || !*url)
+        return;
+    String input = String::fromUTF8(url);
+    if (input.isEmpty())
+        return;
+    URL parsed { input };
+    if (!parsed.isValid() || parsed.host().isEmpty())
+        parsed = URL { makeString("https://"_s, input) };   // still being typed: no scheme yet
+    if (!parsed.isValid() || !parsed.protocolIsInHTTPFamily())
+        return;
+    String host = parsed.host().toString();
+    if (host.isEmpty())
+        return;
+    ::apotheosisPrefetchDNS(host);
 }
 
 int WebCoreEnableCompositing()

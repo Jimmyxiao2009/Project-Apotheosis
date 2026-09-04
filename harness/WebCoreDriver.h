@@ -242,6 +242,13 @@ void WebCoreSetUserAgentString(const char* ua);
 // enabled!=0 时网页可预取用户未点击的 URL。仅引擎线程调；对当前会话和新建会话都生效。
 void WebCoreSetSpeculativePrefetch(int enabled);
 
+// Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is
+// being typed (debounced, e.g. once per suggestion update) so the DNS lookup is already done when
+// Enter arrives. Accepts a full URL or a bare host ("ntv.de"); anything else is ignored. DNS only:
+// libcurl cannot open a reusable connection ahead of time (see WebCoreDriver.cpp). Non-blocking
+// (resolves on a work queue), idempotent per host, engine thread.
+void WebCorePreconnect(const char* url);
+
 // M1:GPU 合成是否在跑(根 GraphicsLayer 已附)。加载后查,返回 1/0。
 int WebCoreEnableCompositing();
 
