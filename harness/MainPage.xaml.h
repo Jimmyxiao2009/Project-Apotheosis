@@ -232,6 +232,17 @@ namespace Harness {
         void RequestScrollState();                    // seed the cached scroll/bounds (async)
         void RestartPanSnapTimer();                   // ~1 s after the last movement the engine wins
         void OnPanSnapTick(Platform::Object^ sender, Platform::Object^ e);
+        // ---- Apotheosis (pan present handshake): during an instant-pan gesture the engine must
+        // not present on its own - see the block comment above PanGestureBegin() in the .cpp.
+        void PanGestureBegin();       // first main-frame pan delta: engine stops presenting itself
+        void PanGestureEnd();         // finger left the glass / inertia over: commit the remainder
+        void PanDeferOff();           // give presents back to the engine right now (pinch, nav, ...)
+        bool PanFlushDue() const;     // the held-back scroll offset has grown past the coarse step
+        void ArmPanPresentAck();      // wait for XAML to commit the transform, then release the swap
+        void DisarmPanAck();          // stop waiting (superseded by a newer frame, or handed back)
+        void ReleasePanPresent();     // post WebCorePresent() (and, if we are done, SetPanGesture(0))
+        void OnPanAckRendering(Platform::Object^ sender, Platform::Object^ e);
+        void OnPanAckTimeout(Platform::Object^ sender, Platform::Object^ e);
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
         //   presenting element (TransformGroup, scale first so the translation stays screen-space).
         void ApplyPresentTransform();
@@ -443,6 +454,13 @@ namespace Harness {
         int  m_contentW { 0 }, m_contentH { 0 }, m_viewW { 0 }, m_viewH { 0 };
         bool m_scrollStateValid { false };
         unsigned long long m_scrollStateGen { 0 };   // drops answers from a superseded gesture
+        // ---- Apotheosis (pan present handshake) ----
+        bool m_panGestureOn { false };   // a main-frame instant pan (incl. inertia) is in progress
+        bool m_panDefer { false };       // engine is in "present only when we ask" mode
+        bool m_panAckArmed { false };    // CompositionTarget::Rendering hooked for the pending swap
+        int  m_panAckFrames { 0 };       // frames still to pass before the swap is released
+        Windows::Foundation::EventRegistrationToken m_panAckToken;
+        Windows::UI::Xaml::DispatcherTimer^ m_panAckTimer;   // releases the swap if Rendering stops
         bool m_pointerDown { false }; // 指针按下中(拖拽跟踪)
         bool m_dragging { false };    // 已超过阈值判定为拖拽(非点击)
         double m_dragLastY { 0 };     // 上次指针 Y(算增量)

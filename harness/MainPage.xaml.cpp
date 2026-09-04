@@ -698,6 +698,10 @@ MainPage::MainPage()
     Window::Current->VisibilityChanged += ref new Windows::UI::Xaml::WindowVisibilityChangedEventHandler(
         [this](Platform::Object^, Windows::UI::Core::VisibilityChangedEventArgs^ e) {
             m_appForeground = e->Visible;
+            // Apotheosis (pan present handshake): a gesture cannot survive a visibility change, and
+            // its ManipulationCompleted may never arrive - hand the presents back on both edges, or
+            // the engine would stay silent on the way back in.
+            PanDeferOff();
             if (e->Visible) StartLiveMode();
             else {
                 StopLiveMode();
@@ -1154,6 +1158,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     m_zoomTransform = nullptr;
     // Apotheosis (instant pan): a new document invalidates the cached scroll position and bounds,
     // and any pan remainder belongs to the page we are leaving.
+    PanDeferOff();   // a pan of the old page must not keep the engine from presenting the new one
     m_panRemX = 0; m_panRemY = 0;
     if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
     if (m_panSnapTimer) m_panSnapTimer->Stop();
@@ -1655,6 +1660,14 @@ void MainPage::FreeScrollBy(int dx, int dy)
     if (!m_sessionActive || (dx == 0 && dy == 0)) return;
     m_scrollAccumX += dx;
     m_scrollAccum += dy;
+    // Apotheosis (pan present handshake, coarse engine steps): while the finger owns the screen the
+    // TranslateTransform carries the motion at display rate, so the engine does not have to be fed
+    // every coalesced delta - it only has to catch up before the preview runs out of pixels. Every
+    // engine present is a moment where composited content and XAML transform can disagree for a
+    // frame, so the fewer of them a gesture costs the better: hold the offset here until it is
+    // worth a step (PanFlushDue) or the gesture ends (PanGestureEnd). m_scrollAccum* IS the ledger
+    // of what the engine has not been told about yet, so nothing can be sent twice or lost.
+    if (m_panGestureOn && !PanFlushDue()) return;
     if (!m_scrollBusy) PumpScroll();
 }
 void MainPage::PumpScroll()
@@ -1663,6 +1676,11 @@ void MainPage::PumpScroll()
     int dy = m_scrollAccum; m_scrollAccum = 0;
     int dx = m_scrollAccumX; m_scrollAccumX = 0;
     m_scrollBusy = true;
+    // Apotheosis (pan present handshake): a composite may still be waiting for its translation to
+    // be committed. This job overwrites the back buffer, so releasing that older swap now would
+    // show the newer content under the older translation - exactly the artefact. Drop the wait;
+    // this job's own completion arms a fresh one and releases both at once.
+    DisarmPanAck();
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // 不自增:被动滚动不作废点击/导航令牌,但被它们作废(导航后丢弃迟到滚动帧)
@@ -1697,8 +1715,16 @@ void MainPage::PumpScroll()
                     s->InstantPanApplied(sx, sy, haveState, dx, dy);
                 }
                 s->m_scrollBusy = false;
-                if (s->m_scrollAccum != 0 || s->m_scrollAccumX != 0) s->PumpScroll();   // 拖拽期间又攒了位移(含纯横向),继续冲刷
-                else { s->SyncLinksAfterScroll(); s->StartLiveMode(); }  // 滚动停了 → 补链接表 + 重启实时(新视口懒加载/动画)
+                // Apotheosis (pan present handshake): the transform above was just corrected by the
+                // distance the engine really scrolled. The engine composited that frame but has NOT
+                // shown it (WebCoreSetPanGesture) - release the swap only once XAML has this
+                // translation on screen, otherwise the new content appears under the old one.
+                if (s->m_panDefer) s->ArmPanPresentAck();
+                if (s->m_scrollAccum != 0 || s->m_scrollAccumX != 0) {
+                    if (!s->m_panGestureOn || s->PanFlushDue()) s->PumpScroll();   // 拖拽期间又攒了位移(含纯横向),继续冲刷
+                } else if (!s->m_panGestureOn) {
+                    s->SyncLinksAfterScroll(); s->StartLiveMode();   // 滚动停了 → 补链接表 + 重启实时(新视口懒加载/动画)
+                }
             }));
         } catch (...) {}
     });
@@ -2037,6 +2063,10 @@ void MainPage::InstantPanBy(int dx, int dy)
         return;
     if (dx == 0 && dy == 0)
         return;
+    // Apotheosis (pan present handshake): this is the first thing that happens on the main-frame
+    // pan route (and only on it - the nested-scroll and drag routes never come through here), so it
+    // is where the gesture is declared to the engine.
+    PanGestureBegin();
     m_panRemX += dx;
     m_panRemY += dy;
     ClampPanRemainder();
@@ -2079,6 +2109,10 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
 
 void MainPage::InstantPanReset()
 {
+    // Apotheosis (pan present handshake): the preview is gone, so the engine must be allowed to
+    // present again. Covers every way a pan can be abandoned: a new gesture, a pinch taking over,
+    // the 1 s snap timer, a superseded scroll frame, the developer toggle being switched off.
+    PanDeferOff();
     m_panRemX = 0;
     m_panRemY = 0;
     if (m_panSnapTimer) m_panSnapTimer->Stop();
@@ -2195,6 +2229,143 @@ void MainPage::RestartPanSnapTimer()
 void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
 {
     InstantPanReset();
+}
+
+// ===========================================================================
+// Apotheosis (pan present handshake) - why a pan may not let the engine present.
+//
+// Two independent producers end up on the same screen: the engine composites and swaps the
+// SwapChainPanel on the ENGINE thread whenever it likes, and instant pan puts a TranslateTransform
+// on that very panel from the UI thread. DWM composes the two without knowing they belong
+// together. So the instant a scroll present lands, the screen shows content that has already moved
+// by D *plus* a translation that still contains D - one frame of double movement, corrected only
+// when the engine's completion reaches the UI thread. On device that is the "content briefly jumps
+// back" flicker, and event-driven present made it continuous, because rAF/timers/decodes now wake
+// the engine during the gesture too and every one of those presents races the transform as well.
+//
+// The rules while a main-frame pan gesture is running:
+//   1. The engine presents ONLY what we ask for. WebCoreSetPanGesture(1) defers every
+//      eglSwapBuffers and makes the live tick skip its composite (content updates still run).
+//   2. The engine is fed in coarse steps (FreeScrollBy / PanFlushDue): 1/3 of the viewport, so a
+//      whole screen of panning costs three presents instead of one per touch frame. The preview is
+//      capped at one screen anyway (ClampPanRemainder), so 1/3 keeps two thirds of margin.
+//   3. Each present is released only after XAML has committed the matching translation
+//      (ArmPanPresentAck). This is the ordering that actually removes the artefact: a XAML property
+//      change is on screen at the next composition commit, an eglSwapBuffers is on screen at once,
+//      so "swap, then fix the transform" can never look right no matter how small the gap is.
+//
+// Why not the two-hop handshake with the engine waiting for an ack: the engine thread must not
+// block on the UI thread here (ANGLE marshals surface work back to the panel dispatcher - the
+// 线程铁律 in this repo's CLAUDE.md), and even a perfect ack would not help, because what has to
+// happen first is the XAML *commit*, not the UI-thread assignment. Counting Rendering events costs
+// the same two frames and blocks nobody: the engine returns from WebCoreScrollBy immediately and
+// simply receives a WebCorePresent() job a couple of frames later. Those frames of engine latency
+// are invisible during a pan - the translation, not the engine, is what the finger sees moving.
+// ===========================================================================
+
+// The engine catches up in steps of a third of the viewport. Engine px, same units as
+// m_scrollAccum/WebCoreScrollBy.
+static const int kPanStepX = kW / 3;
+static const int kPanStepY = kH / 3;
+
+bool MainPage::PanFlushDue() const
+{
+    const int ax = (m_scrollAccumX < 0) ? -m_scrollAccumX : m_scrollAccumX;
+    const int ay = (m_scrollAccum  < 0) ? -m_scrollAccum  : m_scrollAccum;
+    return ax >= kPanStepX || ay >= kPanStepY;
+}
+
+// First main-frame pan delta of a gesture: take the presents away from the engine. Posted, like
+// every other C ABI call - and because the engine queue is FIFO, it is guaranteed to be seen
+// before the WebCoreScrollBy this same delta is about to queue.
+void MainPage::PanGestureBegin()
+{
+    m_panGestureOn = true;
+    if (m_panDefer) return;
+    m_panDefer = true;
+    WebEngine::instance().post([]() { try { WebCoreSetPanGesture(1); } catch (...) {} });
+}
+
+// The finger has left the glass and inertia is over. Commit the offset the coarse gate held back in
+// one step; its completion corrects the transform and releases the last swap through the same
+// handshake, so the final frame and the snap to identity land in the same UI frame. If nothing is
+// owed, hand the presents back straight away.
+void MainPage::PanGestureEnd()
+{
+    if (!m_panGestureOn) return;
+    m_panGestureOn = false;
+    if (m_scrollBusy) return;                                   // its completion finishes this
+    if (m_scrollAccum != 0 || m_scrollAccumX != 0) { PumpScroll(); return; }
+    PanDeferOff();
+}
+
+// Give presents back to the engine now, flushing whatever swap it may still owe. Idempotent.
+void MainPage::PanDeferOff()
+{
+    m_panGestureOn = false;
+    if (!m_panDefer) return;
+    m_panDefer = false;
+    DisarmPanAck();
+    WebEngine::instance().post([]() { try { WebCorePresent(); WebCoreSetPanGesture(0); } catch (...) {} });
+    if (!m_loading) StartLiveMode();   // the live loop was held off while the gesture owned the screen
+}
+
+// Stop waiting for a commit: either a newer scroll frame has superseded the composite we were
+// holding (its own ack will release both) or the presents have been handed back.
+void MainPage::DisarmPanAck()
+{
+    if (m_panAckArmed) { CompositionTarget::Rendering -= m_panAckToken; m_panAckArmed = false; }
+    if (m_panAckTimer) m_panAckTimer->Stop();
+    m_panAckFrames = 0;
+}
+
+// A composite is waiting in the back buffer and the translation that goes with it has just been
+// written. Wait two CompositionTarget::Rendering events - the first ends the frame our assignment
+// belongs to, the second guarantees it has been composed - then let the engine swap. Rearming while
+// already armed just restarts the count, which is what a second scroll frame wants. The timer is
+// the escape hatch for "Rendering stopped firing" (app going to the background mid-gesture).
+void MainPage::ArmPanPresentAck()
+{
+    m_panAckFrames = 2;
+    if (!m_panAckArmed) {
+        m_panAckArmed = true;
+        m_panAckToken = CompositionTarget::Rendering +=
+            ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanAckRendering);
+    }
+    if (!m_panAckTimer) {
+        m_panAckTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        m_panAckTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanAckTimeout);
+    }
+    Windows::Foundation::TimeSpan ts; ts.Duration = 600000LL;   // 60 ms (100 ns units)
+    m_panAckTimer->Stop();
+    m_panAckTimer->Interval = ts;
+    m_panAckTimer->Start();
+}
+
+void MainPage::OnPanAckRendering(Platform::Object^, Platform::Object^)
+{
+    if (--m_panAckFrames > 0) return;
+    ReleasePanPresent();
+}
+
+void MainPage::OnPanAckTimeout(Platform::Object^, Platform::Object^)
+{
+    ReleasePanPresent();
+}
+
+// The translation is on screen: let the engine show the frame that belongs to it. If the gesture is
+// over and nothing is queued behind this, the same engine hop also hands the presents back - one
+// post, so no other present can slip between the two.
+void MainPage::ReleasePanPresent()
+{
+    DisarmPanAck();
+    if (!m_panDefer) return;
+    const bool finish = !m_panGestureOn && !m_scrollBusy && m_scrollAccum == 0 && m_scrollAccumX == 0;
+    if (finish) m_panDefer = false;
+    WebEngine::instance().post([finish]() {
+        try { WebCorePresent(); if (finish) WebCoreSetPanGesture(0); } catch (...) {}
+    });
+    if (finish && !m_loading) StartLiveMode();
 }
 
 // Apotheosis: one place that decides what sits on the presenting element. The pinch preview scale
@@ -2571,6 +2742,11 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
         m_dragReleasePending = true;
         PumpDrag();
     }
+    // Apotheosis (pan present handshake, step 4): the gesture (including its inertia - a
+    // ManipulationCompleted only arrives once inertia has run out) is over. Commit the offset the
+    // coarse gate held back in one step and let its frame release the last swap, so the final
+    // present and the snap of the translation to identity happen in the same UI frame.
+    PanGestureEnd();
     ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     if (!m_pinching) return;
@@ -2930,6 +3106,12 @@ void MainPage::OnPresentWake()
 void MainPage::ScheduleWakeComposite()
 {
     if (!m_eventPresent || !m_wakePending) return;
+    // Apotheosis (pan present handshake): the engine presents only from our scroll jobs while a pan
+    // owns the screen. m_wakePending stays set, so the wake is served as soon as the gesture ends
+    // (PanDeferOff/ReleasePanPresent call StartLiveMode). Not queueing the tick at all - rather
+    // than only suppressing its swap in the driver - is also what keeps the engine thread free for
+    // the scroll jobs the finger is waiting on.
+    if (m_panDefer) return;
     if (m_liveBusy) return;                 // 上一帧还没回;它回来时会重新排
     if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
@@ -2970,6 +3152,7 @@ void MainPage::OnFallbackTick(Platform::Object^, Platform::Object^)
 {
     if (!m_eventPresent) { if (m_fallbackTimer) m_fallbackTimer->Stop(); return; }
     if (!m_sessionActive || !m_appForeground) return;
+    if (m_panDefer) return;   // Apotheosis (pan present handshake): the gesture owns the presents
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
         || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
         || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
@@ -2997,6 +3180,7 @@ void MainPage::OnFallbackTick(Platform::Object^, Platform::Object^)
 void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
 {
     if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
+    if (m_panDefer) return;   // Apotheosis (pan present handshake): the gesture owns the presents
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
         || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
         || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
