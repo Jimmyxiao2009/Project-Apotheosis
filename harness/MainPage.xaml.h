@@ -466,6 +466,10 @@ namespace Harness {
         //   libGLESv2 AV class), so the panel is translated instead of given a top margin. Always
         //   the outermost transform on GpuPanel — see ApplyPresentTransform().
         Windows::UI::Xaml::Media::TranslateTransform^ m_gpuInset;
+        // Apotheosis (review 2026-09-04 item 2): last insets ApplyViewInsets() actually applied.
+        //   It is called from every source that could move an edge, so most calls are no-ops.
+        double m_lastInsetTop { 0.0 }, m_lastInsetBottom { 0.0 };
+        bool   m_insetsValid { false };
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         int  m_panRemX { 0 }, m_panRemY { 0 };
         // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Only used to

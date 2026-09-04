@@ -1113,6 +1113,16 @@ void MainPage::ApplyViewInsets()
     } catch (...) { return; }
     if (!(top > 0.0)) top = 0.0;
     if (!(bottom > 0.0)) bottom = 0.0;
+    // Apotheosis (review 2026-09-04 item 2): at least five sources call this (page Loaded, window
+    //   SizeChanged, VisibleBoundsChanged, the Hide-status-bar setting, the OOBE/settings overlays),
+    //   several of them repeatedly for one user action. Everything below writes layout properties
+    //   and rebuilds the presenting element's transform stack, so do none of it while the edges are
+    //   where we last left them.
+    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom)
+        return;
+    m_insetsValid = true;
+    m_lastInsetTop = top;
+    m_lastInsetBottom = bottom;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
     if (Progress) Progress->Margin = topPad;
     if (FindBar) FindBar->Margin = topPad;
