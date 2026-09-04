@@ -2552,6 +2552,22 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     // the moment anything scrolls between the composite and the acknowledgement (a click's
     // scrollIntoView, the engine's own anchoring, a second job overtaking this completion). Build
     // the translation from that frame's own position.
+    //
+    // Apotheosis (deferred transform commit): but not YET. That frame is still in the back buffer,
+    // and the acknowledgement that releases it is two CompositionTarget::Rendering events away
+    // (ArmPanPresentAck). Committing its translation here puts the OLD content under the NEW
+    // translation for those two frames — a backwards jump of one coarse engine step, twice per
+    // screen of panning, which is exactly the artefact on device. Leave the transform as the finger
+    // left it and let ReleasePanPresent() commit the corrected one in the same UI turn as the
+    // present: at most one frame of mismatch, in the forward direction, instead of two backwards.
+    const bool deferTransform = haveOwedSwap && m_panDefer && m_panBaseValid;
+    if (deferTransform) {
+        m_scrollX = newScrollX;
+        m_scrollY = newScrollY;
+        m_scrollStateValid = true;
+        m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2)
+        return;
+    }
     if (!(haveOwedSwap && PanRemainderFromFrame(swapScrollX, swapScrollY))) {
         if (m_scrollStateValid) {
             m_panRemX -= (newScrollX - m_scrollX);
@@ -2926,9 +2942,20 @@ void MainPage::ReleasePanPresent()
     // when the gesture ends, and the driver arms a real present wake at WebCoreSetPanGesture(0).
     // Take the record before DisarmPanAck() drops it; id 0 keeps the old "whatever is owed" meaning
     // and is what the paths that never saw a composite (timeout on an idle gesture) want.
-    const unsigned long long swapId = m_panSwapValid ? m_panSwapId : 0ull;
+    const bool haveSwap = m_panSwapValid;
+    const unsigned long long swapId = haveSwap ? m_panSwapId : 0ull;
+    const int swapX = m_panSwapX, swapY = m_panSwapY;
     DisarmPanAck();
     if (!m_panDefer) return;
+    // Apotheosis (deferred transform commit): the translation that belongs to this frame is written
+    // HERE, one UI turn before the swap, instead of when the completion landed two Rendering events
+    // ago — see InstantPanApplied(). Built from the finger's total as it is right now, so the deltas
+    // that arrived during those two frames are in it; the frame's own scroll position is what it is
+    // measured against.
+    if (haveSwap && PanRemainderFromFrame(swapX, swapY)) {
+        ClampPanRemainder();
+        ApplyPanTransform();
+    }
     const bool finish = !m_panGestureOn && !m_scrollBusy && m_scrollAccum == 0 && m_scrollAccumX == 0;
     if (finish) m_panDefer = false;
     WebEngine::instance().post([finish, swapId]() {
