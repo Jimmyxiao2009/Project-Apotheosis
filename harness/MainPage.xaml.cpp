@@ -2903,6 +2903,12 @@ void MainPage::PanGestureEnd()
         //   be stale by the time the gesture actually ends; re-clamp against the current cache.
         ClampPanAbs();
         try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 0); } catch (...) {}
+        // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): every composite during the gesture took the
+        // engine's scroll fast path, so the frame the page settles on is drawn from whatever tiles
+        // survived the coarse steps - on device that was the page background and nothing else. In
+        // presenter mode WebCoreSetPanGesture(0) is not a handshake any more (see the driver), it
+        // means exactly "the gesture is over: make the next composite a full one and ask for it".
+        WebEngine::instance().post([]() { try { WebCoreSetPanGesture(0); } catch (...) {} });
     }
     if (m_scrollBusy) return;                                   // its completion finishes this
     if (m_scrollAccum != 0 || m_scrollAccumX != 0) { PumpScroll(); return; }

@@ -287,7 +287,13 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 // scroll present). WebCorePresent() releases a deferred swap; the harness posts it once XAML has
 // committed the matching translation. WebCoreSetPanGesture(0) hands presents back and asks for one
 // full composite. Both engine thread only; WebCorePresent is idempotent and a no-op when nothing
-// is owed. Returns 0 (kOK). BOTH ARE NO-OPS while the presenter thread owns the swap chain.
+// is owed. Returns 0 (kOK). WebCorePresent is a no-op while the presenter thread owns the swap
+// chain.
+// Apotheosis (2026-09-04): WebCoreSetPanGesture is NOT a no-op there any more. With the presenter
+// on, WebCoreSetPanGesture(0) means only "the pan gesture is over": it forces the next composite to
+// force-dirty the whole tree and asks for that composite. Every frame during a pan is drawn on the
+// scroll fast path, so without it the page settles on whatever tiles the coarse steps left behind -
+// on device, the page background and nothing else. WebCoreSetPanGesture(1) stays a no-op there.
 
 // Apotheosis (presenter thread): the swap chain has exactly one owner, a dedicated presenter
 // thread, instead of being written by the engine thread and transformed by the UI thread. The

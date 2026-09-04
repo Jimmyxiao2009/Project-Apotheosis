@@ -120,6 +120,13 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 // the switch is here so the device can A/B it without a rebuild. Declared by hand for the same
 // reason as everything above - the texmap header would drag in TextureMapperGLHeaders.h.
 void wkWinUWPSetStaleTiles(bool);
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): how often a visible tile has run out of composites
+// to draw something (TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles, counted inside
+// paintToTextureMapper). A LEVEL, not a snapshot - the interesting quantity is the delta across one
+// composite: "this paint walked over visible tiles that hold no pixels". That is the authoritative
+// version of the pixel probe this replaces. Declared by hand for the same reason as everything
+// above - the texmap header would drag in TextureMapperGLHeaders.h.
+unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -623,7 +630,7 @@ static std::atomic<unsigned> g_presEngineDrops { 0 };    // engine dropped a com
 static std::atomic<int> g_presLastEglError { 0 };        // eglGetError() after the last swap
 static std::atomic<int> g_presProbeContent { -1 };       // pixels != clear colour in the last probe block
 static std::atomic<int> g_presProbeTotal { 0 };
-static std::atomic<unsigned> g_presSkipEmpty { 0 };      // publishes suppressed: the composite drew nothing
+static std::atomic<unsigned> g_presSkipEmpty { 0 };      // light composites redrawn in full: unpainted visible tiles
 
 // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): the engine may publish a slot that holds nothing
 // but the clear colour.
@@ -645,17 +652,22 @@ static std::atomic<unsigned> g_presSkipEmpty { 0 };      // publishes suppressed
 // colour. The engine-side repair (keeping stale tiles) is a separate change; what belongs HERE is
 // that a composite which drew nothing must not be published over a good frame.
 //
-// So: after a light composite, sample the slot (three rows, on the FBO that is still bound) and
-// compare against the clear colour. Nothing but background where the previous published frame had
-// content = do not publish, keep the frame that is on screen, and force the NEXT composite to
-// force-dirty the whole tree so the tiles come back. Bounded by kPresMaxEmptySkips so a page that
-// really is blank cannot be held back for ever. Full composites are never probed and never
-// suppressed: a force-dirtied tree that paints background IS background.
+// Apotheosis (2026-09-04, device package 13): the pixel probe this block first described was the
+// wrong instrument. On device it PASSED - the light composite draws the layer's background colour,
+// which is not the clear colour, so "did anything at all get drawn" says yes - while the frame held
+// no content tile whatsoever and the screen showed nothing but github's dark grey. The engine
+// already knows the answer exactly: wkWinUWPTexmapUnpaintedVisibleTiles() counts, inside the paint
+// itself, every visible tile that has run out of composites to produce pixels. Its delta across one
+// paint is therefore the authoritative "this frame is missing content".
+//
+// So the rule is now: a LIGHT composite that walked over unpainted visible tiles is not published.
+// It is redrawn in full - force-dirty the whole tree, update every backing store, paint again into
+// the same slot - and THAT frame is published. Exactly what the pre-presenter path did for every
+// frame, at the cost of one full composite in the rare case; a full composite is trusted
+// unconditionally, so this can never loop.
 static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tree this composite
 static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
-static int g_presEmptySkips = 0;              // consecutive publishes suppressed (engine thread)
-static int g_presLastPublishedContent = -1;   // probe of the last frame we published, -1 = never probed
-static constexpr int kPresMaxEmptySkips = 4;
+static int g_gpuLastUnpainted = 0;            // unpainted-visible-tile events in the last paint (diagnostics)
 
 struct PresenterState {
     WTF::Lock lock;
@@ -2303,7 +2315,7 @@ static void presenterStatsDump(const char* why)
         g_presSkipSuspended.load(std::memory_order_relaxed), g_presSkipNoTex.load(std::memory_order_relaxed),
         g_presSkipEmpty.load(std::memory_order_relaxed),
         g_presEngineDrops.load(std::memory_order_relaxed),
-        probe, g_presProbeTotal.load(std::memory_order_relaxed), g_presLastPublishedContent,
+        probe, g_presProbeTotal.load(std::memory_order_relaxed), g_gpuLastUnpainted,
         static_cast<unsigned>(g_presLastEglError.load(std::memory_order_relaxed)),
         g_gpuW, g_gpuH);
     std::fclose(fp);
@@ -2698,52 +2710,17 @@ static bool presenterStart(void* nativeWindow, int w, int h)
     return false;
 }
 
-// Apotheosis (WHITE-AT-SCROLL-END): is the finger (not its decaying residual) driving the pan
-// right now? Engine thread; takes the presenter lock like every other reader. Used to keep the
-// probe below off the hot scroll path - while the gesture runs, every composite is a scroll
-// composite and the content is demonstrably there.
-static bool presenterPanActive()
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): paint the tree and report how many visible tiles
+// ran out of composites to produce pixels while doing so. wkWinUWPTexmapUnpaintedVisibleTiles() is
+// a level that TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles() bumps from inside
+// paintToTextureMapper(), so the delta across this call is exactly "this frame is missing content",
+// measured by the engine itself instead of guessed from a pixel sample. Costs nothing: two reads of
+// a static unsigned.
+static unsigned gpuPaintTree(WebCore::GraphicsLayerTextureMapper& glRoot)
 {
-    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
-    if (!pres)
-        return false;
-    Locker locker { pres->lock };
-    return pres->panActive;
-}
-
-// Apotheosis (WHITE-AT-SCROLL-END): "did this composite actually paint anything?", measured on the
-// render target that is still bound (call between paint() and endPainting(), exactly where
-// gpuCompositeReadback does its readback). Three rows rather than one block: a single band across
-// a page can legitimately fall between two lines of text, three at a quarter, a half and three
-// quarters of the height practically cannot all miss content. ~8 KB of readback, and only on light
-// composites outside a live gesture (see the caller), so it never touches the scroll path.
-// Returns the number of sampled pixels that differ from `bg`, or -1 when it could not sample.
-static int gpuProbeContent(int w, int h, const WebCore::Color& bg)
-{
-    if (w <= 0 || h <= 0)
-        return -1;
-    auto [bgrf, bggf, bgbf, bgaf] = bg.toColorTypeLossy<WebCore::SRGBA<float>>().resolved();
-    (void)bgaf;
-    const int bgR = static_cast<int>(bgrf * 255.0f + 0.5f);
-    const int bgG = static_cast<int>(bggf * 255.0f + 0.5f);
-    const int bgB = static_cast<int>(bgbf * 255.0f + 0.5f);
-    static std::vector<uint8_t> row;
-    row.resize(static_cast<size_t>(w) * 4);
-    const int ys[3] = { h / 4, h / 2, (h * 3) / 4 };
-    int differ = 0;
-    for (int i = 0; i < 3; ++i) {
-        const int y = ys[i];
-        if (y < 0 || y >= h)
-            continue;
-        glReadPixels(0, y, w, 1, GL_RGBA, GL_UNSIGNED_BYTE, row.data());
-        for (int x = 0; x < w; ++x) {
-            const uint8_t* s = row.data() + static_cast<size_t>(x) * 4;
-            if (std::abs(static_cast<int>(s[0]) - bgR) + std::abs(static_cast<int>(s[1]) - bgG)
-                + std::abs(static_cast<int>(s[2]) - bgB) > 24)
-                ++differ;
-        }
-    }
-    return differ;
+    const unsigned before = WebCore::wkWinUWPTexmapUnpaintedVisibleTiles();
+    glRoot.layer().paint(*g_textureMapper);
+    return WebCore::wkWinUWPTexmapUnpaintedVisibleTiles() - before;
 }
 
 // 直呈现:把图层树合成进默认帧缓冲(GpuInit 绑的窗口表面)并 eglSwapBuffers。返回 kOK / 负错误码。
@@ -2790,34 +2767,42 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
         g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
         g_textureMapper->clearColor(docBg);
-        int drew = -1;
+        unsigned unpainted = 0;
         {
             PerfPhase perfPaint(&g_perfCur.paint);
-            glRoot.layer().paint(*g_textureMapper);
-            // Apotheosis (WHITE-AT-SCROLL-END): while the target FBO is still bound. Only a light
-            // composite outside a live gesture is worth the ~8 KB readback - see gpuProbeContent().
-            if (!g_gpuLastCompositeFull && !presenterPanActive())
-                drew = gpuProbeContent(w, h, docBg);
+            unpainted = gpuPaintTree(glRoot);
             g_textureMapper->endPainting();
         }
-        // Apotheosis (WHITE-AT-SCROLL-END): a fast-path composite that painted nothing at all is
-        // not a frame, it is a cleared slot. Publishing it replaces a good frame with white (the
-        // device symptom); keeping the published one costs at most a few stale frames and the
-        // forced full composite below brings the tiles back within one tick. Only ever suppressed
-        // when the frame we are protecting demonstrably HAD content, and never more than
-        // kPresMaxEmptySkips in a row, so a page that is genuinely blank still gets through.
-        if (drew == 0 && g_presLastPublishedContent > 0 && g_presEmptySkips < kPresMaxEmptySkips) {
-            ++g_presEmptySkips;
+        g_gpuLastUnpainted = static_cast<int>(unpainted);
+        // Apotheosis (WHITE-AT-SCROLL-END, device package 13): a LIGHT composite that walked over
+        // visible tiles holding no pixels is not a frame, it is a background-coloured slot - which
+        // is precisely what the device shows at the end of a pan: the coarse WebCoreScrollBy steps
+        // move the visible rect past the painted cover, the tiles outside the keep rect are gone,
+        // and the fast path (g_gpuScrollFast: no forceDirtyTree, no backing-store update) has
+        // nothing to draw. The old pixel probe could not see this - the layer background IS drawn,
+        // so "something was painted" was true while no content existed.
+        //
+        // Do what the pre-presenter path did for every frame: redraw this one in full, right here,
+        // into the same slot, and publish THAT. One extra composite in the rare case, and it cannot
+        // loop - a force-dirtied tree is trusted unconditionally (it repaints every backing store,
+        // so tiles that draw nothing afterwards genuinely have nothing to draw).
+        if (unpainted && !g_gpuLastCompositeFull) {
             g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
-            g_gpuForceFullNext = true;              // the next composite repaints the whole tree
-            if (g_session && g_session->chrome)
-                g_session->chrome->setNeedsPresent();
-            WebCorePort::presentRequested();        // and make sure that composite is actually asked for
-            return kOK;
+            g_gpuForceFullNext = true;              // consumed by the gpuPrepare on the next line
+            gpuPrepare(view, glRoot);               // force-dirty the tree + update every backing store
+            docBg = view.documentBackgroundColor();
+            if (!docBg.isValid())
+                docBg = Color::white;
+            glViewport(0, 0, w, h);
+            target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
+            g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
+            g_textureMapper->clearColor(docBg);
+            {
+                PerfPhase perfPaint(&g_perfCur.paint);
+                glRoot.layer().paint(*g_textureMapper);
+                g_textureMapper->endPainting();
+            }
         }
-        g_presEmptySkips = 0;
-        if (drew >= 0)
-            g_presLastPublishedContent = drew;
         {
             PerfPhase perfSwap(&g_perfCur.swap);   // M4: fence + publish (the swap itself is the presenter's)
             const IntPoint scroll = view.scrollPosition();
@@ -2832,10 +2817,34 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         Color docBg = view.documentBackgroundColor();
         g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);   // 文档 base 背景(同 readback,见上)
     }
+    unsigned unpaintedDirect = 0;
     {
         PerfPhase perfPaint(&g_perfCur.paint);      // M4: TextureMapper composite into the default framebuffer
-        glRoot.layer().paint(*g_textureMapper);
+        unpaintedDirect = gpuPaintTree(glRoot);
         g_textureMapper->endPainting();
+    }
+    g_gpuLastUnpainted = static_cast<int>(unpaintedDirect);
+    // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): the same rule as in the presenter branch above,
+    // and for the same reason - a coarse WebCoreScrollBy step can move the visible rect past the
+    // painted cover, and the scroll fast path has no way to paint the tiles that were dropped. Here
+    // the back buffer is not published but swapped, so the repair has to happen before the swap:
+    // redo the composite in full (force-dirty + backing-store update, i.e. what this path always did
+    // before g_gpuScrollFast existed) and swap THAT. Cannot loop: a full composite is never redone.
+    if (unpaintedDirect && !g_gpuLastCompositeFull) {
+        g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
+        g_gpuForceFullNext = true;                  // consumed by the gpuPrepare on the next line
+        gpuPrepare(view, glRoot);
+        glViewport(0, 0, w, h);
+        g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);
+        {
+            Color docBg = view.documentBackgroundColor();
+            g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);
+        }
+        {
+            PerfPhase perfPaint(&g_perfCur.paint);
+            glRoot.layer().paint(*g_textureMapper);
+            g_textureMapper->endPainting();
+        }
     }
     // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
     // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
@@ -3147,13 +3156,11 @@ static void teardownSession()
         g_glContext->makeContextCurrent();
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
-    // Apotheosis (WHITE-AT-SCROLL-END): "the last published frame had content" is a statement about
-    // the page that is going away. A new session must be able to publish its first (possibly
-    // background-only) frame, and its first composite must force-dirty.
+    // Apotheosis (WHITE-AT-SCROLL-END): the tile bookkeeping describes the page that is going away.
+    // The new session's first composite must force-dirty.
     g_gpuForceFullNext = true;
     g_gpuLastCompositeFull = false;
-    g_presEmptySkips = 0;
-    g_presLastPublishedContent = -1;
+    g_gpuLastUnpainted = 0;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
     // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
     // the deferral (a new session must present normally) and the swap it may still owe - the back
@@ -5382,14 +5389,28 @@ int WebCoreComposite()
 void WebCoreSetPanGesture(int active)
 {
     // Apotheosis (presenter thread): the presenter owns the swap chain, there is no swap on this
-    // thread to defer and no XAML transform to stay in step with. No-op.
-    if (g_presenterActive.load())
+    // thread to defer and no XAML transform to stay in step with - but the END of a gesture still
+    // means something here (2026-09-04, device package 13). Every composite during the pan took the
+    // scroll fast path, so the last frame of the gesture is drawn from whatever tiles survived the
+    // coarse steps; the first frame after it must be a FULL one, or the page settles on a
+    // background-coloured slot. The harness posts this at PanGestureEnd in presenter mode too.
+    if (g_presenterActive.load()) {
+        if (!active) {
+            g_gpuForceFullNext = true;
+            if (g_session && g_session->chrome)
+                g_session->chrome->setNeedsPresent();
+            WebCorePort::presentRequested();
+        }
         return;
+    }
     const bool on = (active != 0);
     if (g_panGesture == on)
         return;
     g_panGesture = on;
     if (!on && g_session && g_session->chrome) {
+        // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make that composite a FULL one - see
+        // the presenter branch above, the reasoning is identical for the window-surface path.
+        g_gpuForceFullNext = true;
         g_session->chrome->setNeedsPresent();
         // Apotheosis (XAML-path consistency review, 2026-09-04): and ASK for that composite. Every
         // tick during the gesture disarmed the present wake at its top (presentWakeDisarm) and then
