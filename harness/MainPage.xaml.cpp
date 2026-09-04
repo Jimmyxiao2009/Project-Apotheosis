@@ -3211,7 +3211,12 @@ void MainPage::ApplyStaleTilesSetting()
 //   all it is allowed to do is post: CoreDispatcher is agile, RunAsync is fire-and-forget, and the
 //   whole live-loop state (m_liveBusy, the timers, the rate limit) lives on the UI thread where
 //   OnPresentWake then runs. No engine call, no wait — 线程铁律 intact in both directions.
-//   Both globals are written on the UI thread before the callback is registered on the engine one.
+//   Apotheosis (review 2026-09-04 item 5): both globals are written EXACTLY ONCE, on the UI
+//   thread, before the callback is first registered on the engine one - see the one-shot guard in
+//   ApplyEventPresentSetting(). They used to be reassigned on every Settings-page close, i.e.
+//   while PresentWakeThunk was reading them from the engine thread and from raster workers;
+//   Platform::Agile assignment is a refcount swap, not an atomic store, so that was a genuine
+//   data race on a pointer a worker thread was about to dereference.
 static Platform::Agile<Windows::UI::Core::CoreDispatcher^> g_wakeDispatcher;
 static Platform::Agile<Harness::MainPage^> g_wakePage;
 
@@ -3235,8 +3240,17 @@ static void PresentWakeThunk(void*)
 //   UI thread; the registration itself is posted to the engine thread as the ABI demands.
 void MainPage::ApplyEventPresentSetting()
 {
-    g_wakeDispatcher = this->Dispatcher;
-    g_wakePage = this;
+    // Apotheosis (review 2026-09-04 item 5): bind the wake context once and never touch it again.
+    //   Both values are constant for the life of the page (the window's CoreDispatcher and `this`),
+    //   so there is nothing to update on a later call - and the first write still happens-before
+    //   the registration below, which is posted to the engine thread. Toggling the setting off and
+    //   on again therefore only ever (un)registers the callback; the readers keep a stable target.
+    static bool s_wakeBound = false;   // UI thread only
+    if (!s_wakeBound) {
+        g_wakeDispatcher = this->Dispatcher;
+        g_wakePage = this;
+        s_wakeBound = true;
+    }
     const bool on = m_eventPresent;
     WebEngine::instance().post([on]() {
         try { WebCoreSetPresentRequestCallback(on ? &PresentWakeThunk : nullptr, nullptr); } catch (...) {}
