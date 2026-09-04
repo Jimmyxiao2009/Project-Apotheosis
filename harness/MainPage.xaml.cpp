@@ -3749,6 +3749,12 @@ void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
         ++m_opSeq;
         m_interacting = false;
         if (m_loadWatchdog) m_loadWatchdog->Stop();
+        // Apotheosis (review 2026-09-04 item 6): the session is about to go away, so hand the
+        //   presents back first. Stop can be hit while a pan is still deferring them (m_panDefer),
+        //   and after the teardown nothing would ever call PanGestureEnd/PanDeferOff — the engine
+        //   would stay in "present only when we ask" mode into the next page. Same reason
+        //   NavigateTo calls it.
+        PanDeferOff();
         WebEngine::instance().post([]() { try { WebCoreCloseSession(); } catch (...) {} });
         m_sessionActive = false;
         ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
