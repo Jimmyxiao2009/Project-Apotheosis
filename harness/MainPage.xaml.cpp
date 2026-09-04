@@ -168,8 +168,24 @@ static void WriteStage(const char* stage)
 // crash dump once it is exceeded (github.com ≈620 MB → ntv.de). One compact snapshot of the OS view
 // of our own working set, appended to the stage lines so WDP can pull the numbers back.
 // 这三个 API 在 15254 上都有;取不到就返回 "mem=n/a",绝不影响调用点。
+// Apotheosis (review 2026-09-04 item 1): AppMemoryUsage/Limit only track the UWP App Container's
+// assigned memory budget, never the flat 32-bit address space every allocation still has to fit
+// in. The Google Maps abort (night6, 2026-09-04 ~02:35, DAY-REPORT.md) happened at 57% of that
+// budget (pressure level still 0) with GlobalMemoryStatusEx().ullAvailVirtual down to 271 MB — a
+// single large contiguous allocation (BitmapTexturePool::Entry vector) failed long before the
+// budget percentage said anything was wrong. The driver already reads this same field; sampled
+// here too so SampleMemoryPressure() below can react to it and mem.txt can show it.
+static unsigned long long AvailVirtMB()
+{
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return ~0ULL;   // unavailable -> "plenty", never fabricate pressure
+    return ms.ullAvailVirtual / (1024ULL * 1024ULL);
+}
+
 static std::string MemSnapshot()
 {
+    std::string s;
     try {
         unsigned long long used = Windows::System::MemoryManager::AppMemoryUsage;
         unsigned long long limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
@@ -184,9 +200,12 @@ static std::string MemSnapshot()
         }
         const unsigned long long kMB = 1024ULL * 1024ULL;
         int pct = (limit > 0) ? (int)((used * 100ULL) / limit) : 0;
-        return "mem=" + std::to_string(used / kMB) + "/" + std::to_string(limit / kMB)
-             + "MB(" + std::to_string(pct) + "%) lvl=" + std::string(lvlName);
-    } catch (...) { return std::string("mem=n/a"); }
+        s = "mem=" + std::to_string(used / kMB) + "/" + std::to_string(limit / kMB)
+          + "MB(" + std::to_string(pct) + "%) lvl=" + std::string(lvlName);
+    } catch (...) { s = "mem=n/a"; }
+    unsigned long long availVirt = AvailVirtMB();
+    s += " avail_virt=" + (availVirt == ~0ULL ? std::string("n/a") : std::to_string(availVirt) + "MB");
+    return s;
 }
 
 // Apotheosis (M4): stage.txt is truncated on every write (it is the "where are we now" marker), so
@@ -251,31 +270,55 @@ static void ApplyMemoryPressure(int level, const std::string& why)
                 + " (" + why + ") " + MemSnapshot());
 }
 
-// ENGINE THREAD ONLY. Two property reads per call, so it is cheap enough for every live tick;
-// the engine is only touched on an actual transition. Hysteresis: up at 65 %/80 %, down at
-// 60 %/75 %, and never straight from 2 back to 0.
+// ENGINE THREAD ONLY. Cheap enough for every live tick; the engine is only touched on an actual
+// transition. Two independent signals, each with its own hysteresis (up at 65%/80% budget or
+// <400/<250 MB free address space, down at 60%/75% or >450/>300 MB, never straight from 2 back to
+// 0) — whichever wants more pressure wins, since either running out is a real abort risk (review
+// 2026-09-04 item 1: the Google Maps abort happened with the budget signal still at level 0).
 static void SampleMemoryPressure()
 {
     unsigned long long used = 0, limit = 0;
+    bool haveBudget = true;
     try {
         used = Windows::System::MemoryManager::AppMemoryUsage;
         limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
-    } catch (...) { return; }
-    if (!limit) return;
-    const int pct = (int)((used * 100ULL) / limit);
+    } catch (...) { haveBudget = false; }
+    unsigned long long availVirt = AvailVirtMB();
+    bool haveVirt = (availVirt != ~0ULL);
+    if ((!haveBudget || !limit) && !haveVirt) return;
+
     const int cur = g_engMemPressure;
-    int want = cur;
-    if (cur <= 0) {
-        if (pct >= 80) want = 2;
-        else if (pct >= 65) want = 1;
-    } else if (cur == 1) {
-        if (pct >= 80) want = 2;
-        else if (pct < 60) want = 0;
-    } else {
-        if (pct < 75) want = 1;
+    int pct = 0;
+    int wantPct = cur, wantVirt = cur;
+    if (haveBudget && limit) {
+        pct = (int)((used * 100ULL) / limit);
+        if (cur <= 0) {
+            if (pct >= 80) wantPct = 2;
+            else if (pct >= 65) wantPct = 1;
+        } else if (cur == 1) {
+            if (pct >= 80) wantPct = 2;
+            else if (pct < 60) wantPct = 0;
+        } else {
+            if (pct < 75) wantPct = 1;
+        }
     }
-    if (want != cur)
-        ApplyMemoryPressure(want, "sample pct=" + std::to_string(pct));
+    if (haveVirt) {
+        if (cur <= 0) {
+            if (availVirt < 250) wantVirt = 2;
+            else if (availVirt < 400) wantVirt = 1;
+        } else if (cur == 1) {
+            if (availVirt < 250) wantVirt = 2;
+            else if (availVirt > 450) wantVirt = 0;
+        } else {
+            if (availVirt > 300) wantVirt = 1;
+        }
+    }
+    const int want = (wantPct > wantVirt) ? wantPct : wantVirt;
+    if (want != cur) {
+        std::string why = "pct=" + std::to_string(pct)
+                         + " avail_virt=" + (haveVirt ? std::to_string(availVirt) + "MB" : std::string("n/a"));
+        ApplyMemoryPressure(want, "sample " + why);
+    }
 }
 
 // IME 诊断日志开关:仅当 LocalState\imedebug.txt 已存在(测试者经 WDP 放置,重启生效)才追加记录 ——
