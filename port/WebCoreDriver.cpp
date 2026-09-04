@@ -2234,7 +2234,28 @@ static void presenterThreadMain()
         // texture before sampling it. eglClientWaitSync with FLUSH_COMMANDS is the cheap way; with
         // no fence extension the engine did a glFinish() before publishing instead.
         if (fence && g_eglClientWaitSyncKHR) {
-            g_eglClientWaitSyncKHR(g_presenterEglDisplay, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ll /* 50 ms */);
+            const EGLint waited = g_eglClientWaitSyncKHR(g_presenterEglDisplay, fence,
+                EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ll /* 50 ms */);
+            if (waited != EGL_CONDITION_SATISFIED_KHR) {
+                // Apotheosis: the wait timed out (or failed) - the engine's composite has NOT
+                // landed in this texture, and drawing it now would put exactly the half-composited
+                // frame on screen that the fence exists to prevent. Skip the draw: put the fence
+                // back so the retry waits for the same composite (an EGL sync may be waited on
+                // any number of times), release the slot so the engine is not blocked meanwhile,
+                // and do not advance drawnGeneration, so this frame is still owed. Each retry
+                // costs another wait, so a GPU that never finishes throttles this loop to ~20
+                // attempts a second instead of spinning it.
+                Locker locker { P.lock };
+                PresenterFrame& pending = P.slot[idx];
+                if (!pending.fence)
+                    pending.fence = fence;
+                else if (g_eglDestroySyncKHR)
+                    g_eglDestroySyncKHR(g_presenterEglDisplay, fence);   // a newer publish replaced it
+                P.inUse = -1;
+                P.wake = true;
+                P.cond.notifyAll();
+                continue;
+            }
             if (g_eglDestroySyncKHR)
                 g_eglDestroySyncKHR(g_presenterEglDisplay, fence);
         }
