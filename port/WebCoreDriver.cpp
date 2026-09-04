@@ -124,6 +124,7 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 #include <WebCore/LayoutMilestone.h>     // Apotheosis (M4 load timeline): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
+#include <WebCore/FontLoadTimingOverride.h>  // Apotheosis (M4): FontLoadTimingOverride::Swap
 #include <WebCore/LocalFrame.h>          // WebCore::LocalFrame
 #include <WebCore/LocalFrameInlines.h>   // inline LocalFrame::document()/protectedDocument()
 #include <WebCore/LocalFrameView.h>      // WebCore::LocalFrameView
@@ -2333,6 +2334,16 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setAcceleratedCompositingEnabled(g_gpuActive);   // 仅 GPU 就绪才开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层),经 TextureMapper GPU 呈现
     page->settings().setForceCompositingMode(g_gpuActive);            // 同上;GPU 未起时关闭 → 纯软件 cairo,零回归
     page->settings().setShouldAllowUserInstalledFonts(false);
+    // Apotheosis (M4): never let a web font hold text back. CSSFontFace::fontLoadTiming() maps the
+    // default (FontLoadTimingOverride::None with font-display:auto/block, which is what most sites
+    // end up with) to a 3 s block period: for those three seconds the text is laid out but painted
+    // with nothing - on a phone whose first visually-non-empty layout we measure at 0.4 s. Swap
+    // overrides every face to { block 0 s, swap infinite }: the fallback font is painted
+    // immediately and replaced when the web font arrives. The trade-off is icon fonts - their code
+    // points have no fallback glyph, so a Font-Awesome-style icon is a blank box until it loads,
+    // and it cannot be exempted (the timing is per-face and nothing tells us a face is an icon
+    // font). Readable text at first paint is worth more here than icons arriving at the same time.
+    page->settings().setFontLoadTimingOverride(FontLoadTimingOverride::Swap);
     page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
