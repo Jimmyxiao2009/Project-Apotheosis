@@ -1123,13 +1123,30 @@ void MainPage::ApplyViewInsets()
     //   several of them repeatedly for one user action. Everything below writes layout properties
     //   and rebuilds the presenting element's transform stack, so do none of it while the edges are
     //   where we last left them.
-    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom)
+    // Apotheosis (review 2026-09-04 item 5): the title row's height is XAML's to decide — read it
+    //   back instead of duplicating the literal here, where the two silently drift apart. Before the
+    //   first arrange ActualHeight is still 0; TitleBar->Height carries the value the markup set
+    //   (NaN only if the markup ever drops it, hence the guard and the last-resort literal).
+    double titleH = 0.0;
+    if (TitleBar) {
+        titleH = TitleBar->ActualHeight;
+        if (!(titleH > 0.0)) {
+            const double declared = TitleBar->Height;
+            if (declared > 0.0 && declared < 1.0e6) titleH = declared;   // false for NaN
+        }
+        if (!(titleH > 0.0)) titleH = 26.0;
+    }
+    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && titleH == m_lastTitleH)
         return;
     m_insetsValid = true;
     m_lastInsetTop = top;
     m_lastInsetBottom = bottom;
+    m_lastTitleH = titleH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
-    if (Progress) Progress->Margin = topPad;
+    // Apotheosis (review 2026-09-04 item 5): Progress is declared after TitleBar, so at topPad it
+    //   painted its 3 DIP over the title row's top edge. It belongs under the row — the 6 DIP gap
+    //   between TitleBar's bottom and ContentBorder's top, where it covers neither.
+    if (Progress) Progress->Margin = Windows::UI::Xaml::Thickness(0, top + titleH, 0, 0);
     if (FindBar) FindBar->Margin = topPad;
     if (Drawer) Drawer->Padding = topPad;
     if (SettingsPage) SettingsPage->Padding = topPad;
@@ -1140,10 +1157,9 @@ void MainPage::ApplyViewInsets()
     //   y=0 inside their row, so the page ran under the shell's clock. They now get the same top
     //   inset as the chrome above, plus the height of TitleBar (the status/loading row, moved here
     //   from the bottom chrome — see MainPage.xaml): TitleBar sits right under the inset, content
-    //   starts right under TitleBar. kTitleBarHeight must match TitleBar's XAML Height.
-    const double kTitleBarHeight = 26.0;
+    //   starts right under TitleBar. titleH is read back from TitleBar above, not duplicated.
     if (TitleBar) TitleBar->Margin = topPad;
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + kTitleBarHeight + 6, 6, 0);
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + titleH + 6, 6, 0);
     // Apotheosis (review 2026-09-04 item 1): NEVER touch GpuPanel's size here. A margin shrinks the
     //   SwapChainPanel; XAML then reports a new size to ANGLE, which rebuilds the swap chain from
     //   the engine thread's next eglSwapBuffers (the libGLESv2 SEH-AV class of the first-launch
@@ -1156,7 +1172,7 @@ void MainPage::ApplyViewInsets()
     if (GpuPanel) {
         if (m_gpuInset == nullptr) m_gpuInset = ref new Windows::UI::Xaml::Media::TranslateTransform();
         m_gpuInset->X = 0.0;
-        m_gpuInset->Y = top + kTitleBarHeight;
+        m_gpuInset->Y = top + titleH;
         ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
     }
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
