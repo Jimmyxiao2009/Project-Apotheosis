@@ -233,6 +233,7 @@ namespace Harness {
                                int fallbackDx, int fallbackDy);   // an engine frame landed
         void InstantPanReset();                       // remainder → 0, transform → identity
         void ClampPanRemainder();                     // document bounds + one screen
+        void ClampPanAbs();                           // same document-bounds clamp for the presenter's m_panAbsX/Y
         void ApplyPanTransform();                     // remainder (engine px) → translation (DIP)
         void RequestScrollState();                    // seed the cached scroll/bounds (async)
         void RestartPanSnapTimer();                   // ~1 s after the last movement the engine wins

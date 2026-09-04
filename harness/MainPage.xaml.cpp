@@ -2235,6 +2235,7 @@ void MainPage::InstantPanBy(int dx, int dy)
     if (m_presenterActive) {
         m_panAbsX += dx;
         m_panAbsY += dy;
+        ClampPanAbs();
         try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 1); } catch (...) {}
         return;
     }
@@ -2326,6 +2327,27 @@ void MainPage::ClampPanRemainder()
     if (m_panRemX < -kW) m_panRemX = -kW;
     if (m_panRemY >  kH) m_panRemY =  kH;
     if (m_panRemY < -kH) m_panRemY = -kH;
+}
+
+// Apotheosis (2026-09-04 review): the presenter path (InstantPanBy/PanGestureEnd, m_presenterActive)
+//   accumulates raw finger deltas into m_panAbsX/Y and hands them straight to WebCoreSetPanOffset —
+//   it never went through ClampPanRemainder, which only ever touched m_panRemX/Y, the transform used
+//   by the non-presenter XAML path. Nothing stopped a fling past the top/bottom from dragging the
+//   whole page off screen instead of stopping at the edge. Same bound as ClampPanRemainder's
+//   document-bounds half (the "cap at one screen" half is the presenter's own job, per the comment in
+//   InstantPanBy): keep m_scrollX + m_panAbsX — what the presenter actually composites — inside
+//   [0, content - view]. No-op until the first scroll-state reply, same as ClampPanRemainder.
+void MainPage::ClampPanAbs()
+{
+    if (!m_scrollStateValid) return;
+    int maxX = m_contentW - m_viewW; if (maxX < 0) maxX = 0;
+    int maxY = m_contentH - m_viewH; if (maxY < 0) maxY = 0;
+    const int loX = -m_scrollX, hiX = maxX - m_scrollX;
+    const int loY = -m_scrollY, hiY = maxY - m_scrollY;
+    if (m_panAbsX < loX) m_panAbsX = loX;
+    if (m_panAbsX > hiX) m_panAbsX = hiX;
+    if (m_panAbsY < loY) m_panAbsY = loY;
+    if (m_panAbsY > hiY) m_panAbsY = hiY;
 }
 
 // Engine px → presenting-layer DIPs. Same DIP↔px factor as MapTapToEngine/SetPinchAnchor
@@ -2497,8 +2519,13 @@ void MainPage::PanGestureEnd()
     // screen. Tell the presenter the gesture ended and let it decay the residual as the engine
     // catches up (and snap to zero after a second if it never does) - the offset is deliberately
     // NOT reset to 0 here, that would put the pre-gesture frame back for one frame.
-    if (m_presenterActive)
+    if (m_presenterActive) {
+        // m_scrollX/Y may have moved since the last InstantPanBy (every landed engine frame updates
+        //   the cache — see InstantPanApplied's presenter branch), so the last-clamped m_panAbsX/Y can
+        //   be stale by the time the gesture actually ends; re-clamp against the current cache.
+        ClampPanAbs();
         try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 0); } catch (...) {}
+    }
     if (m_scrollBusy) return;                                   // its completion finishes this
     if (m_scrollAccum != 0 || m_scrollAccumX != 0) { PumpScroll(); return; }
     PanDeferOff();
