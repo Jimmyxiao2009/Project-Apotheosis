@@ -255,7 +255,7 @@ namespace Harness {
         bool PanFlushDue() const;     // the held-back scroll offset has grown past the coarse step
         void ArmPanPresentAck();      // wait for XAML to commit the transform, then release the swap
         void DisarmPanAck();          // stop waiting (superseded by a newer frame, or handed back)
-        void ReleasePanPresent();     // post WebCorePresent() (and, if we are done, SetPanGesture(0))
+        void ReleasePanPresent();     // post WebCorePresentFrame(id) (and, if we are done, SetPanGesture(0))
         void OnPanAckRendering(Platform::Object^ sender, Platform::Object^ e);
         void OnPanAckTimeout(Platform::Object^ sender, Platform::Object^ e);
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the

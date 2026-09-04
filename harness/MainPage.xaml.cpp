@@ -2916,12 +2916,23 @@ void MainPage::OnPanAckTimeout(Platform::Object^, Platform::Object^)
 // post, so no other present can slip between the two.
 void MainPage::ReleasePanPresent()
 {
+    // Apotheosis (owed-frame identity, driver b531043): name the frame. WebCorePresent() releases
+    // "whatever is owed", so an acknowledgement that reaches the engine queue behind a newer
+    // WebCoreScrollBy - or behind any other export that paints during a gesture (click, wheel,
+    // drag, pinch, session paint) - puts a frame on screen under a translation committed for a
+    // different one. WebCorePresentFrame(id) releases the composite only while it is still that
+    // frame and otherwise leaves it owed, so a mismatch costs a frame of latency instead of a jump:
+    // the next scroll completion arms a fresh ack for it, PanDeferOff's WebCorePresent() flushes it
+    // when the gesture ends, and the driver arms a real present wake at WebCoreSetPanGesture(0).
+    // Take the record before DisarmPanAck() drops it; id 0 keeps the old "whatever is owed" meaning
+    // and is what the paths that never saw a composite (timeout on an idle gesture) want.
+    const unsigned long long swapId = m_panSwapValid ? m_panSwapId : 0ull;
     DisarmPanAck();
     if (!m_panDefer) return;
     const bool finish = !m_panGestureOn && !m_scrollBusy && m_scrollAccum == 0 && m_scrollAccumX == 0;
     if (finish) m_panDefer = false;
-    WebEngine::instance().post([finish]() {
-        try { WebCorePresent(); if (finish) WebCoreSetPanGesture(0); } catch (...) {}
+    WebEngine::instance().post([finish, swapId]() {
+        try { WebCorePresentFrame(swapId); if (finish) WebCoreSetPanGesture(0); } catch (...) {}
     });
     if (finish && !m_loading) StartLiveMode();
 }
