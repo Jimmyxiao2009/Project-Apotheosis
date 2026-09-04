@@ -449,6 +449,16 @@ static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即�
 static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
+// Apotheosis (pan present handshake): during a main-frame touch pan the harness moves the already
+// presented pixels itself with a XAML TranslateTransform (instant pan) while the engine catches up
+// in coarse steps. The SwapChainPanel content and that transform are composed by DWM
+// independently, so ANY present the harness did not ask for shows new content under the old
+// translation for a frame - the "it briefly jumps back" flicker seen on device. While g_panGesture
+// is set the engine therefore presents nothing on its own: eglSwapBuffers is deferred (g_swapOwed)
+// and released by WebCorePresent(), which the harness posts once XAML has committed the matching
+// translation. Engine thread only, like every other flag here.
+static bool g_panGesture = false;
+static bool g_swapOwed = false;       // a composite ran whose swap was deferred and is still owed
 // Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
 // consumed is still in flight — moves/releases only reach the page while this is set, and
 // teardownSession() clears it. Engine thread only, like every other flag here.
@@ -1814,6 +1824,13 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         glRoot.layer().paint(*g_textureMapper);
         g_textureMapper->endPainting();
     }
+    // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
+    // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
+    // TranslateTransform on screen, or the two disagree for a frame. WebCorePresent() does the swap.
+    if (g_panGesture) {
+        g_swapOwed = true;
+        return kOK;
+    }
     {
         PerfPhase perfSwap(&g_perfCur.swap);        // M4: eglSwapBuffers → SwapChainPanel
         g_glContext->swapBuffers();
@@ -2109,6 +2126,11 @@ static void teardownSession()
         g_glContext->makeContextCurrent();
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
+    // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
+    // the deferral (a new session must present normally) and the swap it may still owe - the back
+    // buffer is about to be redrawn by the next session anyway.
+    g_panGesture = false;
+    g_swapOwed = false;
     // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
     // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
     // mousemove/mouseup into a document that never saw the press.
@@ -4062,6 +4084,42 @@ int WebCoreComposite()
     return gpuPresent(*view, g_gpuW, g_gpuH, *root);
 }
 
+// Apotheosis (pan present handshake): tell the engine that a main-frame pan gesture owns the
+// screen. While it does, nothing presents on its own initiative:
+//   - gpuPresent() composites into the back buffer but defers the eglSwapBuffers (g_swapOwed),
+//   - WebCoreLiveTick() skips its composite altogether, which also leaves the engine thread free
+//     for the harness' scroll jobs on a heavy page (github),
+// and the harness releases each swap with WebCorePresent() at the moment its own
+// TranslateTransform for that scroll position has been committed by XAML. Anything a wake-up,
+// timer, rAF or image decode changes in the meantime still happens - it simply becomes visible
+// with the next scroll present instead of racing the transform.
+// Engine thread only (post it like every other export); active=0 hands presents back and asks for
+// one full composite, because the ticks that ran during the gesture produced no pixels.
+void WebCoreSetPanGesture(int active)
+{
+    const bool on = (active != 0);
+    if (g_panGesture == on)
+        return;
+    g_panGesture = on;
+    if (!on && g_session && g_session->chrome)
+        g_session->chrome->setNeedsPresent();
+}
+
+// Apotheosis (pan present handshake): perform the swap a composite deferred while g_panGesture was
+// set. Cheap and idempotent - with nothing owed it does nothing, so the harness may post it freely
+// (it also flushes a swap left over after the gesture ended). Engine thread only.
+int WebCorePresent()
+{
+    if (!g_swapOwed)
+        return kOK;
+    g_swapOwed = false;
+    if (!g_gpuActive || !g_gpuPresentMode || !g_glContext)
+        return kOK;
+    g_glContext->makeContextCurrent();
+    g_glContext->swapBuffers();
+    return kOK;
+}
+
 // M2(离屏验证):把当前会话图层树经 TextureMapper 合成到离屏纹理,readback 出 RGBA 到 outRGBA(>= w*h*4)。
 //   用现有 WriteableBitmap 通道显示,先证合成像素正确。返回 0 成功。
 //   注:本版会话各绘制点已在 paintToRGBA 顶部自动走此路(GPU 起后),此导出供需要显式呈现时用。
@@ -4365,6 +4423,12 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
 
+    // Apotheosis (pan present handshake): safety net for an acknowledgement that never came back
+    // (a lost RunAsync, the app going to the background mid-gesture). The gesture is over, so a
+    // composited-but-unswapped frame must not stay invisible.
+    if (!g_panGesture && g_swapOwed)
+        WebCorePresent();
+
     // Apotheosis (event-driven present): the composite the last wake-up asked for starts here, so
     // re-arm the wake path. Anything invalidated from now on - including from inside this very
     // tick's isolatedUpdateRendering (a rAF callback re-registering, a CSS animation asking for the
@@ -4400,6 +4464,14 @@ int WebCoreLiveTick(uint8_t* outRGBA)
         doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });   // see gpuPrepare
     }
     g_lastPendingResources = countPendingResources(*doc);
+    // Apotheosis (pan present handshake): a pan gesture owns the screen. Everything above (rAF, WTF
+    // timers, finished decodes, style/layout) has run and stays in the tree; only the composite is
+    // skipped, because the sole thing allowed to reach the panel during a gesture is a present the
+    // harness asked for. That also leaves the engine thread to the scroll jobs, which is what the
+    // finger actually sees. needsPresent stays set (nothing consumed takeNeedsPresent), so the
+    // first composite after the gesture is a full one.
+    if (g_panGesture)
+        return kOK;
     int nonWhite = 0;
     // Apotheosis (M4): perf.csv showed every idle tick paying ~1 s in
     // updateBackingStoreIncludingSubLayers because gpuPrepare force-dirties the

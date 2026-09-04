@@ -260,6 +260,20 @@ void WebCoreSetThreadedRaster(int enabled);
 // block and must not call back into the engine - post to a queue and return. nullptr unregisters
 // (back to pure polling). Register from the engine thread, once, before the first navigation.
 void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
+// Apotheosis (pan present handshake): a main-frame touch pan is shown by the harness itself, as a
+// XAML TranslateTransform on the presenting element, while the engine catches up in coarse steps.
+// The panel content and that transform are composed independently, so any present the harness did
+// not ask for puts new content under the old translation for a frame (visible flicker/jump-back).
+// WebCoreSetPanGesture(1) therefore makes the engine present nothing on its own: composites still
+// happen but the eglSwapBuffers is deferred, and WebCoreLiveTick skips its composite entirely
+// (content updates - rAF, timers, decodes - still run, they just become visible with the next
+// scroll present). WebCorePresent() releases a deferred swap; the harness posts it once XAML has
+// committed the matching translation. WebCoreSetPanGesture(0) hands presents back and asks for one
+// full composite. Both engine thread only; WebCorePresent is idempotent and a no-op when nothing
+// is owed. Returns 0 (kOK).
+void WebCoreSetPanGesture(int active);
+int WebCorePresent(void);
+
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document
