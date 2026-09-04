@@ -2970,6 +2970,17 @@ void MainPage::OnPanAckRendering(Platform::Object^, Platform::Object^)
 
 void MainPage::OnPanAckTimeout(Platform::Object^, Platform::Object^)
 {
+    // Apotheosis (2026-09-04): this timer exists for one case only - CompositionTarget::Rendering
+    // stopped firing (the app went to the background mid-gesture) and the swap would otherwise stay
+    // owed for ever. It must not fire because the UI thread was merely busy: with a WebCoreScrollBy
+    // in flight the completion that lands next is about to arm a fresh acknowledgement for a NEWER
+    // frame, and releasing now puts the frame we are holding on screen under a translation that is
+    // one step out of date - the very artefact the handshake exists to prevent, produced by its own
+    // safety net. Wait another 60 ms instead; nothing is lost, the frame stays owed either way.
+    if (m_scrollBusy) {
+        if (m_panAckTimer) { m_panAckTimer->Stop(); m_panAckTimer->Start(); }
+        return;
+    }
     ReleasePanPresent();
 }
 
