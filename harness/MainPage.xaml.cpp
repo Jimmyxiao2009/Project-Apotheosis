@@ -2789,9 +2789,11 @@ void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
 // The rules while a main-frame pan gesture is running:
 //   1. The engine presents ONLY what we ask for. WebCoreSetPanGesture(1) defers every
 //      eglSwapBuffers and makes the live tick skip its composite (content updates still run).
-//   2. The engine is fed in coarse steps (FreeScrollBy / PanFlushDue): 1/3 of the viewport, so a
-//      whole screen of panning costs three presents instead of one per touch frame. The preview is
-//      capped at one screen anyway (ClampPanRemainder), so 1/3 keeps two thirds of margin.
+//   2. The engine is fed in coarse steps (FreeScrollBy / PanFlushDue): 1/6 of the viewport, so a
+//      whole screen of panning costs six presents instead of one per touch frame. The preview is
+//      capped at one screen anyway (ClampPanRemainder), so 1/6 keeps five sixths of margin - and
+//      the residual mismatch a released frame can carry is a fraction of one step, so a smaller
+//      step is a smaller artefact (see kPanStepX).
 //   3. Each present is released only after XAML has committed the matching translation
 //      (ArmPanPresentAck). This is the ordering that actually removes the artefact: a XAML property
 //      change is on screen at the next composition commit, an eglSwapBuffers is on screen at once,
@@ -2806,10 +2808,18 @@ void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
 // are invisible during a pan - the translation, not the engine, is what the finger sees moving.
 // ===========================================================================
 
-// The engine catches up in steps of a third of the viewport. Engine px, same units as
+// The engine catches up in steps of a sixth of the viewport. Engine px, same units as
 // m_scrollAccum/WebCoreScrollBy.
-static const int kPanStepX = kW / 3;
-static const int kPanStepY = kH / 3;
+//
+// Apotheosis (2026-09-04): it was a third. Whatever residual mismatch a released frame carries -
+// the one frame ReleasePanPresent() still cannot remove, a coarse step the engine clamped, a swap
+// that arrived out of order - is a fraction of ONE STEP, so the visible artefact scales directly
+// with the step size: halve the step, halve the jump. The cost is twice as many presents per screen
+// (six instead of three), each of which is a composite the engine was going to do anyway; the
+// preview is still capped at a full screen (ClampPanRemainder), so there is five sixths of margin
+// left instead of two thirds.
+static const int kPanStepX = kW / 6;
+static const int kPanStepY = kH / 6;
 
 bool MainPage::PanFlushDue() const
 {
