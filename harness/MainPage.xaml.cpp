@@ -2619,6 +2619,7 @@ void MainPage::InstantPanReset()
     m_panFingerY = 0;
     m_panBaseValid = false;
     if (m_panSnapTimer) m_panSnapTimer->Stop();
+    m_panSnapDeadline = 0;   // Apotheosis (pan snap decay): nothing is outstanding any more
     ApplyPanTransform();
 }
 
@@ -2757,21 +2758,56 @@ void MainPage::RestartPanSnapTimer()
 {
     if (m_panRemX == 0 && m_panRemY == 0) {
         if (m_panSnapTimer) m_panSnapTimer->Stop();
+        m_panSnapDeadline = 0;
         return;
     }
     if (!m_panSnapTimer) {
         m_panSnapTimer = ref new Windows::UI::Xaml::DispatcherTimer();
         m_panSnapTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanSnapTick);
     }
+    // Apotheosis (pan snap decay): the hard deadline the first tick may not cross. Measured from the
+    // last movement like the tick itself, so during a gesture it keeps moving out of reach.
+    m_panSnapDeadline = GetTickCount64() + 3000;
     Windows::Foundation::TimeSpan ts; ts.Duration = 10000000LL;   // 1 s (100 ns units)
     m_panSnapTimer->Stop();
     m_panSnapTimer->Interval = ts;
     m_panSnapTimer->Start();
 }
 
+// Apotheosis (pan snap decay): this used to be a bare InstantPanReset() — the translation was
+// zeroed a second after the last movement whether or not the engine had caught up. When it had not
+// (a load owns the engine thread, a swap is still owed, the last completion was superseded) the
+// content jumped back by the whole remainder in one frame and then forward again when the frame
+// finally landed: the "it settles, then twitches" on device.
+//
+// Do what the presenter does with the residual of a finished gesture instead. First RECOMPUTE
+// against the engine's actual position - a frame may well have landed since, and then there is
+// nothing left to snap at all. Whatever is still owed is given up gradually (halved every 100 ms,
+// finger total included so a later recompute does not put it back) rather than dropped in one
+// frame, and the hard reset only happens once the engine has caught up or 3 s after the last
+// movement, whichever comes first.
 void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
 {
-    InstantPanReset();
+    if (ScrollStateUsable() && PanRemainderFromFrame(m_scrollX, m_scrollY)) {
+        ClampPanRemainder();
+        ApplyPanTransform();
+    }
+    const unsigned long long now = GetTickCount64();
+    if ((m_panRemX == 0 && m_panRemY == 0) || m_panSnapDeadline == 0 || now >= m_panSnapDeadline) {
+        InstantPanReset();
+        return;
+    }
+    const int giveUpX = m_panRemX - m_panRemX / 2;   // integer division truncates towards zero,
+    const int giveUpY = m_panRemY - m_panRemY / 2;   // so this reaches 0 from either sign
+    m_panRemX -= giveUpX;
+    m_panRemY -= giveUpY;
+    m_panFingerX -= giveUpX;   // the finger no longer asks for what we just gave up
+    m_panFingerY -= giveUpY;
+    ApplyPanTransform();
+    Windows::Foundation::TimeSpan ts; ts.Duration = 1000000LL;   // 100 ms (100 ns units)
+    m_panSnapTimer->Stop();
+    m_panSnapTimer->Interval = ts;
+    m_panSnapTimer->Start();
 }
 
 // ===========================================================================

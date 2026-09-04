@@ -542,6 +542,10 @@ namespace Harness {
         unsigned long long m_titleRowToken { 0 };
         bool m_titleRowShown { true };   // matches the XAML (TitleRow starts visible)
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
+        // Apotheosis (pan snap decay): GetTickCount64() by which the remainder must be gone. The
+        //   snap tick recomputes and decays instead of zeroing the translation outright; this is the
+        //   point at which it stops being patient. 0 = nothing outstanding.
+        unsigned long long m_panSnapDeadline { 0 };
         int  m_panRemX { 0 }, m_panRemY { 0 };
         // Apotheosis (presenter thread): what the finger has asked for since this gesture started,
         //   in engine px, cumulative. The presenter needs the absolute offset (it subtracts the
