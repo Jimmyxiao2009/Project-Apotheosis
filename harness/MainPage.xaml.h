@@ -237,6 +237,10 @@ namespace Harness {
                                int swapScrollX, int swapScrollY,
                                unsigned long long swapId, bool haveOwedSwap);   // an engine frame landed
         void InstantPanReset();                       // remainder → 0, transform → identity
+        // Apotheosis (owed-frame remainder): remainder := m_panFinger* − (frameScroll* − m_panBase*)
+        //   — what the finger asked for minus what the frame at that position really moved. False
+        //   when no base has been taken yet. Computes only; the caller clamps and applies.
+        bool PanRemainderFromFrame(int frameScrollX, int frameScrollY);
         void ClampPanRemainder();                     // document bounds + one screen
         void ClampPanAbs();                           // same document-bounds clamp for the presenter's m_panAbsX/Y
         void ApplyPanTransform();                     // remainder (engine px) → translation (DIP)
@@ -543,6 +547,14 @@ namespace Harness {
         //   in engine px, cumulative. The presenter needs the absolute offset (it subtracts the
         //   engine's own progress itself), not the remainder m_panRem* carries for the XAML path.
         int  m_panAbsX { 0 }, m_panAbsY { 0 };
+        // Apotheosis (owed-frame remainder): the XAML path's absolute pair. m_panFinger* = engine px
+        //   this gesture's finger has asked for in total, m_panBase* = the scroll position it started
+        //   from; remainder = finger − (frameScroll − base). Taken once per manipulation
+        //   (m_panGenSeen mirrors m_nestedScrollGen) and dropped by InstantPanReset().
+        int  m_panFingerX { 0 }, m_panFingerY { 0 };
+        int  m_panBaseX { 0 }, m_panBaseY { 0 };
+        bool m_panBaseValid { false };
+        unsigned long long m_panGenSeen { 0 };
         // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Only used to
         //   clamp the preview to the document and to measure how far the engine really got.
         int  m_scrollX { 0 }, m_scrollY { 0 };

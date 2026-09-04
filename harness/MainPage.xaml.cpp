@@ -2462,11 +2462,46 @@ void MainPage::InstantPanBy(int dx, int dy)
         try { WebCoreSetPanOffset((float)m_panAbsX, (float)m_panAbsY, 1); } catch (...) {}
         return;
     }
+    // Apotheosis (owed-frame remainder): the XAML path keeps an ABSOLUTE pair as well as the
+    // running remainder — everything this gesture's finger has asked for (m_panFinger*) measured
+    // against the scroll position the gesture started from (m_panBase*). A landing frame then
+    // rebuilds the remainder as "asked for minus what that frame really moved" instead of
+    // subtracting deltas from a total, which drifts as soon as anything scrolls that we did not
+    // dispatch. The base is per manipulation, so it is (re)taken whenever m_nestedScrollGen moves.
+    if (m_panGenSeen != m_nestedScrollGen) {
+        m_panGenSeen = m_nestedScrollGen;
+        m_panFingerX = 0;
+        m_panFingerY = 0;
+        m_panBaseValid = false;
+    }
+    if (!m_panBaseValid && ScrollStateUsable()) {
+        m_panBaseX = m_scrollX;
+        m_panBaseY = m_scrollY;
+        m_panBaseValid = true;
+    }
+    m_panFingerX += dx;
+    m_panFingerY += dy;
     m_panRemX += dx;
     m_panRemY += dy;
     ClampPanRemainder();
     ApplyPanTransform();
     RestartPanSnapTimer();
+}
+
+// Apotheosis (owed-frame remainder): rebuild the remainder from the position a frame SHOWS.
+// m_panFinger* is what the finger has asked for since the gesture started, frameScroll* minus
+// m_panBase* is what that frame has actually moved in the same time, and the difference is what
+// the translation still has to carry. Absolute, so it cannot accumulate error, and it is exactly
+// the arithmetic the presenter thread does per composited frame. False = no base yet (the gesture
+// started before any scroll state existed); the caller keeps its incremental estimate.
+// The caller clamps and applies — this only computes.
+bool MainPage::PanRemainderFromFrame(int frameScrollX, int frameScrollY)
+{
+    if (!m_panBaseValid)
+        return false;
+    m_panRemX = m_panFingerX - (frameScrollX - m_panBaseX);
+    m_panRemY = m_panFingerY - (frameScrollY - m_panBaseY);
+    return true;
 }
 
 // An engine frame landed. newScrollX/Y is where the engine now is (WebCoreGetScrollState, read on
@@ -2512,19 +2547,37 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
         }
         return;
     }
-    if (m_scrollStateValid) {
-        m_panRemX -= (newScrollX - m_scrollX);
-        m_panRemY -= (newScrollY - m_scrollY);
-    } else {
-        // First frame of this gesture and the seed from RequestScrollState() never arrived: the
-        // dispatched delta is the best estimate we have.
-        m_panRemX -= fallbackDx;
-        m_panRemY -= fallbackDy;
+    // Apotheosis (owed-frame remainder, driver b531043): what the user is about to look at is the
+    // frame in the BACK BUFFER, not wherever the engine happens to be now — the two part company
+    // the moment anything scrolls between the composite and the acknowledgement (a click's
+    // scrollIntoView, the engine's own anchoring, a second job overtaking this completion). Build
+    // the translation from that frame's own position.
+    if (!(haveOwedSwap && PanRemainderFromFrame(swapScrollX, swapScrollY))) {
+        if (m_scrollStateValid) {
+            m_panRemX -= (newScrollX - m_scrollX);
+            m_panRemY -= (newScrollY - m_scrollY);
+        } else {
+            // First frame of this gesture and the seed from RequestScrollState() never arrived: the
+            // dispatched delta is the best estimate we have.
+            m_panRemX -= fallbackDx;
+            m_panRemY -= fallbackDy;
+        }
     }
     m_scrollX = newScrollX;
     m_scrollY = newScrollY;
     m_scrollStateValid = true;
     m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
+    // Apotheosis (owed-frame remainder): the gesture began before there was any scroll state to
+    // measure against, so no base was taken (InstantPanBy). This frame is the first thing that
+    // knows where the document is — adopt its position as the base and the incremental remainder
+    // above as what the finger is asking for on top of it. Every later frame is absolute.
+    if (!m_panBaseValid) {
+        m_panBaseX = haveOwedSwap ? swapScrollX : newScrollX;
+        m_panBaseY = haveOwedSwap ? swapScrollY : newScrollY;
+        m_panFingerX = m_panRemX;
+        m_panFingerY = m_panRemY;
+        m_panBaseValid = true;
+    }
     ClampPanRemainder();
     ApplyPanTransform();
 }
@@ -2543,6 +2596,12 @@ void MainPage::InstantPanReset()
     if (m_presenterActive) { try { WebCoreSetPanOffset(0.0f, 0.0f, 0); } catch (...) {} }
     m_panRemX = 0;
     m_panRemY = 0;
+    // Apotheosis (owed-frame remainder): the absolute pair describes a gesture that is over. Leaving
+    // it behind would let the next frame of a NEW gesture rebuild the remainder against a base from
+    // the old one — a full-screen jump. InstantPanBy re-takes both at the next manipulation.
+    m_panFingerX = 0;
+    m_panFingerY = 0;
+    m_panBaseValid = false;
     if (m_panSnapTimer) m_panSnapTimer->Stop();
     ApplyPanTransform();
 }
