@@ -2068,6 +2068,24 @@ struct PresenterGL {
     GLint uTex { -1 };
 };
 
+// Apotheosis: whole-token search in a space-separated EGL/GL extension string. eglGetProcAddress
+// returning a non-null pointer says nothing about whether the extension is supported - ANGLE
+// resolves entry points for extensions it does not expose on the current display - so the string
+// is the only answer that counts. strstr() alone would also accept a prefix of a longer name.
+static bool presenterHasExtension(const char* extensions, const char* name)
+{
+    if (!extensions || !name)
+        return false;
+    const size_t len = std::strlen(name);
+    for (const char* p = extensions; (p = std::strstr(p, name)); p += len) {
+        const bool leftOk = (p == extensions) || (p[-1] == ' ');
+        const bool rightOk = (p[len] == ' ') || (p[len] == '\0');
+        if (leftOk && rightOk)
+            return true;
+    }
+    return false;
+}
+
 static GLuint presenterCompile(GLenum type, const char* src)
 {
     GLuint s = glCreateShader(type);
@@ -2428,9 +2446,14 @@ static bool presenterStart(void* nativeWindow, int w, int h)
     g_eglCreateSyncKHR = reinterpret_cast<ApoCreateSyncKHRProc>(eglGetProcAddress("eglCreateSyncKHR"));
     g_eglDestroySyncKHR = reinterpret_cast<ApoDestroySyncKHRProc>(eglGetProcAddress("eglDestroySyncKHR"));
     g_eglClientWaitSyncKHR = reinterpret_cast<ApoClientWaitSyncKHRProc>(eglGetProcAddress("eglClientWaitSyncKHR"));
-    if (!g_eglCreateSyncKHR || !g_eglClientWaitSyncKHR) {
+    // The entry points alone are not permission to call them: eglGetProcAddress hands out
+    // addresses for extensions the display does not expose, and calling eglCreateSyncKHR on such a
+    // display returns EGL_NO_SYNC_KHR at best. Ask the display's extension string as well.
+    const bool hasFenceSync = presenterHasExtension(eglQueryString(g_presenterEglDisplay, EGL_EXTENSIONS),
+        "EGL_KHR_fence_sync");
+    if (!hasFenceSync || !g_eglCreateSyncKHR || !g_eglClientWaitSyncKHR) {
         g_eglCreateSyncKHR = nullptr;
-        g_eglClientWaitSyncKHR = nullptr;   // presenterPublish falls back to glFinish()
+        g_eglClientWaitSyncKHR = nullptr;   // both sides fall back to glFinish()
     }
 
     if (g_pres.load(std::memory_order_acquire))
