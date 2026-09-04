@@ -2157,6 +2157,7 @@ static void presenterThreadMain()
     uint64_t drawnGeneration = 0;
     float drawnTx = 0.0f, drawnTy = 0.0f;
     bool drawnAnything = false;
+    bool wasSuspended = false;
 
     for (;;) {
         int idx = -1;
@@ -2176,7 +2177,22 @@ static void presenterThreadMain()
             if (P.stop)
                 break;
             P.wake = false;
-            if (P.suspended || P.published < 0)
+            if (P.suspended) {
+                wasSuspended = true;
+                continue;
+            }
+            if (wasSuspended) {
+                // Apotheosis: coming back from suspend, what is on the swap chain is not ours to
+                // reason about - the shell may have dropped or resized it while we were frozen,
+                // and the first swap after a resume is the one that puts pixels back. Forget what
+                // we believe we drew, so the checks below cannot decide that an unchanged frame
+                // needs no redraw and leave the panel showing whatever survived the suspend.
+                wasSuspended = false;
+                drawnAnything = false;
+                drawnGeneration = 0;
+                drawnTx = drawnTy = 0.0f;
+            }
+            if (P.published < 0)
                 continue;
             idx = P.published;
             PresenterFrame& f = P.slot[idx];
