@@ -606,6 +606,12 @@ static const float kMinLiveScale = 0.5f;
 // Spring-back animation on the preview transform. Short enough to feel like a release, long
 //   enough to read as a movement rather than a jump; runs on the composition thread.
 static const int kZoomSpringMs = 180;
+// Apotheosis (2837ce0 review item 1): the title/toast row shows while a page loads and for this
+//   long after the load finishes (or after any other TitleText write — the code uses it as a toast
+//   bar), then fades out and gives its strip back to the page. Long enough to read a page title or
+//   a "Bookmarked" toast, short enough that the row is gone by the time the user starts reading.
+static const int kTitleRowIdleMs = 2000;
+static const int kTitleRowFadeMs = 200;
 // Apotheosis: snap band around 1:1. Generous (±33 %, package 7 feedback widened it from ±20 %) on
 //   purpose — 1:1 is the one scale that matters (fit-to-width, crisp text), a pinch is an
 //   accumulating product of float deltas, and without a wide band the page ends up parked at 0.94
@@ -832,8 +838,10 @@ MainPage::MainPage()
                 });
     } catch (...) {}
     // 软键盘遮挡:底栏在屏幕底部,键盘弹出会盖住地址栏。仅当地址栏聚焦时把导航栏(标签数/地址胶囊/
-    //   菜单键那一行,NavBarShift)上移键盘高度;细状态行(标题/加载点,在它上面那一行)刻意不受
-    //   影响的话,键盘再高也推不出屏幕。网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
+    //   菜单键那一行,NavBarShift)上移键盘高度。网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口。
+    //   Apotheosis (2837ce0 review item 1): the title row is no longer a chrome row above this one —
+    //   it is a bottom-anchored overlay in the content row (TitleRow), so it rides along with the
+    //   suggestion dropdown through ShiftSuggestPanel() instead of staying put.
     try {
         auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
         ip->Showing += ref new Windows::Foundation::TypedEventHandler<
@@ -901,7 +909,25 @@ MainPage::MainPage()
                 [this](Windows::UI::ViewManagement::StatusBar^, Platform::Object^) { ApplyViewInsets(); });
         }
     } catch (...) {}
+    // Apotheosis (2837ce0 review item 1): the title row auto-hides when the page is idle, but the
+    //   code writes TitleText from ~25 places as a toast bar ("Bookmarked", "Link copied", update
+    //   check, download progress, …) — every one of those has to bring the row back or the message
+    //   would be written into a collapsed element and never seen. Rather than touching all of them
+    //   (and every future one), listen on the dependency property itself: one callback, no call
+    //   site knows the row can be hidden. RegisterPropertyChangedCallback is 8.1+, so it is there
+    //   on 15254; the try/catch is only for the XamlReader::Load fallback path where TitleText
+    //   could be null.
+    try {
+        if (TitleText)
+            TitleText->RegisterPropertyChangedCallback(
+                Windows::UI::Xaml::Controls::TextBlock::TextProperty,
+                ref new Windows::UI::Xaml::DependencyPropertyChangedCallback(
+                    [this](Windows::UI::Xaml::DependencyObject^, Windows::UI::Xaml::DependencyProperty^) {
+                        RevealTitleRow();
+                    }));
+    } catch (...) {}
     ApplyViewInsets();
+    RevealTitleRow();   // visible at startup, then the same ~2 s grace as everywhere else
     // 测试钩子:若 LocalState\testurl.txt 存在,启动直接导航到它(供 WDP 远程自动化测试,免 UI 输入)。
     std::wstring testUrl;
     try {
@@ -1092,16 +1118,99 @@ void MainPage::OnHideStatusBarToggled(Platform::Object^, RoutedEventArgs^)
 //   NavBarShift only covers the bottom chrome, so it needs its own translation by the same Y.
 //   Created lazily and kept on the element — y == 0 restores the resting position.
 //   UI THREAD ONLY.
+//   Apotheosis (2837ce0 review item 1): TitleRow is a bottom-anchored overlay in the same subtree
+//   since the title row left the bottom chrome, so it needs the identical treatment — otherwise it
+//   stays behind the keyboard while the nav bar it belongs above has moved up.
 void MainPage::ShiftSuggestPanel(double y)
 {
-    if (!SuggestPanel) return;
-    auto t = dynamic_cast<Windows::UI::Xaml::Media::TranslateTransform^>(SuggestPanel->RenderTransform);
-    if (t == nullptr) {
-        if (y == 0.0) return;   // nothing to restore
-        t = ref new Windows::UI::Xaml::Media::TranslateTransform();
-        SuggestPanel->RenderTransform = t;
+    Windows::UI::Xaml::FrameworkElement^ els[2] = { SuggestPanel, TitleRow };
+    for (int i = 0; i < 2; ++i) {
+        auto el = els[i];
+        if (!el) continue;
+        auto t = dynamic_cast<Windows::UI::Xaml::Media::TranslateTransform^>(el->RenderTransform);
+        if (t == nullptr) {
+            if (y == 0.0) continue;   // nothing to restore
+            t = ref new Windows::UI::Xaml::Media::TranslateTransform();
+            el->RenderTransform = t;
+        }
+        t->Y = y;
     }
-    t->Y = y;
+}
+
+// Apotheosis (2837ce0 review item 1): show the title/toast row and, unless a page is loading, arm
+//   the grace period after which it fades away again. Called from SetLoading() and — through the
+//   TitleText::Text property-changed callback registered in the constructor — from every one of the
+//   ~25 places that write a page title or a toast into TitleText, so none of them had to change.
+//   UI THREAD ONLY.
+void MainPage::RevealTitleRow()
+{
+    if (!TitleRow) return;
+    ++m_titleRowToken;                 // a fade still running (or its Completed) is stale now
+    if (m_titleFade != nullptr) { try { m_titleFade->Stop(); } catch (...) {} m_titleFade = nullptr; }
+    TitleRow->Opacity = 1.0;
+    if (!m_titleRowShown) {
+        m_titleRowShown = true;
+        TitleRow->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        ApplyViewInsets();             // the row takes its strip back from the content area
+    }
+    if (m_titleHideTimer == nullptr) {
+        m_titleHideTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        Windows::Foundation::TimeSpan iv; iv.Duration = (long long)kTitleRowIdleMs * 10000;   // 100 ns
+        m_titleHideTimer->Interval = iv;
+        m_titleHideTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+            this, &MainPage::OnTitleRowHideTick);
+    }
+    try { m_titleHideTimer->Stop(); } catch (...) {}
+    // While a page is loading the row stays put (the title is the progress readout). SetLoading(false)
+    //   calls back in here and only then does the grace period start.
+    if (!m_loading) { try { m_titleHideTimer->Start(); } catch (...) {} }
+}
+
+void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
+{
+    if (m_titleHideTimer) { try { m_titleHideTimer->Stop(); } catch (...) {} }   // one-shot
+    if (m_loading) return;             // a load started while the grace period ran — keep it up
+    CollapseTitleRow();
+}
+
+// Fade out over kTitleRowFadeMs, then leave the layout entirely (Visibility=Collapsed) so
+//   ApplyViewInsets' titleH drops to 0 and the page gets the strip. Opacity is an independently
+//   animatable property, so the fade runs on the composition thread — no UI-thread work per frame,
+//   which matters on this device. If the Storyboard cannot start, collapse right away.
+void MainPage::CollapseTitleRow()
+{
+    if (!TitleRow || !m_titleRowShown) return;
+    using namespace Windows::UI::Xaml::Media::Animation;
+    const unsigned long long token = ++m_titleRowToken;
+    Platform::Agile<MainPage^> self(this);
+    auto finish = [self, token]() {
+        MainPage^ s = self.Get(); if (!s) return;
+        if (s->m_titleRowToken != token) return;                 // overtaken by a Reveal()
+        s->m_titleFade = nullptr;
+        s->m_titleRowShown = false;
+        if (s->TitleRow) {
+            s->TitleRow->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+            s->TitleRow->Opacity = 1.0;                          // ready for the next Reveal()
+        }
+        s->ApplyViewInsets();                                    // hand the strip to the content area
+    };
+    try {
+        auto sb = ref new Storyboard();
+        auto a = ref new DoubleAnimation();
+        a->To = ref new Platform::Box<double>(0.0);
+        Windows::Foundation::TimeSpan ts; ts.Duration = (long long)kTitleRowFadeMs * 10000;
+        a->Duration = Windows::UI::Xaml::Duration(ts);
+        Storyboard::SetTarget(a, TitleRow);
+        Storyboard::SetTargetProperty(a, "Opacity");
+        sb->Children->Append(a);
+        sb->Completed += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+            [finish](Platform::Object^, Platform::Object^) { finish(); });
+        m_titleFade = sb;
+        sb->Begin();
+    } catch (...) {
+        m_titleFade = nullptr;
+        finish();
+    }
 }
 
 // Apotheosis (review 2026-09-03): with ApplicationViewBoundsMode::UseCoreWindow our window covers
@@ -1147,12 +1256,29 @@ void MainPage::ApplyViewInsets()
         }
         if (!(stripH > 0.0)) stripH = 5.0;
     }
-    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH)
+    // Apotheosis (2837ce0 review item 1): the title/toast row is a bottom-anchored OVERLAY in the
+    //   content row now (it used to be a layout row of the bottom chrome, permanently costing an
+    //   idle page ~24 DIP). Same treatment as the loading strip, mirrored to the bottom edge: while
+    //   it is shown its height is the content area's bottom inset, and once RevealTitleRow's timer
+    //   has faded it away the page gets that strip back. Read the height from XAML with the same
+    //   ActualHeight → declared Height → literal fallback chain as stripH.
+    double titleH = 0.0;
+    if (TitleRow && TitleRow->Visibility == Windows::UI::Xaml::Visibility::Visible) {
+        titleH = TitleRow->ActualHeight;
+        if (!(titleH > 0.0)) {
+            const double declared = TitleRow->Height;
+            if (declared > 0.0 && declared < 1.0e6) titleH = declared;   // false for NaN
+        }
+        if (!(titleH > 0.0)) titleH = 24.0;
+    }
+    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH
+        && titleH == m_lastTitleH)
         return;
     m_insetsValid = true;
     m_lastInsetTop = top;
     m_lastInsetBottom = bottom;
     m_lastStripH = stripH;
+    m_lastTitleH = titleH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
     if (Progress) Progress->Margin = topPad;
     if (FindBar) FindBar->Margin = topPad;
@@ -1167,7 +1293,12 @@ void MainPage::ApplyViewInsets()
     //   while it is visible (stripH is 0 once SetLoading(false) collapses it, called from there so
     //   this re-evaluates on every loading start/stop) — an idle page gets that space back instead
     //   of permanently losing it to a strip nothing is drawing in.
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + 6, 6, 0);
+    //   (2837ce0 review item 1) The bottom edge now works the same way for the title/toast row.
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + 6, 6, titleH);
+    // Apotheosis (2837ce0 review item 1): the suggestion dropdown is anchored to the same bottom
+    //   edge as TitleRow and would otherwise cover it while the user types over a loading page.
+    //   Lift it by titleH so the two stack (XAML Margin is "8,0" = the left/right 8 stays).
+    if (SuggestPanel) SuggestPanel->Margin = Windows::UI::Xaml::Thickness(8, 0, 8, titleH);
     // Apotheosis (review 2026-09-04 item 1): NEVER touch GpuPanel's size here. A margin shrinks the
     //   SwapChainPanel; XAML then reports a new size to ANGLE, which rebuilds the swap chain from
     //   the engine thread's next eglSwapBuffers (the libGLESv2 SEH-AV class of the first-launch
@@ -1265,6 +1396,11 @@ void MainPage::SetLoading(bool loading)
     //   content/GpuPanel top-inset math (ApplyViewInsets' stripH) — re-run it here so the inset
     //   actually follows the strip appearing/collapsing instead of only the next unrelated call.
     ApplyViewInsets();
+    // Apotheosis (2837ce0 review item 1): the title row is "what am I looking at / what is going
+    //   on", so it belongs on screen exactly while something is going on. Loading start pins it
+    //   (RevealTitleRow stops the hide timer while m_loading), loading end re-arms the ~2 s grace
+    //   so the final page title is readable before the row gets out of the way.
+    RevealTitleRow();
 }
 
 void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)

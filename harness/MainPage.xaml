@@ -353,6 +353,33 @@
                 </Grid>
             </Border>
 
+            <!-- 细状态行:页面标题 / 临时提示(code 大量写 TitleText 当 toast)。
+                 Apotheosis (2837ce0 review item 1): the row used to be a real layout row of the
+                 bottom chrome, so an idle page permanently paid ~24 DIP for a line that mostly
+                 repeats what the address bar already says. It is an OVERLAY in the content row now,
+                 bottom-anchored right above the nav bar (visually exactly where it was), and the
+                 code-behind reveals it while a page is loading / for ~2 s after any TitleText write
+                 (the code uses TitleText as a toast in ~25 places) and fades it away when idle —
+                 see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
+                 ★ Overlay and not a chrome row ON PURPOSE: a bottom chrome that shrinks would grow
+                 the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
+                 the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
+                 AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
+                 strip it covers is handed back to the page exactly like the loading strip's at the
+                 top edge — ApplyViewInsets() gives ContentBorder a bottom margin for the software
+                 path, while the GPU panel keeps its size and simply has that strip covered.
+                 Explicit Height so ApplyViewInsets' titleH is deterministic before the first
+                 arrange (same technique as Progress/stripH). -->
+            <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
+                    Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
+                <Grid Margin="14,0,14,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock x:Name="TitleText" Grid.Column="1" Text="APOTHEOSIS" Foreground="{StaticResource TxtLo}" FontSize="11"
+                               CharacterSpacing="90" HorizontalAlignment="Left" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                </Grid>
+            </Border>
+
             <!-- 地址栏建议下拉:锚定内容区底部 → 浮在底栏正上方。点项即导航。 -->
             <Border x:Name="SuggestPanel" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
                     Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0" Margin="8,0" CornerRadius="12,12,0,0" Visibility="Collapsed">
@@ -362,105 +389,84 @@
             </Border>
         </Grid>
 
-        <!-- ===== 底部 chrome:状态行 + 导航栏 ===== -->
-        <!-- Apotheosis(2026-09-04 review): title row moved back here from the content-area top edge
-             (4b39175 undone) — "where am I" belongs right above the address bar, not sharing the
-             status-bar edge with the loading strip (Progress, above). Two Auto rows again so
-             NavBarShift (inner Grid only) shifts just the nav row for the keyboard, leaving the title
-             row unaffected — see the InputPane Showing/Hiding handlers. -->
-        <Grid Grid.Row="1">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
+        <!-- ===== 底部 chrome:导航栏(标签数/地址栏/菜单)===== -->
+        <!-- Apotheosis (2837ce0 review item 1): the thin status row (title/toast) moved into the
+             content row as a bottom-anchored overlay (see TitleRow above) so an idle page gets its
+             ~24 DIP back — the bottom chrome is the nav row and nothing else again, no wrapper Grid.
+             软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理)。 -->
+        <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
+            <Grid.RenderTransform>
+                <TranslateTransform x:Name="NavBarShift" Y="0"/>
+            </Grid.RenderTransform>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
 
-            <!-- 细状态行:页面标题 / 临时提示(code 大量写 TitleText 当 toast) -->
-            <Border Grid.Row="0" Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
-                <Grid Margin="14,4,14,3">
-                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                    <Ellipse Grid.Column="0" Width="5" Height="5" Fill="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                    <TextBlock x:Name="TitleText" Grid.Column="1" Text="APOTHEOSIS" Foreground="{StaticResource TxtLo}" FontSize="11"
-                               CharacterSpacing="90" HorizontalAlignment="Left" TextTrimming="CharacterEllipsis"/>
+            <!-- 标签键:方框数字,点开标签切换器 -->
+            <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
+                <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
+                    <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource Accent}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Border>
+            </Button>
+
+            <!-- Apotheosis: the hairline separators that used to sit in columns 1 and 3 are
+                 gone — on a 432 DIP phone screen every DIP of the address field counts, and
+                 the pill's own rounded border already separates it from the two keys. The
+                 Auto columns stay (empty = zero width) so no Grid.Column index moves. -->
+
+            <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。三者统一 40 高。UWP TextBox 不理会 VerticalContentAlignment(模板没绑),文字靠 Padding 上下值居中。 -->
+            <Border Grid.Column="2" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="20" Margin="7,9" Padding="0" Height="42">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
+                    <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
+                               FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight"
+                               VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0"/>
+                    <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
+                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8"
+                             InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
+                             KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
+                             GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
+                    <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
+                         plain Button.Content centred on the font's line box, not its glyph ink, which
+                         sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
+                         2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
+                         own ink still sits ~2px low inside it (font-specific) — nudge up. -->
+                    <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
+                            Width="42" Height="40" Padding="0"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                            Click="OnUrlAction">
+                        <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
+                                   Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
+                    <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
+                         输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
+                         2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
+                         same technique as UrlActionGlyph above — plain Button.Content centred on the
+                         ✕'s full font line box sat ~2px high. -->
+                    <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
+                            Width="44" Height="40" Padding="0"
+                            IsTabStop="False" Visibility="Collapsed"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                            Click="OnUrlClear">
+                        <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
+                                   Foreground="{StaticResource TxtHi}"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
                 </Grid>
             </Border>
 
-            <!-- 导航栏:[标签数] | 🔒 地址 [Go/⟳/✕] | ⋯ -->
-            <!-- Apotheosis: 软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理) —
-                 细状态行(标题)留在原位,键盘再高也不会把它推出屏幕。 -->
-            <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
-                <Grid.RenderTransform>
-                    <TranslateTransform x:Name="NavBarShift" Y="0"/>
-                </Grid.RenderTransform>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-
-                <!-- 标签键:方框数字,点开标签切换器 -->
-                <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
-                    <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
-                        <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource Accent}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                    </Border>
-                </Button>
-
-                <!-- Apotheosis: the hairline separators that used to sit in columns 1 and 3 are
-                     gone — on a 432 DIP phone screen every DIP of the address field counts, and
-                     the pill's own rounded border already separates it from the two keys. The
-                     Auto columns stay (empty = zero width) so no Grid.Column index moves. -->
-
-                <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。三者统一 40 高。UWP TextBox 不理会 VerticalContentAlignment(模板没绑),文字靠 Padding 上下值居中。 -->
-                <Border Grid.Column="2" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="20" Margin="7,9" Padding="0" Height="42">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
-                        <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
-                                   FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight"
-                                   VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0"/>
-                        <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
-                                 Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8"
-                                 InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
-                                 KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
-                                 GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
-                        <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
-                             plain Button.Content centred on the font's line box, not its glyph ink, which
-                             sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
-                             2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
-                             own ink still sits ~2px low inside it (font-specific) — nudge up. -->
-                        <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                                Width="42" Height="40" Padding="0"
-                                VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
-                                Click="OnUrlAction">
-                            <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
-                                       Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                        </Button>
-                        <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
-                             输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
-                             2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
-                             same technique as UrlActionGlyph above — plain Button.Content centred on the
-                             ✕'s full font line box sat ~2px high. -->
-                        <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                                Width="44" Height="40" Padding="0"
-                                IsTabStop="False" Visibility="Collapsed"
-                                VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
-                                Click="OnUrlClear">
-                            <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
-                                       Foreground="{StaticResource TxtHi}"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                        </Button>
-                    </Grid>
-                </Border>
-
-                <!-- 菜单(More):弹出底部动作面板 -->
-                <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>
-            </Grid>
+            <!-- 菜单(More):弹出底部动作面板 -->
+            <Button x:Name="MenuBtn" Grid.Column="4" Style="{StaticResource NavBtn}" Content="&#xE712;" Click="OnMenu"/>
         </Grid>
 
         <!-- ============================================================================

@@ -258,7 +258,16 @@ namespace Harness {
         void ApplyViewInsets();
         // Apotheosis (review 2026-09-03): the URL suggestion dropdown sits in the content row, so
         //   it needs the same soft-keyboard shift as NavBarShift. 0 = back to rest.
+        //   (2837ce0 review item 1): TitleRow lives in the same subtree and rides along.
         void ShiftSuggestPanel(double y);
+        // Apotheosis (2837ce0 review item 1): the title/toast row auto-hides. Reveal() shows it and
+        //   — unless a page is loading — arms the ~2 s hide; Collapse() fades it out and hands its
+        //   strip back to the content area (ApplyViewInsets' titleH). Every write to TitleText::Text
+        //   reveals the row through a property-changed callback registered in the constructor, so
+        //   the ~25 places that use TitleText as a toast keep working untouched. UI thread only.
+        void RevealTitleRow();
+        void CollapseTitleRow();
+        void OnTitleRowHideTick(Platform::Object^ sender, Platform::Object^ e);
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();
@@ -490,7 +499,19 @@ namespace Harness {
         //   goes 0 -> its real value at the first arrange and because it now flips between 0 and that
         //   value every time SetLoading() shows/hides the strip.
         double m_lastStripH { 0.0 };
+        // Apotheosis (2837ce0 review item 1): same for TitleRow, the auto-hiding title/toast strip
+        //   at the bottom edge of the content row — 0 while it is collapsed, its height while it is
+        //   shown. It is an overlay, so this is the content area's BOTTOM inset; GpuPanel keeps its
+        //   size (see the XAML comment) and simply has that strip covered.
+        double m_lastTitleH { 0.0 };
         bool   m_insetsValid { false };
+        // Apotheosis (2837ce0 review item 1): auto-hide of the title/toast row. The timer is the
+        //   one-shot "idle for ~2 s → fade out"; the token drops a fade that a later Reveal()
+        //   overtook (Storyboard::Completed still fires after Stop()).
+        Windows::UI::Xaml::DispatcherTimer^ m_titleHideTimer;
+        Windows::UI::Xaml::Media::Animation::Storyboard^ m_titleFade;
+        unsigned long long m_titleRowToken { 0 };
+        bool m_titleRowShown { true };   // matches the XAML (TitleRow starts visible)
         Windows::UI::Xaml::DispatcherTimer^ m_panSnapTimer;
         int  m_panRemX { 0 }, m_panRemY { 0 };
         // Apotheosis (presenter thread): what the finger has asked for since this gesture started,
