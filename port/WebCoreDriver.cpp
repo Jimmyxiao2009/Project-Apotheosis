@@ -2199,15 +2199,24 @@ static void presenterThreadMain()
             generation = P.generation;
 
             float rx = 0.0f, ry = 0.0f;
-            if ((P.panActive || P.panEnding) && P.panBaseValid) {
-                rx = P.panX - static_cast<float>(f.scrollX - P.panBaseX);
-                ry = P.panY - static_cast<float>(f.scrollY - P.panBaseY);
-                const float maxX = static_cast<float>(g_gpuW), maxY = static_cast<float>(g_gpuH);
-                if (rx > maxX) rx = maxX; else if (rx < -maxX) rx = -maxX;
-                if (ry > maxY) ry = maxY; else if (ry < -maxY) ry = -maxY;
+            if (P.panActive || P.panEnding) {
+                if (P.panBaseValid) {
+                    rx = P.panX - static_cast<float>(f.scrollX - P.panBaseX);
+                    ry = P.panY - static_cast<float>(f.scrollY - P.panBaseY);
+                    const float maxX = static_cast<float>(g_gpuW), maxY = static_cast<float>(g_gpuH);
+                    if (rx > maxX) rx = maxX; else if (rx < -maxX) rx = -maxX;
+                    if (ry > maxY) ry = maxY; else if (ry < -maxY) ry = -maxY;
+                }
                 // The gesture is over: the residual shrinks with every frame the engine publishes.
                 // At zero (or after one second of the engine not catching up) the engine frame alone
                 // is on screen again and the pan state is dropped.
+                // Apotheosis: this must run WITHOUT a valid base too. A gesture that ended before
+                // any frame carried a base (WebCoreSetPanOffset found published < 0, and no publish
+                // latched one afterwards) left panEnding set for ever inside the old
+                // `&& P.panBaseValid` guard, and panEnding is what makes the loop take the 8 ms
+                // heartbeat instead of sleeping - so the presenter woke 125 times a second for the
+                // rest of the session and drew nothing. With no base there is no residual to
+                // decay: rx/ry are zero, so the test below drops the pan state on the next pass.
                 if (P.panEnding && ((rx > -0.5f && rx < 0.5f && ry > -0.5f && ry < 0.5f) || MonotonicTime::now() >= P.panDeadline)) {
                     P.panEnding = false;
                     P.panBaseValid = false;
