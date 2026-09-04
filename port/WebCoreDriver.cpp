@@ -2875,6 +2875,22 @@ static void teardownSession()
     // buffer is about to be redrawn by the next session anyway.
     g_panGesture = false;
     g_swapOwed = false;
+    // Apotheosis (presenter thread): the frames in the presenter's slots were composited from the
+    // layer tree that is about to be destroyed. Mark them stale, or the 8 ms pan heartbeat (and
+    // any pan offset that arrives before the next session publishes) would keep re-swapping a
+    // closed tab's last frame. Nothing is freed here - the textures are process-lifetime and the
+    // presenter may still be sampling one; it simply has nothing to show until the next publish,
+    // and what is already on the swap chain stays there. Its pan state belonged to that page too.
+    if (PresenterState* pres = g_pres.load(std::memory_order_acquire)) {
+        Locker locker { pres->lock };
+        pres->published = -1;
+        pres->panActive = false;
+        pres->panEnding = false;
+        pres->panBaseValid = false;
+        pres->panX = pres->panY = 0.0f;
+        pres->wake = true;
+        pres->cond.notifyAll();
+    }
     // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
     // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
     // mousemove/mouseup into a document that never saw the press.
