@@ -21,6 +21,7 @@
 #include <deque>
 #include <functional>
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <cstdlib>
 #include <ppltasks.h>
@@ -685,6 +686,44 @@ static float SnapAndClampPageScale(float s)
 //   release, exactly like the ±33% page-scale snap band above is eased.
 static const double kZoomRubberBandDip = 40.0;
 
+// Apotheosis (bug fix 2026-09-06, device test 0.1.9.16): keyboard-avoidance seam constants. Two
+//   gaps were reported at the nav bar when the on-screen keyboard is up — page pixels visible
+//   between the nav bar and the keyboard, and between the suggestion dropdown and the nav bar.
+//   Root cause of the first: the InputPane Showing handler shifted the nav bar up by the raw
+//   OccludedRect.Height, but the nav bar's resting position is already `m_lastInsetBottom` DIP
+//   above the true window edge (RootGrid's bottom Padding, see ApplyViewInsets) — that inset was
+//   being counted twice (once via the Padding, once implicitly missing from the shift), leaving a
+//   gap of exactly that size. The fix subtracts it (see the Showing handler). The second gap has
+//   no single provable cause (two independently-rendered visuals — the nav bar Grid and the
+//   suggestion/title-row overlay — translated by nominally identical DIP values can still round to
+//   different device pixels), so rather than chase sub-pixel rounding, the nav bar is shifted a
+//   couple of DIPs *further* up than the suggestion panel needs (kSeamOverlapDip) so its opaque
+//   background overlaps down onto the suggestion panel's bottom edge — it already paints on top of
+//   the content row at the RootGrid level (declared after it), so the overlap is invisible. That
+//   extra upward reach would in turn open a gap versus the keyboard, so the nav bar also carries a
+//   plain decorative bleed strip (kSeamBleedDip, in the XAML, unnamed child of the nav bar Grid)
+//   that extends its opaque area a few DIP below its own Height="62" box; at rest, or with the
+//   keyboard hidden, that strip lands below the row entirely (in the reserved bottom inset, or past
+//   the screen edge when there is none), so nothing about the idle layout changes.
+static const double kSeamOverlapDip = 3.0;   // nav bar reaches this much further up than exact
+static const double kSeamBleedDip = 6.0;     // >= kSeamOverlapDip, see the nav bar XAML bleed strip
+
+// DIP -> nearest whole device pixel, using the same double back. RenderTransform (unlike layout)
+//   is never rounded by the XAML layout engine, so two independently-set TranslateTransforms can
+//   each land on a different fractional device pixel even for the same DIP value; snapping the
+//   value first makes the composited result deterministic. Falls back to 1:1 if DisplayInformation
+//   is unavailable (XamlReader::Load fallback path, or an odd Insider build).
+static double RoundToDevicePixel(double dip)
+{
+    double scale = 1.0;
+    try {
+        auto di = Windows::Graphics::Display::DisplayInformation::GetForCurrentView();
+        if (di) scale = di->RawPixelsPerViewPixel;
+    } catch (...) {}
+    if (!(scale > 0.0)) scale = 1.0;
+    return std::round(dip * scale) / scale;
+}
+
 // One axis of the live-pinch clamp (ApplyLiveZoom). Works entirely in engine px (WebCoreGetScrollState
 //   units), like ClampPanRemainder/InstantPanBy — the caller converts the result to DIP.
 //
@@ -908,12 +947,25 @@ MainPage::MainPage()
                 m_titleRowPinned = true;
                 RevealTitleRow();
                 if (m_urlFocused && NavBarShift) {
-                    NavBarShift->Y = -e->OccludedRect.Height;
+                    // Apotheosis (bug fix 2026-09-06): the nav bar's resting bottom edge is already
+                    //   m_lastInsetBottom DIP above the true window edge (RootGrid's bottom Padding
+                    //   from ApplyViewInsets) — shifting by the raw OccludedRect.Height double-counts
+                    //   that inset and leaves a gap of exactly that size below the bar. Subtract it,
+                    //   then snap to a whole device pixel (see kSeamOverlapDip's comment above).
+                    double shiftUp = e->OccludedRect.Height - m_lastInsetBottom;
+                    if (!(shiftUp > 0.0)) shiftUp = 0.0;
+                    shiftUp = RoundToDevicePixel(shiftUp);
+                    // The nav bar reaches a little further up than the suggestion panel needs, so
+                    //   its background (painted after/over the content row) overlaps the seam
+                    //   against the suggestion dropdown instead of exactly abutting it; the matching
+                    //   downward bleed strip in its own XAML keeps its bottom edge at the keyboard
+                    //   regardless (see kSeamBleedDip).
+                    NavBarShift->Y = -(shiftUp + kSeamOverlapDip);
                     // Apotheosis (review 2026-09-03): the suggestion dropdown is anchored to the
                     //   bottom of the *content* row, i.e. it floats right on top of the nav bar.
                     //   Shifting only the nav bar left it behind the keyboard while typing, so it
                     //   rides along by the same amount (its own transform — different subtree).
-                    ShiftSuggestPanel(-e->OccludedRect.Height);
+                    ShiftSuggestPanel(-shiftUp);
                     e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
                 }
             });

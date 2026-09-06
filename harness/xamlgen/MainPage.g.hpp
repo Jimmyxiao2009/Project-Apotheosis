@@ -369,6 +369,16 @@ static ::Platform::String^ __MainPageXaml() {
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
+            <!-- Apotheosis (bug fix 2026-09-06): decorative seam bleed, see kSeamOverlapDip /
+                 kSeamBleedDip in MainPage.xaml.cpp. Extends this Grid's opaque background a few DIP
+                 below its own Height="62" box (negative bottom margin — Grid does not clip children
+                 to its bounds). At rest this lands in RootGrid's reserved bottom inset or past the
+                 screen edge, so nothing is covered; with the keyboard up it keeps the bar's visible
+                 bottom edge at the keyboard's top even though the bar is shifted a little further up
+                 than that (see NavBarShift in the InputPane Showing handler). Must never bleed
+                 upward instead — that would permanently cover part of the content row. -->
+            <Border Grid.ColumnSpan="5" VerticalAlignment="Bottom" Height="6" Margin="0,0,0,-6" Background="{StaticResource Chrome}" IsHitTestVisible="False" />
+
             <!-- 标签键:方框数字,点开标签切换器 -->
             <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False">
                 <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
