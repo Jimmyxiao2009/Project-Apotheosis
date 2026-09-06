@@ -49,6 +49,7 @@
 #include <csignal>
 #include <cstdlib>     // Apotheosis: std::abort / _set_purecall_handler (crash.txt legs)
 #include <atomic>      // Apotheosis: try-flag guarding perfFlush() from the crash legs
+#include <mutex>       // Apotheosis: the process-wide ANGLE lock (std::recursive_mutex, see g_angleMutex)
 #include <exception>   // Apotheosis: std::set_terminate (crash.txt leg (d))
 #include <new.h>       // Apotheosis: _set_new_handler — CRT form, gets the requested size
 #include <JavaScriptCore/ExecutableAllocator.h>   // Apotheosis: JIT pool range / isJITPC for crash.txt       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
@@ -614,6 +615,143 @@ static std::atomic<bool> g_presenterActive { false };  // the presenter really o
 static std::atomic<int> g_presenterRetired { 0 };
 static void* g_presenterWindow = nullptr;              // native window handed to the presenter thread
 static EGLDisplay g_presenterEglDisplay = nullptr;
+
+// ===========================================================================
+// Apotheosis (2026-09-06, ANGLE GLOBAL LOCK): one process-wide recursive mutex held around every
+// GL/EGL call, on every thread. The presenter's last attempt.
+//
+// WHY. The presenter thread draws the engine's slot texture from a SECOND EGL context in the same
+// share group. That is legal GL - and it is not what the white screen on device is about. ANGLE
+// 2.1.13 (the ANGLE.WindowsStore NuGet we ship) is NOT THREAD SAFE AT ALL on its D3D11 backend:
+// one EGLDisplay owns one ID3D11Device and one immediate ID3D11DeviceContext, and the state that
+// rides on them - StateManager11's cached bindings, TextureStorage11's SRV/dirty caches, the
+// shader/buffer caches - is shared by every context on that display and carries no lock of any
+// kind. Two threads issuing GL concurrently therefore corrupt each other's D3D state rather than
+// merely racing over pixels: the presenter's quad goes out with the engine's half-set render
+// target, viewport and program, or the engine's composite lands in the presenter's, and what
+// reaches the SwapChainPanel is a cleared surface. That is the "white nearly always, content
+// occasionally and seconds late" the device shows, and it is exactly what the glFinish handoffs
+// cannot fix: they order the GPU's work, not ANGLE's CPU-side bookkeeping.
+//
+// The ANGLE developers' documented workaround for this era is a single coarse application lock
+// around EVERY GL and EGL entry point from every thread:
+//   https://groups.google.com/g/angleproject/c/qeTAV4Bpr2Q
+//   https://github.com/microsoft/angle/issues/61
+// This is that lock. If the screen is still white with it, the two-context split is not viable on
+// this ANGLE and the presenter goes away for good.
+//
+// WHAT HOLDS IT (grep AngleLocker):
+//   engine thread    - eglMakeCurrent; the compositing-flush and backing-store passes of
+//                      gpuPrepare() (BitmapTextureGL::updateContents -> glTexSubImage2D happens
+//                      inside updateBackingStoreIncludingSubLayers, so the whole pass is covered,
+//                      cairo tile painting included); the TextureMapper composite
+//                      (beginPainting/paint/endPainting) in gpuPresent() and
+//                      gpuCompositeReadback(), plus the repair composite; glFinish + glReadPixels;
+//                      presenterPublish()'s glFinish; eglSwapBuffers (gpuPresent and
+//                      presentOwedSwap); context/TextureMapper construction and destruction in
+//                      WebCoreGpuInit(); the GL destructors ~Page runs in teardownSession(); and
+//                      wkReleaseMemoryLevel()'s three other call sites, which delete textures too.
+//   presenter thread - one span per frame: makeContextCurrent, the quad, the probe, glFinish,
+//                      eglSwapBuffers and the swap-lost bookkeeping; plus its one-off GL setup
+//                      (shaders, VBO) and its context teardown.
+//   UI thread        - nothing. WebCoreSetPanOffset / WebCoreSetPresenterSuspended only touch
+//                      presenter state under P.lock and make no GL call (verified 2026-09-06).
+//   raster workers   - nothing. The threaded-raster pool replays cairo into CPU image buffers and
+//                      reports completion through atomics; the GL upload of a finished buffer is
+//                      done by the engine thread inside the backing-store pass (verified
+//                      2026-09-06 in TextureMapperTile.cpp: the worker lambda calls
+//                      Cairo::PaintingContext::replay + completePainting only).
+//
+// WHAT DELIBERATELY RUNS UNLOCKED, so the presenter can keep presenting through it: layout and
+// style (the first block of gpuPrepare), JS, the RunLoop, cairo recording and raster replays -
+// and EVERY WAIT: presenterAcquireSlot()'s 50 ms wait for a free slot, presenterStart()'s 5 s wait
+// for the presenter to come up, and the presenter's own condvar wait for the next frame.
+//
+// THE TWO RULES THAT KEEP THIS DEADLOCK-FREE:
+//   (1) never block on P.cond while holding the ANGLE lock;
+//   (2) always take the ANGLE lock BEFORE P.lock, never the other way round. The presenter takes
+//       P.lock alone (to pick a frame) or ANGLE-then-P (to clear inUse); the engine takes P.lock
+//       alone (presenterAcquireSlot, where it waits) or ANGLE-then-P (presenterPublish). No thread
+//       ever waits for the ANGLE lock while holding P.lock, so there is no cycle.
+//
+// KNOWN GAP: GL that WebCore issues outside a composite is not covered - in practice
+// BitmapTexturePool's release timer (RunLoop, engine thread) deleting unused textures every few
+// seconds. It is not a per-frame path; if the lock helps but the screen still glitches
+// occasionally, that timer is the next thing to wrap (it needs a WebKit-side hook).
+//
+// COST with the presenter off: taken and released from one thread only. An uncontended
+// std::recursive_mutex on Windows is an atomic compare-exchange plus a thread-id compare - a few
+// nanoseconds, a handful of times per composite, far below the noise of a composite. So the lock
+// is UNCONDITIONAL rather than conditional on g_presenterActive: a conditional one would have to
+// stay consistent across a presenter that starts late or retires mid-session, and getting that
+// wrong costs a hang. Recursive because gpuPrepare() locks and is itself called from inside the
+// already-locked repair path in gpuPresent().
+static std::recursive_mutex g_angleMutex;
+
+// Apotheosis (ANGLE global lock): per-side wait/hold diagnostics, reported in the presenter-stats
+// line. If the screen comes right but scrolling stutters, this says which side starves the other:
+// a high engine wait means the presenter holds the device too long, a high presenter wait means
+// the engine's composite does.
+enum class AngleSide { Engine = 0, Presenter = 1 };
+static std::atomic<unsigned long long> g_angleWaitUs[2] { { 0 }, { 0 } };   // [0]=engine, [1]=presenter
+static std::atomic<unsigned> g_angleWaitMaxUs[2] { { 0 }, { 0 } };
+static std::atomic<unsigned> g_angleHoldMaxUs[2] { { 0 }, { 0 } };
+static std::atomic<unsigned> g_angleLocks[2] { { 0 }, { 0 } };
+
+static unsigned angleElapsedUs(MonotonicTime from, MonotonicTime to)
+{
+    const double us = (to - from).value() * 1000000.0;
+    if (!(us > 0.0))
+        return 0;
+    return (us > 1000000000.0) ? 1000000000u : static_cast<unsigned>(us);
+}
+
+static void angleNoteMax(std::atomic<unsigned>& slot, unsigned value)
+{
+    unsigned cur = slot.load(std::memory_order_relaxed);
+    while (value > cur && !slot.compare_exchange_weak(cur, value, std::memory_order_relaxed)) { }
+}
+
+// Apotheosis (ANGLE global lock): RAII holder. Recursive re-entries are counted too - they are
+// uncontended by construction and only add a little noise to the average.
+class AngleLocker {
+public:
+    explicit AngleLocker(AngleSide side)
+        : m_side(static_cast<int>(side))
+    {
+        const MonotonicTime before = MonotonicTime::now();
+        g_angleMutex.lock();
+        m_held = MonotonicTime::now();
+        const unsigned waitUs = angleElapsedUs(before, m_held);
+        g_angleWaitUs[m_side].fetch_add(waitUs, std::memory_order_relaxed);
+        g_angleLocks[m_side].fetch_add(1, std::memory_order_relaxed);
+        angleNoteMax(g_angleWaitMaxUs[m_side], waitUs);
+    }
+    ~AngleLocker()
+    {
+        angleNoteMax(g_angleHoldMaxUs[m_side], angleElapsedUs(m_held, MonotonicTime::now()));
+        g_angleMutex.unlock();
+    }
+    AngleLocker(const AngleLocker&) = delete;
+    AngleLocker& operator=(const AngleLocker&) = delete;
+
+private:
+    int m_side;
+    MonotonicTime m_held;
+};
+
+// Apotheosis (ANGLE global lock): "n/avg/max wait, max hold" in ms for one side, for presenter-stats.
+static void angleLockStats(AngleSide side, char* out, size_t outSize)
+{
+    const int i = static_cast<int>(side);
+    const unsigned n = g_angleLocks[i].load(std::memory_order_relaxed);
+    const unsigned long long totalUs = g_angleWaitUs[i].load(std::memory_order_relaxed);
+    const double avgMs = n ? (static_cast<double>(totalUs) / static_cast<double>(n) / 1000.0) : 0.0;
+    std::snprintf(out, outSize, "n=%u avg=%.2f max=%.2f hold=%.2f", n, avgMs,
+        g_angleWaitMaxUs[i].load(std::memory_order_relaxed) / 1000.0,
+        g_angleHoldMaxUs[i].load(std::memory_order_relaxed) / 1000.0);
+}
+// ===========================================================================
 
 // Apotheosis (presenter thread, WHITE-SCREEN fix 2026-09-04): the cross-context EGL fence
 // handshake is GONE. Both halves of it - the engine's eglCreateSyncKHR + the presenter's
@@ -2090,6 +2228,12 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         Color docBg = view.documentBackgroundColor();
         glRoot.setBackgroundColor(docBg.isValid() ? docBg : Color::white);
     }
+    // Apotheosis (ANGLE global lock): from here to the end of gpuPrepare() everything may issue GL
+    // - the compositing flush walks platform layers, and the backing-store pass below paints tiles
+    // and uploads them (BitmapTextureGL::updateContents -> glTexSubImage2D). The style/layout block
+    // above is deliberately OUTSIDE it: it is the longest phase and touches no GL, so the presenter
+    // keeps presenting through it. No wait happens under this lock (see the rules at g_angleMutex).
+    AngleLocker angleLock(AngleSide::Engine);
     {
         PerfPhase perfFlushPhase(&g_perfCur.flush);        // M4: compositing flush (+ scroll-layer positioning)
         // Apotheosis (C2): position the scrolled-contents layer *before* the flush as well.
@@ -2156,6 +2300,10 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     using namespace WebCore;
     if (!g_glContext || !g_textureMapper)
         return kErrNoView;
+    // Apotheosis (ANGLE global lock): the whole readback is GL. The CPU tail (flip/statistics/hash)
+    // holds it too - this path is the offscreen mode, where no presenter exists, and the one case
+    // where it runs with a live presenter is the tab-switch snapshot, i.e. once per tab switch.
+    AngleLocker angleLock(AngleSide::Engine);
     g_glContext->makeContextCurrent();
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
     gpuPrepare(view, glRoot);
@@ -2370,9 +2518,17 @@ static void presenterStatsDump(const char* why)
     SYSTEMTIME st;
     GetLocalTime(&st);
     const int probe = g_presProbeContent.load(std::memory_order_relaxed);
+    // Apotheosis (ANGLE global lock): what the two threads cost each other, in ms. eng/pres wait
+    // near zero = no contention (and, if the screen is still white, the lock was not the problem);
+    // a large pres wait with a large eng hold = the composite owns the device and the presenter
+    // only gets in between frames.
+    char lockEng[96] = { 0 }, lockPres[96] = { 0 };
+    angleLockStats(AngleSide::Engine, lockEng, sizeof lockEng);
+    angleLockStats(AngleSide::Presenter, lockPres, sizeof lockPres);
     std::fprintf(fp,
-        "presenter-stats %02u:%02u:%02u.%03u %s fence_adv=%d sync=glFinish draws=%u swaps=%u "
+        "presenter-stats %02u:%02u:%02u.%03u %s fence_adv=%d sync=glFinish+anglelock draws=%u swaps=%u "
         "skip_nopub=%u skip_dedupe=%u skip_susp=%u skip_notex=%u skip_empty=%u engine_drops=%u "
+        "lock_eng=[%s] lock_pres=[%s] "
         "probe=%d/%d drew=%d eglerr=0x%04x size=%dx%d\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, why ? why : "-",
         g_presFenceAdvertised ? 1 : 0,
@@ -2381,6 +2537,7 @@ static void presenterStatsDump(const char* why)
         g_presSkipSuspended.load(std::memory_order_relaxed), g_presSkipNoTex.load(std::memory_order_relaxed),
         g_presSkipEmpty.load(std::memory_order_relaxed),
         g_presEngineDrops.load(std::memory_order_relaxed),
+        lockEng, lockPres,
         probe, g_presProbeTotal.load(std::memory_order_relaxed), g_gpuLastUnpainted,
         static_cast<unsigned>(g_presLastEglError.load(std::memory_order_relaxed)),
         g_gpuW, g_gpuH);
@@ -2464,10 +2621,21 @@ static void presenterThreadMain()
     // SwapChainPanel work inside eglCreateWindowSurface to the panel's dispatcher, so this blocks
     // until the (idle) UI thread has run it - which is why WebCoreGpuInit only ever waits for this
     // with a timeout, and why nothing on the UI thread may be waiting for the engine at that point.
+    //
+    // Apotheosis (ANGLE global lock): this ONE call is made without the lock, on purpose. It can
+    // block for as long as the UI thread takes to run the marshalled work, and presenterStart()
+    // answers a five second timeout by DETACHING this thread - so holding the lock across it would
+    // let a detached presenter block the fallback engine's every GL call for ever. Nothing on the
+    // engine thread issues GL between presenterStart() and initState (it is inside the condvar
+    // wait), so the window in which this is unlocked is a window in which nothing else runs.
     std::unique_ptr<GLContext> ctx = GLContext::create(PlatformDisplay::sharedDisplay(),
         reinterpret_cast<GLNativeWindowType>(g_presenterWindow));
     PresenterGL gl;
-    bool ok = ctx && ctx->makeContextCurrent() && presenterBuildGL(gl);
+    bool ok = false;
+    if (ctx) {
+        AngleLocker angleLock(AngleSide::Presenter);
+        ok = ctx->makeContextCurrent() && presenterBuildGL(gl);
+    }
     {
         Locker locker { P.lock };
         P.initState = ok ? 1 : -1;
@@ -2477,7 +2645,10 @@ static void presenterThreadMain()
         // The context (and with it the window surface, which holds COM references to the panel)
         // must go before the apartment it was created in - releasing COM objects after
         // RoUninitialize is undefined. Same order on the way out of the loop below.
-        ctx = nullptr;
+        {
+            AngleLocker angleLock(AngleSide::Presenter);   // ~GLContext is eglMakeCurrent + eglDestroy*
+            ctx = nullptr;
+        }
         if (roOwned)
             RoUninitialize();
         return;
@@ -2571,6 +2742,16 @@ static void presenterThreadMain()
         }
         if (!texId)
             g_presSkipNoTex.fetch_add(1, std::memory_order_relaxed);
+
+        // Apotheosis (ANGLE global lock): ONE span per frame, from here to the end of this loop
+        // iteration - the quad, the probe, glFinish, eglSwapBuffers and the swap-lost bookkeeping.
+        // It is taken only after the block above has released P.lock (rule (2): ANGLE before
+        // P.lock, and never a condvar wait underneath it), and it is released before the next
+        // iteration goes back to sleep, so the engine is never kept out while this thread waits.
+        AngleLocker angleLock(AngleSide::Presenter);
+        // Cheap re-assertion (GLContext::makeContextCurrent() early-outs on isCurrent()): says in
+        // one place that this thread's context is only ever made current under the lock.
+        ctx->makeContextCurrent();
 
         // Apotheosis (WHITE-SCREEN fix): nothing to wait for here any more. presenterPublish()
         // glFinish()es on the engine thread before it sets P.published, so by the time this slot
@@ -2672,7 +2853,10 @@ static void presenterThreadMain()
         drawnAnything = true;
     }
 
-    ctx = nullptr;              // before RoUninitialize: it releases the panel's COM references
+    {
+        AngleLocker angleLock(AngleSide::Presenter);   // ~GLContext is eglMakeCurrent + eglDestroy*
+        ctx = nullptr;          // before RoUninitialize: it releases the panel's COM references
+    }
     if (roOwned)
         RoUninitialize();
 }
@@ -2686,6 +2870,11 @@ static void presenterThreadMain()
 // Returns -1 when the 50 ms are up and the presenter is still in the slot: there is no safe buffer
 // to composite into, so the caller drops this frame rather than drawing into the one being
 // sampled (which is what the old code did - it returned the slot anyway).
+//
+// Apotheosis (ANGLE global lock): CALLED WITHOUT THE ANGLE LOCK, and it must stay that way. This is
+// the one place where the engine waits for the presenter; holding the lock the presenter needs in
+// order to finish its draw would turn every frame into a 50 ms deadlock-and-drop. See rule (1) at
+// g_angleMutex.
 static int presenterAcquireSlot()
 {
     PresenterState& P = *g_pres.load(std::memory_order_acquire);
@@ -2710,7 +2899,12 @@ static void presenterPublish(int idx, int scrollX, int scrollY, const WebCore::C
     // submitted, before P.published names this slot - the presenter thread is on another EGL
     // context and there is no working cross-context sync on this ANGLE (see g_presFenceAdvertised).
     // glFinish() before the lock, so the presenter is not waiting on us while the GPU drains.
-    glFinish();
+    // Apotheosis (ANGLE global lock): the caller (gpuPresent) already holds it - this recursive
+    // re-entry documents that the glFinish is GL, and keeps the function correct on its own.
+    {
+        AngleLocker angleLock(AngleSide::Engine);
+        glFinish();
+    }
 
     auto [r, g, b, a] = background.toColorTypeLossy<WebCore::SRGBA<float>>().resolved();
     Locker locker { P.lock };
@@ -2750,12 +2944,19 @@ static bool presenterStart(void* nativeWindow, int w, int h)
     // Built locally and only published into g_pres once it is complete: from the moment the
     // pointer is visible, the presenter thread and the UI-thread exports may touch it, and from
     // that moment on it is never freed again (see the timeout below).
+    // Apotheosis (ANGLE global lock): uncontended - everything above and here runs before the
+    // presenter thread exists (and a second presenter is refused above) - but the render targets
+    // are GL objects, so they are created under the lock like every other GL call. The lock is
+    // released again before the wait for initState below: the presenter needs it to come up.
     std::unique_ptr<PresenterState> pres = std::make_unique<PresenterState>();
-    for (int i = 0; i < 2; ++i) {
-        pres->slot[i].texture = BitmapTexture::create(IntSize(w, h),
-            { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
-        if (!pres->slot[i].texture)
-            return false;   // nothing published yet, nothing to clean up but this object
+    {
+        AngleLocker angleLock(AngleSide::Engine);
+        for (int i = 0; i < 2; ++i) {
+            pres->slot[i].texture = BitmapTexture::create(IntSize(w, h),
+                { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
+            if (!pres->slot[i].texture)
+                return false;   // nothing published yet, nothing to clean up but this object
+        }
     }
     g_presenterWindow = nativeWindow;
     PresenterState& P = *pres;
@@ -2850,7 +3051,14 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     using namespace WebCore;
     if (!g_glContext || !g_textureMapper)
         return kErrNoView;
-    g_glContext->makeContextCurrent();
+    {
+        // Apotheosis (ANGLE global lock): eglMakeCurrent is an ANGLE state change like any other.
+        // Its own scope: what follows (gpuPrepare's layout block, presenterAcquireSlot's wait) must
+        // NOT run under the lock. The context stays current on this thread across the gaps - EGL
+        // currency is per-thread, only the call itself touches the display's shared state.
+        AngleLocker angleLock(AngleSide::Engine);
+        g_glContext->makeContextCurrent();
+    }
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
     // Apotheosis (review 2026-09-04 item 2): the presenter retired itself since the last composite.
     // Nothing below has run on the engine's own default framebuffer since GpuInit, and the last
@@ -2880,6 +3088,12 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
                 g_session->chrome->setNeedsPresent();
             return kOK;
         }
+        // Apotheosis (ANGLE global lock): from here to the publish this is one GL span - the
+        // composite into the slot, the repair composite (which re-enters gpuPrepare recursively,
+        // layout included: a rare path, and it must not hand the device to the presenter in the
+        // middle of a half-drawn slot) and presenterPublish()'s glFinish. Taken AFTER
+        // presenterAcquireSlot()'s wait, never around it.
+        AngleLocker angleLock(AngleSide::Engine);
         BitmapTexture& target = *pres->slot[idx].texture;
         Color docBg = view.documentBackgroundColor();
         if (!docBg.isValid())
@@ -2950,6 +3164,10 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         return kOK;
     }
 
+    // Apotheosis (ANGLE global lock): the engine-owned window surface path - composite, repair and
+    // the eglSwapBuffers at the end of the function are one GL span. Reached when the presenter is
+    // off or has retired, so it is normally uncontended.
+    AngleLocker angleLock(AngleSide::Engine);
     glViewport(0, 0, w, h);
     g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);   // nullptr → 默认帧缓冲
     {
@@ -3305,8 +3523,10 @@ static void teardownSession()
     // (suspected device crash). Make it current first. Also drop the per-frame flags, which
     // describe the session that is going away; g_gpuActive / g_gpuPresentMode / g_glContext /
     // g_textureMapper are deliberately process-lifetime and stay untouched.
-    if (g_gpuActive && g_glContext)
+    if (g_gpuActive && g_glContext) {
+        AngleLocker angleLock(AngleSide::Engine);   // Apotheosis (ANGLE global lock)
         g_glContext->makeContextCurrent();
+    }
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
     // Apotheosis (WHITE-AT-SCROLL-END): the tile bookkeeping describes the page that is going away.
@@ -3356,6 +3576,12 @@ static void teardownSession()
     // (e) 关键:在 reset() 之前显式丢最后一个 Page 引用,触发 ~Page。此时 g_session(及其 load 成员)仍存活,
     //     ~Page 内若有晚到回调写 load 也是写活内存。若改为直接 reset(),~Session 按反声明序先析构 load 再析构
     //     page,~Page 的回调就会写到已析构的 load → UAF。
+    // Apotheosis (ANGLE global lock): ~Page destroys the GraphicsLayerTextureMapper tree and with
+    // it every BitmapTexture and FBO it owns, and the RunLoop drain below runs the deferred
+    // deletions - all GL, from here to the end of the function. The presenter shows the last
+    // published frame meanwhile; nothing here waits on it (no composite can run without
+    // g_session), so holding the lock across the drain cannot deadlock.
+    AngleLocker angleLock(AngleSide::Engine);
     g_session->page = nullptr;
     g_session.reset();                                          // (f) 此时 Session.page 已空,~Session 不再触发回调
     for (int i = 0; i < 4; ++i)                                  // (g) 排空延迟清理 / curl 取消
@@ -3622,6 +3848,9 @@ extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain
 extern "C" void WebCoreReleaseMemory(int critical)
 {
     if (!ensureWebCoreInitialized()) return;
+    // Apotheosis (ANGLE global lock): releaseMemory() drops decoded images and layer
+    // backing stores, i.e. it deletes GL textures. Rare path, engine thread.
+    AngleLocker angleLock(AngleSide::Engine);
     wkReleaseMemoryLevel(critical ? 2 : 1, /*keepResourceCache*/ false);
 }
 
@@ -3667,6 +3896,8 @@ extern "C" void WebCoreSetMemoryPressure(int level)
     if (level > previous) {
         // Keep the encoded resource cache at level 1; at level 2 we are close enough to the
         // kill threshold that a white image is better than a dead app.
+        // Apotheosis (ANGLE global lock): this deletes GL textures - see WebCoreReleaseMemory.
+        AngleLocker angleLock(AngleSide::Engine);
         wkReleaseMemoryLevel(level, /*keepResourceCache*/ level < 2);
     }
 }
@@ -4409,8 +4640,11 @@ void WebCoreCloseSession()
     // Apotheosis (MEMORY-PLAN.md §3 change 6): the user left the page for good (home screen,
     // suspend, tab closed) — unlike the navigation path there is no next page that would reuse
     // the encoded resources or the compiled code, so take the critical route as well.
-    if (hadSession)
+    if (hadSession) {
+        // Apotheosis (ANGLE global lock): this deletes GL textures - see WebCoreReleaseMemory.
+        AngleLocker angleLock(AngleSide::Engine);
         wkReleaseMemoryLevel(2, /*keepResourceCache*/ false);
+    }
 }
 
 // ===========================================================================
@@ -5813,34 +6047,62 @@ int WebCoreGpuInit(void* nativeWindow, int w, int h)
     // presenter thread starts, so nothing races over sharingGLContext()'s lazy construction.
     // Any failure falls through to the original engine-owned window surface below.
     if (nativeWindow && g_presenterWanted) {
-        std::unique_ptr<GLContext> engineCtx = GLContext::createOffscreen(display);
-        if (engineCtx && engineCtx->makeContextCurrent()) {
-            std::unique_ptr<TextureMapper> tm = TextureMapper::create();
-            if (tm && presenterStart(nativeWindow, w, h)) {
-                g_glContext = engineCtx.release();
-                g_textureMapper = tm.release();
-                g_gpuW = w;
-                g_gpuH = h;
-                g_gpuPresentMode = true;
-                g_presenterActive.store(true);
-                g_gpuActive = true;
-                return kOK;
-            }
+        // Apotheosis (ANGLE global lock): the presenter thread does not exist yet, so none of this
+        // is contended - it is locked to keep "no GL/EGL outside the lock" true everywhere, and
+        // because the fall-through destructors below run at a point where a presenter DETACHED by
+        // presenterStart()'s timeout may already be issuing GL. presenterStart() itself is called
+        // unlocked: it waits on a condvar for the presenter, which needs the lock to come up.
+        std::unique_ptr<GLContext> engineCtx;
+        std::unique_ptr<TextureMapper> tm;
+        {
+            AngleLocker angleLock(AngleSide::Engine);
+            engineCtx = GLContext::createOffscreen(display);
+            if (engineCtx && engineCtx->makeContextCurrent())
+                tm = TextureMapper::create();
+        }
+        if (tm && presenterStart(nativeWindow, w, h)) {
+            g_glContext = engineCtx.release();
+            g_textureMapper = tm.release();
+            g_gpuW = w;
+            g_gpuH = h;
+            g_gpuPresentMode = true;
+            g_presenterActive.store(true);
+            g_gpuActive = true;
+            return kOK;
         }
         // ~GLContext does eglMakeCurrent(none) + eglDestroyContext on this thread - correct here,
         // this is the thread that created it and nothing has used it yet.
+        AngleLocker angleLock(AngleSide::Engine);
+        tm = nullptr;
+        engineCtx = nullptr;
     }
 
-    std::unique_ptr<GLContext> ctx = nativeWindow
-        ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
-        : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
-    if (!ctx)
-        return -20;
-    if (!ctx->makeContextCurrent())
-        return -21;
-    std::unique_ptr<TextureMapper> tm = TextureMapper::create();   // 需 GLContext::current() 非空(刚 makeCurrent 满足)
-    if (!tm)
-        return -22;
+    // Apotheosis (ANGLE global lock): a presenter detached by the timeout above can still be alive
+    // here, so the fallback context is built under the lock as well.
+    std::unique_ptr<GLContext> ctx;
+    std::unique_ptr<TextureMapper> tm;   // 需 GLContext::current() 非空(刚 makeCurrent 满足)
+    int gpuErr = 0;
+    {
+        AngleLocker angleLock(AngleSide::Engine);
+        ctx = nativeWindow
+            ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
+            : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
+        if (!ctx)
+            gpuErr = -20;
+        else if (!ctx->makeContextCurrent())
+            gpuErr = -21;
+        else {
+            tm = TextureMapper::create();
+            if (!tm)
+                gpuErr = -22;
+        }
+        if (gpuErr) {
+            tm = nullptr;       // the destructors are GL too - drop them inside the lock
+            ctx = nullptr;
+        }
+    }
+    if (gpuErr)
+        return gpuErr;
     g_glContext = ctx.release();        // 故意泄漏=随进程存活(避免退出时在错误线程 eglDestroyContext)
     g_textureMapper = tm.release();
     g_gpuW = w;
@@ -5982,8 +6244,11 @@ static int presentOwedSwap(uint64_t ackId)
         return kOK;
     }
     g_swapOwed = false;
-    g_glContext->makeContextCurrent();
-    g_glContext->swapBuffers();
+    {
+        AngleLocker angleLock(AngleSide::Engine);   // Apotheosis (ANGLE global lock)
+        g_glContext->makeContextCurrent();
+        g_glContext->swapBuffers();
+    }
     return kOK;
 }
 
