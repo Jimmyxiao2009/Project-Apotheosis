@@ -5420,8 +5420,18 @@ int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA)
     // A press left down by an abandoned gesture would turn this mousedown into a pointermove — same
     // guard, same reason, as at the top of WebCoreClickAt/WebCoreDragAt.
     const bool unwound = lf->eventHandler().mousePressed();
-    if (unwound)
+    if (unwound) {
         releaseDanglingPress(*lf, p, mods);
+        // That release dispatches a mouseup, which runs script and in the worst case navigates —
+        // re-fetch before pressing, exactly as WebCoreClickAt does.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (!lf)
+            return kErrFrameGone;
+        g_session->mainFrame = lf;
+        view = lf->view();
+        if (!view)
+            return kErrNoView;
+    }
     g_dragActive = false;   // this call owns the press from here to its release
 
     DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
