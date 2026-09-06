@@ -22,6 +22,7 @@
 #include <functional>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cwctype>
 #include <cstdlib>
 #include <ppltasks.h>
@@ -709,18 +710,28 @@ static const double kZoomRubberBandDip = 40.0;
 //   roughly 1.1-1.6 s to 0.75-1.25 s without starving either trigger.
 static const int kLongPressEngineHoldMs = 250;
 
-// Apotheosis (bug fix 2026-09-06, device test 0.1.9.16): keyboard-avoidance seam. 0.1.9.16 shifted
-//   the nav bar up by (OccludedRect.Height - m_lastInsetBottom) — both already in DIP, see the units
-//   note on the Showing handler below — but then added an extra couple of DIP of upward reach on the
-//   nav bar alone plus a decorative bleed strip to paper over a seam against the suggestion panel,
-//   on the theory that two independently-set TranslateTransforms driven by nominally identical
-//   values could still round to different device pixels. On device that extra reach was itself the
-//   bug: it is pure guesswork with no way to verify which direction (if any) the two transforms
-//   actually diverge. Replaced with the structurally sound fix — ONE rounded DIP value (shiftUp),
-//   computed once in the Showing handler and applied verbatim to both NavBarShift->Y and
-//   ShiftSuggestPanel(); see ComputeKeyboardShift(). Two transforms fed the identical already-quantised
-//   double cannot disagree, so there is no seam left to paper over — the XAML bleed Border and the
-//   kSeamOverlapDip/kSeamBleedDip constants are gone.
+// Apotheosis (bug fix 2026-09-06 evening, device tests 0.1.9.16/0.1.9.18): keyboard avoidance.
+//   TWO mechanisms can move the bottom chrome when the on-screen keyboard appears and NEITHER of
+//   them knows about the other:
+//     (a) the inset path — ApplicationView::VisibleBounds vs CoreWindow::Bounds → RootGrid's bottom
+//         Padding (ApplyViewInsets). On W10M this reserves the software navigation bar's strip; on a
+//         shell where VisibleBounds ALSO shrinks for the input pane it would reserve the keyboard too.
+//     (b) this path — a RenderTransform on the nav bar + the content-row overlays.
+//   0.1.9.16 (raw OccludedRect.Height) assumed (a) never sees the keyboard; 0.1.9.17/18
+//   (OccludedRect.Height - m_lastInsetBottom) assumed the occluded rect runs all the way down to the
+//   window edge, i.e. that it swallows the nav bar strip. Device verdict on 0.1.9.18: the bar sits
+//   LOWER than before, by about the nav-bar inset — so the occluded rect covers the keyboard ONLY,
+//   sitting on top of the nav-bar strip, and 0.1.9.16 was right by luck.
+//   Neither guess is needed. There is one requirement — the nav bar's bottom edge must land exactly
+//   on the keyboard's TOP edge — and both quantities are measurable:
+//       resting bottom edge (window coords) = CoreWindow::Bounds.Height - <RootGrid bottom padding>
+//       keyboard top edge   (window coords) = InputPane::OccludedRect.Y
+//       shift               = resting bottom edge - keyboard top edge, clamped to >= 0
+//   Using OccludedRect.Y instead of .Height makes the result independent of how far down the rect
+//   extends, and folding the CURRENT inset in makes it self-correcting against (a): if VisibleBounds
+//   does shrink for the keyboard, the padding alone already puts the bar in the right place and this
+//   formula yields 0 — no summing, no double application. ApplyViewInsets() re-runs it whenever the
+//   insets change, so whichever mechanism moves first, the end state is the same.
 //   The nav bar stays a RenderTransform (not a layout Margin/Padding): Row 1 (nav bar) and Row 0
 //   (content, which owns GpuPanel) share RootGrid's row list, so growing Row 1 to make room for the
 //   keyboard would shrink Row 0 and resize GpuPanel — the ANGLE swap-chain-rebuild crash class the
@@ -750,36 +761,48 @@ static double RoundToDevicePixel(double dip)
     return std::round(dip * scale) / scale;
 }
 
-// Apotheosis (bug fix 2026-09-06): both m_lastInsetBottom (from ApplicationView::VisibleBounds vs
-//   CoreWindow::Bounds, see ApplyViewInsets) and InputPane::OccludedRect are documented as DIP in the
-//   same CoreWindow coordinate space — no px/DIP conversion needed here, only the subtraction below.
-//   The nav bar's resting bottom edge already sits m_lastInsetBottom DIP above the physical screen
-//   edge (RootGrid's bottom Padding); OccludedRect.Height is measured from that same screen edge, so
-//   shifting the bar by the raw height double-counts the inset. shiftUp is the additional distance —
-//   clamped to 0 (keyboard shorter than the existing inset -> nothing to do) and rounded once so both
-//   consumers agree down to the device pixel.
-//   Some builds report OccludedRect.Height == 0 on the very first Showing dispatch (rect not yet
-//   computed) — re-query the InputPane's own property (not the event args) as a same-call fallback;
-//   if that is also 0 there is nothing usable and the bar does not move (logged either way).
-static double ComputeKeyboardShift(Windows::UI::ViewManagement::InputPane^ ip,
-                                    Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e,
-                                    double insetBottom, const char* who)
+// The bottom chrome row's declared Height in MainPage.xaml. Only used as the safety clamp below —
+//   the shift may never carry the bar so far up that less than one bar's worth of window is left.
+static const double kNavBarHeightDip = 62.0;
+
+// Compact DIP formatting for the stage.txt diagnostics — std::to_string(double) writes six decimals
+//   per number, which turns one keyboard line into 200 characters of noise. One decimal is finer than
+//   any device pixel we can address (RawPixelsPerViewPixel is 2.5 at most here).
+static std::string Dip(double v)
 {
-    double occluded = e ? e->OccludedRect.Height : 0.0;
-    const char* source = "event";
-    if (!(occluded > 0.0) && ip) {
-        try { occluded = ip->OccludedRect.Height; source = "requery"; } catch (...) {}
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f", v);
+    return std::string(buf);
+}
+
+// Apotheosis (bug fix 2026-09-06 evening): the one keyboard geometry computation — see the block
+//   comment above for the derivation. Everything is in CoreWindow-local DIP: winHeight is
+//   CoreWindow::Bounds.Height, insetBottom is what ApplyViewInsets() last put into RootGrid's bottom
+//   Padding, and kbTop/kbHeight are InputPane::OccludedRect's Y/Height.
+//   `mode` (written to the log) says which branch produced the value:
+//     edge   - the normal path, anchored on the occluded rect's TOP edge (layout-independent).
+//     height - the rect has a height but a Y we cannot trust (0, or below the window); fall back to
+//              the pre-0.1.9.17 behaviour, which device-tested closest to correct.
+//     none   - no usable rect at all: do not move.
+static double KeyboardShiftFor(double winHeight, double insetBottom,
+                               double kbTop, double kbHeight, const char** modeOut)
+{
+    const double restingBottom = winHeight - insetBottom;   // nav bar's bottom edge at rest
+    double shift = 0.0;
+    const char* mode = "none";
+    if (kbHeight > 0.0 && kbTop > 0.0 && kbTop <= winHeight) {
+        shift = restingBottom - kbTop;
+        mode = "edge";
+    } else if (kbHeight > 0.0) {
+        shift = kbHeight;
+        mode = "height";
     }
-    if (!(occluded > 0.0)) { occluded = 0.0; source = "unavailable"; }
-    double shiftUp = occluded - insetBottom;
-    if (!(shiftUp > 0.0)) shiftUp = 0.0;
-    shiftUp = RoundToDevicePixel(shiftUp);
-    WriteStage((std::string(who) + " occluded=" + std::to_string(occluded)
-                + " inset=" + std::to_string(insetBottom)
-                + " scale=" + std::to_string(CurrentDeviceScale())
-                + " shift=" + std::to_string(shiftUp)
-                + " src=" + source).c_str());
-    return shiftUp;
+    if (!(shift > 0.0)) shift = 0.0;
+    // Never fling the chrome off the top of the window, whatever the shell reports.
+    const double maxShift = (winHeight > kNavBarHeightDip) ? (winHeight - kNavBarHeightDip) : 0.0;
+    if (shift > maxShift) shift = maxShift;
+    *modeOut = mode;
+    return RoundToDevicePixel(shift);
 }
 
 // One axis of the live-pinch clamp (ApplyLiveZoom). Works entirely in engine px (WebCoreGetScrollState
@@ -994,6 +1017,7 @@ MainPage::MainPage()
     //   Apotheosis (2837ce0 review item 1): the title row is no longer a chrome row above this one —
     //   it is a bottom-anchored overlay in the content row (TitleRow), so it rides along with the
     //   suggestion dropdown through ShiftSuggestPanel() instead of staying put.
+    SetupKeyboardShiftTransforms();
     try {
         auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
         ip->Showing += ref new Windows::Foundation::TypedEventHandler<
@@ -1004,21 +1028,31 @@ MainPage::MainPage()
                 //   ShiftSuggestPanel(), so hiding it while typing is what leaves the strip empty.
                 m_titleRowPinned = true;
                 RevealTitleRow();
-                if (m_urlFocused && NavBarShift) {
-                    // Apotheosis (bug fix 2026-09-06): ONE rounded shift value, applied verbatim to
-                    //   both the nav bar and the suggestion panel — see ComputeKeyboardShift() above
-                    //   for the derivation (occluded height minus the inset already reserved by
-                    //   RootGrid's Padding) and for the units note (both inputs are DIP already).
-                    double shiftUp = ComputeKeyboardShift(ip, e, m_lastInsetBottom, "keyboard-show");
-                    NavBarShift->Y = -shiftUp;
-                    // Apotheosis (review 2026-09-03): the suggestion dropdown is anchored to the
-                    //   bottom of the *content* row, i.e. it floats right on top of the nav bar.
-                    //   Shifting only the nav bar left it behind the keyboard while typing, so it
-                    //   rides along by the identical value (its own transform — different subtree) —
-                    //   no seam is possible when both consumers receive the same already-rounded double.
-                    ShiftSuggestPanel(-shiftUp);
-                    e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
+                // Apotheosis (bug fix 2026-09-06 evening): record the geometry, then let
+                //   ApplyKeyboardShift() decide what (if anything) is left for this path to do —
+                //   see the block comment on KeyboardShiftFor(). Recording is UNCONDITIONAL: the
+                //   0.1.9.18 device log had no keyboard line at all because the old handler did all
+                //   of its work, logging included, inside `if (m_urlFocused && NavBarShift)`, so a
+                //   Showing that arrives before UrlBox's GotFocus left no trace and no shift.
+                //   OnUrlGotFocus() calls ApplyKeyboardShift() too, which repairs exactly that order.
+                Windows::Foundation::Rect occ(0.0f, 0.0f, 0.0f, 0.0f);
+                if (e) occ = e->OccludedRect;
+                const char* src = "event";
+                if (!(occ.Height > 0.0f) && ip) {   // some builds report an empty rect on the first dispatch
+                    try { occ = ip->OccludedRect; src = "requery"; } catch (...) {}
                 }
+                m_kbVisible = occ.Height > 0.0f;
+                m_kbTop = m_kbVisible ? (double)occ.Y : 0.0;
+                m_kbHeight = m_kbVisible ? (double)occ.Height : 0.0;
+                WriteStage(("keyboard-show occ=" + Dip(occ.X) + "," + Dip(occ.Y)
+                            + " " + Dip(occ.Width) + "x" + Dip(occ.Height)
+                            + " src=" + src
+                            + " urlfocus=" + (m_urlFocused ? "1" : "0")
+                            + " inset=" + Dip(m_lastInsetBottom)
+                            + " scale=" + Dip(CurrentDeviceScale())).c_str());
+                ApplyKeyboardShift("show");
+                if (m_kbShiftApplied > 0.0 && e)
+                    e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
             });
         ip->Hiding += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
@@ -1027,16 +1061,18 @@ MainPage::MainPage()
                 //   (it keeps its own pin, OnUrlLostFocus clears that), hand the row back to the
                 //   usual grace period.
                 if (!m_urlFocused) { m_titleRowPinned = false; RevealTitleRow(); }
-                if (NavBarShift && NavBarShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
-                    // Apotheosis (bug fix 2026-09-06): one diagnostic line to match keyboard-show, so
-                    //   a device log always has a matched show/hide pair to compare.
-                    WriteStage(("keyboard-hide occluded=" + std::to_string(e ? e->OccludedRect.Height : 0.0)
-                                + " inset=" + std::to_string(m_lastInsetBottom)
-                                + " prevshift=" + std::to_string(-NavBarShift->Y)).c_str());
-                    NavBarShift->Y = 0;
-                    ShiftSuggestPanel(0.0);
+                // Apotheosis (bug fix 2026-09-06 evening): unconditional too, so a device log always
+                //   has a matched show/hide pair even when nothing was shifted.
+                const double prev = m_kbShiftApplied;
+                m_kbVisible = false;
+                m_kbTop = 0.0;
+                m_kbHeight = 0.0;
+                WriteStage(("keyboard-hide occ=" + Dip(e ? e->OccludedRect.Height : 0.0f)
+                            + " inset=" + Dip(m_lastInsetBottom)
+                            + " prevshift=" + Dip(prev)).c_str());
+                ApplyKeyboardShift("hide");
+                if (prev > 0.0 && e)   // 仅当我们上移过才认领(设置页文本框靠系统自身滚动恢复,别干扰)
                     e->EnsuredFocusedElementInView = true;
-                }
             });
     } catch (...) {}
     // Apotheosis (review 2026-09-03): DISPLAY toggle "Hide navigation bar". Wired here rather than
@@ -1285,28 +1321,85 @@ void MainPage::OnHideStatusBarToggled(Platform::Object^, RoutedEventArgs^)
     ApplyHideStatusBarSetting();
 }
 
+// Apotheosis (bug fix 2026-09-06 evening): give the two content-row overlays that ride with the nav
+//   bar a keyboard transform of their OWN, once, at construction.
+//   SuggestPanel had none in the XAML, so the old lazy `el->RenderTransform = new TranslateTransform`
+//   worked for it. TitleRow, however, already carries TitleRowShift — the transform RevealTitleRow()/
+//   CollapseTitleRow() ANIMATE. Writing the keyboard offset into that same transform could never
+//   work: a Storyboard's value wins over a local one while it runs and, with the default
+//   FillBehavior=HoldEnd, keeps winning after it completes — and RevealTitleRow() is called from the
+//   Showing handler immediately before the shift. So the title row silently stayed at the bottom of
+//   the content row while the nav bar and the dropdown moved up, leaving exactly its own 24 DIP of
+//   page pixels between the dropdown and the bar: the second of the two reported gaps.
+//   A TransformGroup keeps the slide (still targeted by object, so both Storyboards keep working)
+//   and adds an independent keyboard translation on top. Built here, before the first RevealTitleRow(),
+//   so no animation is ever re-parented mid-flight. UI THREAD ONLY.
+void MainPage::SetupKeyboardShiftTransforms()
+{
+    try {
+        if (SuggestPanel && m_suggestKbShift == nullptr) {
+            m_suggestKbShift = ref new Windows::UI::Xaml::Media::TranslateTransform();
+            SuggestPanel->RenderTransform = m_suggestKbShift;
+        }
+        if (TitleRow && m_titleKbShift == nullptr) {
+            m_titleKbShift = ref new Windows::UI::Xaml::Media::TranslateTransform();
+            auto group = ref new Windows::UI::Xaml::Media::TransformGroup();
+            if (TitleRowShift) group->Children->Append(TitleRowShift);   // the animated slide
+            group->Children->Append(m_titleKbShift);                    // the keyboard offset
+            TitleRow->RenderTransform = group;
+        }
+    } catch (...) {}
+}
+
 // Apotheosis (review 2026-09-03): move the URL suggestion dropdown together with the nav bar when
 //   the soft keyboard comes up. SuggestPanel lives in the content row (bottom-anchored) while
 //   NavBarShift only covers the bottom chrome, so it needs its own translation by the same Y.
-//   Created lazily and kept on the element — y == 0 restores the resting position.
-//   UI THREAD ONLY.
+//   y == 0 restores the resting position. UI THREAD ONLY.
 //   Apotheosis (2837ce0 review item 1): TitleRow is a bottom-anchored overlay in the same subtree
 //   since the title row left the bottom chrome, so it needs the identical treatment — otherwise it
 //   stays behind the keyboard while the nav bar it belongs above has moved up.
 void MainPage::ShiftSuggestPanel(double y)
 {
-    Windows::UI::Xaml::FrameworkElement^ els[2] = { SuggestPanel, TitleRow };
-    for (int i = 0; i < 2; ++i) {
-        auto el = els[i];
-        if (!el) continue;
-        auto t = dynamic_cast<Windows::UI::Xaml::Media::TranslateTransform^>(el->RenderTransform);
-        if (t == nullptr) {
-            if (y == 0.0) continue;   // nothing to restore
-            t = ref new Windows::UI::Xaml::Media::TranslateTransform();
-            el->RenderTransform = t;
-        }
-        t->Y = y;
+    SetupKeyboardShiftTransforms();   // no-op after the first call; covers a late XamlReader fallback
+    if (m_suggestKbShift) m_suggestKbShift->Y = y;
+    if (m_titleKbShift) m_titleKbShift->Y = y;
+}
+
+// Apotheosis (bug fix 2026-09-06 evening): the single place that decides where the bottom chrome
+//   sits while the on-screen keyboard is up — see the block comment on KeyboardShiftFor() for the
+//   geometry and for why this is anchored on the occluded rect's top edge and on the CURRENT bottom
+//   inset. Idempotent and cheap: called from the InputPane Showing/Hiding handlers, from
+//   ApplyViewInsets() whenever the insets actually move (so the inset path and this one can never
+//   sum up), and from the UrlBox focus handlers (a Showing that beat GotFocus, or focus leaving
+//   while the keyboard stays up). Only logs when the applied value changes, so it cannot spam
+//   stage.txt from ApplyViewInsets. UI THREAD ONLY.
+void MainPage::ApplyKeyboardShift(const char* why)
+{
+    // 网页表单输入(ImeBox)不上移——引擎自管把聚焦框滚进视口;只有地址栏编辑态才让位。
+    double shiftUp = 0.0;
+    const char* mode = "idle";
+    double winH = 0.0;
+    if (m_kbVisible && m_urlFocused) {
+        try {
+            auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+            if (win) winH = (double)win->Bounds.Height;
+        } catch (...) {}
+        if (winH > 0.0)
+            shiftUp = KeyboardShiftFor(winH, m_lastInsetBottom, m_kbTop, m_kbHeight, &mode);
+        else
+            mode = "nowindow";
     }
+    if (shiftUp == m_kbShiftApplied) return;
+    m_kbShiftApplied = shiftUp;
+    if (NavBarShift) NavBarShift->Y = -shiftUp;
+    ShiftSuggestPanel(-shiftUp);
+    WriteStage((std::string("keyboard-shift why=") + why
+                + " mode=" + mode
+                + " shift=" + Dip(shiftUp)
+                + " winh=" + Dip(winH)
+                + " kbtop=" + Dip(m_kbTop)
+                + " kbh=" + Dip(m_kbHeight)
+                + " inset=" + Dip(m_lastInsetBottom)).c_str());
 }
 
 // Apotheosis (2837ce0 review item 1): show the title/toast row and, unless a page is loading, arm
@@ -1473,6 +1566,11 @@ void MainPage::ApplyViewInsets()
     //   PinchCommit's continuation flushes the deferred call.
     if (m_pinching || m_zoomSpring != nullptr) { m_insetsPending = true; return; }
     double top = 0.0, bottom = 0.0;
+    // Apotheosis (bug fix 2026-09-06 evening): kept for the stage.txt line at the bottom of this
+    //   function — the numbers that say, once and for all, whether this shell moves VisibleBounds for
+    //   the on-screen keyboard (the "insets" line's bottom value jumping by the keyboard height when
+    //   keyboard-show is logged) or only for the software navigation bar.
+    double vbY = 0.0, vbH = 0.0, wbY = 0.0, wbH = 0.0;
     try {
         auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
         auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
@@ -1480,8 +1578,10 @@ void MainPage::ApplyViewInsets()
         Windows::Foundation::Rect vb = view->VisibleBounds;
         Windows::Foundation::Rect wb = win->Bounds;
         if (!(vb.Height > 0.0f) || !(wb.Height > 0.0f)) return;
-        top = (double)vb.Y - (double)wb.Y;
-        bottom = ((double)wb.Y + (double)wb.Height) - ((double)vb.Y + (double)vb.Height);
+        vbY = (double)vb.Y; vbH = (double)vb.Height;
+        wbY = (double)wb.Y; wbH = (double)wb.Height;
+        top = vbY - wbY;
+        bottom = (wbY + wbH) - (vbY + vbH);
     } catch (...) { return; }
     if (!(top > 0.0)) top = 0.0;
     if (!(bottom > 0.0)) bottom = 0.0;
@@ -1563,6 +1663,18 @@ void MainPage::ApplyViewInsets()
         ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
     }
     if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
+    // Apotheosis (bug fix 2026-09-06 evening): one line per ACTUAL inset change (the early-out above
+    //   swallows the many no-op calls), so a device log shows both keyboard-avoidance mechanisms side
+    //   by side and the next session can be diagnosed from stage.txt alone.
+    WriteStage(("insets top=" + Dip(top) + " bottom=" + Dip(bottom)
+                + " strip=" + Dip(stripH) + " title=" + Dip(titleH)
+                + " vb=" + Dip(vbY) + "+" + Dip(vbH)
+                + " wb=" + Dip(wbY) + "+" + Dip(wbH)
+                + " kb=" + (m_kbVisible ? "1" : "0")).c_str());
+    // The bottom padding just moved the nav bar's resting position, so whatever the keyboard shift
+    //   still owes on top of it has changed with it — recompute from the same single formula rather
+    //   than letting the two mechanisms add up. No-op (and silent) when nothing is owed.
+    ApplyKeyboardShift("insets");
 }
 
 // ---- 持久化 ----
@@ -4214,6 +4326,7 @@ void MainPage::DismissKeyboardForOverlay()
 {
     m_urlFocused = false;
     SetUrlEditingChrome(false);   // 焦点没真的离开 UrlBox → LostFocus 不会触发,手动还原刷新/停止键
+    ApplyKeyboardShift("overlay");   // 同理:LostFocus 不触发 → 这里得自己把底栏放回原位
     CloseKeyboard();
     try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
 }
@@ -4954,6 +5067,14 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
     //   stops the timer from taking it away again while the field has focus.
     m_titleRowPinned = true;
     RevealTitleRow();
+    // Apotheosis (bug fix 2026-09-06 evening): the InputPane's Showing can arrive BEFORE this handler
+    //   (tapping the field raises the pane and moves focus, and the order is not contractual). The
+    //   old code shifted the chrome only from inside Showing, guarded on m_urlFocused, so in that
+    //   order nothing moved at all and — because the diagnostic sat inside the same guard — nothing
+    //   was logged either, which is why the 0.1.9.18 stage.txt had no keyboard line. The shift is a
+    //   pure function of (keyboard geometry, current inset, editing state) now, so simply re-running
+    //   it whenever any of the three changes covers every ordering.
+    ApplyKeyboardShift("url-focus");
 }
 // Apotheosis (review 2026-09-04 item 4): the collapse used to happen only from explicit callers
 //   (tap the page / open the menu-settings-etc — still true, see the other HideSuggestions() call
@@ -4981,6 +5102,10 @@ void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
     //   whichever runs last re-arms the timer, and RevealTitleRow() is idempotent.
     m_titleRowPinned = false;
     RevealTitleRow();
+    // Apotheosis (bug fix 2026-09-06 evening): the chrome only gives way for the ADDRESS BAR's
+    //   keyboard (a page's own form field is scrolled into view by the engine). Focus leaving while
+    //   the pane is still up therefore has to put it back — Hiding may never come.
+    ApplyKeyboardShift("url-blur");
     if (UrlBox) {
         std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
         std::wstring want = (m_currentUrl == L"about:home") ? std::wstring() : m_currentUrl;

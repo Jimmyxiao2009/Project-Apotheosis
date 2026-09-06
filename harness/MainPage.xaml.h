@@ -310,6 +310,15 @@ namespace Harness {
         //   it needs the same soft-keyboard shift as NavBarShift. 0 = back to rest.
         //   (2837ce0 review item 1): TitleRow lives in the same subtree and rides along.
         void ShiftSuggestPanel(double y);
+        // Apotheosis (bug fix 2026-09-06 evening): build the dedicated keyboard TranslateTransforms
+        //   for the two content-row overlays once, at construction — TitleRow's existing transform is
+        //   animated by RevealTitleRow()/CollapseTitleRow() and must not be written to. UI thread only.
+        void SetupKeyboardShiftTransforms();
+        // Apotheosis (bug fix 2026-09-06 evening): THE place that positions the bottom chrome against
+        //   the on-screen keyboard. Recomputes from (recorded keyboard geometry, current bottom inset,
+        //   address-bar editing state) and applies the difference; idempotent, so every input that can
+        //   change one of the three just calls it. `why` only lands in the stage.txt line. UI thread only.
+        void ApplyKeyboardShift(const char* why);
         // Apotheosis (2837ce0 review item 1): the title/toast row auto-hides. Reveal() shows it and
         //   — unless a page is loading — arms the ~2 s hide; Collapse() fades it out and hands its
         //   strip back to the content area (ApplyViewInsets' titleH). Every write to TitleText::Text
@@ -617,6 +626,22 @@ namespace Harness {
         //   size (see the XAML comment) and simply has that strip covered.
         double m_lastTitleH { 0.0 };
         bool   m_insetsValid { false };
+        // Apotheosis (bug fix 2026-09-06 evening): on-screen keyboard state, recorded by the InputPane
+        //   Showing/Hiding handlers and consumed by ApplyKeyboardShift(). m_kbTop/m_kbHeight are
+        //   InputPane::OccludedRect's Y/Height in CoreWindow-local DIP; the TOP edge is what the shift
+        //   is anchored on, so the result does not depend on how far down the rect extends (0.1.9.16
+        //   and 0.1.9.18 each guessed that differently and each got it wrong in one direction).
+        //   m_kbShiftApplied is what NavBarShift/ShiftSuggestPanel currently carry, so the recompute
+        //   can be called from anywhere and stays silent when nothing changes.
+        bool   m_kbVisible { false };
+        double m_kbTop { 0.0 }, m_kbHeight { 0.0 };
+        double m_kbShiftApplied { 0.0 };
+        // The keyboard offset of the two bottom-anchored content-row overlays. SuggestPanel has no
+        //   other transform; TitleRow's own TitleRowShift is ANIMATED (reveal/collapse slide) and a
+        //   Storyboard's value overrides a local one both while it runs and, with HoldEnd, afterwards
+        //   — so the keyboard offset gets its own transform, grouped with the animated one.
+        Windows::UI::Xaml::Media::TranslateTransform^ m_suggestKbShift;
+        Windows::UI::Xaml::Media::TranslateTransform^ m_titleKbShift;
         // Apotheosis (2837ce0 review item 1): auto-hide of the title/toast row. The timer is the
         //   one-shot "idle for ~2 s → slide away"; the token drops a slide-up/slide-down that a later
         //   Reveal()/Collapse() overtook (Storyboard::Completed still fires after Stop()).

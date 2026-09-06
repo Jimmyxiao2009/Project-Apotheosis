@@ -418,6 +418,18 @@
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
+            <!-- Apotheosis (bug fix 2026-09-06 evening): seam bleed. The keyboard shift is computed
+                 in whole device pixels (ApplyKeyboardShift / KeyboardShiftFor in MainPage.xaml.cpp),
+                 but the shell's own keyboard top edge is not ours to round, so a sub-DIP sliver of
+                 page can still show between this bar and the keyboard. This strip extends the bar's
+                 opaque background 6 DIP BELOW its own Height="62" box (negative bottom margin — a
+                 Grid does not clip its children), which is always covered: at rest by RootGrid's
+                 reserved bottom inset (or past the screen edge when there is none), with the keyboard
+                 up by the keyboard itself. Purely decorative — never bleed upward instead, that would
+                 permanently cover part of the content row. -->
+            <Border Grid.ColumnSpan="5" VerticalAlignment="Bottom" Height="6" Margin="0,0,0,-6"
+                    Background="{StaticResource Chrome}" IsHitTestVisible="False"/>
+
             <!-- 标签键:方框数字,点开标签切换器 -->
             <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
                 <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
