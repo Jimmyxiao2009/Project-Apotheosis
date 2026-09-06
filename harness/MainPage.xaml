@@ -292,6 +292,7 @@
                 <Grid x:Name="ContentArea" Background="White"
                        ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale"
                        IsTapEnabled="True" Tapped="OnPageTapped"
+                       IsHoldingEnabled="True" Holding="OnPageHolding"
                        ManipulationDelta="OnImageManipDelta"
                        ManipulationCompleted="OnImageManipCompleted">
                     <!-- 固定 720x1080 的软件帧须随可用视口铺满；否则横屏时右侧会留下空白。 -->
@@ -769,6 +770,8 @@
                          dominant axis once the accumulated delta clears a small threshold, like
                          Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock). -->
                     <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <!-- Apotheosis: 在地图/画布上捏合时把手势交给页面(ctrl+滚轮)，而不是缩放整页；默认开。 -->
+                    <ToggleSwitch x:Name="SetPinchPageSwitch" Header="捏合作用于页面元素(地图)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>

@@ -256,7 +256,7 @@ static ::Platform::String^ __MainPageXaml() {
             <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10">
                 <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖→引擎滚动+惯性,捏合→Scale)。
                      点击走 Tapped;坐标用 GetPosition(ContentArea) 映回引擎像素(MapTapToEngine)。 -->
-                <Grid x:Name="ContentArea" Background="White" ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale" IsTapEnabled="True">
+                <Grid x:Name="ContentArea" Background="White" ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale" IsTapEnabled="True" IsHoldingEnabled="True">
                     <!-- 固定 720x1080 的软件帧须随可用视口铺满；否则横屏时右侧会留下空白。 -->
                     <Image x:Name="RenderImage" Stretch="Fill" />
                 </Grid>
@@ -706,6 +706,7 @@ static ::Platform::String^ __MainPageXaml() {
                          dominant axis once the accumulated delta clears a small threshold, like
                          Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock). -->
                     <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <ToggleSwitch x:Name="SetPinchPageSwitch" Header="捏合作用于页面元素(地图)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8" />
@@ -804,6 +805,7 @@ void MainPage::InitializeComponent() {
     SetDragPointerSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetDragPointerSwitch"));
     SetStaleTilesSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetStaleTilesSwitch"));
     SetAxisLockSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetAxisLockSwitch"));
+    SetPinchPageSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetPinchPageSwitch"));
     SetHideNavBarSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetHideNavBarSwitch"));
     SetHideStatusBarSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetHideStatusBarSwitch"));
     VersionText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"VersionText"));
@@ -850,6 +852,7 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Holding += ref new ::Windows::UI::Xaml::Input::HoldingEventHandler(this, &MainPage::OnPageHolding);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
     safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);

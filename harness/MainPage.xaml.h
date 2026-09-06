@@ -191,10 +191,15 @@ namespace Harness {
         void OnLoadWatchdog(Platform::Object^ sender, Platform::Object^ e);
         // 网页点击:有会话则把点击转发到引擎(按钮/表单/链接统一走真实事件);无会话(主页)走链接表。
         void OnPageTapped(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        // Apotheosis (Google Maps pin, 2026-09-06): press and hold on a map/canvas. XAML raises
+        // Holding for touch while the finger is still on the glass; the engine then gets a real
+        // long press (WebCoreLongPressAt) instead of the click a tap delivers.
+        void OnPageHolding(Platform::Object^ sender, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e);
         // 把内容区显示坐标(DIP)映回引擎像素空间(直呈现下表面被拉伸+设备分辨率缩放),修点击/焦点偏移。
         void MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy);
         // 把位图像素 (px,py) 的点击转发到引擎活会话(WebCoreClickAt),完成后同步地址栏/历史/链接表。
-        void ForwardClickToEngine(int px, int py);
+        // longPress = hold the button down first (WebCoreLongPressAt) instead of clicking.
+        void ForwardClickToEngine(int px, int py, bool longPress = false);
         // 引擎滚动 dy 像素(触发懒加载图片)后重绘。dy>0 向下。
         void EngineScroll(int dy);
         // Apotheosis: show/hide the floating page up/down buttons (developer setting, off by default).
@@ -240,6 +245,11 @@ namespace Harness {
         // its return value is what decides whether the gesture belongs to the page at all.
         void DragMoveTo(int px, int py, int fallbackDx, int fallbackDy);   // finger is here now
         void PumpDrag();          // send the next queued phase, one engine post at a time
+        // Apotheosis (pinch on map widgets, 2026-09-06): a pinch that started over a map is fed to
+        // the page as ctrl+wheel notches instead of scaling the page. Same one-post-in-flight shape
+        // as PumpDrag; notches accumulate while a post is out.
+        void ZoomWheelBy(int px, int py, int notches);
+        void PumpZoomWheel();
         void DragReset();         // forget the gesture (new gesture, session gone, superseded)
         // ---- Apotheosis (instant pan, developer setting "Instant pan"): the last frame follows
         // the finger. A main-frame pan is applied to the presenting element as a XAML
@@ -462,6 +472,11 @@ namespace Harness {
         //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is
         //   the only way those pages can be panned at all. settings.ini dragpointer
         bool m_dragPointer { true };
+        // Apotheosis (pinch on map widgets, 2026-09-06): DEVELOPER toggle, default ON. A pinch that
+        //   starts on a drag widget while the page is at 1:1 goes to the page as ctrl+wheel notches
+        //   (the map zooms itself and re-fetches its tiles) instead of scaling the rendered page.
+        //   Pure harness-side routing, no engine push needed. settings.ini pinchpage
+        bool m_pinchToPage { true };
         // Apotheosis (axis lock / rail scrolling): DEVELOPER toggle, default ON. Pure harness-side
         // logic (see UpdateAxisLock/ApplyAxisLock) — no engine call, so unlike threadraster/
         // staletiles it needs no ApplyXSetting push, m_axisLockEnabled is read directly.
@@ -554,6 +569,20 @@ namespace Harness {
         int  m_dragFallbackDx { 0 }, m_dragFallbackDy { 0 };
         // M4 捏合缩放状态
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
+        // Apotheosis (Google Maps pin, 2026-09-06): tick count of the last Holding(Started) that was
+        //   turned into a long press. A hold normally ends in RightTapped rather than Tapped, but a
+        //   Tapped within a second of one is the tail of that same gesture and must not reach the
+        //   page as a second click.
+        unsigned long long m_holdAtMs { 0 };
+        // Apotheosis (pinch on map widgets, 2026-09-06): this pinch is being fed to the page as
+        //   ctrl+wheel notches (WebCoreZoomWheelAt) rather than scaled with WebCoreSetPageScale.
+        //   Decided once, at the first pinch delta, and cleared by EndGesture with the rest of the
+        //   gesture state. m_pinchPageAccum is the scale change not yet worth a notch.
+        bool   m_pinchPage { false };
+        float  m_pinchPageAccum { 1.0f };
+        int    m_pinchPagePx { 0 }, m_pinchPagePy { 0 };   // pinch centre, engine px
+        int    m_zoomWheelNotches { 0 };                   // waiting for the engine (coalesced)
+        bool   m_zoomWheelBusy { false };                  // a WebCoreZoomWheelAt post is in flight
         float  m_liveScale { 1.0f };   // 捏合期间相对"已提交尺度"的实时缩放(RenderTransform 用)
         float  m_pageScale { 1.0f };   // 已提交给引擎的页面缩放因子(Page::pageScaleFactor)
         // 捏合锚点。手势开始时固定一次(SetPinchAnchor),期间不再跟随焦点移动。

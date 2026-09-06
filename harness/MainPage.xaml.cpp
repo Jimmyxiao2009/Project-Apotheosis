@@ -651,6 +651,11 @@ static const float kMinPageScale = 0.5f;
 static const float kMaxPageScale = 6.0f;
 // The live preview never needs to go below what we can commit any more.
 static const float kMinLiveScale = 0.5f;
+// Apotheosis (pinch on map widgets, 2026-09-06): how much pinch scale is worth one wheel notch when
+//   the gesture is routed to the page. A map zooms by a factor of 2 per notch, so a notch must not
+//   be cheap; 1.15 makes a full-screen-width pinch (roughly 2x) about five notches, which reads as
+//   a continuous zoom without overshooting on the small movements a two-finger gesture always has.
+static const float kPinchNotchScale = 1.15f;
 // Spring-back animation on the preview transform. Short enough to feel like a release, long
 //   enough to read as a movement rather than a jump; runs on the composition thread.
 static const int kZoomSpringMs = 180;
@@ -1912,6 +1917,11 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
 {
     HideSuggestions();   // 点页面即收起地址栏建议下拉(否则只能靠导航/清空关 → "关不掉")
     if (m_loading || m_interacting) return;
+    // Apotheosis (Google Maps pin, 2026-09-06): the tail of a long press is not a tap. XAML normally
+    // raises RightTapped rather than Tapped once a hold has been recognised, but the engine has been
+    // given the whole press/hold/release either way - a click on top of it would toggle the map view
+    // the long press was meant to avoid.
+    if (m_holdAtMs && GetTickCount64() - m_holdAtMs < 1000) return;
     // 取相对 ContentArea(承接手势/点击的层,始终参与布局)的坐标。★ 不能用 RenderImage:直呈现模式下它被
     //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
     //   ContentArea 左上角 = 渲染视口原点,故二者在软件模式下等价,直呈现模式下正确。
@@ -1936,9 +1946,38 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
     }
 }
 
+// Apotheosis (Google Maps pin, 2026-09-06): press and hold on a map.
+//
+// Why this is a gesture of its own: a tap already reaches the page as a clean click - hover move,
+// mousedown (buttons 1), mouseup at the identical point, DOM click (WebCoreClickAt) - and on the
+// mobile Maps page a click is "toggle the full-screen map view", which is what the site does with
+// it. The pin sits behind a LONG press, i.e. behind TIME with the button down, and nothing in the
+// harness could ask for that: the tap path presses and releases inside one engine call, and the
+// drag route only holds a press while the finger keeps moving.
+//
+// XAML raises Holding for touch/pen while the finger is still down (HoldingState::Started), and
+// again as Completed when it leaves or Canceled when the gesture turns into a manipulation. Only
+// Started is acted on, so a hold that becomes a pan is never delivered as one. Whether the point
+// deserves a long press at all is decided in the engine (WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY): a
+// hold over ordinary article text must keep doing nothing, or press-hold-release over a link would
+// open it. The route is deliberately ForwardClickToEngine's - it already owns the busy flag, the
+// watchdog, the navigation/title/link resync and the keyboard handling for an engine-side gesture.
+void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e)
+{
+    if (e == nullptr || e->HoldingState != Windows::UI::Xaml::Input::HoldingState::Started) return;
+    if (!m_sessionActive || m_loading || m_interacting) return;
+    auto pt = e->GetPosition(ContentArea);
+    int px, py; MapTapToEngine(pt.X, pt.Y, px, py);
+    if (px < 0 || py < 0 || px >= kW || py >= kH) return;
+    HideSuggestions();
+    m_holdAtMs = GetTickCount64();
+    e->Handled = true;
+    ForwardClickToEngine(px, py, /*longPress*/ true);
+}
+
 // 把 (px,py) 点击转发给引擎活会话。引擎派发真实鼠标事件并处理默认动作;若触发了会话内导航
 // (URL 变化),回 UI 后同步地址栏/前进后退栈/历史。引擎点击失败但命中了链接表 → 退回经典导航。
-void MainPage::ForwardClickToEngine(int px, int py)
+void MainPage::ForwardClickToEngine(int px, int py, bool longPress)
 {
     if (m_interacting) return;
     m_interacting = true;
@@ -1947,10 +1986,16 @@ void MainPage::ForwardClickToEngine(int px, int py)
     TitleText->Text = L8(L"处理中…", L"Working…");
 
     // 链接表命中(供引擎点击失败时退回经典导航)
+    // Apotheosis (long press, 2026-09-06): never for a long press. This fallback exists for a click
+    // the engine could not turn into a navigation; a long press is not supposed to navigate at all,
+    // and it answers kOK for its "not a drag widget" skip - with a link hit in hand that skip would
+    // open whatever link happens to sit under the finger.
     auto linkHit = std::make_shared<std::wstring>();
-    for (auto it = m_pageLinks.rbegin(); it != m_pageLinks.rend(); ++it) {
-        const PageLink& l = *it;
-        if (px >= l.x && px < l.x + l.w && py >= l.y && py < l.y + l.h) { *linkHit = l.url; break; }
+    if (!longPress) {
+        for (auto it = m_pageLinks.rbegin(); it != m_pageLinks.rend(); ++it) {
+            const PageLink& l = *it;
+            if (px >= l.x && px < l.x + l.w && py >= l.y && py < l.y + l.h) { *linkHit = l.url; break; }
+        }
     }
 
     std::wstring prevUrl = m_currentUrl;
@@ -1958,11 +2003,21 @@ void MainPage::ForwardClickToEngine(int px, int py)
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
 
-    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq]() {
+    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
-        try { rc = WebCoreClickAt(px, py, rgba->data()); } catch (...) { rc = -1000; }
+        // Apotheosis (Google Maps pin, 2026-09-06): the long press holds the button down in the
+        // engine for its default 600 ms, then releases with the click and sends a contextmenu at the
+        // same point - the two things a map can turn into a dropped pin. DRAG_WIDGET_ONLY makes it a
+        // no-op (kOK, current frame painted) anywhere else on the page.
+        try {
+            rc = longPress
+                ? WebCoreLongPressAt(px, py, /*holdMs default*/ 0,
+                                     WEBCORE_LONGPRESS_CONTEXTMENU | WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY,
+                                     rgba->data())
+                : WebCoreClickAt(px, py, rgba->data());
+        } catch (...) { rc = -1000; }
         unsigned hashAfter = (rc == 0) ? WebCoreGetFrameHash() : hashBefore;
         bool changed = (hashAfter != hashBefore);   // 引擎点击是否改变了画面(区分模态关闭/按钮 vs 死链接)
         int editable = 0;
@@ -2444,6 +2499,62 @@ void MainPage::PumpDrag()
                 s->m_dragBusy = false;
                 if (s->m_dragMovePending || s->m_dragReleasePending) s->PumpDrag();
                 else if (!s->m_dragActive) { s->SyncLinksAfterScroll(); s->StartLiveMode(); }
+            }));
+        } catch (...) {}
+    });
+}
+
+// ===========================================================================
+// Apotheosis (pinch on map widgets, 2026-09-06): the WebCoreZoomWheelAt route.
+//
+// A pinch over a map used to scale the rendered page: the map's own tiles stay at the zoom level
+// they were fetched for, so the labels grow blurry and the map shows no more detail than before -
+// a picture of a map being zoomed. A map zooms itself on a wheel, so a pinch that starts on one is
+// converted into wheel notches at the pinch centre (ctrl held, which is what a page reads as "zoom
+// me"), and the map fetches the tiles for its next zoom level.
+//
+// Same one-post-in-flight shape as PumpDrag/PumpNestedScroll. Notches ACCUMULATE while a post is
+// out, so a fast pinch becomes one wheel event with a bigger tick count instead of a queue of
+// events the engine works through after the fingers have gone.
+// ===========================================================================
+void MainPage::ZoomWheelBy(int px, int py, int notches)
+{
+    if (!m_sessionActive || !notches) return;
+    m_pinchPagePx = px; m_pinchPagePy = py;   // the centre can drift with the fingers; latest wins
+    m_zoomWheelNotches += notches;
+    PumpZoomWheel();
+}
+
+void MainPage::PumpZoomWheel()
+{
+    if (m_zoomWheelBusy || !m_sessionActive) return;
+    const int notches = m_zoomWheelNotches;
+    if (!notches) return;
+    m_zoomWheelNotches = 0;
+    m_zoomWheelBusy = true;
+    const int px = m_pinchPagePx, py = m_pinchPagePy;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;   // as PumpDrag: not a token of its own, but superseded by one
+    bool present = m_gpuPresent;
+    WebEngine::instance().post([disp, self, px, py, notches, mySeq, present]() {
+        auto rgba = AcquireEngineBuffer(present);
+        int rc = -999;
+        try { rc = WebCoreZoomWheelAt(px, py, notches, rgba->data()); } catch (...) { rc = -1000; }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                s->m_zoomWheelBusy = false;
+                if (s->m_opSeq != mySeq) { s->m_zoomWheelNotches = 0; return; }   // navigation/click took over
+                if (rcCopy == 1) {
+                    // WebCoreZoomWheelAt already composited/presented this frame in present mode,
+                    // same contract as WebCoreWheelAt - only the software path needs the blit.
+                    if (!present) s->PresentSoftwareFrame(rgba);
+                    s->m_lastFrameHash = 0;
+                }
+                if (s->m_zoomWheelNotches) s->PumpZoomWheel();
+                else if (!s->m_pinchPage) { s->SyncLinksAfterScroll(); s->StartLiveMode(); }
             }));
         } catch (...) {}
     });
@@ -3388,14 +3499,23 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     // M4 捏合缩放:本次增量 Scale≠1(或已进入捏合)→ 捏合模式:只对显示层做实时 ScaleTransform(零引擎调用,
     //   丝滑),不走引擎滚动;松手(OnImageManipCompleted)再把累计缩放提交给引擎按新尺度重栅格。
     float ds = e->Delta.Scale;
-    if (m_pinching || (ds > 0.0f && (ds > 1.002f || ds < 0.998f))) {
+    // Apotheosis (pinch on map widgets, 2026-09-06): m_pinchPage keeps this gesture on the pinch
+    // branch even though m_pinching is never set for it - the per-delta scale of a slow pinch drops
+    // back inside the dead band all the time, and falling through to the pan path there would scroll
+    // the document under a two-finger gesture.
+    if (m_pinching || m_pinchPage || (ds > 0.0f && (ds > 1.002f || ds < 0.998f))) {
         // Apotheosis: the anchor is taken ONCE, at the first pinch delta, and then frozen for the
         //   whole gesture. It used to follow e->Position on every delta, and the centroid of a
         //   two-finger manipulation becomes the position of the remaining finger the moment the
         //   first one leaves the glass — re-centring the transform there shifts the content by
         //   (Fnew − Fold)·(1 − live), which is exactly the "it snaps to the other finger" jump on
         //   release (worst when zooming in, where 1 − live is largest).
-        if (!m_pinching) {
+        if (!m_pinching && !m_pinchPage) {
+            // Apotheosis (pinch on map widgets, 2026-09-06): read the gesture-start probe BEFORE the
+            // reset below overwrites it. NestedScrollState::Drag means WebCoreWantsDragAt said the
+            // touch-down point belongs to something that drags itself (canvas / touch-action:none),
+            // i.e. the same test the one-finger drag route uses.
+            const bool overDragWidget = (m_nestedScrollState == NestedScrollState::Drag);
             // Apotheosis (review 2026-09-03): this gesture turns out to be a pinch, not a pan —
             // drop anything buffered for the (never-resolved) nested-scroll route so it cannot be
             // replayed as a scroll on top of the zoom.
@@ -3423,12 +3543,45 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             //   what a later ClampPanAbs()/ClampPanRemainder() would then translate the view by.
             ++m_scrollStateGen;
             m_scrollStateValid = false;
-            m_pinching = true;
             // Apotheosis (axis lock / rail scrolling): a second contact turned this into a pinch —
             // drop any rail lock so a pan that resumes after the pinch (same gesture, one finger
             // lifted) is not still constrained to whatever axis the pre-pinch pan picked.
             m_axisLockState = AxisLock::Free;
-            SetPinchAnchor(e->Position.X, e->Position.Y);
+            // Apotheosis (pinch on map widgets, 2026-09-06): route the gesture ONCE. To the page
+            // only when it started on a drag widget AND the page is at 1:1 - a page the user has
+            // already zoomed must keep pinching as page zoom, or a pinch-out on a zoomed map would
+            // silently change what the zoom gesture means halfway through a session.
+            if (m_pinchToPage && overDragWidget && m_pageScale <= 1.001f) {
+                int cx, cy; MapTapToEngine(e->Position.X, e->Position.Y, cx, cy);
+                if (cx < 0) cx = 0; else if (cx >= kW) cx = kW - 1;
+                if (cy < 0) cy = 0; else if (cy >= kH) cy = kH - 1;
+                m_pinchPage = true;
+                m_pinchPageAccum = 1.0f;
+                m_pinchPagePx = cx; m_pinchPagePy = cy;
+            } else {
+                m_pinching = true;
+                SetPinchAnchor(e->Position.X, e->Position.Y);
+            }
+        }
+        // Apotheosis (pinch on map widgets, 2026-09-06): the page owns this pinch - turn the scale
+        // change into wheel notches and leave every zoom transform alone. The accumulator keeps the
+        // remainder, so a slow pinch still reaches the map one notch at a time.
+        if (m_pinchPage) {
+            if (ds > 0.0f) m_pinchPageAccum *= ds;
+            int notches = 0;
+            while (m_pinchPageAccum >= kPinchNotchScale && notches < 8) {
+                m_pinchPageAccum /= kPinchNotchScale; ++notches;
+            }
+            while (m_pinchPageAccum <= 1.0f / kPinchNotchScale && notches > -8) {
+                m_pinchPageAccum *= kPinchNotchScale; --notches;
+            }
+            if (notches) {
+                int cx, cy; MapTapToEngine(e->Position.X, e->Position.Y, cx, cy);
+                if (cx < 0) cx = 0; else if (cx >= kW) cx = kW - 1;
+                if (cy < 0) cy = 0; else if (cy >= kH) cy = kH - 1;
+                ZoomWheelBy(cx, cy, notches);
+            }
+            return;
         }
         if (ds > 0.0f) m_liveScale *= ds;
         float total = m_pageScale * m_liveScale;          // 钳总缩放到 [kMinLiveScale,kMaxPageScale]
@@ -3731,6 +3884,13 @@ void MainPage::EndGesture(GestureEnd reason)
     // --- pinch. Cleared for every reason; this is the flag whose absence froze scrolling.
     m_pinching = false;
     m_liveScale = 1.0f;
+    // Apotheosis (pinch on map widgets, 2026-09-06): the ctrl+wheel route ends here too, for every
+    // reason including Completed - there is nothing to commit, the page zoomed itself notch by
+    // notch while the fingers moved. A post still in flight is harmless: its completion clears
+    // m_zoomWheelBusy and, seeing m_pinchPage gone, settles the page instead of pumping more.
+    m_pinchPage = false;
+    m_pinchPageAccum = 1.0f;
+    m_zoomWheelNotches = 0;
     if (abort && m_zoomSpring != nullptr) {
         try { m_zoomSpring->Stop(); } catch (...) {}   // Stop() does not raise Completed
         m_zoomSpring = nullptr;
@@ -5040,6 +5200,7 @@ void MainPage::LoadSettings()
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
             else if (k == "staletiles") m_staleTiles = (atoi(v.c_str()) != 0);
             else if (k == "axislock") m_axisLockEnabled = (atoi(v.c_str()) != 0);
+            else if (k == "pinchpage") m_pinchToPage = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -5073,6 +5234,7 @@ void MainPage::SaveSettings()
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
     s += "staletiles=" + std::to_string(m_staleTiles ? 1 : 0) + "\n";
     s += "axislock=" + std::to_string(m_axisLockEnabled ? 1 : 0) + "\n";
+    s += "pinchpage=" + std::to_string(m_pinchToPage ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -5102,6 +5264,7 @@ void MainPage::ShowSettings()
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
     if (SetStaleTilesSwitch) SetStaleTilesSwitch->IsOn = m_staleTiles;
     if (SetAxisLockSwitch) SetAxisLockSwitch->IsOn = m_axisLockEnabled;
+    if (SetPinchPageSwitch) SetPinchPageSwitch->IsOn = m_pinchToPage;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -5149,6 +5312,7 @@ void MainPage::HideSettings()
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
     if (SetStaleTilesSwitch) m_staleTiles = SetStaleTilesSwitch->IsOn;
     if (SetAxisLockSwitch) m_axisLockEnabled = SetAxisLockSwitch->IsOn;
+    if (SetPinchPageSwitch) m_pinchToPage = SetPinchPageSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -5197,6 +5361,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
     { L"陈旧瓦片占位符", L"Stale tile placeholders" },
     { L"轴锁定(单指滚动吸附方向)", L"Axis lock" },
+    { L"捏合作用于页面元素(地图)", L"Pinch to page elements (maps)" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
