@@ -425,7 +425,7 @@ namespace Harness {
         //   presenter ON this flag is irrelevant - m_presenterActive picks the presenter's own pan
         //   path in InstantPanBy. settings.ini instantpanxaml
         bool m_instantPanXaml { false };
-        bool m_threadedRaster { false };// settings.ini threadraster
+        bool m_threadedRaster { true }; // settings.ini threadraster (default ON since 0.1.9.18: 2.9 ms vs 25 ms per scroll tick on device)
         // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
         //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles
         bool m_staleTiles { true };
