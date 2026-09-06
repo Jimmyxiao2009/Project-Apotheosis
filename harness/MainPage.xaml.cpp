@@ -691,6 +691,24 @@ static float SnapAndClampPageScale(float s)
 //   release, exactly like the ±33% page-scale snap band above is eased.
 static const double kZoomRubberBandDip = 40.0;
 
+// Apotheosis (long-press latency, device feedback 0.1.9.18: "about 1 s feels long, it's really a
+//   right-click"): how long WebCoreLongPressAt keeps the mouse button down before releasing with the
+//   click and the contextmenu event. This is only HALF the total the finger feels - the other half
+//   already elapsed before OnPageHolding even runs: XAML's own Holding gesture recognizer needs
+//   roughly 500 ms-1 s of stationary touch before it raises Started at all, and ForwardClickToEngine
+//   is called only then. That system stage cannot be shortened from here.
+//   The 600 ms this used to pass was sized to be safe for a page's own press-and-hold timer (Google
+//   Maps' mobile "drop pin" reacts to a sustained pointerdown), but that timer starts counting from
+//   when the engine dispatches mousedown - i.e. from this call, not from when the finger physically
+//   landed - so it does not need the system's threshold repeated on top of it. And on Maps in
+//   particular, what actually places the pin/opens "What's here?" is very likely the contextmenu
+//   event this call still sends after the release (WEBCORE_LONGPRESS_CONTEXTMENU), the same path a
+//   desktop right-click uses; the held-mousedown is Maps' touch-only pin timer, a secondary or
+//   redundant trigger for a mouse-shaped press. 250 ms is comfortably above that JS timer's usual
+//   ~200-300 ms while cutting the engine-side stage well over half, so the two-stage total drops from
+//   roughly 1.1-1.6 s to 0.75-1.25 s without starving either trigger.
+static const int kLongPressEngineHoldMs = 250;
+
 // Apotheosis (bug fix 2026-09-06, device test 0.1.9.16): keyboard-avoidance seam. 0.1.9.16 shifted
 //   the nav bar up by (OccludedRect.Height - m_lastInsetBottom) — both already in DIP, see the units
 //   note on the Showing handler below — but then added an extra couple of DIP of upward reach on the
@@ -2007,13 +2025,14 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress)
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
-        // Apotheosis (Google Maps pin, 2026-09-06): the long press holds the button down in the
-        // engine for its default 600 ms, then releases with the click and sends a contextmenu at the
-        // same point - the two things a map can turn into a dropped pin. DRAG_WIDGET_ONLY makes it a
-        // no-op (kOK, current frame painted) anywhere else on the page.
+        // Apotheosis (Google Maps pin, 2026-09-06; latency cut 2026-09-06, kLongPressEngineHoldMs):
+        // the long press holds the button down in the engine for kLongPressEngineHoldMs, then
+        // releases with the click and sends a contextmenu at the same point - the two things a map
+        // can turn into a dropped pin. DRAG_WIDGET_ONLY makes it a no-op (kOK, current frame painted)
+        // anywhere else on the page.
         try {
             rc = longPress
-                ? WebCoreLongPressAt(px, py, /*holdMs default*/ 0,
+                ? WebCoreLongPressAt(px, py, kLongPressEngineHoldMs,
                                      WEBCORE_LONGPRESS_CONTEXTMENU | WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY,
                                      rgba->data())
                 : WebCoreClickAt(px, py, rgba->data());
