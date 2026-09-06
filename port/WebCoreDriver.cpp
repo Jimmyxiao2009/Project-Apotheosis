@@ -518,10 +518,6 @@ static bool g_swapOwed = false;       // a composite ran whose swap was deferred
 // is still owed to its own acknowledgement, and nothing would ever recomposite it during a gesture
 // (WebCoreLiveTick skips its composite while g_panGesture is set).
 static uint64_t g_scrollGen = 0;      // bumped by every main-frame scroll the engine applies
-// Apotheosis (review 2026-09-04 item 6): g_scrollGen as WebCoreLiveTick last saw it. Engine thread
-// only. A tick may take the scroll fast path only when a scroll job has run since the previous
-// tick - see the block at the bottom of WebCoreLiveTick.
-static uint64_t g_lastTickScrollGen = 0;
 static uint64_t g_swapOwedGen = 0;    // g_scrollGen as it was when the owed composite ran
 static uint64_t g_swapOwedId = 0;     // identity of the owed frame; what WebCorePresentFrame matches on
 static uint64_t g_swapIdNext = 1;     // 0 stays reserved for "no frame" / "any frame" (legacy WebCorePresent)
@@ -6025,21 +6021,36 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // one of 84 ticks took the fast path - the page requests a rendering update every
     // tick, so each tick still re-rasterised the whole tree (0.8-1.1 s).
     //
-    // Apotheosis (review 2026-09-04 item 6): that is what MANUFACTURES the empty light
-    // composites gpuPresent now has to detect (unpainted visible tiles) and redo in
-    // full - two full composites where one would have done, plus a visible white frame
-    // whenever the repair does not catch it. A tick is entitled to the fast path only
-    // when it is riding on a scroll the engine has just applied (the tiles are painted,
-    // only the scroll layer moved) AND nothing has asked for a rendering update since
-    // the last present. Either condition failing means content may have changed, and
-    // forceDirtyTree is exactly the answer to that. An idle tick on a static page is
-    // cheap either way: the dirty tree it force-dirties has nothing new to upload.
-    if (g_gpuActive) {
-        const bool afterScroll = (g_scrollGen != g_lastTickScrollGen);
-        g_lastTickScrollGen = g_scrollGen;
-        const bool dirty = g_session->chrome && g_session->chrome->peekNeedsPresent();
-        g_gpuScrollFast = afterScroll && !dirty;
-    }
+    // Apotheosis (review 2026-09-04 item 6) then narrowed it to "riding on a scroll the
+    // engine has just applied AND nothing asked for a rendering update since the last
+    // present", on the theory that a tick which fails either test may have changed
+    // content that only forceDirtyTree can recover.
+    //
+    // Apotheosis (2026-09-06, package 0.1.9.16 device regression): that theory is wrong
+    // and its cost is the stall the user sees. peekNeedsPresent() is "somebody asked for
+    // a rendering update", which on any page with a timer, an animation or an
+    // IntersectionObserver is EVERY tick - on n-tv.de all 626 ticks of session
+    // 20260906-180145 force-dirtied all ~90 layers at 400-1100 ms of ms_backing each,
+    // against 15 such ticks in ~900 rows of the 0.1.9.15 session (20260904-161535) and 17
+    // in 1895 rows of 0.1.9.12. Scrolling is smooth until a tick lands, then stalls for
+    // most of a second - a quarter page apart, exactly as reported.
+    //
+    // forceDirtyTree() only ever existed to recover content the BACKING STORE lost, never
+    // content the page changed: a real change arrives as m_needsDisplay/m_needsDisplayRect
+    // from RenderLayerBacking and is repainted on the fast path too, and gpuPrepare()
+    // runs updateBackingStoreIncludingSubLayers() either way. Every way a store can end up
+    // without its pixels is now detected per layer, so the sledgehammer has nothing left to
+    // fix and only repaints what is already correct:
+    //   - store freshly created            -> m_wkNeedsFullRepaint (GraphicsLayerTextureMapper.cpp
+    //                                         :413, the "images flicker to a white box" fix that
+    //                                         experiment F used to expose)
+    //   - layer resized / contents rescaled -> m_wkBackingStoreSize / m_wkBackingStoreScale (:718)
+    //   - tiles entering the viewport       -> m_wkVisibleRectChanged, they paint themselves in full
+    //   - tiles that lost their rasterisation -> wkHasUnpaintedVisibleTiles() (035bae976c, 9ac9296254)
+    // and the composite that still comes out short of pixels is redone in full by the
+    // unpainted-tile repair in gpuPresent() - the safety net, now back to being rare.
+    if (g_gpuActive)
+        g_gpuScrollFast = true;
     const int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
     // Apotheosis (event-driven present): belt and braces for the "still dirty when the tick ended"
     // case - a repaint request that landed after gpuPresent() consumed takeNeedsPresent(), or one
