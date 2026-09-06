@@ -2492,6 +2492,9 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     m_nestedScrollState = NestedScrollState::Unknown;
     m_manipActive = true;   // a finger is on the glass until ManipulationCompleted (incl. inertia)
     m_pendingPanX = 0; m_pendingPanY = 0;
+    // Apotheosis (axis lock / rail scrolling): a new gesture decides its own axis from scratch.
+    m_axisLockState = AxisLock::Deciding;
+    m_axisAccumX = 0.0; m_axisAccumY = 0.0;
     // Apotheosis (drag as pointer events): a new gesture — drop whatever the previous one left
     // behind before the probe below can answer Drag for this one.
     ++m_dragGen;
@@ -2548,12 +2551,43 @@ void MainPage::ReplayPendingPan()
         return;
     if (m_nestedScrollState == NestedScrollState::Drag)
         DragMoveTo(m_pendingPanPx, m_pendingPanPy, dx, dy);   // presses at the touch-down point first
-    else if (m_nestedScrollState == NestedScrollState::Yes)
+    else if (m_nestedScrollState == NestedScrollState::Yes) {
+        ApplyAxisLock(dx, dy);   // axis lock covers nested scrollables too — never the drag route
         NestedScrollBy(m_pendingPanPx, m_pendingPanPy, dx, dy);
-    else {
+    } else {
+        ApplyAxisLock(dx, dy);
         InstantPanBy(dx, dy);
         FreeScrollBy(dx, dy);
     }
+}
+
+// Apotheosis (axis lock / rail scrolling, developer setting "Axis lock", default ON): Chrome/
+// Safari-style one-finger rail scrolling. Decides the axis once from the accumulated raw
+// (pre-scale, DIP) translation since gesture start, then holds it for the rest of the gesture
+// including inertia — nothing here is reconsidered once Deciding leaves that state, so a curve
+// that starts vertical and drifts diagonal stays locked vertical (matches Chrome/Safari, and
+// keeps this a one-shot per-gesture decision instead of a per-frame wobble).
+static const double kAxisLockThresholdDip = 9.0;   // accumulated distance before deciding (~8-10 DIP)
+static const double kAxisLockRatio = 0.35;         // minor/major ratio <= this -> lock (~20 deg off-axis)
+void MainPage::UpdateAxisLock(double rawDx, double rawDy)
+{
+    if (m_axisLockState != AxisLock::Deciding) return;
+    m_axisAccumX += rawDx;
+    m_axisAccumY += rawDy;
+    double ax = std::abs(m_axisAccumX), ay = std::abs(m_axisAccumY);
+    if (ax < kAxisLockThresholdDip && ay < kAxisLockThresholdDip) return;   // not moved enough yet
+    double major = ax > ay ? ax : ay, minor = ax > ay ? ay : ax;
+    if (major > 0.0 && minor / major <= kAxisLockRatio)
+        m_axisLockState = (ax >= ay) ? AxisLock::X : AxisLock::Y;
+    else
+        m_axisLockState = AxisLock::Free;   // too diagonal — free pan for the rest of the gesture
+}
+
+void MainPage::ApplyAxisLock(int& dx, int& dy)
+{
+    if (!m_axisLockEnabled) return;
+    if (m_axisLockState == AxisLock::X) dy = 0;        // locked horizontal: zero the vertical drift
+    else if (m_axisLockState == AxisLock::Y) dx = 0;   // locked vertical: zero the horizontal drift
 }
 
 // ===========================================================================
@@ -3390,6 +3424,10 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             ++m_scrollStateGen;
             m_scrollStateValid = false;
             m_pinching = true;
+            // Apotheosis (axis lock / rail scrolling): a second contact turned this into a pinch —
+            // drop any rail lock so a pan that resumes after the pinch (same gesture, one finger
+            // lifted) is not still constrained to whatever axis the pre-pinch pan picked.
+            m_axisLockState = AxisLock::Free;
             SetPinchAnchor(e->Position.X, e->Position.Y);
         }
         if (ds > 0.0f) m_liveScale *= ds;
@@ -3411,6 +3449,9 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     int idx = (int)(dx < 0 ? dx - 0.5 : dx + 0.5);
     int idy = (int)(dy < 0 ? dy - 0.5 : dy + 0.5);
     if (idx == 0 && idy == 0) return;
+    // Apotheosis (axis lock / rail scrolling): feed the raw (pre-scale) DIP translation, not idx/idy
+    // — the threshold/ratio are meant in screen space, not stretched by the kW/ActualWidth factors.
+    UpdateAxisLock(e->Delta.Translation.X, e->Delta.Translation.Y);
     // Apotheosis (d982774): this gesture started over a nested scroller (cookie overlay/modal/
     // iframe) -> route through WebCoreWheelAt instead of the main-frame fast path. Covers inertia
     // too: OnImageManipDelta keeps firing translation deltas during TranslateInertia, and
@@ -3444,12 +3485,14 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
         if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
         if (py < 0) py = 0; else if (py >= kH) py = kH - 1;
+        ApplyAxisLock(idx, idy);   // rail lock covers nested scrollables (same WebCoreWheelAt delta)
         NestedScrollBy(px, py, idx, idy);
         return;
     }
     // No:现有主帧快路径不变。
     // Apotheosis (instant pan): move the presented frame with the finger right now; the engine
     // still gets the same coalesced WebCoreScrollBy it always did.
+    ApplyAxisLock(idx, idy);   // Apotheosis (axis lock / rail scrolling)
     InstantPanBy(idx, idy);
     FreeScrollBy(idx, idy);
 }
@@ -4996,6 +5039,7 @@ void MainPage::LoadSettings()
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
             else if (k == "staletiles") m_staleTiles = (atoi(v.c_str()) != 0);
+            else if (k == "axislock") m_axisLockEnabled = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -5028,6 +5072,7 @@ void MainPage::SaveSettings()
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
     s += "staletiles=" + std::to_string(m_staleTiles ? 1 : 0) + "\n";
+    s += "axislock=" + std::to_string(m_axisLockEnabled ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -5056,6 +5101,7 @@ void MainPage::ShowSettings()
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
     if (SetStaleTilesSwitch) SetStaleTilesSwitch->IsOn = m_staleTiles;
+    if (SetAxisLockSwitch) SetAxisLockSwitch->IsOn = m_axisLockEnabled;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -5102,6 +5148,7 @@ void MainPage::HideSettings()
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
     if (SetStaleTilesSwitch) m_staleTiles = SetStaleTilesSwitch->IsOn;
+    if (SetAxisLockSwitch) m_axisLockEnabled = SetAxisLockSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -5149,6 +5196,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"事件驱动呈现", L"Event-driven present" },
     { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
     { L"陈旧瓦片占位符", L"Stale tile placeholders" },
+    { L"轴锁定(单指滚动吸附方向)", L"Axis lock" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },

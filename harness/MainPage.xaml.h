@@ -21,6 +21,10 @@ namespace Harness {
     // Unknown = hit test still in flight (or none posted this gesture): existing main-frame fast
     // path. Yes/No = the async answer for the point the current gesture started at.
     enum class NestedScrollState { Unknown, Yes, No, Drag };
+    // Apotheosis (axis lock / rail scrolling): Deciding = still accumulating raw translation to
+    // judge the gesture's direction; X/Y = locked to that axis for the rest of the gesture
+    // (incl. inertia); Free = the accumulated delta was too diagonal, no lock this gesture.
+    enum class AxisLock { Deciding, X, Y, Free };
     // Apotheosis (review 2026-09-04 item 3): why a gesture is ending. Only Completed is the normal
     //   exit (ManipulationCompleted, i.e. after inertia); every other reason is an abort, and an
     //   abort also stops the zoom spring - on Completed the caller owns the pinch commit and is
@@ -219,6 +223,15 @@ namespace Harness {
         // 手势前几个 delta 抢在 WebCoreIsScrollableAt 答案之前到达时先缓存(见 m_pendingPan*),
         // 答案落地(或手势结束)后按选定路径一次性补发。
         void ReplayPendingPan();
+        // Apotheosis (axis lock / rail scrolling, developer setting "Axis lock"): fold in one more
+        // raw (DIP, pre-scale) translation delta and, once the accumulated distance since gesture
+        // start passes kAxisLockThresholdDip, decide X/Y/Free from the minor/major component ratio
+        // (kAxisLockRatio). A no-op once a decision is already made. Never called while pinching.
+        void UpdateAxisLock(double rawDx, double rawDy);
+        // Zero the minor-axis component of an engine-px delta pair if the gesture is locked and the
+        // setting is on. Applied only to page-panning routes (main fast path, nested WebCoreWheelAt)
+        // — never to the drag-as-pointer-events route (map/canvas) or to pinch.
+        void ApplyAxisLock(int& dx, int& dy);
         // Apotheosis (drag as pointer events): a gesture that started over something which drags
         // itself (map, canvas — WebCoreWantsDragAt said so) is fed to the page as a real mouse
         // drag instead of being turned into scrolling. Same one-in-flight shape as
@@ -449,6 +462,11 @@ namespace Harness {
         //   canvas) to the page as mouse/pointer events instead of scrolling. Default ON — it is
         //   the only way those pages can be panned at all. settings.ini dragpointer
         bool m_dragPointer { true };
+        // Apotheosis (axis lock / rail scrolling): DEVELOPER toggle, default ON. Pure harness-side
+        // logic (see UpdateAxisLock/ApplyAxisLock) — no engine call, so unlike threadraster/
+        // staletiles it needs no ApplyXSetting push, m_axisLockEnabled is read directly.
+        // settings.ini axislock
+        bool m_axisLockEnabled { true };
         // Apotheosis (review 2026-09-03): DISPLAY toggle. Off = the phone keeps its software
         //   back/Windows/search bar; on = SuppressSystemOverlays hands that strip to us and the
         //   bottom inset in ApplyViewInsets() goes to 0. settings.ini hidenavbar
@@ -511,6 +529,12 @@ namespace Harness {
         // (ReplayPendingPan). Reset per gesture in OnImageManipStarted.
         int  m_pendingPanX { 0 }, m_pendingPanY { 0 };     // accumulated buffered offset delta
         int  m_pendingPanPx { 0 }, m_pendingPanPy { 0 };   // finger position (engine px) of the last of them
+        // Apotheosis (axis lock / rail scrolling): per-gesture state. Reset in OnImageManipStarted;
+        // dropped to Free the moment a gesture turns out to be a pinch (SetPinchAnchor). The
+        // accumulators are raw DIP translation (Manipulation coordinate space), independent of the
+        // engine-px dx/dy the accumulated decision is later applied to.
+        AxisLock m_axisLockState { AxisLock::Deciding };
+        double m_axisAccumX { 0.0 }, m_axisAccumY { 0.0 };
         // Apotheosis (drag as pointer events): state of the WebCoreDragAt route. m_dragGen is bumped
         // only at ManipulationStarted (NOT at ManipulationCompleted like m_nestedScrollGen), because
         // the release is posted while the gesture is still current and its answer must not be dropped.

@@ -702,6 +702,10 @@ static ::Platform::String^ __MainPageXaml() {
                     <!-- Apotheosis: 瓦片重建/失效时先垫一块陈旧占位而不是空白，默认开；下发到引擎的
                          WebCoreSetStaleTiles(int)，启动时和这里改动时各调一次(ApplyStaleTilesSetting)。 -->
                     <ToggleSwitch x:Name="SetStaleTilesSwitch" Header="陈旧瓦片占位符" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <!-- Apotheosis (axis lock / rail scrolling): one-finger pan locks to the
+                         dominant axis once the accumulated delta clears a small threshold, like
+                         Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock). -->
+                    <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8" />
@@ -799,6 +803,7 @@ void MainPage::InitializeComponent() {
     SetEventPresentSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetEventPresentSwitch"));
     SetDragPointerSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetDragPointerSwitch"));
     SetStaleTilesSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetStaleTilesSwitch"));
+    SetAxisLockSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetAxisLockSwitch"));
     SetHideNavBarSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetHideNavBarSwitch"));
     SetHideStatusBarSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetHideStatusBarSwitch"));
     VersionText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"VersionText"));

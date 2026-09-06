@@ -83,6 +83,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetEventPresentSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetDragPointerSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetStaleTilesSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetAxisLockSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideNavBarSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideStatusBarSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
