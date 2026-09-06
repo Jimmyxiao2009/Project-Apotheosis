@@ -1964,7 +1964,7 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
 // watchdog, the navigation/title/link resync and the keyboard handling for an engine-side gesture.
 void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e)
 {
-    if (e == nullptr || e->HoldingState != Windows::UI::Xaml::Input::HoldingState::Started) return;
+    if (e == nullptr || e->HoldingState != Windows::UI::Input::HoldingState::Started) return;
     if (!m_sessionActive || m_loading || m_interacting) return;
     auto pt = e->GetPosition(ContentArea);
     int px, py; MapTapToEngine(pt.X, pt.Y, px, py);
