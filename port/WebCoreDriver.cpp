@@ -115,6 +115,14 @@ unsigned wkWinUWPTexmapPendingRasterTiles();
 unsigned wkWinUWPTexmapTakeFinishedRasterTiles();          // engine thread; reading resets
 void wkWinUWPSetRasterCompletionHandler(void (*)());       // called ON A WORKER thread
 void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& blockingWaits);
+// Apotheosis (2026-09-06, WebKit winuwp): per-frame tile-upload budget. A finished replay costs a
+// ~4 MB glTexSubImage2D on the engine thread (~8-10 ms on the Adreno 430), and draining seven to
+// nine of them in one pass is what turns a 2.9 ms scroll tick into an 80 ms one. The engine now
+// uploads at most a few per composite - visible tiles that would otherwise be a hole are exempt -
+// and reports how many it pushed to a later frame. Non-zero means "the pixels exist, nothing has
+// shown them yet", so it owes a present exactly like wkWinUWPTexmapTakeFinishedRasterTiles();
+// reading resets it. Declared by hand for the same reason as everything above.
+unsigned wkWinUWPTexmapTakeDeferredUploads();
 // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): keep the tiles a layer drops out of its cover rect
 // and re-draw them, scaled, until fresh ones exist (TextureMapperTiledBackingStore). Default ON;
 // the switch is here so the device can A/B it without a rebuild. Declared by hand for the same
@@ -1400,7 +1408,13 @@ static const char* const kPerfHeader =
     // Apotheosis (M4 load timeline): ms since dispatchDidStartProvisionalLoad, empty = never
     // reached; the n_* pair is cumulative at t_load. ms_style_layout / ms_paint above already
     // are the per-navigation sums, so the timeline does not duplicate them.
-    "t_firstbyte,t_commit,t_dcl,t_firstpaint,t_load,t_settle,n_scripts,n_subres\n";
+    "t_firstbyte,t_commit,t_dcl,t_firstpaint,t_load,t_settle,n_scripts,n_subres,"
+    // Apotheosis (2026-09-06): finished tile replays the engine's upload budget pushed to a later
+    // frame. Appended at the END rather than next to the other raster_ columns on purpose - the
+    // analysis notes and scripts address the existing columns by index (the raster_ block starts at
+    // column 31 counting from one), and shifting eight of them to group one new one with them would
+    // break every one of those.
+    "raster_deferred\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1434,6 +1448,12 @@ struct PerfRow {
     // last one is the one to watch: it must stay near zero, otherwise off-thread raster is worse
     // than synchronous raster.
     int rasterDone = -1, rasterPosted = -1, rasterCancelled = -1, rasterBlocked = -1;
+    // Apotheosis (2026-09-06): raster_deferred = finished replays the engine's per-pass upload
+    // budget moved to a later frame (edge-triggered, wkWinUWPTexmapTakeDeferredUploads). It is the
+    // price side of the ms_backing improvement: a row with a low ms_backing and a high
+    // raster_deferred means the burst was spread, a row where it never falls back to zero means
+    // the budget is too small for what the page produces.
+    int rasterDeferred = -1;
     // Apotheosis (event-driven present): wake-ups fired to the harness since the previous tick.
     // 0 on an idle page (the loop is asleep, only the 1 s fallback tick runs), ~1 per frame on an
     // animating one; a number much larger than 1 means the arming atomic stopped collapsing bursts.
@@ -1575,14 +1595,16 @@ static void perfFlushLocked()
         char nsc[12], nsr[12];
         perfFmtI(nsc, sizeof nsc, r.nScripts);
         perfFmtI(nsr, sizeof nsr, r.nSubres);
+        char rdf[12];
+        perfFmtI(rdf, sizeof rdf, r.rasterDeferred);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
             nt[0], nt[1], nt[2], nt[3], hv,
             rs[0], rs[1], rs[2], rs[3], rs[4], wk,
-            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr);
+            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -3007,18 +3029,27 @@ static void notePendingRasterTiles()
     // between two composites, which leaves `pending` at zero although nothing has uploaded the new
     // pixels yet. With step 4's asynchronous first paints (OFFTHREAD-RASTER-LOG.md §10) that case
     // is an *empty* tile on screen, not a stale one, so it is the more important of the two.
+    // Apotheosis (2026-09-06): and `deferred` covers the third case, which the tile-upload budget
+    // introduced — a replay that finished long ago and whose pixels the last pass chose not to
+    // upload because it had already spent its budget on nearer tiles. Nothing is running for it
+    // (so `pending` is zero), its completion edge was consumed frames ago (so `finished` is zero),
+    // and no worker will ever wake anybody for it again: only the next composite's drain can put
+    // it on screen. Without this a page that stops dirtying itself the moment a burst is deferred
+    // would keep the last one or two tiles of that burst in memory and off the screen.
     const unsigned pending = WebCore::wkWinUWPTexmapPendingRasterTiles();
     const unsigned finished = WebCore::wkWinUWPTexmapTakeFinishedRasterTiles();
+    const unsigned deferred = WebCore::wkWinUWPTexmapTakeDeferredUploads();
     if (g_perfOn) {
         g_perfCur.rasterPending = static_cast<int>(pending);
         g_perfCur.rasterDone = static_cast<int>(finished);
+        g_perfCur.rasterDeferred = static_cast<int>(deferred);
         unsigned posted = 0, cancelled = 0, blocking = 0;
         WebCore::wkWinUWPTexmapRasterStats(posted, cancelled, blocking);
         g_perfCur.rasterPosted = static_cast<int>(posted);
         g_perfCur.rasterCancelled = static_cast<int>(cancelled);
         g_perfCur.rasterBlocked = static_cast<int>(blocking);
     }
-    if (!pending && !finished)
+    if (!pending && !finished && !deferred)
         return;
     if (g_session && g_session->chrome)
         g_session->chrome->setNeedsPresent();
