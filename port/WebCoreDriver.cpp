@@ -527,6 +527,16 @@ static int g_swapOwedScrollY = 0;
 // consumed is still in flight — moves/releases only reach the page while this is set, and
 // teardownSession() clears it. Engine thread only, like every other flag here.
 static bool g_dragActive = false;
+// Apotheosis (map tap, 2026-09-06): where that press landed, and whether the finger has since
+// travelled far enough that the gesture stopped being a tap. A touch pan must NOT end in a click:
+// on maps.google.com every pan ended with a click on the map canvas, which is the site's own
+// "toggle the full-screen map view" action - the reported "a tap/drag flips the map view".
+// (A mouse drag inside one element does fire a click in a desktop browser; a touch pan never does,
+// and every gesture that reaches WebCoreDragAt came from a finger.) Engine thread only.
+static int g_dragPressX = 0;
+static int g_dragPressY = 0;
+static bool g_dragMoved = false;
+static const int kDragTapSlopPx = 8;   // engine px (~4 DIP at 720 over a 360 DIP wide content area)
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
@@ -4403,6 +4413,7 @@ public:
 };
 }
 static const unsigned short kButtonsLeftDown = 1;   // MouseEvent.buttons bit for the primary button
+static const unsigned short kButtonsRightDown = 2;  // ...and for the secondary one (contextmenu, WebCoreLongPressAt)
 
 // Apotheosis (2026-09-04): unwind a mousedown the page never got a mouseup for.
 // EventHandler::handleMousePressEvent() sets m_mousePressed (EventHandler.cpp:2030) before it even
@@ -4422,6 +4433,76 @@ static void releaseDanglingPress(WebCore::LocalFrame& frame, const WebCore::Doub
     DriverMouseEvent up(at, WebCore::MouseButton::Left, WebCore::PlatformEvent::Type::MouseReleased,
                         /*clickCount*/ 0, modifiers, MonotonicTime::now(), /*buttons*/ 0);
     frame.eventHandler().handleMouseReleaseEvent(up);
+}
+
+// Apotheosis (map tap / long press, 2026-09-06): one plain line per input gesture into crash.txt,
+// the only writable path the driver knows. Same channel as presenter-stats / pan-swap-drop /
+// drag-press (no crash record, no crash-entry budget), capped so a session of tapping cannot fill
+// the file. The caller formats the text with snprintf. Grep for "tap ", "drag-release",
+// "long-press".
+static void inputNote(const char* text)
+{
+    static int notes = 0;
+    if (!text || !g_crashLogPath[0] || notes >= 24)
+        return;
+    ++notes;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "%s %02u:%02u:%02u.%03u\n", text, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    std::fclose(fp);
+}
+
+// Apotheosis: the drag-widget walk (canvas / touch-action:none), defined with WebCoreWantsDragAt
+// further down — the tap and long-press paths want the same answer about the same point.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y);
+
+// Apotheosis (long press, 2026-09-06): turn the run loop for `seconds` with the mouse button held
+// down. A touch long press is a *timed* gesture: the widget starts a timer on pointerdown and does
+// its thing (Google Maps drops a pin) when the timer fires, with the pointer still down. Nothing in
+// this driver ever kept a button pressed across time before — WebCoreClickAt presses and releases
+// in the same call, and WebCoreDragAt only holds the press between two harness calls — so the hold
+// needs its own pump. Same shape as pumpLoop's settle timer (isolatedUpdateRendering per tick to
+// keep rAF/animations running, microtask checkpoint, bail out if a navigation replaces the main
+// frame), but it stops on the clock instead of on idleness.
+static void holdPump(WebCore::LocalFrame& frame, WebCore::Page* pageForRendering, double seconds)
+{
+    using namespace WebCore;
+    if (seconds <= 0.0)
+        return;
+    bool stopped = false;
+    auto stopLoop = [&stopped] {
+        if (stopped)
+            return;
+        stopped = true;
+        RunLoop::currentSingleton().stop();
+    };
+    MonotonicTime deadline = MonotonicTime::now() + WTF::Seconds(seconds);
+    RefPtr<LocalFrame> frameRef = &frame;
+    RunLoop::Timer hold(Ref { RunLoop::currentSingleton() }, "WebCorePort.longpress.hold"_s,
+        WTF::Function<void()> { [&stopLoop, deadline, frameRef, pageForRendering] {
+            if (pageForRendering) {
+                pageForRendering->isolatedUpdateRendering();
+                RefPtr<LocalFrame> mf = pageForRendering->localMainFrame();
+                if (mf.get() != frameRef.get()) {   // navigated away under us: the caller re-fetches
+                    stopLoop();
+                    return;
+                }
+            }
+            if (RefPtr<Document> doc = frameRef->document())
+                doc->eventLoop().performMicrotaskCheckpoint();
+            if (MonotonicTime::now() >= deadline)
+                stopLoop();
+        } });
+    hold.startRepeating(0.05_s);
+    RunLoop::Timer watchdog(Ref { RunLoop::currentSingleton() }, "WebCorePort.longpress.watchdog"_s,
+        WTF::Function<void()> { [&stopLoop] { stopLoop(); } });
+    watchdog.startOneShot(WTF::Seconds(seconds + 2.0));   // a stuck tick must not hold the button for ever
+    RunLoop::run();
+    hold.stop();
+    watchdog.stop();
 }
 
 // 在 (x,y)(位图/视口像素,无需减 scroll —— EventHandler 内部 windowToContents 会加 scrollY)派发一次
@@ -4450,7 +4531,8 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     // Apotheosis (2026-09-04): a press from an earlier gesture must not still be "down" here, or
     // this click's mousedown becomes a pointermove and the page never sees a press at all - see
     // releaseDanglingPress(). Normally a no-op; WebCoreDragAt now unwinds its own presses.
-    if (lf->eventHandler().mousePressed()) {
+    const bool tapUnwound = lf->eventHandler().mousePressed();
+    if (tapUnwound) {
         releaseDanglingPress(*lf, DoublePoint(static_cast<double>(x), static_cast<double>(y)), { });
         // That release dispatches a mouseup, which runs script and in the worst case navigates.
         lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
@@ -4468,6 +4550,10 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         PerfPhase perfLayout(&g_perfCur.styleLayout);
         doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
     }
+    // Apotheosis (map tap, 2026-09-06): does this tap land on something that drags itself (map,
+    // canvas)? Diagnostics only — asked here, before dispatching, because the click can navigate
+    // and `doc` would then be a detached document.
+    const bool tapWantsDrag = dragWidgetAtPoint(*doc, x, y);
 
     // 重新武装加载检测:点击触发的导航能被 pump 捕获。关键:signalLoadComplete 触发一次后会把完成回调
     // move 走(LoadingFrameLoaderClient.cpp:131),初次加载完成后回调已空 —— 故每次点击都必须重装,否则
@@ -4493,9 +4579,23 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     DriverMouseEvent move(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
     lf->eventHandler().handleMouseMoveEvent(move);     // 设 :hover / elementUnderMouse
     DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
-    lf->eventHandler().handleMousePressEvent(down);    // 安装 UserGestureIndicator
+    const bool tapDownHandled = lf->eventHandler().handleMousePressEvent(down).wasHandled();   // 安装 UserGestureIndicator
     DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0);
-    lf->eventHandler().handleMouseReleaseEvent(up);    // 派发 DOM 'click' + 默认动作(导航/提交)
+    const bool tapUpHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();     // 派发 DOM 'click' + 默认动作(导航/提交)
+    // Apotheosis (map tap, 2026-09-06): settle on device what a plain tap actually delivers. The
+    // sequence above IS a clean click - hover move, press (clickCount 1, buttons 1), release
+    // (buttons 0, which is what makes EventHandler dispatch the DOM 'click'), all three at exactly
+    // the same point - so if a tap on a map does not do what a tap in a real browser does, the
+    // cause is on the page's side (Maps' mobile UI wants a LONG press for a pin, see
+    // WebCoreLongPressAt) and not a missing or mismatched event here. `wants` says whether the tap
+    // landed on a drag widget, i.e. whether the drag route would have claimed the same point.
+    {
+        char note[160];
+        std::snprintf(note, sizeof note, "tap at=%d,%d wants=%d down=%d up=%d unwound=%d",
+            x, y, tapWantsDrag ? 1 : 0, tapDownHandled ? 1 : 0,
+            tapUpHandled ? 1 : 0, tapUnwound ? 1 : 0);
+        inputNote(note);
+    }
 
     // ★ 显式聚焦命中点的可编辑元素:headless 下合成点击对"设置焦点"的副作用不稳定(时灵时不灵 → 键盘
     //   时弹时不弹)。这里命中测试点击点,若落在 text input / textarea / contenteditable 上就直接 focus(),
@@ -4791,10 +4891,24 @@ int WebCoreIsScrollableAt(int x, int y)
 // caller not looking at it) — kept optional-by-null rather than added to the bad-args check
 // because a failed present must not turn a real "consumed" answer into a 0 (that would risk
 // WebCoreScrollBy double-moving the main frame for the same delta).
-int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA)
+// Apotheosis (pinch on map widgets, 2026-09-06): the body of WebCoreWheelAt, with the two knobs
+// the zoom variant below needs.
+//   ctrlKey     — a wheel with ctrl held is what a page reads as "zoom me" (Google Maps, Leaflet
+//                 and OpenLayers all zoom on a plain wheel over the map AND on ctrl+wheel; the
+//                 modifier is what stops an embedded map from merely scrolling the page).
+//   zoomMode    — changes what counts as "the page took it" and what happens to the main frame.
+//                 For the scroll route only an actual nested scroll counts (a preventDefault that
+//                 scrolled nothing must fall back to WebCoreScrollBy, see the long comment above).
+//                 A zooming map does exactly that, though: it preventDefaults the wheel and moves
+//                 nothing scrollable — so in zoom mode "handled OR default-prevented" is the
+//                 answer, and the main frame is restored unconditionally, because a pinch must
+//                 never scroll the document underneath it.
+// ticksX/ticksY are the wheel's tick count (DOM wheelDelta = ticks x 120); the scroll route passes
+// its pixel deltas there as it always did.
+static int wheelAtImpl(int x, int y, float deltaX, float deltaY, float ticksX, float ticksY,
+                       bool ctrlKey, bool zoomMode, uint8_t* outRGBA)
 {
     using namespace WebCore;
-    (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
     if (!g_session || !g_session->mainFrame)
         return 0;
     if (g_inPump)
@@ -4818,9 +4932,9 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     const ScrollPosition beforeMain = view->scrollPosition();
 
     IntPoint p(x, y);
-    PlatformWheelEvent wheelEvent(p, p, deltaX, deltaY, deltaX, deltaY,
+    PlatformWheelEvent wheelEvent(p, p, deltaX, deltaY, ticksX, ticksY,
         PlatformWheelEventGranularity::ScrollByPixelWheelEvent,
-        /* shiftKey */ false, /* ctrlKey */ false, /* altKey */ false, /* metaKey */ false);
+        /* shiftKey */ false, ctrlKey, /* altKey */ false, /* metaKey */ false);
     OptionSet<WheelEventProcessingSteps> steps { WheelEventProcessingSteps::SynchronousScrolling,
         WheelEventProcessingSteps::BlockingDOMEventDispatch };   // the default/synchronous steps (see EventHandlerMac/IOS)
     auto [result, handling] = lf->eventHandler().handleWheelEvent(wheelEvent, steps);
@@ -4835,12 +4949,15 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     // non-passive wheel listener (analytics/sticky-header scripts, most cookie banners) became
     // completely unscrollable. Require all three: handled, not default-prevented, main frame
     // still where it was.
-    const bool consumedByNested = result.wasHandled()
-        && !handling.contains(EventHandling::DefaultPrevented)
-        && (afterMain == beforeMain);
+    const bool consumedByNested = zoomMode
+        ? (result.wasHandled() || handling.contains(EventHandling::DefaultPrevented))
+        : (result.wasHandled()
+            && !handling.contains(EventHandling::DefaultPrevented)
+            && (afterMain == beforeMain));
 
-    if (!consumedByNested && afterMain != beforeMain)
+    if ((zoomMode || !consumedByNested) && afterMain != beforeMain)
         view->setScrollPosition(beforeMain);   // undo any main-frame move: that is WebCoreScrollBy's job
+                                               // (and in zoom mode nothing may scroll the page at all)
 
     if (consumedByNested) {
         // Same present path WebCoreScrollBy uses (578cbc3/82c5cef): commit the moved layer's
@@ -4869,6 +4986,31 @@ int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t*
     }
 
     return consumedByNested ? 1 : 0;
+}
+
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA)
+{
+    (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
+    return wheelAtImpl(x, y, deltaX, deltaY, deltaX, deltaY, /*ctrlKey*/ false, /*zoomMode*/ false, outRGBA);
+}
+
+// Apotheosis (pinch on map widgets, 2026-09-06): `notches` wheel clicks with ctrl held at (x,y),
+// positive = wheel up = zoom in. A pinch over a map has to become this: the harness' pinch scales
+// the whole page (WebCoreSetPageScale), which on a map means zooming a picture of the map instead
+// of asking the map for more detail — the tiles stay at the old zoom level and the labels grow
+// blurry. One notch is 120 px of delta and one wheel tick, i.e. exactly what a mouse wheel sends
+// (DOM deltaY = -120 per notch up, wheelDeltaY = +120), so the map's own wheel handler applies its
+// normal one-step zoom around the point. Returns 1 if the page took it, 0 if nothing did — on a 0
+// the caller can fall back to page zoom. The document itself never scrolls on this path.
+int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
+{
+    if (!notches)
+        return 0;
+    if (notches > 8) notches = 8;            // one gesture step should never be a whole zoom range
+    if (notches < -8) notches = -8;
+    const float ticks = static_cast<float>(notches);
+    return wheelAtImpl(x, y, /*deltaX*/ 0.0f, /*deltaY*/ ticks * 120.0f, /*ticksX*/ 0.0f, ticks,
+                       /*ctrlKey*/ true, /*zoomMode*/ true, outRGBA);
 }
 
 // ===========================================================================
@@ -5105,6 +5247,9 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // page - see releaseDanglingPress).
         const bool own = handled || wants;
         g_dragActive = own;
+        // Apotheosis (map tap, 2026-09-06): remember where the gesture pressed, so the release can
+        // tell a pan (no click) from a gesture that never really moved (click, exactly as a tap).
+        g_dragPressX = x; g_dragPressY = y; g_dragMoved = false;
         if (!own)
             releaseDanglingPress(*lf, p, mods);
         dragPressNote(x, y, handled, wants, own);
@@ -5116,6 +5261,11 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // precisely what map widgets ignore (see DriverMouseEvent).
         DriverMouseEvent move(p, MouseButton::Left, PlatformEvent::Type::MouseMoved, 0, mods, t, kButtonsLeftDown);
         lf->eventHandler().handleMouseMoveEvent(move);
+        if (!g_dragMoved) {
+            const int mdx = x - g_dragPressX, mdy = y - g_dragPressY;
+            if (mdx * mdx + mdy * mdy > kDragTapSlopPx * kDragTapSlopPx)
+                g_dragMoved = true;   // past the slop: this gesture is a pan, its release fires no click
+        }
         handled = true;   // see the header comment: the press decided, per-move results are noise
     } else {
         // 2 = release, 3 = cancel (and any unknown phase): both must end with a mouseup, otherwise
@@ -5125,12 +5275,27 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // chorded-button rules (PointerCaptureController.cpp:432) - no pointerup, pointer stays
         // pressed for ever. A cancel additionally drops the click: an aborted gesture must not
         // activate what happens to be under the finger.
-        if (phase != 2)
+        //
+        // Apotheosis (map tap, 2026-09-06): a gesture that actually travelled must not end in a
+        // click either. WebCore fires the DOM 'click' on the release whenever press and release
+        // share the same target — on a map that is the one canvas for the whole pan, so every
+        // finger pan on maps.google.com ended with a click on the map, which is the site's own
+        // "toggle full-screen map view" action. A touch pan never produces a click in a real
+        // browser; a gesture that stayed inside the slop is a tap that only reached this route
+        // because XAML raised a manipulation, and it keeps its click.
+        const bool fireClick = (phase == 2 && !g_dragMoved);
+        if (!fireClick)
             lf->eventHandler().invalidateClick();
-        DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, phase == 2 ? 1 : 0, mods, t, 0);
+        DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, fireClick ? 1 : 0, mods, t, 0);
         lf->eventHandler().handleMouseReleaseEvent(up);
         g_dragActive = false;
         handled = true;
+        {
+            char note[160];
+            std::snprintf(note, sizeof note, "drag-release at=%d,%d from=%d,%d phase=%d moved=%d click=%d",
+                x, y, g_dragPressX, g_dragPressY, phase, g_dragMoved ? 1 : 0, fireClick ? 1 : 0);
+            inputNote(note);
+        }
     }
 
     if (!handled)
@@ -5151,6 +5316,167 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // best-effort, as in WebCoreWheelAt
     }
     return 1;
+}
+
+// ===========================================================================
+// Apotheosis (Google Maps pin, 2026-09-06): LONG PRESS.
+//
+// What a long press is on this port: ENABLE_TOUCH_EVENTS is 0 (OptionsWinUWP.cmake) and nothing
+// synthesises Touch or raw Pointer input, so every gesture reaches the page as mouse input, which
+// the engine then also turns into pointer events (pointerType "mouse"). A touch long press is
+// therefore not expressible one-to-one; what IS expressible is everything a widget can key a long
+// press off with a mouse:
+//   * mousedown / pointerdown, then the button STAYS DOWN while the run loop turns, so a
+//     press-and-hold timer inside the page (Google Maps drops its pin from exactly such a timer)
+//     gets the time it is waiting for. This is the part no existing export could do: WebCoreClickAt
+//     releases in the same call, and WebCoreDragAt's press is only held between harness calls
+//     during which the engine dispatches nothing.
+//   * the release afterwards, with the DOM 'click' (Maps' mobile UI reacts to a click on the map)
+//     unless the caller suppresses it.
+//   * a 'contextmenu' event at the same point (flag 1) — on desktop Maps the right-click menu is
+//     the usable "drop a pin / What's here?" path, and a touch long press is exactly what a browser
+//     turns into a contextmenu. Sent through EventHandler::sendContextMenuEvent(), i.e. the same
+//     entry the Windows port uses for WM_CONTEXTMENU: it hit-tests, clears the press state and
+//     dispatches the DOM event. ENABLE_CONTEXT_MENUS is 0 here, so there is no UA menu to show and
+//     nothing but the page's own listener can react — which is what we want.
+//
+// flags (WEBCORE_LONGPRESS_* in WebCoreDriver.h): 1 = also send contextmenu, 2 = suppress the
+// click, 4 = do nothing unless the point is a drag widget (canvas / touch-action:none — the same
+// walk WebCoreWantsDragAt runs). 4 is what the harness passes: a long press anywhere else on the
+// page must keep behaving the way it does today (XAML raises Holding over ordinary text too, and a
+// press-hold-click on a link would open it).
+//
+// holdMs: how long the button stays down (default 600, capped at 2000). (x,y) = viewport/bitmap px,
+// same convention as every other input export. Returns kOK once the gesture was delivered — and
+// also on the "not a drag widget" skip, with the current frame painted into outRGBA, so the caller
+// never has to tell a skip from a failure to keep its screen correct. Engine thread only.
+int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;
+    PerfOpGuard perfOp("longpress", nullptr, 0, 0);
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // the press hit-tests, as in WebCoreClickAt
+
+    const bool wants = dragWidgetAtPoint(*doc, x, y);
+    if ((flags & 4) && !wants) {
+        char note[128];
+        std::snprintf(note, sizeof note, "long-press skip at=%d,%d wants=0", x, y);
+        inputNote(note);
+        if (outRGBA) {
+            int nonWhite = 0;
+            paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // keep the caller's frame valid
+        }
+        return kOK;
+    }
+
+    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    OptionSet<PlatformEvent::Modifier> mods;
+    MonotonicTime t = MonotonicTime::now();
+
+    // A press left down by an abandoned gesture would turn this mousedown into a pointermove — same
+    // guard, same reason, as at the top of WebCoreClickAt/WebCoreDragAt.
+    const bool unwound = lf->eventHandler().mousePressed();
+    if (unwound)
+        releaseDanglingPress(*lf, p, mods);
+    g_dragActive = false;   // this call owns the press from here to its release
+
+    DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
+    lf->eventHandler().handleMouseMoveEvent(hover);   // :hover / elementUnderMouse, as in WebCoreClickAt
+    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
+    const bool downHandled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
+
+    int hold = holdMs <= 0 ? 600 : holdMs;
+    if (hold > 2000)
+        hold = 2000;
+    holdPump(*lf, g_session->page.get(), hold / 1000.0);
+
+    // The hold ran script (timers, rAF) and can have navigated — re-fetch before the release, the
+    // way WebCoreClickAt does after its pump.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+
+    const bool fireClick = !(flags & 2);
+    if (!fireClick)
+        lf->eventHandler().invalidateClick();
+    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, fireClick ? 1 : 0,
+                        mods, MonotonicTime::now(), 0);
+    const bool upHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();
+
+    bool ctxSwallowed = false;
+    bool ctxSent = false;
+#if ENABLE(CONTEXT_MENU_EVENT)
+    if (flags & 1) {
+        // The release can navigate too (a link under the finger): re-fetch once more before asking
+        // for a context menu on a frame that may be gone.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (lf) {
+            g_session->mainFrame = lf;
+            DriverMouseEvent ctx(p, MouseButton::Right, PlatformEvent::Type::MousePressed, 1, mods,
+                                 MonotonicTime::now(), kButtonsRightDown);
+            ctxSwallowed = lf->eventHandler().sendContextMenuEvent(ctx);
+            ctxSent = true;
+        }
+    }
+#endif
+    {
+        char note[192];
+        std::snprintf(note, sizeof note,
+            "long-press at=%d,%d wants=%d hold=%d down=%d up=%d click=%d ctx=%d/%d unwound=%d",
+            x, y, wants ? 1 : 0, hold, downHandled ? 1 : 0, upHandled ? 1 : 0, fireClick ? 1 : 0,
+            ctxSent ? 1 : 0, ctxSwallowed ? 1 : 0, unwound ? 1 : 0);
+        inputNote(note);
+    }
+
+    // Let the synchronous handlers land (pumpQuick, the same light settle typing uses — the pin's
+    // own network work streams into the live tick), then present.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+    pumpQuick(*lf, g_session->page.get());
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+    if (RefPtr<Document> d2 = lf->document()) {
+        d2->updateLayoutIgnorePendingStylesheets();
+        extractLinks(d2.get(), g_session->h);
+    }
+    if (outRGBA) {
+        int nonWhite = 0;
+        paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    }
+    return kOK;
 }
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了 extractLinks)。轻量:仅布局 + 提取,不绘制、不派发事件。

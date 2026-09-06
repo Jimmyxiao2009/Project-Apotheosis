@@ -230,6 +230,32 @@ int WebCoreWantsDragAt(int x, int y);
 // return the frame is already composited/presented into outRGBA the
 // way WebCoreWheelAt does it; outRGBA may be null (no present attempted).
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA);
+// Apotheosis (Google Maps pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
+// on this port and nothing synthesises Touch/Pointer input, so a touch long press cannot be
+// delivered as one; what this does deliver is everything a page can key a long press off with a
+// mouse: mousedown, the button STAYS DOWN while the engine turns its run loop for holdMs (so a
+// press-and-hold timer inside the page - Google Maps drops its pin from exactly such a timer - gets
+// the time it waits for), then mouseup + DOM click, and optionally a 'contextmenu' event at the
+// same point (on desktop Maps the right-click menu is the usable "drop a pin / What's here?" path,
+// and a long press is what a browser turns into a contextmenu).
+// holdMs: 0 = default 600, capped at 2000. flags: see WEBCORE_LONGPRESS_* below.
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt. Returns 0 (kOK) once delivered -
+// and also on the DRAG_WIDGET_ONLY skip, with the current frame painted into outRGBA, so the caller
+// never has to tell a skip from a failure. Negative = the usual driver error codes.
+#define WEBCORE_LONGPRESS_CONTEXTMENU      1   // also send a 'contextmenu' event after the release
+#define WEBCORE_LONGPRESS_NO_CLICK         2   // suppress the DOM 'click' the release would fire
+#define WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY 4   // do nothing unless (x,y) is a canvas / touch-action:none
+int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA);
+
+// Apotheosis (pinch on map widgets, 2026-09-06): `notches` ctrl+wheel clicks at (x,y), positive =
+// wheel up = zoom in, one notch = 120 px of delta and one wheel tick (what a real mouse wheel
+// sends). A pinch that starts over a map must become this instead of WebCoreSetPageScale: page zoom
+// scales a picture of the map (old tiles, blurry labels), while the wheel asks the map itself for
+// the next zoom level around the point. Returns 1 if the page took the wheel, 0 if nothing did (the
+// caller can then fall back to page zoom). The document never scrolls on this path; on a 1 the
+// frame is already composited/presented into outRGBA the way WebCoreWheelAt does it.
+int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
+
 
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
