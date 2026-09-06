@@ -79,7 +79,6 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetInstantPanSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetThreadedRasterSwitch;
-        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetPresenterSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetEventPresentSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetDragPointerSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetStaleTilesSwitch;

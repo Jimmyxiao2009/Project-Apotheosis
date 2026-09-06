@@ -49,7 +49,6 @@
 #include <csignal>
 #include <cstdlib>     // Apotheosis: std::abort / _set_purecall_handler (crash.txt legs)
 #include <atomic>      // Apotheosis: try-flag guarding perfFlush() from the crash legs
-#include <mutex>       // Apotheosis: the process-wide ANGLE lock (std::recursive_mutex, see g_angleMutex)
 #include <exception>   // Apotheosis: std::set_terminate (crash.txt leg (d))
 #include <new.h>       // Apotheosis: _set_new_handler — CRT form, gets the requested size
 #include <JavaScriptCore/ExecutableAllocator.h>   // Apotheosis: JIT pool range / isJITPC for crash.txt       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
@@ -251,19 +250,6 @@ unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
 #include <WebCore/RenderView.h>             // view->renderView()->compositor()
 #include <WebCore/RenderLayerCompositor.h>  // compositor().frameViewDidScroll()(同步 TextureMapper 路径滚动)
 #include <memory>                           // std::unique_ptr
-
-// ---- Apotheosis (presenter thread): a second GL context on its own thread owns the swap chain ----
-// Raw EGL is needed for exactly two things the WebCore GLContext wrapper does not expose: the
-// cross-thread fence (EGL_KHR_fence_sync, resolved through eglGetProcAddress so the driver keeps no
-// link-time dependency on an extension ANGLE 2.1.13 may or may not advertise at runtime) and the
-// EGLDisplay to pass to it. Everything else - context creation, share group, makeCurrent,
-// eglSwapBuffers - still goes through WebCore::GLContext, which already knows how to hand a
-// SwapChainPanel PropertySet to eglCreateWindowSurface.
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <wtf/Condition.h>
-#include <wtf/Lock.h>
-#include <wtf/Threading.h>
 
 // Installs the PlatformStrategies singleton (loader strategy = WebResourceLoadScheduler).
 // Defined in port/PortPlatformStrategies.cpp. Idempotent.
@@ -549,295 +535,32 @@ static const int kDragTapSlopPx = 8;   // engine px (~4 DIP at 720 over a 360 DI
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
-// Apotheosis (presenter thread): RoInitialize/RoUninitialize for the presenter thread. WinRT
-// apartment bring-up, not WRL - nothing here uses C++/CX or WRL types, ANGLE only needs the
-// calling thread to have an apartment when it QIs the SwapChainPanel. Declared in the App
-// partition of the SDK, imported from WindowsApp.lib, which the driver already links.
-#include <roapi.h>
-
-// ===========================================================================
-// Apotheosis (presenter thread) - the swap chain gets exactly one owner.
-//
-// The problem the pan-present handshake above could not solve. Two producers ended up on the same
-// screen: the engine thread's eglSwapBuffers and the UI thread's XAML TranslateTransform on the
-// same SwapChainPanel. DWM commits them in different frames, so every engine step showed one frame
-// of content-without-transform (or transform-without-content) - a visible jump. Coarser engine
-// steps only made the jumps rarer, and no UI-thread handshake can close it, because a XAML property
-// change becomes visible at the next composition commit while an eglSwapBuffers is visible at once.
-// On top of that, while the engine thread ran JS or layout it could not present at all, so the page
-// simply stopped moving (github).
-//
-// The fix is to take the swap chain away from both of them and give it to a third thread that does
-// nothing else:
-//
-//   engine thread    composites the layer tree into an OFFSCREEN FBO-backed texture (two of them,
-//                    double buffered, viewport sized) with its own EGL context - which is now an
-//                    offscreen context, it never touches the window surface again - and publishes
-//                    {texture, fence, scroll position at composite time, background colour} here.
-//   presenter thread owns a second EGL context in the SAME share group (both are created through
-//                    PlatformDisplay, so both share with PlatformDisplay::sharingGLContext()) and
-//                    owns the window surface. It draws the newest published texture as a full-screen
-//                    quad, translated by the pan residual, and swaps. Nothing else runs on it, so a
-//                    busy engine can no longer stop the screen from moving.
-//   UI thread        pushes the raw finger offset in with WebCoreSetPanOffset() at touch rate and
-//                    goes away again. No engine hop, no XAML transform, no handshake.
-//
-// The pan residual is computed HERE, not in the harness: every published frame carries the scroll
-// position it was composited at, so the presenter subtracts the engine's real progress itself
-//   residual = panOffset - (scrollAtComposite - scrollAtGestureStart)
-// which is exactly what the old InstantPanApplied() bookkeeping did on the UI thread, one round
-// trip later. Clamped to one screen; the strip the translation uncovers is cleared to the page
-// background colour of the frame being shown.
-//
-// Threading rules kept intact (repo CLAUDE.md 线程铁律): the presenter never calls into WebCore and
-// never waits on the UI thread; the UI thread never waits on the presenter (WebCoreSetPanOffset
-// takes one uncontended lock and returns); the engine waits on the presenter only for the few
-// microseconds it takes to issue one quad if it wants to overwrite the buffer being sampled, and
-// gives up after 50 ms. ANGLE marshals window-surface CREATION to the panel dispatcher, which is
-// why the presenter creates its surface while the UI thread is idle (WebCoreGpuInit is already a
-// posted job) and why WebCoreGpuInit falls back to the old engine-owned window surface if that
-// does not come back within 5 s.
-//
-// Everything here is behind WebCoreSetPresenterThread(); with it off WebCoreGpuInit takes exactly
-// the path it took before and g_presenterActive stays false, so every branch below is skipped.
-// ===========================================================================
-// Apotheosis (review 2026-09-04 item 1): DEFAULT OFF. 0.1.9.14 on device showed background-only
-// frames at the end of a scroll with the presenter on, so the shipping default is the engine-owned
-// window surface (the pre-presenter behaviour). The harness mirrors this default in
-// MainPage.xaml.h; a settings.ini that already carries "presenter=1" still wins for that install.
-static bool g_presenterWanted = false;                 // switch, read once per WebCoreGpuInit
-static std::atomic<bool> g_presenterActive { false };  // the presenter really owns the swap chain
-// Apotheosis (review 2026-09-04 item 2): the presenter can retire ITSELF, mid-session, on a swap
-// that fails for good. It clears g_presenterActive from its own thread, where it may not touch
-// WebCore, so it leaves this behind instead: the next gpuPresent on the ENGINE thread consumes it,
-// force-dirties the whole tree and re-arms needsPresent, so the engine goes back to compositing
-// and swapping on its own context - the only thing left that can still put pixels anywhere.
-static std::atomic<int> g_presenterRetired { 0 };
-static void* g_presenterWindow = nullptr;              // native window handed to the presenter thread
-static EGLDisplay g_presenterEglDisplay = nullptr;
-
-// ===========================================================================
-// Apotheosis (2026-09-06, ANGLE GLOBAL LOCK): one process-wide recursive mutex held around every
-// GL/EGL call, on every thread. The presenter's last attempt.
-//
-// WHY. The presenter thread draws the engine's slot texture from a SECOND EGL context in the same
-// share group. That is legal GL - and it is not what the white screen on device is about. ANGLE
-// 2.1.13 (the ANGLE.WindowsStore NuGet we ship) is NOT THREAD SAFE AT ALL on its D3D11 backend:
-// one EGLDisplay owns one ID3D11Device and one immediate ID3D11DeviceContext, and the state that
-// rides on them - StateManager11's cached bindings, TextureStorage11's SRV/dirty caches, the
-// shader/buffer caches - is shared by every context on that display and carries no lock of any
-// kind. Two threads issuing GL concurrently therefore corrupt each other's D3D state rather than
-// merely racing over pixels: the presenter's quad goes out with the engine's half-set render
-// target, viewport and program, or the engine's composite lands in the presenter's, and what
-// reaches the SwapChainPanel is a cleared surface. That is the "white nearly always, content
-// occasionally and seconds late" the device shows, and it is exactly what the glFinish handoffs
-// cannot fix: they order the GPU's work, not ANGLE's CPU-side bookkeeping.
-//
-// The ANGLE developers' documented workaround for this era is a single coarse application lock
-// around EVERY GL and EGL entry point from every thread:
-//   https://groups.google.com/g/angleproject/c/qeTAV4Bpr2Q
-//   https://github.com/microsoft/angle/issues/61
-// This is that lock. If the screen is still white with it, the two-context split is not viable on
-// this ANGLE and the presenter goes away for good.
-//
-// WHAT HOLDS IT (grep AngleLocker):
-//   engine thread    - eglMakeCurrent; the compositing-flush and backing-store passes of
-//                      gpuPrepare() (BitmapTextureGL::updateContents -> glTexSubImage2D happens
-//                      inside updateBackingStoreIncludingSubLayers, so the whole pass is covered,
-//                      cairo tile painting included); the TextureMapper composite
-//                      (beginPainting/paint/endPainting) in gpuPresent() and
-//                      gpuCompositeReadback(), plus the repair composite; glFinish + glReadPixels;
-//                      presenterPublish()'s glFinish; eglSwapBuffers (gpuPresent and
-//                      presentOwedSwap); context/TextureMapper construction and destruction in
-//                      WebCoreGpuInit(); the GL destructors ~Page runs in teardownSession(); and
-//                      wkReleaseMemoryLevel()'s three other call sites, which delete textures too.
-//   presenter thread - one span per frame: makeContextCurrent, the quad, the probe, glFinish,
-//                      eglSwapBuffers and the swap-lost bookkeeping; plus its one-off GL setup
-//                      (shaders, VBO) and its context teardown.
-//   UI thread        - nothing. WebCoreSetPanOffset / WebCoreSetPresenterSuspended only touch
-//                      presenter state under P.lock and make no GL call (verified 2026-09-06).
-//   raster workers   - nothing. The threaded-raster pool replays cairo into CPU image buffers and
-//                      reports completion through atomics; the GL upload of a finished buffer is
-//                      done by the engine thread inside the backing-store pass (verified
-//                      2026-09-06 in TextureMapperTile.cpp: the worker lambda calls
-//                      Cairo::PaintingContext::replay + completePainting only).
-//
-// WHAT DELIBERATELY RUNS UNLOCKED, so the presenter can keep presenting through it: layout and
-// style (the first block of gpuPrepare), JS, the RunLoop, cairo recording and raster replays -
-// and EVERY WAIT: presenterAcquireSlot()'s 50 ms wait for a free slot, presenterStart()'s 5 s wait
-// for the presenter to come up, and the presenter's own condvar wait for the next frame.
-//
-// THE TWO RULES THAT KEEP THIS DEADLOCK-FREE:
-//   (1) never block on P.cond while holding the ANGLE lock;
-//   (2) always take the ANGLE lock BEFORE P.lock, never the other way round. The presenter takes
-//       P.lock alone (to pick a frame) or ANGLE-then-P (to clear inUse); the engine takes P.lock
-//       alone (presenterAcquireSlot, where it waits) or ANGLE-then-P (presenterPublish). No thread
-//       ever waits for the ANGLE lock while holding P.lock, so there is no cycle.
-//
-// KNOWN GAP: GL that WebCore issues outside a composite is not covered - in practice
-// BitmapTexturePool's release timer (RunLoop, engine thread) deleting unused textures every few
-// seconds. It is not a per-frame path; if the lock helps but the screen still glitches
-// occasionally, that timer is the next thing to wrap (it needs a WebKit-side hook).
-//
-// COST with the presenter off: taken and released from one thread only. An uncontended
-// std::recursive_mutex on Windows is an atomic compare-exchange plus a thread-id compare - a few
-// nanoseconds, a handful of times per composite, far below the noise of a composite. So the lock
-// is UNCONDITIONAL rather than conditional on g_presenterActive: a conditional one would have to
-// stay consistent across a presenter that starts late or retires mid-session, and getting that
-// wrong costs a hang. Recursive because gpuPrepare() locks and is itself called from inside the
-// already-locked repair path in gpuPresent().
-static std::recursive_mutex g_angleMutex;
-
-// Apotheosis (ANGLE global lock): per-side wait/hold diagnostics, reported in the presenter-stats
-// line. If the screen comes right but scrolling stutters, this says which side starves the other:
-// a high engine wait means the presenter holds the device too long, a high presenter wait means
-// the engine's composite does.
-enum class AngleSide { Engine = 0, Presenter = 1 };
-static std::atomic<unsigned long long> g_angleWaitUs[2] { { 0 }, { 0 } };   // [0]=engine, [1]=presenter
-static std::atomic<unsigned> g_angleWaitMaxUs[2] { { 0 }, { 0 } };
-static std::atomic<unsigned> g_angleHoldMaxUs[2] { { 0 }, { 0 } };
-static std::atomic<unsigned> g_angleLocks[2] { { 0 }, { 0 } };
-
-static unsigned angleElapsedUs(MonotonicTime from, MonotonicTime to)
-{
-    const double us = (to - from).value() * 1000000.0;
-    if (!(us > 0.0))
-        return 0;
-    return (us > 1000000000.0) ? 1000000000u : static_cast<unsigned>(us);
-}
-
-static void angleNoteMax(std::atomic<unsigned>& slot, unsigned value)
-{
-    unsigned cur = slot.load(std::memory_order_relaxed);
-    while (value > cur && !slot.compare_exchange_weak(cur, value, std::memory_order_relaxed)) { }
-}
-
-// Apotheosis (ANGLE global lock): RAII holder. Recursive re-entries are counted too - they are
-// uncontended by construction and only add a little noise to the average.
-class AngleLocker {
-public:
-    explicit AngleLocker(AngleSide side)
-        : m_side(static_cast<int>(side))
-    {
-        const MonotonicTime before = MonotonicTime::now();
-        g_angleMutex.lock();
-        m_held = MonotonicTime::now();
-        const unsigned waitUs = angleElapsedUs(before, m_held);
-        g_angleWaitUs[m_side].fetch_add(waitUs, std::memory_order_relaxed);
-        g_angleLocks[m_side].fetch_add(1, std::memory_order_relaxed);
-        angleNoteMax(g_angleWaitMaxUs[m_side], waitUs);
-    }
-    ~AngleLocker()
-    {
-        angleNoteMax(g_angleHoldMaxUs[m_side], angleElapsedUs(m_held, MonotonicTime::now()));
-        g_angleMutex.unlock();
-    }
-    AngleLocker(const AngleLocker&) = delete;
-    AngleLocker& operator=(const AngleLocker&) = delete;
-
-private:
-    int m_side;
-    MonotonicTime m_held;
-};
-
-// Apotheosis (ANGLE global lock): "n/avg/max wait, max hold" in ms for one side, for presenter-stats.
-static void angleLockStats(AngleSide side, char* out, size_t outSize)
-{
-    const int i = static_cast<int>(side);
-    const unsigned n = g_angleLocks[i].load(std::memory_order_relaxed);
-    const unsigned long long totalUs = g_angleWaitUs[i].load(std::memory_order_relaxed);
-    const double avgMs = n ? (static_cast<double>(totalUs) / static_cast<double>(n) / 1000.0) : 0.0;
-    std::snprintf(out, outSize, "n=%u avg=%.2f max=%.2f hold=%.2f", n, avgMs,
-        g_angleWaitMaxUs[i].load(std::memory_order_relaxed) / 1000.0,
-        g_angleHoldMaxUs[i].load(std::memory_order_relaxed) / 1000.0);
-}
-// ===========================================================================
-
-// Apotheosis (presenter thread, WHITE-SCREEN fix 2026-09-04): the cross-context EGL fence
-// handshake is GONE. Both halves of it - the engine's eglCreateSyncKHR + the presenter's
-// eglClientWaitSyncKHR, and the presenter's fence the engine waited on before reusing a slot -
-// were waits on an EGLSync created by ANOTHER context on ANOTHER thread. ANGLE 2.1.13 (the
-// WindowsStore NuGet we ship) implements EGL_KHR_fence_sync on D3D11 as an ID3D11Query(EVENT)
-// whose End()/GetData() run on the ONE immediate device context the whole display shares; asking
-// for it from the presenter thread does not order anything against the engine thread's command
-// stream, and it came back EGL_CONDITION_SATISFIED_KHR straight away. The presenter therefore
-// sampled the slot texture while the engine's composite had only got as far as
-// TextureMapper::clearColor(documentBackgroundColor) - i.e. an all-white texture - and swapped
-// that. On device: the page shows up once (the last composite of a load lands while the presenter
-// is asleep) and then goes white for the rest of the session, flashing in whenever the race is
-// won. The synchronisation is now a plain glFinish() on the producing side of each handover:
-// the engine finishes before it publishes, the presenter finishes before it releases the slot.
-// That is what the no-extension branch always did; it is simply the only branch left. The
-// extension string is still queried, but only so the diagnostics can say what the display claims.
-static bool g_presFenceAdvertised = false;
-
-// One published frame. `texture` is set once at start-up and never replaced, so the presenter may
-// read `texture->id()` under the lock and sample it outside; BitmapTexture is ThreadSafeRefCounted
-// and these two are held for the life of the process (like g_glContext, deliberately never
-// destroyed - a cross-thread glDeleteTextures at exit is what we are avoiding everywhere here).
-struct PresenterFrame {
-    RefPtr<WebCore::BitmapTexture> texture;
-    int scrollX { 0 };
-    int scrollY { 0 };
-    float bg[4] { 1.0f, 1.0f, 1.0f, 1.0f };
-};
-
-// Apotheosis (presenter diagnostics): counted on the presenter thread (and one on the engine
-// thread), dumped into crash.txt every kPresStatsEvery draws and on the first one. A device run
-// that is still wrong must be able to say WHY without another guess - see presenterStatsDump().
-static const unsigned kPresStatsEvery = 240;
-static std::atomic<unsigned> g_presDraws { 0 };          // quads issued
-static std::atomic<unsigned> g_presSwaps { 0 };          // eglSwapBuffers done
-static std::atomic<unsigned> g_presSkipNoPub { 0 };      // woke with nothing published
-static std::atomic<unsigned> g_presSkipDedupe { 0 };     // same generation and same translation
-static std::atomic<unsigned> g_presSkipSuspended { 0 };  // app suspended
-static std::atomic<unsigned> g_presSkipNoTex { 0 };      // published slot had texture id 0 -> clear only
-static std::atomic<unsigned> g_presEngineDrops { 0 };    // engine dropped a composite: no free slot in 50 ms
-static std::atomic<int> g_presLastEglError { 0 };        // eglGetError() after the last swap
-static std::atomic<int> g_presProbeContent { -1 };       // pixels != clear colour in the last probe block
-static std::atomic<int> g_presProbeTotal { 0 };
-static std::atomic<unsigned> g_presSkipEmpty { 0 };      // light composites redrawn in full: unpainted visible tiles
-
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): the engine may publish a slot that holds nothing
-// but the clear colour.
-//
-// In the old engine-owned-window-surface world an "empty" composite was harmless: a frame that
-// painted no tile simply left the back buffer holding the PREVIOUS frame's pixels and re-swapped
-// it, so the screen did not change. With two offscreen slots every composite starts with
-// target.reset() + bindAsSurface(), i.e. a full clear (3c866bf) - so the same no-op composite now
-// publishes a freshly cleared, white texture, and the presenter dutifully puts it on screen. That
-// is the device symptom: content while the finger moves, everything white the moment scrolling
-// ends, with draws==swaps, skip_notex=0, engine_drops=0 and the probe of the drawn slot falling
-// 256 -> 94 -> 0.
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): a composite can come up with no content at all.
 //
 // Who produces such a composite: every live tick takes the scroll fast path (WebCoreLiveTick sets
 // g_gpuScrollFast unconditionally), so gpuPrepare skips forceDirtyTree and the composite is drawn
 // entirely from the tiles the backing stores still hold. When those tiles are gone - dropped
 // outside the keep rect while the gesture moved the visible rect, recycled on a scale change, or
 // still owed by a raster worker - the tree paints nothing at all and the whole screen is the clear
-// colour. The engine-side repair (keeping stale tiles) is a separate change; what belongs HERE is
-// that a composite which drew nothing must not be published over a good frame.
+// colour. That is the device symptom: content while the finger moves, the page background alone
+// the moment scrolling ends.
 //
-// Apotheosis (2026-09-04, device package 13): the pixel probe this block first described was the
-// wrong instrument. On device it PASSED - the light composite draws the layer's background colour,
-// which is not the clear colour, so "did anything at all get drawn" says yes - while the frame held
-// no content tile whatsoever and the screen showed nothing but github's dark grey. The engine
-// already knows the answer exactly: wkWinUWPTexmapUnpaintedVisibleTiles() counts, inside the paint
-// itself, every visible tile that has run out of composites to produce pixels. Its delta across one
-// paint is therefore the authoritative "this frame is missing content".
+// The engine knows the answer exactly: wkWinUWPTexmapUnpaintedVisibleTiles() counts, inside the
+// paint itself, every visible tile that has run out of composites to produce pixels. Its delta
+// across one paint is therefore the authoritative "this frame is missing content" - a pixel probe
+// is not, because the layer background IS drawn, so "did anything get drawn" says yes while no
+// content tile exists at all.
 //
-// So the rule is now: a LIGHT composite that walked over unpainted visible tiles is not published.
-// It is redrawn in full - force-dirty the whole tree, update every backing store, paint again into
-// the same slot - and THAT frame is published. Exactly what the pre-presenter path did for every
-// frame, at the cost of one full composite in the rare case; a full composite is trusted
+// So the rule is: a LIGHT composite that walked over unpainted visible tiles is repaired before it
+// reaches the screen - painted again and swapped only then. A full composite is trusted
 // unconditionally, so this can never loop.
 //
-// Apotheosis (2026-09-06): "redrawn in full" was the wrong half of that rule. The repair has to
-// happen - a slot holding nothing but the background must not reach the screen - but forcing the
-// WHOLE tree is a sledgehammer that costs 400-1000 ms of ms_backing on n-tv.de/github.com, and the
-// device symptom was one such stall per gesture (perf.csv 20260906-180145: 7 of 413 scroll rows).
-// The stores that lost their pixels say so themselves: the paint that came up short has just put
-// every visible tile that drew nothing back on the synchronous path
+// Apotheosis (2026-09-06): the repair is TARGETED, not a forced full-tree repaint. The repair has
+// to happen - a frame holding nothing but the background must not reach the screen - but forcing
+// the WHOLE tree is a sledgehammer that costs 400-1000 ms of ms_backing on n-tv.de/github.com, and
+// the device symptom was one such stall per gesture (perf.csv 20260906-180145: 7 of 413 scroll
+// rows). The stores that lost their pixels say so themselves: the paint that came up short has
+// just put every visible tile that drew nothing back on the synchronous path
 // (TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles), so wkHasUnpaintedVisibleTiles()
 // is true for exactly those stores and false for every other layer. A repair that does NOT
 // force-dirty therefore repaints precisely the layers that are missing content
@@ -847,38 +570,6 @@ static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tr
 static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
 static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
 static unsigned g_gpuRepairMisses = 0;        // targeted repairs that still came up short (escalation counter)
-static int g_gpuLastUnpainted = 0;            // unpainted-visible-tile events in the last paint (diagnostics)
-
-struct PresenterState {
-    WTF::Lock lock;
-    WTF::Condition cond;
-    PresenterFrame slot[2];
-    int published { -1 };          // newest published slot, -1 = nothing composited yet
-    int inUse { -1 };              // slot the presenter is sampling right now
-    uint64_t generation { 0 };     // bumped on every publish
-    // Pan, all in engine px. panX/panY = what the finger has asked for since the gesture started.
-    float panX { 0.0f };
-    float panY { 0.0f };
-    bool panActive { false };      // finger (or inertia) is driving the offset
-    bool panEnding { false };      // gesture over, the residual is decaying as the engine catches up
-    MonotonicTime panDeadline;     // hard snap-to-zero if the engine never catches up
-    int panBaseX { 0 };            // scroll position the frame on screen had when the gesture began
-    int panBaseY { 0 };
-    bool panBaseValid { false };
-    bool wake { false };
-    bool stop { false };
-    bool suspended { false };
-    int initState { 0 };           // 0 = starting, 1 = ready, -1 = failed
-};
-// Apotheosis: written exactly once, by the engine thread in presenterStart(), and read by the
-// presenter thread and - the reason this is an atomic - by the UI thread in WebCoreSetPanOffset /
-// WebCoreSetPresenterSuspended. The release store publishes the fully built PresenterState (its
-// lock, its textures) to whoever acquire-loads a non-null pointer; a plain pointer gave the
-// compiler and the ARMv7 memory model every right to hand out a half-initialised object. It is
-// never freed and never reset to null once non-null, so an acquire-load that saw it stays valid
-// for the life of the process (see presenterStart's detach path).
-static std::atomic<PresenterState*> g_pres { nullptr };
-static RefPtr<WTF::Thread> g_presenterThread;
 
 // ---------------------------------------------------------------------------
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
@@ -2228,12 +1919,6 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         Color docBg = view.documentBackgroundColor();
         glRoot.setBackgroundColor(docBg.isValid() ? docBg : Color::white);
     }
-    // Apotheosis (ANGLE global lock): from here to the end of gpuPrepare() everything may issue GL
-    // - the compositing flush walks platform layers, and the backing-store pass below paints tiles
-    // and uploads them (BitmapTextureGL::updateContents -> glTexSubImage2D). The style/layout block
-    // above is deliberately OUTSIDE it: it is the longest phase and touches no GL, so the presenter
-    // keeps presenting through it. No wait happens under this lock (see the rules at g_angleMutex).
-    AngleLocker angleLock(AngleSide::Engine);
     {
         PerfPhase perfFlushPhase(&g_perfCur.flush);        // M4: compositing flush (+ scroll-layer positioning)
         // Apotheosis (C2): position the scrolled-contents layer *before* the flush as well.
@@ -2300,10 +1985,6 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     using namespace WebCore;
     if (!g_glContext || !g_textureMapper)
         return kErrNoView;
-    // Apotheosis (ANGLE global lock): the whole readback is GL. The CPU tail (flip/statistics/hash)
-    // holds it too - this path is the offscreen mode, where no presenter exists, and the one case
-    // where it runs with a live presenter is the tab-switch snapshot, i.e. once per tab switch.
-    AngleLocker angleLock(AngleSide::Engine);
     g_glContext->makeContextCurrent();
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
     gpuPrepare(view, glRoot);
@@ -2361,192 +2042,9 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     return kOK;
 }
 
-// ===========================================================================
-// Apotheosis (presenter thread) - implementation. See the big comment at g_presenterWanted.
-// ===========================================================================
-
-// A textured quad, drawn once per presented frame. GLES2, written out here rather than borrowed
-// from TextureMapper because a second TextureMapper on a second thread would drag WebCore's shader
-// cache, texture pool and their singletons onto a thread that must never touch WebCore.
-static const char* kPresenterVertexShader =
-    "attribute vec2 a_pos;\n"
-    "uniform vec2 u_trans;\n"
-    "varying vec2 v_tex;\n"
-    "void main() {\n"
-    // The engine renders into an FBO, where TextureMapper forces the flipped projection
-    // (updateProjectionMatrix: a bound surface is always flipY=true), so texture row 0 holds the
-    // TOP of the page. The window surface is the other way round, hence 1.0 - y here. Derived from
-    // the untranslated corner so the translation moves texture and quad together.
-    "  v_tex = vec2((a_pos.x + 1.0) * 0.5, (1.0 - a_pos.y) * 0.5);\n"
-    "  gl_Position = vec4(a_pos + u_trans, 0.0, 1.0);\n"
-    "}\n";
-static const char* kPresenterFragmentShader =
-    "precision mediump float;\n"
-    "uniform sampler2D u_tex;\n"
-    "varying vec2 v_tex;\n"
-    "void main() { gl_FragColor = texture2D(u_tex, v_tex); }\n";
-
-struct PresenterGL {
-    GLuint program { 0 };
-    GLuint vbo { 0 };
-    GLint aPos { -1 };
-    GLint uTrans { -1 };
-    GLint uTex { -1 };
-    GLuint probeFbo { 0 };   // diagnostics only, created on the first probe (see presenterProbe)
-};
-
-// Apotheosis: whole-token search in a space-separated EGL/GL extension string. eglGetProcAddress
-// returning a non-null pointer says nothing about whether the extension is supported - ANGLE
-// resolves entry points for extensions it does not expose on the current display - so the string
-// is the only answer that counts. strstr() alone would also accept a prefix of a longer name.
-static bool presenterHasExtension(const char* extensions, const char* name)
-{
-    if (!extensions || !name)
-        return false;
-    const size_t len = std::strlen(name);
-    for (const char* p = extensions; (p = std::strstr(p, name)); p += len) {
-        const bool leftOk = (p == extensions) || (p[-1] == ' ');
-        const bool rightOk = (p[len] == ' ') || (p[len] == '\0');
-        if (leftOk && rightOk)
-            return true;
-    }
-    return false;
-}
-
-static GLuint presenterCompile(GLenum type, const char* src)
-{
-    GLuint s = glCreateShader(type);
-    if (!s)
-        return 0;
-    glShaderSource(s, 1, &src, nullptr);
-    glCompileShader(s);
-    GLint ok = 0;
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        glDeleteShader(s);
-        return 0;
-    }
-    return s;
-}
-
-static bool presenterBuildGL(PresenterGL& gl)
-{
-    GLuint vs = presenterCompile(GL_VERTEX_SHADER, kPresenterVertexShader);
-    GLuint fs = presenterCompile(GL_FRAGMENT_SHADER, kPresenterFragmentShader);
-    if (!vs || !fs) {
-        if (vs) glDeleteShader(vs);
-        if (fs) glDeleteShader(fs);
-        return false;
-    }
-    gl.program = glCreateProgram();
-    glAttachShader(gl.program, vs);
-    glAttachShader(gl.program, fs);
-    glBindAttribLocation(gl.program, 0, "a_pos");
-    glLinkProgram(gl.program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    GLint linked = 0;
-    glGetProgramiv(gl.program, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        glDeleteProgram(gl.program);
-        gl.program = 0;
-        return false;
-    }
-    gl.aPos = glGetAttribLocation(gl.program, "a_pos");
-    gl.uTrans = glGetUniformLocation(gl.program, "u_trans");
-    gl.uTex = glGetUniformLocation(gl.program, "u_tex");
-    static const GLfloat quad[8] = { -1.0f, -1.0f,  1.0f, -1.0f,  -1.0f, 1.0f,  1.0f, 1.0f };
-    glGenBuffers(1, &gl.vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-    return gl.program != 0 && gl.vbo != 0 && gl.aPos >= 0;
-}
-
-// Apotheosis (presenter diagnostics): is what the presenter is about to swap actually the page, or
-// an empty frame? Attach the slot texture the presenter has just drawn from to a throwaway FBO in
-// the PRESENTER's context and read a small block out of its middle. The count of pixels that
-// differ from the frame's own clear colour is the one number that separates "the engine composited
-// nothing" from "the presenter is not showing what the engine composited": non-zero here with a
-// white screen means the bug is on this side of the handover, zero means it is on the engine's.
-// Expensive (a full pipeline stall plus a readback), so it runs once every kPresStatsEvery draws.
-static void presenterProbe(PresenterGL& gl, GLuint texId, const float bg[4])
-{
-    if (!texId)
-        return;
-    if (!gl.probeFbo) {
-        glGenFramebuffers(1, &gl.probeFbo);
-        if (!gl.probeFbo)
-            return;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, gl.probeFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texId, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
-        const int side = 16;
-        const int x = (g_gpuW > side) ? (g_gpuW - side) / 2 : 0;
-        const int y = (g_gpuH > side) ? (g_gpuH - side) / 2 : 0;
-        uint8_t px[16 * 16 * 4] = { 0 };
-        glReadPixels(x, y, side, side, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        const int br = static_cast<int>(bg[0] * 255.0f + 0.5f);
-        const int bgc = static_cast<int>(bg[1] * 255.0f + 0.5f);
-        const int bb = static_cast<int>(bg[2] * 255.0f + 0.5f);
-        int differ = 0;
-        for (int i = 0; i < side * side; ++i) {
-            const int dr = static_cast<int>(px[i * 4 + 0]) - br;
-            const int dg = static_cast<int>(px[i * 4 + 1]) - bgc;
-            const int db = static_cast<int>(px[i * 4 + 2]) - bb;
-            if (std::abs(dr) + std::abs(dg) + std::abs(db) > 24)
-                ++differ;
-        }
-        g_presProbeContent.store(differ, std::memory_order_relaxed);
-        g_presProbeTotal.store(side * side, std::memory_order_relaxed);
-    }
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-// Apotheosis (presenter diagnostics): one line into crash.txt - the file the device tooling always
-// pulls (local\pull-lumia-logs.ps1) and the only writable path the driver knows. Deliberately NOT
-// routed through WebCoreCrashNote/crashLogWrite: those write a full crash record and are capped at
-// kMaxCrashLogEntries, which a periodic stats line would exhaust. Grep for "presenter-stats".
-static void presenterStatsDump(const char* why)
-{
-    if (!g_crashLogPath[0])
-        return;
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
-        return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    const int probe = g_presProbeContent.load(std::memory_order_relaxed);
-    // Apotheosis (ANGLE global lock): what the two threads cost each other, in ms. eng/pres wait
-    // near zero = no contention (and, if the screen is still white, the lock was not the problem);
-    // a large pres wait with a large eng hold = the composite owns the device and the presenter
-    // only gets in between frames.
-    char lockEng[96] = { 0 }, lockPres[96] = { 0 };
-    angleLockStats(AngleSide::Engine, lockEng, sizeof lockEng);
-    angleLockStats(AngleSide::Presenter, lockPres, sizeof lockPres);
-    std::fprintf(fp,
-        "presenter-stats %02u:%02u:%02u.%03u %s fence_adv=%d sync=glFinish+anglelock draws=%u swaps=%u "
-        "skip_nopub=%u skip_dedupe=%u skip_susp=%u skip_notex=%u skip_empty=%u engine_drops=%u "
-        "lock_eng=[%s] lock_pres=[%s] "
-        "probe=%d/%d drew=%d eglerr=0x%04x size=%dx%d\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, why ? why : "-",
-        g_presFenceAdvertised ? 1 : 0,
-        g_presDraws.load(std::memory_order_relaxed), g_presSwaps.load(std::memory_order_relaxed),
-        g_presSkipNoPub.load(std::memory_order_relaxed), g_presSkipDedupe.load(std::memory_order_relaxed),
-        g_presSkipSuspended.load(std::memory_order_relaxed), g_presSkipNoTex.load(std::memory_order_relaxed),
-        g_presSkipEmpty.load(std::memory_order_relaxed),
-        g_presEngineDrops.load(std::memory_order_relaxed),
-        lockEng, lockPres,
-        probe, g_presProbeTotal.load(std::memory_order_relaxed), g_gpuLastUnpainted,
-        static_cast<unsigned>(g_presLastEglError.load(std::memory_order_relaxed)),
-        g_gpuW, g_gpuH);
-    std::fclose(fp);
-}
-
 // Apotheosis (stale deferred swap): confirmation on device that the guard in WebCorePresent()
-// actually fires, and by how much the dropped frame was out of date. Same plain-line channel as
-// presenter-stats (crash.txt, no crash record, no crash-entry budget), capped so a long pan cannot
+// actually fires, and by how much the dropped frame was out of date. Written as a plain line
+// into crash.txt (no crash record, no crash-entry budget), capped so a long pan cannot
 // fill the file. Grep for "pan-swap-drop".
 static void panSwapDropNote(int nowX, int nowY)
 {
@@ -2564,436 +2062,6 @@ static void panSwapDropNote(int nowX, int nowY)
         static_cast<unsigned long long>(g_swapOwedGen), static_cast<unsigned long long>(g_scrollGen),
         g_swapOwedScrollX, g_swapOwedScrollY, nowX, nowY);
     std::fclose(fp);
-}
-
-// Apotheosis (pinch vs. pan residual, 2026-09-04): drop the presenter's pan base and offset.
-//
-// What the presenter draws during a gesture is  residual = pan - (scrollAtComposite - panBase),
-// with panBase latched ONCE from the frame on screen when the gesture began (WebCoreSetPanOffset,
-// or presenterPublish for a gesture that started before the first frame) and never touched again.
-// Every one of those numbers lives in the engine px of ONE page scale. A pinch changes the scale
-// AND re-anchors the scroll position under it (WebCoreSetPageScale), so panBase and pan now
-// describe a layout that no longer exists: the residual computed from them is meaningless, and if
-// the pan was still "ending" the presenter keeps translating the freshly zoomed frame by it until
-// the one second deadline snaps it to zero - the page drifting away for a second after a pinch.
-// Nothing else invalidated this: teardownSession() clears it for a new page, and
-// WebCoreSetPanOffset(0,0,0) is the harness' own hard reset, but a scale change went unnoticed.
-//
-// Engine-thread callable (takes the presenter lock like every other writer), no-op when the
-// presenter is not running or has no pan state. Deliberately does NOT drop P.published: the frame
-// on screen is still the right pixels, only the translation applied to it is wrong.
-static void presenterResetPan()
-{
-    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
-    if (!pres)
-        return;
-    PresenterState& P = *pres;
-    Locker locker { P.lock };
-    if (!P.panActive && !P.panEnding && !P.panBaseValid && P.panX == 0.0f && P.panY == 0.0f)
-        return;
-    P.panActive = false;
-    P.panEnding = false;
-    P.panBaseValid = false;
-    P.panX = P.panY = 0.0f;
-    P.wake = true;      // redraw the frame on screen untranslated instead of waiting for a publish
-    P.cond.notifyAll();
-}
-
-static void presenterThreadMain()
-{
-    using namespace WebCore;
-    PresenterState& P = *g_pres.load(std::memory_order_acquire);
-
-    // Apotheosis: this thread must be a WinRT/COM thread before it touches EGL. ANGLE's
-    // SwapChainPanel path QIs ISwapChainPanelNative off the IInspectable* we hand it, on the
-    // CALLING thread - on a thread that never initialised the apartment that QI fails with
-    // CO_E_NOTINITIALIZED, eglCreateWindowSurface fails, and the only symptom is the silent
-    // fallback to the engine-owned window surface. Multi-threaded (MTA), never STA: an STA would
-    // need a message pump this thread does not run, and the presenter must not be re-entered.
-    // RO_INIT_MULTITHREADED is CoInitializeEx(COINIT_MULTITHREADED) plus the WinRT metadata
-    // bring-up; RoInitialize/RoUninitialize are App-Container APIs and come from WindowsApp.lib.
-    // S_FALSE (already initialised) is a success, RPC_E_CHANGED_MODE is not - in both cases the
-    // apartment exists, so only a hard failure is worth giving up on.
-    const HRESULT roHr = RoInitialize(RO_INIT_MULTITHREADED);
-    const bool roOwned = SUCCEEDED(roHr);
-
-    // The window surface is created HERE, on the thread that will own it. ANGLE marshals the
-    // SwapChainPanel work inside eglCreateWindowSurface to the panel's dispatcher, so this blocks
-    // until the (idle) UI thread has run it - which is why WebCoreGpuInit only ever waits for this
-    // with a timeout, and why nothing on the UI thread may be waiting for the engine at that point.
-    //
-    // Apotheosis (ANGLE global lock): this ONE call is made without the lock, on purpose. It can
-    // block for as long as the UI thread takes to run the marshalled work, and presenterStart()
-    // answers a five second timeout by DETACHING this thread - so holding the lock across it would
-    // let a detached presenter block the fallback engine's every GL call for ever. Nothing on the
-    // engine thread issues GL between presenterStart() and initState (it is inside the condvar
-    // wait), so the window in which this is unlocked is a window in which nothing else runs.
-    std::unique_ptr<GLContext> ctx = GLContext::create(PlatformDisplay::sharedDisplay(),
-        reinterpret_cast<GLNativeWindowType>(g_presenterWindow));
-    PresenterGL gl;
-    bool ok = false;
-    if (ctx) {
-        AngleLocker angleLock(AngleSide::Presenter);
-        ok = ctx->makeContextCurrent() && presenterBuildGL(gl);
-    }
-    {
-        Locker locker { P.lock };
-        P.initState = ok ? 1 : -1;
-        P.cond.notifyAll();
-    }
-    if (!ok) {
-        // The context (and with it the window surface, which holds COM references to the panel)
-        // must go before the apartment it was created in - releasing COM objects after
-        // RoUninitialize is undefined. Same order on the way out of the loop below.
-        {
-            AngleLocker angleLock(AngleSide::Presenter);   // ~GLContext is eglMakeCurrent + eglDestroy*
-            ctx = nullptr;
-        }
-        if (roOwned)
-            RoUninitialize();
-        return;
-    }
-
-    uint64_t drawnGeneration = 0;
-    float drawnTx = 0.0f, drawnTy = 0.0f;
-    bool drawnAnything = false;
-    bool wasSuspended = false;
-
-    for (;;) {
-        int idx = -1;
-        GLuint texId = 0;
-        uint64_t generation = 0;
-        float tx = 0.0f, ty = 0.0f;
-        float bg[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-        {
-            Locker locker { P.lock };
-            if (!P.stop && !P.wake) {
-                // A live pan needs a heartbeat: the offset may keep changing without the engine
-                // publishing anything. Otherwise sleep until someone wakes us (the 500 ms is only
-                // a safety net, not a poll).
-                P.cond.waitFor(P.lock, (P.panActive || P.panEnding) ? Seconds::fromMilliseconds(8) : Seconds(0.5));
-            }
-            if (P.stop)
-                break;
-            P.wake = false;
-            if (P.suspended) {
-                wasSuspended = true;
-                g_presSkipSuspended.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (wasSuspended) {
-                // Apotheosis: coming back from suspend, what is on the swap chain is not ours to
-                // reason about - the shell may have dropped or resized it while we were frozen,
-                // and the first swap after a resume is the one that puts pixels back. Forget what
-                // we believe we drew, so the checks below cannot decide that an unchanged frame
-                // needs no redraw and leave the panel showing whatever survived the suspend.
-                wasSuspended = false;
-                drawnAnything = false;
-                drawnGeneration = 0;
-                drawnTx = drawnTy = 0.0f;
-            }
-            if (P.published < 0) {
-                g_presSkipNoPub.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            idx = P.published;
-            PresenterFrame& f = P.slot[idx];
-            generation = P.generation;
-
-            float rx = 0.0f, ry = 0.0f;
-            if (P.panActive || P.panEnding) {
-                if (P.panBaseValid) {
-                    rx = P.panX - static_cast<float>(f.scrollX - P.panBaseX);
-                    ry = P.panY - static_cast<float>(f.scrollY - P.panBaseY);
-                    const float maxX = static_cast<float>(g_gpuW), maxY = static_cast<float>(g_gpuH);
-                    if (rx > maxX) rx = maxX; else if (rx < -maxX) rx = -maxX;
-                    if (ry > maxY) ry = maxY; else if (ry < -maxY) ry = -maxY;
-                }
-                // The gesture is over: the residual shrinks with every frame the engine publishes.
-                // At zero (or after one second of the engine not catching up) the engine frame alone
-                // is on screen again and the pan state is dropped.
-                // Apotheosis: this must run WITHOUT a valid base too. A gesture that ended before
-                // any frame carried a base (WebCoreSetPanOffset found published < 0, and no publish
-                // latched one afterwards) left panEnding set for ever inside the old
-                // `&& P.panBaseValid` guard, and panEnding is what makes the loop take the 8 ms
-                // heartbeat instead of sleeping - so the presenter woke 125 times a second for the
-                // rest of the session and drew nothing. With no base there is no residual to
-                // decay: rx/ry are zero, so the test below drops the pan state on the next pass.
-                if (P.panEnding && ((rx > -0.5f && rx < 0.5f && ry > -0.5f && ry < 0.5f) || MonotonicTime::now() >= P.panDeadline)) {
-                    P.panEnding = false;
-                    P.panBaseValid = false;
-                    P.panX = P.panY = 0.0f;
-                    rx = ry = 0.0f;
-                }
-            }
-            // Engine px -> clip space. A positive residual means "the engine still owes us that
-            // much scroll", i.e. the content must move up/left on screen.
-            tx = (g_gpuW > 0) ? (-2.0f * rx / static_cast<float>(g_gpuW)) : 0.0f;
-            ty = (g_gpuH > 0) ? ( 2.0f * ry / static_cast<float>(g_gpuH)) : 0.0f;
-
-            if (drawnAnything && generation == drawnGeneration && tx == drawnTx && ty == drawnTy) {
-                g_presSkipDedupe.fetch_add(1, std::memory_order_relaxed);
-                continue;   // nothing moved and no new frame: do not burn a swap
-            }
-
-            P.inUse = idx;
-            texId = f.texture ? f.texture->id() : 0;
-            bg[0] = f.bg[0]; bg[1] = f.bg[1]; bg[2] = f.bg[2]; bg[3] = f.bg[3];
-        }
-        if (!texId)
-            g_presSkipNoTex.fetch_add(1, std::memory_order_relaxed);
-
-        // Apotheosis (ANGLE global lock): ONE span per frame, from here to the end of this loop
-        // iteration - the quad, the probe, glFinish, eglSwapBuffers and the swap-lost bookkeeping.
-        // It is taken only after the block above has released P.lock (rule (2): ANGLE before
-        // P.lock, and never a condvar wait underneath it), and it is released before the next
-        // iteration goes back to sleep, so the engine is never kept out while this thread waits.
-        AngleLocker angleLock(AngleSide::Presenter);
-        // Cheap re-assertion (GLContext::makeContextCurrent() early-outs on isCurrent()): says in
-        // one place that this thread's context is only ever made current under the lock.
-        ctx->makeContextCurrent();
-
-        // Apotheosis (WHITE-SCREEN fix): nothing to wait for here any more. presenterPublish()
-        // glFinish()es on the engine thread before it sets P.published, so by the time this slot
-        // can be read the composite is complete on the GPU - not merely submitted, and not merely
-        // "an EGLSync from another context said so". See the comment at g_presFenceAdvertised.
-        glViewport(0, 0, g_gpuW, g_gpuH);
-        glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_STENCIL_TEST);
-        glClearColor(bg[0], bg[1], bg[2], bg[3]);   // the strip the translation uncovers
-        glClear(GL_COLOR_BUFFER_BIT);
-        if (texId) {
-            glUseProgram(gl.program);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texId);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glUniform1i(gl.uTex, 0);
-            glUniform2f(gl.uTrans, tx, ty);
-            glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-            glEnableVertexAttribArray(static_cast<GLuint>(gl.aPos));
-            glVertexAttribPointer(static_cast<GLuint>(gl.aPos), 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableVertexAttribArray(static_cast<GLuint>(gl.aPos));
-        }
-        // Apotheosis: releasing inUse only says "no longer ISSUING from this slot". The quad above
-        // may still be executing, and the engine is free to composite into the slot the moment it
-        // sees inUse clear - straight into the texture this draw is sampling. glFinish() closes
-        // that window on the only side that can: this one. (The EGL fence that used to be handed
-        // to the engine here was a cross-context sync object and did not order anything - see
-        // g_presFenceAdvertised.)
-        const unsigned drawCount = g_presDraws.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (drawCount == 1 || (drawCount % kPresStatsEvery) == 0)
-            presenterProbe(gl, texId, bg);   // reads the slot back BEFORE it is released
-        glFinish();
-
-        {
-            // Released before the swap: the engine may start overwriting the other buffer while
-            // this one is on its way to DWM, so a vsync-blocked eglSwapBuffers never stalls it.
-            Locker locker { P.lock };
-            P.inUse = -1;
-            P.cond.notifyAll();
-        }
-        ctx->swapBuffers();
-        g_presSwaps.fetch_add(1, std::memory_order_relaxed);
-        // Apotheosis: a swap can fail for good. On a lost device (EGL_CONTEXT_LOST) or a surface
-        // the shell has pulled out from under us (EGL_BAD_SURFACE / EGL_BAD_NATIVE_WINDOW) every
-        // further swap fails too, and the loop would spin on a dead swap chain for the rest of the
-        // session. Give the presenter up: stop, and clear g_presenterActive so the engine stops
-        // publishing and takes the ordinary path in gpuPresent again.
-        //
-        // What that path can do at this point, honestly: g_glContext is the OFFSCREEN context
-        // GpuInit created for presenter mode, so it composites into a pbuffer and its
-        // eglSwapBuffers is a no-op. The engine keeps loading, laying out and painting, the app
-        // stays responsive and nothing deadlocks - but the screen stops updating until the session
-        // is torn down and set up again. Moving a live window surface to the engine thread is not
-        // possible (contexts are per-thread) and creating a second one for a panel whose surface
-        // has just been lost is not either, so this is a soft landing, not a recovery. It is
-        // recorded in crash.txt so a frozen screen can be told apart from a hung engine.
-        const EGLint swapErr = eglGetError();
-        g_presLastEglError.store(static_cast<int>(swapErr), std::memory_order_relaxed);
-        if (drawCount == 1 || (drawCount % kPresStatsEvery) == 0)
-            presenterStatsDump("periodic");
-        if (swapErr == EGL_CONTEXT_LOST || swapErr == EGL_BAD_SURFACE || swapErr == EGL_BAD_NATIVE_WINDOW) {
-            g_presenterActive.store(false);
-            // Apotheosis (review 2026-09-04 item 2): hand the engine back its own present path in
-            // the same breath. g_presenterRetired is consumed by the next gpuPresent (engine
-            // thread) and turns it into a full, force-dirtied composite + eglSwapBuffers on
-            // g_glContext; presentRequested() makes sure such a composite is actually asked for,
-            // because in event-driven mode nothing else would wake the loop again. Both are
-            // atomics-only, which is all this thread is allowed to touch.
-            //
-            // HONEST LIMIT: in presenter mode g_glContext was created with a PBUFFER surface
-            // (GpuInit gave the window surface to the presenter), and a window surface cannot be
-            // moved or recreated on another thread's context - ANGLE binds it to the thread that
-            // created it. So the engine's eglSwapBuffers goes to an offscreen buffer and the SCREEN
-            // STAYS FROZEN until the session is rebuilt. What this buys is that the engine keeps a
-            // correct, fully painted frame ready (no half-dirty tree left over from the fast path),
-            // that the harness' WebCorePresenterActive() poll flips back to 0 and it stops routing
-            // pan to WebCoreSetPanOffset, and that the reason is in crash.txt.
-            g_presenterRetired.store(1, std::memory_order_release);
-            presenterStatsDump("swap-lost");
-            WebCoreCrashNote(swapErr == EGL_CONTEXT_LOST
-                ? "presenter: EGL_CONTEXT_LOST on swap, presenter stopped - engine presents again "
-                  "(offscreen context: screen frozen until the session is rebuilt)"
-                : "presenter: surface lost on swap, presenter stopped - engine presents again "
-                  "(offscreen context: screen frozen until the session is rebuilt)");
-            WebCorePort::presentRequested();   // atomics only: legal from this thread
-            Locker locker { P.lock };
-            P.stop = true;
-            break;
-        }
-        drawnGeneration = generation;
-        drawnTx = tx;
-        drawnTy = ty;
-        drawnAnything = true;
-    }
-
-    {
-        AngleLocker angleLock(AngleSide::Presenter);   // ~GLContext is eglMakeCurrent + eglDestroy*
-        ctx = nullptr;          // before RoUninitialize: it releases the panel's COM references
-    }
-    if (roOwned)
-        RoUninitialize();
-}
-
-// Engine thread: pick the slot to composite into. Never the one that is published (the presenter
-// would sample a half-drawn frame), and wait out the short window in which the presenter is issuing
-// its quad from that very slot. Bounded at 50 ms so a wedged presenter can never wedge the engine.
-// The presenter glFinish()es before it clears inUse, so "no longer in use" now also means "its
-// quad has finished reading the texture" - no second, cross-context fence is needed (and the one
-// that used to be here never ordered anything: see g_presFenceAdvertised).
-// Returns -1 when the 50 ms are up and the presenter is still in the slot: there is no safe buffer
-// to composite into, so the caller drops this frame rather than drawing into the one being
-// sampled (which is what the old code did - it returned the slot anyway).
-//
-// Apotheosis (ANGLE global lock): CALLED WITHOUT THE ANGLE LOCK, and it must stay that way. This is
-// the one place where the engine waits for the presenter; holding the lock the presenter needs in
-// order to finish its draw would turn every frame into a 50 ms deadlock-and-drop. See rule (1) at
-// g_angleMutex.
-static int presenterAcquireSlot()
-{
-    PresenterState& P = *g_pres.load(std::memory_order_acquire);
-    int idx = 0;
-    Locker locker { P.lock };
-    idx = (P.published == 0) ? 1 : 0;
-    const MonotonicTime deadline = MonotonicTime::now() + Seconds::fromMilliseconds(50);
-    while (P.inUse == idx) {
-        if (!P.cond.waitUntil(P.lock, deadline)) {
-            g_presEngineDrops.fetch_add(1, std::memory_order_relaxed);
-            return -1;
-        }
-    }
-    return idx;
-}
-
-// Engine thread: the composite into slot `idx` is issued - hand it to the presenter.
-static void presenterPublish(int idx, int scrollX, int scrollY, const WebCore::Color& background)
-{
-    PresenterState& P = *g_pres.load(std::memory_order_acquire);
-    // Apotheosis (WHITE-SCREEN fix 2026-09-04): the composite must be COMPLETE, not merely
-    // submitted, before P.published names this slot - the presenter thread is on another EGL
-    // context and there is no working cross-context sync on this ANGLE (see g_presFenceAdvertised).
-    // glFinish() before the lock, so the presenter is not waiting on us while the GPU drains.
-    // Apotheosis (ANGLE global lock): the caller (gpuPresent) already holds it - this recursive
-    // re-entry documents that the glFinish is GL, and keeps the function correct on its own.
-    {
-        AngleLocker angleLock(AngleSide::Engine);
-        glFinish();
-    }
-
-    auto [r, g, b, a] = background.toColorTypeLossy<WebCore::SRGBA<float>>().resolved();
-    Locker locker { P.lock };
-    PresenterFrame& f = P.slot[idx];
-    f.scrollX = scrollX;
-    f.scrollY = scrollY;
-    f.bg[0] = r; f.bg[1] = g; f.bg[2] = b; f.bg[3] = a;
-    P.published = idx;
-    ++P.generation;
-    // A gesture that started before the first frame was published takes its base from this one.
-    if ((P.panActive || P.panEnding) && !P.panBaseValid) {
-        P.panBaseX = scrollX;
-        P.panBaseY = scrollY;
-        P.panBaseValid = true;
-    }
-    P.wake = true;
-    P.cond.notifyAll();
-}
-
-// Engine thread, from WebCoreGpuInit: allocate the two render targets (the engine context must be
-// current) and bring the presenter thread up. Returns false if it did not come up in time, in which
-// case everything it allocated is released again and the caller falls back to the old path.
-static bool presenterStart(void* nativeWindow, int w, int h)
-{
-    using namespace WebCore;
-    g_presenterEglDisplay = PlatformDisplay::sharedDisplay().eglDisplay();
-    // Apotheosis: recorded for the diagnostics only. Whatever the display advertises, we do NOT
-    // use EGL fences across the two contexts any more - on ANGLE 2.1.13/D3D11 the wait returned
-    // immediately and the presenter swapped half-composited (i.e. just-cleared, white) frames.
-    // See the comment at g_presFenceAdvertised; both handovers are glFinish()-ordered now.
-    g_presFenceAdvertised = presenterHasExtension(eglQueryString(g_presenterEglDisplay, EGL_EXTENSIONS),
-        "EGL_KHR_fence_sync");
-
-    if (g_pres.load(std::memory_order_acquire))
-        return false;   // one presenter per process; a second attempt would orphan the first
-
-    // Built locally and only published into g_pres once it is complete: from the moment the
-    // pointer is visible, the presenter thread and the UI-thread exports may touch it, and from
-    // that moment on it is never freed again (see the timeout below).
-    // Apotheosis (ANGLE global lock): uncontended - everything above and here runs before the
-    // presenter thread exists (and a second presenter is refused above) - but the render targets
-    // are GL objects, so they are created under the lock like every other GL call. The lock is
-    // released again before the wait for initState below: the presenter needs it to come up.
-    std::unique_ptr<PresenterState> pres = std::make_unique<PresenterState>();
-    {
-        AngleLocker angleLock(AngleSide::Engine);
-        for (int i = 0; i < 2; ++i) {
-            pres->slot[i].texture = BitmapTexture::create(IntSize(w, h),
-                { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
-            if (!pres->slot[i].texture)
-                return false;   // nothing published yet, nothing to clean up but this object
-        }
-    }
-    g_presenterWindow = nativeWindow;
-    PresenterState& P = *pres;
-    g_pres.store(pres.release(), std::memory_order_release);
-    g_presenterThread = WTF::Thread::create("ApotheosisPresenter"_s, [] { presenterThreadMain(); },
-        WTF::ThreadType::Graphics);   // 1 MB reserved stack (WTF stackSize(), WK_WINUWP branch)
-
-    bool up = false;
-    {
-        Locker locker { P.lock };
-        const MonotonicTime deadline = MonotonicTime::now() + Seconds(5);
-        while (!P.initState) {
-            if (!P.cond.waitUntil(P.lock, deadline))
-                break;
-        }
-        up = (P.initState == 1);
-        if (!up)
-            P.stop = true;      // it leaves its loop as soon as it is able to
-        P.cond.notifyAll();
-    }
-    if (up)
-        return true;
-
-    // Apotheosis: the timeout DETACHES the presenter, it does not tear it down. The one reason
-    // initState is still 0 after five seconds is that the thread is stuck inside
-    // eglCreateWindowSurface (ANGLE marshals that to the panel dispatcher, and a UI thread that is
-    // busy or waiting makes it arbitrarily slow) - so the thread is alive, holds a reference to
-    // this PresenterState and will still write to it. Joining it here would block the engine
-    // thread for exactly as long as the thing the timeout exists to escape, and deleting the
-    // state (the old code) left it writing to freed memory, as did every later
-    // WebCoreSetPanOffset / WebCoreSetPresenterSuspended from the UI thread. So: leave the thread,
-    // the state and the two render targets alive for the life of the process, drop our own
-    // reference to the thread (WTF::Thread keeps itself alive while it runs) and fall back to the
-    // engine-owned window surface. g_presenterActive stays false, so nothing is ever published
-    // into those slots and the detached thread finds stop=true and exits the moment it unblocks.
-    g_presenterThread = nullptr;
-    return false;
 }
 
 // Apotheosis (2026-09-06): arm the composite that repairs a frame which came up short of content,
@@ -3051,123 +2119,10 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     using namespace WebCore;
     if (!g_glContext || !g_textureMapper)
         return kErrNoView;
-    {
-        // Apotheosis (ANGLE global lock): eglMakeCurrent is an ANGLE state change like any other.
-        // Its own scope: what follows (gpuPrepare's layout block, presenterAcquireSlot's wait) must
-        // NOT run under the lock. The context stays current on this thread across the gaps - EGL
-        // currency is per-thread, only the call itself touches the display's shared state.
-        AngleLocker angleLock(AngleSide::Engine);
-        g_glContext->makeContextCurrent();
-    }
+    g_glContext->makeContextCurrent();
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
-    // Apotheosis (review 2026-09-04 item 2): the presenter retired itself since the last composite.
-    // Nothing below has run on the engine's own default framebuffer since GpuInit, and the last
-    // composites went into presenter slots that nobody samples any more, so this one must be a
-    // full one - the fast path would draw a tree that was last force-dirtied minutes ago. Re-arm
-    // needsPresent too, so the loop keeps coming back rather than judging the frame static.
-    if (g_presenterRetired.exchange(0, std::memory_order_acq_rel)) {
-        g_gpuForceFullNext = true;              // consumed by the gpuPrepare below
-        if (g_session && g_session->chrome)
-            g_session->chrome->setNeedsPresent();
-    }
     gpuPrepare(view, glRoot);
 
-    // Apotheosis (presenter thread): the window surface belongs to the presenter now. Composite
-    // into one of the two offscreen render targets and publish it; the presenter decides when and
-    // with which pan offset it reaches the screen. Nothing below this branch runs in that mode -
-    // no default framebuffer, no g_panGesture handshake, no eglSwapBuffers on this thread.
-    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
-    if (g_presenterActive.load() && pres) {
-        const int idx = presenterAcquireSlot();
-        if (idx < 0) {
-            // Apotheosis: 50 ms and the presenter is still sampling the only free slot. Drop this
-            // frame - the previous one stays on screen, which is right for a composite that is by
-            // definition late - and ask for another present so nothing that was flushed above is
-            // lost. Painting anyway would tear the frame the user is looking at.
-            if (g_session && g_session->chrome)
-                g_session->chrome->setNeedsPresent();
-            return kOK;
-        }
-        // Apotheosis (ANGLE global lock): from here to the publish this is one GL span - the
-        // composite into the slot, the repair composite (which re-enters gpuPrepare recursively,
-        // layout included: a rare path, and it must not hand the device to the presenter in the
-        // middle of a half-drawn slot) and presenterPublish()'s glFinish. Taken AFTER
-        // presenterAcquireSlot()'s wait, never around it.
-        AngleLocker angleLock(AngleSide::Engine);
-        BitmapTexture& target = *pres->slot[idx].texture;
-        Color docBg = view.documentBackgroundColor();
-        if (!docBg.isValid())
-            docBg = Color::white;
-        glViewport(0, 0, w, h);
-        // Apotheosis: these two render targets live for the whole process, which no other
-        // TextureMapper client does - everywhere else a BitmapTexture is taken from the pool,
-        // which reset()s it, or is freshly created. A reused one keeps the clip stack the previous
-        // paint left behind AND, because m_shouldClear is only true once, its depth and stencil
-        // buffers keep the previous frame's contents while beginPainting/bindAsSurface re-enable
-        // GL_DEPTH_TEST (the Flags::DepthBuffer branch) with glDepthFunc(GL_LEQUAL). reset() with
-        // the same size and flags is the cheap, upstream way to say "treat this as fresh": it
-        // returns early at `m_size == size` (no reallocation, same texture id, same FBO) and only
-        // re-arms m_shouldClear, so bindAsSurface() clears colour+depth+stencil and resets the clip
-        // stack exactly as it does for a pool texture.
-        target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
-        g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
-        g_textureMapper->clearColor(docBg);
-        unsigned unpainted = 0;
-        {
-            PerfPhase perfPaint(&g_perfCur.paint);
-            unpainted = gpuPaintTree(glRoot);
-            g_textureMapper->endPainting();
-        }
-        g_gpuLastUnpainted = static_cast<int>(unpainted);
-        // Apotheosis (WHITE-AT-SCROLL-END, device package 13): a LIGHT composite that walked over
-        // visible tiles holding no pixels is not a frame, it is a background-coloured slot - which
-        // is precisely what the device shows at the end of a pan: the coarse WebCoreScrollBy steps
-        // move the visible rect past the painted cover, the tiles outside the keep rect are gone,
-        // and the fast path (g_gpuScrollFast: no forceDirtyTree, no backing-store update) has
-        // nothing to draw. The old pixel probe could not see this - the layer background IS drawn,
-        // so "something was painted" was true while no content existed.
-        //
-        // Do what the pre-presenter path did for every frame: redraw this one, right here, into the
-        // same slot, and publish THAT. One extra composite in the rare case.
-        //
-        // Apotheosis (2026-09-06): the redraw is TARGETED, not a forced full-tree repaint - see
-        // gpuArmRepair(). The paint above has just put every visible tile that drew nothing back on
-        // the synchronous path, so the gpuPrepare below repaints exactly those stores and skips
-        // every layer that is fine. It cannot loop: this is straight-line code, one repair per
-        // composite, and a repair that still comes up short escalates to the old full repaint on
-        // the next composite (gpuNoteRepairResult) instead of retrying here.
-        if (unpainted && !g_gpuLastCompositeFull) {
-            g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
-            const bool escalated = gpuArmRepair();  // consumed by the gpuPrepare on the next line
-            gpuPrepare(view, glRoot);               // repaint the stores that lost their tiles
-            docBg = view.documentBackgroundColor();
-            if (!docBg.isValid())
-                docBg = Color::white;
-            glViewport(0, 0, w, h);
-            target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
-            g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
-            g_textureMapper->clearColor(docBg);
-            unsigned unpaintedRepair = 0;
-            {
-                PerfPhase perfPaint(&g_perfCur.paint);
-                unpaintedRepair = gpuPaintTree(glRoot);
-                g_textureMapper->endPainting();
-            }
-            gpuNoteRepairResult(escalated, unpaintedRepair);
-        } else if (!unpainted)
-            g_gpuRepairMisses = 0;   // a frame that has all its content ends the episode
-        {
-            PerfPhase perfSwap(&g_perfCur.swap);   // M4: fence + publish (the swap itself is the presenter's)
-            const IntPoint scroll = view.scrollPosition();
-            presenterPublish(idx, scroll.x(), scroll.y(), docBg);
-        }
-        return kOK;
-    }
-
-    // Apotheosis (ANGLE global lock): the engine-owned window surface path - composite, repair and
-    // the eglSwapBuffers at the end of the function are one GL span. Reached when the presenter is
-    // off or has retired, so it is normally uncontended.
-    AngleLocker angleLock(AngleSide::Engine);
     glViewport(0, 0, w, h);
     g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);   // nullptr → 默认帧缓冲
     {
@@ -3180,17 +2135,15 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         unpaintedDirect = gpuPaintTree(glRoot);
         g_textureMapper->endPainting();
     }
-    g_gpuLastUnpainted = static_cast<int>(unpaintedDirect);
-    // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): the same rule as in the presenter branch above,
-    // and for the same reason - a coarse WebCoreScrollBy step can move the visible rect past the
-    // painted cover, and the scroll fast path has no way to paint the tiles that were dropped. Here
-    // the back buffer is not published but swapped, so the repair has to happen before the swap:
-    // redo the composite and swap THAT. Apotheosis (2026-09-06): targeted, exactly as in the
-    // presenter branch above (gpuArmRepair) - the stores that reported unpainted visible tiles
-    // repaint, the rest early-outs, and a repair that still comes up short escalates to the full
-    // repaint on the next composite. Cannot loop: one repair per composite, no retry here.
+    // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): a coarse WebCoreScrollBy step can move the
+    // visible rect past the painted cover, and the scroll fast path has no way to paint the tiles
+    // that were dropped, so the composite above may hold nothing but the page background. The back
+    // buffer is swapped, not published, so the repair has to happen before the swap: redo the
+    // composite and swap THAT. Apotheosis (2026-09-06): targeted (gpuArmRepair) - the stores that
+    // reported unpainted visible tiles repaint, the rest early-outs, and a repair that still comes
+    // up short escalates to the full repaint on the next composite. Cannot loop: one repair per
+    // composite, no retry here.
     if (unpaintedDirect && !g_gpuLastCompositeFull) {
-        g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
         const bool escalated = gpuArmRepair();      // consumed by the gpuPrepare on the next line
         gpuPrepare(view, glRoot);
         glViewport(0, 0, w, h);
@@ -3523,10 +2476,8 @@ static void teardownSession()
     // (suspected device crash). Make it current first. Also drop the per-frame flags, which
     // describe the session that is going away; g_gpuActive / g_gpuPresentMode / g_glContext /
     // g_textureMapper are deliberately process-lifetime and stay untouched.
-    if (g_gpuActive && g_glContext) {
-        AngleLocker angleLock(AngleSide::Engine);   // Apotheosis (ANGLE global lock)
+    if (g_gpuActive && g_glContext)
         g_glContext->makeContextCurrent();
-    }
     g_gpuAnimating = false;
     g_gpuScrollFast = false;
     // Apotheosis (WHITE-AT-SCROLL-END): the tile bookkeeping describes the page that is going away.
@@ -3535,7 +2486,6 @@ static void teardownSession()
     g_gpuTargetedNext = false;
     g_gpuRepairMisses = 0;
     g_gpuLastCompositeFull = false;
-    g_gpuLastUnpainted = 0;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
     // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
     // the deferral (a new session must present normally) and the swap it may still owe - the back
@@ -3547,22 +2497,6 @@ static void teardownSession()
     g_swapOwedGen = g_scrollGen;
     g_swapOwedId = 0;   // no frame is owed: a late ack from the old page must match nothing
     g_swapOwedScrollX = g_swapOwedScrollY = 0;
-    // Apotheosis (presenter thread): the frames in the presenter's slots were composited from the
-    // layer tree that is about to be destroyed. Mark them stale, or the 8 ms pan heartbeat (and
-    // any pan offset that arrives before the next session publishes) would keep re-swapping a
-    // closed tab's last frame. Nothing is freed here - the textures are process-lifetime and the
-    // presenter may still be sampling one; it simply has nothing to show until the next publish,
-    // and what is already on the swap chain stays there. Its pan state belonged to that page too.
-    if (PresenterState* pres = g_pres.load(std::memory_order_acquire)) {
-        Locker locker { pres->lock };
-        pres->published = -1;
-        pres->panActive = false;
-        pres->panEnding = false;
-        pres->panBaseValid = false;
-        pres->panX = pres->panY = 0.0f;
-        pres->wake = true;
-        pres->cond.notifyAll();
-    }
     // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
     // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
     // mousemove/mouseup into a document that never saw the press.
@@ -3576,12 +2510,6 @@ static void teardownSession()
     // (e) 关键:在 reset() 之前显式丢最后一个 Page 引用,触发 ~Page。此时 g_session(及其 load 成员)仍存活,
     //     ~Page 内若有晚到回调写 load 也是写活内存。若改为直接 reset(),~Session 按反声明序先析构 load 再析构
     //     page,~Page 的回调就会写到已析构的 load → UAF。
-    // Apotheosis (ANGLE global lock): ~Page destroys the GraphicsLayerTextureMapper tree and with
-    // it every BitmapTexture and FBO it owns, and the RunLoop drain below runs the deferred
-    // deletions - all GL, from here to the end of the function. The presenter shows the last
-    // published frame meanwhile; nothing here waits on it (no composite can run without
-    // g_session), so holding the lock across the drain cannot deadlock.
-    AngleLocker angleLock(AngleSide::Engine);
     g_session->page = nullptr;
     g_session.reset();                                          // (f) 此时 Session.page 已空,~Session 不再触发回调
     for (int i = 0; i < 4; ++i)                                  // (g) 排空延迟清理 / curl 取消
@@ -3848,9 +2776,6 @@ extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain
 extern "C" void WebCoreReleaseMemory(int critical)
 {
     if (!ensureWebCoreInitialized()) return;
-    // Apotheosis (ANGLE global lock): releaseMemory() drops decoded images and layer
-    // backing stores, i.e. it deletes GL textures. Rare path, engine thread.
-    AngleLocker angleLock(AngleSide::Engine);
     wkReleaseMemoryLevel(critical ? 2 : 1, /*keepResourceCache*/ false);
 }
 
@@ -3896,8 +2821,6 @@ extern "C" void WebCoreSetMemoryPressure(int level)
     if (level > previous) {
         // Keep the encoded resource cache at level 1; at level 2 we are close enough to the
         // kill threshold that a white image is better than a dead app.
-        // Apotheosis (ANGLE global lock): this deletes GL textures - see WebCoreReleaseMemory.
-        AngleLocker angleLock(AngleSide::Engine);
         wkReleaseMemoryLevel(level, /*keepResourceCache*/ level < 2);
     }
 }
@@ -4640,11 +3563,8 @@ void WebCoreCloseSession()
     // Apotheosis (MEMORY-PLAN.md §3 change 6): the user left the page for good (home screen,
     // suspend, tab closed) — unlike the navigation path there is no next page that would reuse
     // the encoded resources or the compiled code, so take the critical route as well.
-    if (hadSession) {
-        // Apotheosis (ANGLE global lock): this deletes GL textures - see WebCoreReleaseMemory.
-        AngleLocker angleLock(AngleSide::Engine);
+    if (hadSession)
         wkReleaseMemoryLevel(2, /*keepResourceCache*/ false);
-    }
 }
 
 // ===========================================================================
@@ -4701,10 +3621,9 @@ static void releaseDanglingPress(WebCore::LocalFrame& frame, const WebCore::Doub
 }
 
 // Apotheosis (map tap / long press, 2026-09-06): one plain line per input gesture into crash.txt,
-// the only writable path the driver knows. Same channel as presenter-stats / pan-swap-drop /
-// drag-press (no crash record, no crash-entry budget), capped so a session of tapping cannot fill
-// the file. The caller formats the text with snprintf. Grep for "tap ", "drag-release",
-// "long-press".
+// the only writable path the driver knows. Same channel as pan-swap-drop / drag-press (no crash
+// record, no crash-entry budget), capped so a session of tapping cannot fill the file. The
+// caller formats the text with snprintf. Grep for "tap ", "drag-release", "long-press".
 static void inputNote(const char* text)
 {
     static int notes = 0;
@@ -5421,8 +4340,8 @@ int WebCoreWantsDragAt(int x, int y)
 // never during a gesture that keeps the engine busy. Deliberately NOT g_gpuScrollFast: the widget
 // repaints its own content into an ordinary backing store, so the dirty pass must run.
 // Apotheosis (drag as pointer events, diagnostics 2026-09-04): one line per gesture into crash.txt,
-// the only writable path the driver knows. Same plain-line channel as presenter-stats/pan-swap-drop
-// (no crash record, no crash-entry budget), capped so a session of panning cannot fill the file.
+// the only writable path the driver knows. Same plain-line channel as pan-swap-drop (no crash
+// record, no crash-entry budget), capped so a session of panning cannot fill the file.
 // Grep for "drag-press".
 static void dragPressNote(int x, int y, bool handled, bool wants, bool own)
 {
@@ -5916,11 +4835,6 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     int nsy = static_cast<int>(ny < 0 ? ny - 0.5 : ny + 0.5);
     IntPoint wanted = view->constrainedScrollPosition(IntPoint(nsx, nsy));
 
-    // Apotheosis (2026-09-04): the presenter's pan base is about to become meaningless - the scale
-    // and the scroll position it was measured against both change on the next line. See
-    // presenterResetPan(); without this the residual of the pan that led into the pinch keeps
-    // moving the zoomed frame around until its one second deadline expires.
-    presenterResetPan();
     g_session->page->setPageScaleFactor(scale, wanted);
     g_session->page->isolatedUpdateRendering();
     // Apotheosis: re-apply the anchor AFTER the relayout at the new scale. setPageScaleFactor
@@ -6040,69 +4954,16 @@ int WebCoreGpuInit(void* nativeWindow, int w, int h)
     ensureWebCoreInitialized();
     PlatformDisplay& display = PlatformDisplay::sharedDisplay();   // WIN → PlatformDisplayWin,起 ANGLE EGLDisplay
 
-    // Apotheosis (presenter thread): try the split first - engine context offscreen, window surface
-    // owned by a presenter thread. Both contexts are created through PlatformDisplay, so both share
-    // with PlatformDisplay::sharingGLContext() and the engine's render targets are visible to the
-    // presenter. The engine context is created (and thereby the sharing context) BEFORE the
-    // presenter thread starts, so nothing races over sharingGLContext()'s lazy construction.
-    // Any failure falls through to the original engine-owned window surface below.
-    if (nativeWindow && g_presenterWanted) {
-        // Apotheosis (ANGLE global lock): the presenter thread does not exist yet, so none of this
-        // is contended - it is locked to keep "no GL/EGL outside the lock" true everywhere, and
-        // because the fall-through destructors below run at a point where a presenter DETACHED by
-        // presenterStart()'s timeout may already be issuing GL. presenterStart() itself is called
-        // unlocked: it waits on a condvar for the presenter, which needs the lock to come up.
-        std::unique_ptr<GLContext> engineCtx;
-        std::unique_ptr<TextureMapper> tm;
-        {
-            AngleLocker angleLock(AngleSide::Engine);
-            engineCtx = GLContext::createOffscreen(display);
-            if (engineCtx && engineCtx->makeContextCurrent())
-                tm = TextureMapper::create();
-        }
-        if (tm && presenterStart(nativeWindow, w, h)) {
-            g_glContext = engineCtx.release();
-            g_textureMapper = tm.release();
-            g_gpuW = w;
-            g_gpuH = h;
-            g_gpuPresentMode = true;
-            g_presenterActive.store(true);
-            g_gpuActive = true;
-            return kOK;
-        }
-        // ~GLContext does eglMakeCurrent(none) + eglDestroyContext on this thread - correct here,
-        // this is the thread that created it and nothing has used it yet.
-        AngleLocker angleLock(AngleSide::Engine);
-        tm = nullptr;
-        engineCtx = nullptr;
-    }
-
-    // Apotheosis (ANGLE global lock): a presenter detached by the timeout above can still be alive
-    // here, so the fallback context is built under the lock as well.
-    std::unique_ptr<GLContext> ctx;
-    std::unique_ptr<TextureMapper> tm;   // 需 GLContext::current() 非空(刚 makeCurrent 满足)
-    int gpuErr = 0;
-    {
-        AngleLocker angleLock(AngleSide::Engine);
-        ctx = nativeWindow
-            ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
-            : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
-        if (!ctx)
-            gpuErr = -20;
-        else if (!ctx->makeContextCurrent())
-            gpuErr = -21;
-        else {
-            tm = TextureMapper::create();
-            if (!tm)
-                gpuErr = -22;
-        }
-        if (gpuErr) {
-            tm = nullptr;       // the destructors are GL too - drop them inside the lock
-            ctx = nullptr;
-        }
-    }
-    if (gpuErr)
-        return gpuErr;
+    std::unique_ptr<GLContext> ctx = nativeWindow
+        ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
+        : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
+    if (!ctx)
+        return -20;
+    if (!ctx->makeContextCurrent())
+        return -21;
+    std::unique_ptr<TextureMapper> tm = TextureMapper::create();   // 需 GLContext::current() 非空(刚 makeCurrent 满足)
+    if (!tm)
+        return -22;
     g_glContext = ctx.release();        // 故意泄漏=随进程存活(避免退出时在错误线程 eglDestroyContext)
     g_textureMapper = tm.release();
     g_gpuW = w;
@@ -6155,33 +5016,13 @@ int WebCoreComposite()
 // settle it. So the sledgehammer is still reachable, it is just no longer the first move.
 void WebCoreSetPanGesture(int active)
 {
-    // Apotheosis (presenter thread): the presenter owns the swap chain, there is no swap on this
-    // thread to defer and no XAML transform to stay in step with - but the END of a gesture still
-    // means something here (2026-09-04, device package 13). Every composite during the pan took the
-    // scroll fast path, so the last frame of the gesture is drawn from whatever tiles survived the
-    // coarse steps; the page must not settle on a background-coloured slot. The harness posts this
-    // at PanGestureEnd in presenter mode too.
-    if (g_presenterActive.load()) {
-        if (!active) {
-            // Apotheosis (2026-09-06): say it explicitly rather than relying on whoever serves the
-            // wake. WebCoreLiveTick() sets g_gpuScrollFast itself, but a WebCoreComposite() that
-            // reaches gpuPrepare() with neither flag would force-dirty the whole tree - which is
-            // exactly the stall this is removing.
-            g_gpuTargetedNext = true;
-            if (g_session && g_session->chrome)
-                g_session->chrome->setNeedsPresent();
-            WebCorePort::presentRequested();
-        }
-        return;
-    }
     const bool on = (active != 0);
     if (g_panGesture == on)
         return;
     g_panGesture = on;
     if (!on && g_session && g_session->chrome) {
         // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make sure that composite repaints what
-        // the gesture cost the backing stores - see the presenter branch above, the reasoning is
-        // identical for the window-surface path (2026-09-06: targeted, no longer the whole tree).
+        // the gesture cost the backing stores (2026-09-06: targeted, no longer the whole tree).
         g_gpuTargetedNext = true;
         g_session->chrome->setNeedsPresent();
         // Apotheosis (XAML-path consistency review, 2026-09-04): and ASK for that composite. Every
@@ -6200,8 +5041,6 @@ void WebCoreSetPanGesture(int active)
 // (it also flushes a swap left over after the gesture ended). Engine thread only.
 static int presentOwedSwap(uint64_t ackId)
 {
-    if (g_presenterActive.load())
-        return kOK;   // Apotheosis (presenter thread): nothing is ever owed on this thread
     if (!g_swapOwed)
         return kOK;
     // Apotheosis (XAML-path consistency review, 2026-09-04): an acknowledgement that names a frame
@@ -6244,11 +5083,8 @@ static int presentOwedSwap(uint64_t ackId)
         return kOK;
     }
     g_swapOwed = false;
-    {
-        AngleLocker angleLock(AngleSide::Engine);   // Apotheosis (ANGLE global lock)
-        g_glContext->makeContextCurrent();
-        g_glContext->swapBuffers();
-    }
+    g_glContext->makeContextCurrent();
+    g_glContext->swapBuffers();
     return kOK;
 }
 
@@ -6271,101 +5107,14 @@ int WebCorePresentFrame(unsigned long long swapId)
 // position - offset - (swapScroll - gestureStartScroll) - instead of from "wherever the engine
 // happens to be now", which is what made a coarse engine step visible as a jump. The id comes back
 // with it and is handed to WebCorePresentFrame() when XAML has committed that translation.
-// Returns 1 when a swap is owed, 0 otherwise (also whenever the presenter thread owns the swap
-// chain - nothing is ever owed there). Cheap: no layout, no paint. Engine thread only.
+// Returns 1 when a swap is owed, 0 otherwise. Cheap: no layout, no paint. Engine thread only.
 int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long long* outSwapId)
 {
-    const bool owed = g_swapOwed && !g_presenterActive.load();
+    const bool owed = g_swapOwed;
     if (outScrollX) *outScrollX = owed ? g_swapOwedScrollX : 0;
     if (outScrollY) *outScrollY = owed ? g_swapOwedScrollY : 0;
     if (outSwapId)  *outSwapId  = owed ? static_cast<unsigned long long>(g_swapOwedId) : 0ull;
     return owed ? 1 : 0;
-}
-
-// Apotheosis (presenter thread): pick the presentation model. ON = a presenter thread owns the
-// swap chain; OFF (the default since the 2026-09-04 review) = exactly the behaviour before it
-// existed, the engine thread presents into the window surface itself and the harness does its pan
-// preview with a XAML transform.
-// Read once, inside WebCoreGpuInit - flipping it afterwards cannot move a live EGL window surface
-// between threads, so the harness persists it and it applies at the next start.
-void WebCoreSetPresenterThread(int enabled)
-{
-    g_presenterWanted = (enabled != 0);
-}
-
-// Apotheosis (presenter thread): did the split actually come up? The harness routes its pan either
-// to WebCoreSetPanOffset (1) or to its own XAML transform (0) on the strength of this, so it must
-// be asked after WebCoreGpuInit rather than assumed from the setting - GpuInit falls back silently.
-int WebCorePresenterActive(void)
-{
-    return g_presenterActive.load() ? 1 : 0;
-}
-
-// Apotheosis (presenter thread): where the finger is, in engine px, accumulated since the gesture
-// began (NOT a delta). ★ THE ONE EXPORT THAT IS CALLED FROM THE UI THREAD ★ - it touches nothing
-// but the presenter's own state behind one uncontended lock, never WebCore, and never blocks, so
-// the 线程铁律 holds: no engine hop, no waiting, at ManipulationDelta rate.
-//   gestureActive != 0 : the finger (or its inertia) is driving this offset.
-//   gestureActive == 0, offset != 0 : the gesture ended - the presenter keeps showing the residual
-//       and lets it shrink as the engine catches up, snapping to zero after at most a second.
-//   gestureActive == 0, offset == 0 : hard reset (a pinch takes over, a navigation, the setting
-//       being switched off) - the next frame is drawn untranslated.
-// No-op when the presenter is not running, so the harness may call it unconditionally.
-void WebCoreSetPanOffset(float x, float y, int gestureActive)
-{
-    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
-    if (!pres)
-        return;
-    PresenterState& P = *pres;
-    Locker locker { P.lock };
-    const bool on = (gestureActive != 0);
-    if (!on && x == 0.0f && y == 0.0f) {
-        P.panActive = false;
-        P.panEnding = false;
-        P.panBaseValid = false;
-        P.panX = P.panY = 0.0f;
-    } else if (on) {
-        if (!P.panActive) {
-            // The gesture starts from the frame that is on screen: that frame's scroll position is
-            // the zero point every later residual is measured against.
-            if (P.published >= 0) {
-                P.panBaseX = P.slot[P.published].scrollX;
-                P.panBaseY = P.slot[P.published].scrollY;
-                P.panBaseValid = true;
-            } else
-                P.panBaseValid = false;   // presenterPublish latches it on the first frame instead
-        }
-        P.panActive = true;
-        P.panEnding = false;
-        P.panX = x;
-        P.panY = y;
-    } else {
-        if (P.panActive || P.panEnding) {
-            P.panEnding = true;
-            P.panDeadline = MonotonicTime::now() + Seconds(1);
-        }
-        P.panActive = false;
-        P.panX = x;
-        P.panY = y;
-    }
-    P.wake = true;
-    P.cond.notifyAll();
-}
-
-// Apotheosis (presenter thread): stop/resume the presenter's swaps around app suspend. UWP freezes
-// every thread once the suspend deferral completes, but between the Suspending/VisibilityChanged
-// event and that moment the presenter would happily keep swapping a swap chain the shell is tearing
-// down. UI thread callable, same contract as WebCoreSetPanOffset.
-void WebCoreSetPresenterSuspended(int suspended)
-{
-    PresenterState* const pres = g_pres.load(std::memory_order_acquire);
-    if (!pres)
-        return;
-    PresenterState& P = *pres;
-    Locker locker { P.lock };
-    P.suspended = (suspended != 0);
-    P.wake = true;
-    P.cond.notifyAll();
 }
 
 // M2(离屏验证):把当前会话图层树经 TextureMapper 合成到离屏纹理,readback 出 RGBA 到 outRGBA(>= w*h*4)。

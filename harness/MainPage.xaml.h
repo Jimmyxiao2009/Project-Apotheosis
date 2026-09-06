@@ -270,7 +270,6 @@ namespace Harness {
         //   when no base has been taken yet. Computes only; the caller clamps and applies.
         bool PanRemainderFromFrame(int frameScrollX, int frameScrollY);
         void ClampPanRemainder();                     // document bounds + one screen
-        void ClampPanAbs();                           // same document-bounds clamp for the presenter's m_panAbsX/Y
         void ApplyPanTransform();                     // remainder (engine px) → translation (DIP)
         void RequestScrollState();                    // seed the cached scroll/bounds (async)
         void RestartPanSnapTimer();                   // ~1 s after the last movement the engine wins
@@ -289,12 +288,6 @@ namespace Harness {
         // Apotheosis: compose the pinch preview scale and the instant-pan translation onto the
         //   presenting element (TransformGroup, scale first so the translation stays screen-space).
         void ApplyPresentTransform();
-        // Apotheosis (review 2026-09-04 item 2): m_presenterActive used to be latched once, from the
-        //   WebCoreGpuInit reply. The presenter retires ITSELF on a lost surface, and the harness
-        //   went on routing every pan to WebCoreSetPanOffset - into a driver that had stopped
-        //   listening. Re-asks the driver (posted, the ABI wants the engine thread) and routes pan
-        //   the engine way again if the answer changed. Called at every gesture end.
-        void RefreshPresenterActive();
         // Apotheosis (review 2026-09-04 item 3): the ONE exit from a gesture - see the comment on the
         //   definition. Resets pinch, pan, nested-scroll and drag state together, whatever ended it.
         void EndGesture(GestureEnd reason);
@@ -449,30 +442,16 @@ namespace Harness {
         //   like a pan); threaded raster is the off-by-default night A/B (OFFTHREAD-RASTER-LOG.md).
         bool m_instantPan { true };     // settings.ini instantpan
         // Apotheosis (2026-09-04, device package 13): the XAML half of instant pan - the
-        //   TranslateTransform preview plus the coarse-step/owed-frame handshake it needs - only runs
-        //   when the presenter thread is NOT the one presenting, and on device that path stopped
-        //   scrolling the page at all. It is kept, but behind its own switch, default OFF: with the
-        //   presenter off the harness goes back to the package-10 behaviour (every coalesced delta is
-        //   a WebCoreScrollBy that swaps immediately), which the user rated "much better". With the
-        //   presenter ON this flag is irrelevant - m_presenterActive picks the presenter's own pan
-        //   path in InstantPanBy. settings.ini instantpanxaml
+        //   TranslateTransform preview plus the coarse-step/owed-frame handshake it needs - stopped
+        //   scrolling the page at all on device. It is kept, but behind its own switch, default OFF:
+        //   without it the harness goes back to the package-10 behaviour (every coalesced delta is
+        //   a WebCoreScrollBy that swaps immediately), which the user rated "much better".
+        //   settings.ini instantpanxaml
         bool m_instantPanXaml { false };
         bool m_threadedRaster { true }; // settings.ini threadraster (default ON since 0.1.9.18: 2.9 ms vs 25 ms per scroll tick on device)
         // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
         //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles
         bool m_staleTiles { true };
-        // Apotheosis (presenter thread): ON = a presenter thread inside the driver owns the swap
-        //   chain, the engine composites offscreen and the pan preview is a translation the
-        //   presenter applies (WebCoreSetPanOffset) instead of a XAML transform on GpuPanel.
-        //   Read once by WebCoreGpuInit, so the switch only takes effect at the next start; OFF is
-        //   the pre-presenter behaviour. m_presenterActive is what actually happened - GpuInit
-        //   falls back to the engine-owned window surface silently, and every pan route asks this,
-        //   never the setting.
-        //   Default OFF (review 2026-09-04 item 1): 0.1.9.14 on device showed background-only frames
-        //   at the end of a scroll with the presenter on. An install whose settings.ini already says
-        //   presenter=1 keeps it - LoadSettings only ever overwrites the key it finds.
-        bool m_presenterThread { false };  // settings.ini presenter
-        bool m_presenterActive { false };  // WebCorePresenterActive() after WebCoreGpuInit
         // Apotheosis (review 2026-09-04 item 4): the suspend deferral in flight, and the timer that
         //   bounds how long the engine may keep the shell waiting for it. Both UI thread only.
         Windows::ApplicationModel::SuspendingDeferral^ m_suspendDeferral { nullptr };
@@ -665,10 +644,6 @@ namespace Harness {
         //   point at which it stops being patient. 0 = nothing outstanding.
         unsigned long long m_panSnapDeadline { 0 };
         int  m_panRemX { 0 }, m_panRemY { 0 };
-        // Apotheosis (presenter thread): what the finger has asked for since this gesture started,
-        //   in engine px, cumulative. The presenter needs the absolute offset (it subtracts the
-        //   engine's own progress itself), not the remainder m_panRem* carries for the XAML path.
-        int  m_panAbsX { 0 }, m_panAbsY { 0 };
         // Apotheosis (owed-frame remainder): the XAML path's absolute pair. m_panFinger* = engine px
         //   this gesture's finger has asked for in total, m_panBase* = the scroll position it started
         //   from; remainder = finger − (frameScroll − base). Taken once per manipulation

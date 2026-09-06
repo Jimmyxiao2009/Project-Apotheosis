@@ -313,54 +313,7 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 // scroll present). WebCorePresent() releases a deferred swap; the harness posts it once XAML has
 // committed the matching translation. WebCoreSetPanGesture(0) hands presents back and asks for one
 // full composite. Both engine thread only; WebCorePresent is idempotent and a no-op when nothing
-// is owed. Returns 0 (kOK). WebCorePresent is a no-op while the presenter thread owns the swap
-// chain.
-// Apotheosis (2026-09-04): WebCoreSetPanGesture is NOT a no-op there any more. With the presenter
-// on, WebCoreSetPanGesture(0) means only "the pan gesture is over": it forces the next composite to
-// force-dirty the whole tree and asks for that composite. Every frame during a pan is drawn on the
-// scroll fast path, so without it the page settles on whatever tiles the coarse steps left behind -
-// on device, the page background and nothing else. WebCoreSetPanGesture(1) stays a no-op there.
-
-// Apotheosis (presenter thread): the swap chain has exactly one owner, a dedicated presenter
-// thread, instead of being written by the engine thread and transformed by the UI thread. The
-// engine composites into an offscreen double-buffered render target and publishes it together with
-// the scroll position it was composited at; the presenter draws that texture as a full-screen quad,
-// translated by the pan residual it works out itself, and swaps. This removes the flicker no
-// UI-thread handshake could (a XAML transform lands at the next composition commit, an
-// eglSwapBuffers lands at once) and keeps the page moving while the engine thread is busy with JS
-// or layout. See the long comment in WebCoreDriver.cpp for the full design.
-//
-//   WebCoreSetPresenterThread   pick the model. Default OFF (2026-09-04 review: the presenter
-//                               showed background-only frames at scroll end on device). Read once,
-//                               inside WebCoreGpuInit - a
-//                               live EGL window surface cannot change threads afterwards, so the
-//                               harness persists the setting and it takes effect at the next start.
-//                               OFF = exactly the pre-presenter behaviour. Engine thread.
-//   WebCorePresenterActive      did the split actually come up? WebCoreGpuInit falls back to the
-//                               engine-owned window surface silently, so ask instead of assuming.
-//                               1 = presenter running. Engine thread. It can also drop back to 0
-//                               later in a session: a swap that fails for good (lost device, or a
-//                               surface the shell tore down) stops the presenter, and the screen
-//                               then stops updating until the session is rebuilt - a note lands in
-//                               crash.txt. Worth re-asking after a resume if the harness cares.
-//   WebCoreSetPanOffset         * UI THREAD * - the only export that may be called off the engine
-//                               thread. x/y = what the finger has asked for since the gesture
-//                               started, in engine px, cumulative (NOT a delta); it takes one
-//                               uncontended lock over the presenter's own state, never touches
-//                               WebCore and never blocks, so it can be called straight from
-//                               ManipulationDelta. gestureActive!=0 while the finger/inertia drives
-//                               it; gestureActive==0 with a non-zero offset ends the gesture (the
-//                               residual keeps shrinking as the engine catches up, and snaps to
-//                               zero after at most a second); gestureActive==0 with offset (0,0) is
-//                               a hard reset (pinch takes over, navigation, setting switched off).
-//                               No-op when the presenter is not running.
-//   WebCoreSetPresenterSuspended  * UI THREAD * - stop/resume the presenter's swaps around app
-//                               suspend/visibility changes, so nothing swaps a swap chain the
-//                               shell is tearing down. Same contract as WebCoreSetPanOffset.
-void WebCoreSetPresenterThread(int enabled);
-int WebCorePresenterActive(void);
-void WebCoreSetPanOffset(float x, float y, int gestureActive);
-void WebCoreSetPresenterSuspended(int suspended);
+// is owed. Returns 0 (kOK).
 void WebCoreSetPanGesture(int active);
 int WebCorePresent(void);
 
@@ -374,8 +327,7 @@ int WebCorePresent(void);
 //                             showing and its swap id. Call it in the same engine hop as the
 //                             WebCoreScrollBy (next to WebCoreGetScrollState) and build the pan
 //                             translation from THAT position - offset - (swapScroll -
-//                             gestureStartScroll) - not from wherever the engine is now. 0 while
-//                             the presenter thread owns the swap chain (nothing is ever owed).
+//                             gestureStartScroll) - not from wherever the engine is now.
 //                             Cheap: no layout, no paint. Engine thread.
 //   WebCorePresentFrame       release the owed swap only if it is still the frame `swapId` names;
 //                             an id that does not match leaves the frame owed rather than showing
