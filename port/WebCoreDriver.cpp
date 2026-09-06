@@ -675,8 +675,22 @@ static std::atomic<unsigned> g_presSkipEmpty { 0 };      // light composites red
 // the same slot - and THAT frame is published. Exactly what the pre-presenter path did for every
 // frame, at the cost of one full composite in the rare case; a full composite is trusted
 // unconditionally, so this can never loop.
+//
+// Apotheosis (2026-09-06): "redrawn in full" was the wrong half of that rule. The repair has to
+// happen - a slot holding nothing but the background must not reach the screen - but forcing the
+// WHOLE tree is a sledgehammer that costs 400-1000 ms of ms_backing on n-tv.de/github.com, and the
+// device symptom was one such stall per gesture (perf.csv 20260906-180145: 7 of 413 scroll rows).
+// The stores that lost their pixels say so themselves: the paint that came up short has just put
+// every visible tile that drew nothing back on the synchronous path
+// (TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles), so wkHasUnpaintedVisibleTiles()
+// is true for exactly those stores and false for every other layer. A repair that does NOT
+// force-dirty therefore repaints precisely the layers that are missing content
+// (GraphicsLayerTextureMapper::updateBackingStoreIfNeeded, the early-out at :741) and skips the
+// rest. The whole-tree force is kept as the escalation for the case where that does not settle it.
 static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tree this composite
 static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
+static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
+static unsigned g_gpuRepairMisses = 0;        // targeted repairs that still came up short (escalation counter)
 static int g_gpuLastUnpainted = 0;            // unpainted-visible-tile events in the last paint (diagnostics)
 
 struct PresenterState {
@@ -2071,10 +2085,20 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         // the caller wanted. g_gpuLastCompositeFull tells gpuPresent whether this frame is allowed
         // to be trusted when it comes out empty (a force-dirtied tree that paints background IS
         // background; a fast-path tree that paints background has probably lost its tiles).
-        const bool wkFullDirty = !g_gpuScrollFast || g_gpuForceFullNext;
+        // Apotheosis (2026-09-06): g_gpuTargetedNext is the same "do not force-dirty" statement as
+        // g_gpuScrollFast, made by a caller that is not riding a scroll job - the end of a pan
+        // gesture and the unpainted-tile repair below. Both want the composite that follows to
+        // repaint the stores that have actually lost pixels and nothing else; the per-layer
+        // detection in GraphicsLayerTextureMapper::updateBackingStoreIfNeeded() is what decides,
+        // and updateBackingStoreIncludingSubLayers() runs for a targeted composite just as it does
+        // for a forced one, so a real invalidation (m_needsDisplay/m_needsDisplayRect) is repainted
+        // either way.
+        const bool wkTargeted = g_gpuScrollFast || g_gpuTargetedNext;
+        const bool wkFullDirty = !wkTargeted || g_gpuForceFullNext;
         if (wkFullDirty)
             forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
         g_gpuScrollFast = false;
+        g_gpuTargetedNext = false;
         g_gpuForceFullNext = false;
         g_gpuLastCompositeFull = wkFullDirty;
         glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
@@ -2739,6 +2763,42 @@ static bool presenterStart(void* nativeWindow, int w, int h)
     return false;
 }
 
+// Apotheosis (2026-09-06): arm the composite that repairs a frame which came up short of content,
+// and say whether it is the escalated one. Ordinary case (g_gpuRepairMisses == 0): targeted - only
+// the stores that reported unpainted visible tiles repaint themselves, everything else early-outs,
+// so the repair costs a fraction of the full-tree repaint it replaces. If the previous frame's
+// targeted repair did not settle it, the next one force-dirties the tree once, as before.
+static bool gpuArmRepair()
+{
+    const bool escalate = g_gpuRepairMisses > 0;
+    if (escalate)
+        g_gpuForceFullNext = true;
+    else
+        g_gpuTargetedNext = true;
+    return escalate;
+}
+
+// Apotheosis (2026-09-06): book the result of that repair. `unpaintedAfter` counts visible tiles
+// that ran out of budget during the REPAIR paint, i.e. content the repair could not produce either.
+// The counter is only bumped on the budget edge (wkTrackUnpaintedVisibleTiles), so a hole that is
+// already forced onto the synchronous path does not keep re-reporting itself - a non-zero value
+// here really is "still losing tiles". Escalating costs one full repaint and then resets, so this
+// can rise to at most one forced tree repaint per episode and never becomes per-frame.
+static void gpuNoteRepairResult(bool escalated, unsigned unpaintedAfter)
+{
+    if (escalated || !unpaintedAfter)
+        g_gpuRepairMisses = 0;
+    else
+        ++g_gpuRepairMisses;
+    // Come back for the escalated attempt: a frame that is still missing tiles must not be the one
+    // the page settles on, and nothing else will ask (the layer is clean and the visible rect has
+    // stopped moving - the "white areas that never fill" state).
+    if (unpaintedAfter && !escalated && g_session && g_session->chrome) {
+        g_session->chrome->setNeedsPresent();
+        WebCorePort::presentRequested();
+    }
+}
+
 // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): paint the tree and report how many visible tiles
 // ran out of composites to produce pixels while doing so. wkWinUWPTexmapUnpaintedVisibleTiles() is
 // a level that TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles() bumps from inside
@@ -2821,14 +2881,19 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         // nothing to draw. The old pixel probe could not see this - the layer background IS drawn,
         // so "something was painted" was true while no content existed.
         //
-        // Do what the pre-presenter path did for every frame: redraw this one in full, right here,
-        // into the same slot, and publish THAT. One extra composite in the rare case, and it cannot
-        // loop - a force-dirtied tree is trusted unconditionally (it repaints every backing store,
-        // so tiles that draw nothing afterwards genuinely have nothing to draw).
+        // Do what the pre-presenter path did for every frame: redraw this one, right here, into the
+        // same slot, and publish THAT. One extra composite in the rare case.
+        //
+        // Apotheosis (2026-09-06): the redraw is TARGETED, not a forced full-tree repaint - see
+        // gpuArmRepair(). The paint above has just put every visible tile that drew nothing back on
+        // the synchronous path, so the gpuPrepare below repaints exactly those stores and skips
+        // every layer that is fine. It cannot loop: this is straight-line code, one repair per
+        // composite, and a repair that still comes up short escalates to the old full repaint on
+        // the next composite (gpuNoteRepairResult) instead of retrying here.
         if (unpainted && !g_gpuLastCompositeFull) {
             g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
-            g_gpuForceFullNext = true;              // consumed by the gpuPrepare on the next line
-            gpuPrepare(view, glRoot);               // force-dirty the tree + update every backing store
+            const bool escalated = gpuArmRepair();  // consumed by the gpuPrepare on the next line
+            gpuPrepare(view, glRoot);               // repaint the stores that lost their tiles
             docBg = view.documentBackgroundColor();
             if (!docBg.isValid())
                 docBg = Color::white;
@@ -2836,12 +2901,15 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
             target.reset(IntSize(w, h), { BitmapTexture::Flags::SupportsAlpha, BitmapTexture::Flags::DepthBuffer });
             g_textureMapper->beginPainting(TextureMapper::FlipY::No, &target);
             g_textureMapper->clearColor(docBg);
+            unsigned unpaintedRepair = 0;
             {
                 PerfPhase perfPaint(&g_perfCur.paint);
-                glRoot.layer().paint(*g_textureMapper);
+                unpaintedRepair = gpuPaintTree(glRoot);
                 g_textureMapper->endPainting();
             }
-        }
+            gpuNoteRepairResult(escalated, unpaintedRepair);
+        } else if (!unpainted)
+            g_gpuRepairMisses = 0;   // a frame that has all its content ends the episode
         {
             PerfPhase perfSwap(&g_perfCur.swap);   // M4: fence + publish (the swap itself is the presenter's)
             const IntPoint scroll = view.scrollPosition();
@@ -2867,11 +2935,13 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     // and for the same reason - a coarse WebCoreScrollBy step can move the visible rect past the
     // painted cover, and the scroll fast path has no way to paint the tiles that were dropped. Here
     // the back buffer is not published but swapped, so the repair has to happen before the swap:
-    // redo the composite in full (force-dirty + backing-store update, i.e. what this path always did
-    // before g_gpuScrollFast existed) and swap THAT. Cannot loop: a full composite is never redone.
+    // redo the composite and swap THAT. Apotheosis (2026-09-06): targeted, exactly as in the
+    // presenter branch above (gpuArmRepair) - the stores that reported unpainted visible tiles
+    // repaint, the rest early-outs, and a repair that still comes up short escalates to the full
+    // repaint on the next composite. Cannot loop: one repair per composite, no retry here.
     if (unpaintedDirect && !g_gpuLastCompositeFull) {
         g_presSkipEmpty.fetch_add(1, std::memory_order_relaxed);
-        g_gpuForceFullNext = true;                  // consumed by the gpuPrepare on the next line
+        const bool escalated = gpuArmRepair();      // consumed by the gpuPrepare on the next line
         gpuPrepare(view, glRoot);
         glViewport(0, 0, w, h);
         g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);
@@ -2879,12 +2949,15 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
             Color docBg = view.documentBackgroundColor();
             g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);
         }
+        unsigned unpaintedRepair = 0;
         {
             PerfPhase perfPaint(&g_perfCur.paint);
-            glRoot.layer().paint(*g_textureMapper);
+            unpaintedRepair = gpuPaintTree(glRoot);
             g_textureMapper->endPainting();
         }
-    }
+        gpuNoteRepairResult(escalated, unpaintedRepair);
+    } else if (!unpaintedDirect)
+        g_gpuRepairMisses = 0;
     // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
     // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
     // TranslateTransform on screen, or the two disagree for a frame. WebCorePresent() does the swap.
@@ -3198,6 +3271,8 @@ static void teardownSession()
     // Apotheosis (WHITE-AT-SCROLL-END): the tile bookkeeping describes the page that is going away.
     // The new session's first composite must force-dirty.
     g_gpuForceFullNext = true;
+    g_gpuTargetedNext = false;
+    g_gpuRepairMisses = 0;
     g_gpuLastCompositeFull = false;
     g_gpuLastUnpainted = 0;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
@@ -5433,18 +5508,37 @@ int WebCoreComposite()
 // timer, rAF or image decode changes in the meantime still happens - it simply becomes visible
 // with the next scroll present instead of racing the transform.
 // Engine thread only (post it like every other export); active=0 hands presents back and asks for
-// one full composite, because the ticks that ran during the gesture produced no pixels.
+// one settling composite, because the ticks that ran during the gesture produced no pixels.
+//
+// Apotheosis (2026-09-06): that composite is a TARGETED one, not a forced full-tree repaint. The
+// forced version was one 400-1000 ms tree repaint per gesture on n-tv.de/github.com - "smooth for
+// about a quarter page, then a stall, then smooth again" - and it repaints layers that are
+// perfectly fine, because a gesture does not change content, it moves the visible rect. Everything
+// a pan can actually cost a store is detected per layer and repaired by the ordinary composite:
+//   - tiles created for the area the gesture scrolled to -> m_wkVisibleRectChanged, and a new tile
+//     paints itself in full (GraphicsLayerTextureMapper.cpp:650/:741)
+//   - a store created during the gesture              -> m_wkNeedsFullRepaint (:413)
+//   - a layer resized or rescaled mid-gesture         -> m_wkBackingStoreSize/Scale (:718)
+//   - tiles whose rasterisation was dropped while the cover rect moved
+//                                                     -> wkHasUnpaintedVisibleTiles() (:741)
+// and a settling frame that still comes up short of pixels is repaired by the unpainted-tile
+// branch in gpuPresent(), which now escalates to the full repaint only if the targeted one did not
+// settle it. So the sledgehammer is still reachable, it is just no longer the first move.
 void WebCoreSetPanGesture(int active)
 {
     // Apotheosis (presenter thread): the presenter owns the swap chain, there is no swap on this
     // thread to defer and no XAML transform to stay in step with - but the END of a gesture still
     // means something here (2026-09-04, device package 13). Every composite during the pan took the
     // scroll fast path, so the last frame of the gesture is drawn from whatever tiles survived the
-    // coarse steps; the first frame after it must be a FULL one, or the page settles on a
-    // background-coloured slot. The harness posts this at PanGestureEnd in presenter mode too.
+    // coarse steps; the page must not settle on a background-coloured slot. The harness posts this
+    // at PanGestureEnd in presenter mode too.
     if (g_presenterActive.load()) {
         if (!active) {
-            g_gpuForceFullNext = true;
+            // Apotheosis (2026-09-06): say it explicitly rather than relying on whoever serves the
+            // wake. WebCoreLiveTick() sets g_gpuScrollFast itself, but a WebCoreComposite() that
+            // reaches gpuPrepare() with neither flag would force-dirty the whole tree - which is
+            // exactly the stall this is removing.
+            g_gpuTargetedNext = true;
             if (g_session && g_session->chrome)
                 g_session->chrome->setNeedsPresent();
             WebCorePort::presentRequested();
@@ -5456,9 +5550,10 @@ void WebCoreSetPanGesture(int active)
         return;
     g_panGesture = on;
     if (!on && g_session && g_session->chrome) {
-        // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make that composite a FULL one - see
-        // the presenter branch above, the reasoning is identical for the window-surface path.
-        g_gpuForceFullNext = true;
+        // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make sure that composite repaints what
+        // the gesture cost the backing stores - see the presenter branch above, the reasoning is
+        // identical for the window-surface path (2026-09-06: targeted, no longer the whole tree).
+        g_gpuTargetedNext = true;
         g_session->chrome->setNeedsPresent();
         // Apotheosis (XAML-path consistency review, 2026-09-04): and ASK for that composite. Every
         // tick during the gesture disarmed the present wake at its top (presentWakeDisarm) and then
