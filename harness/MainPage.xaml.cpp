@@ -686,34 +686,31 @@ static float SnapAndClampPageScale(float s)
 //   release, exactly like the ±33% page-scale snap band above is eased.
 static const double kZoomRubberBandDip = 40.0;
 
-// Apotheosis (bug fix 2026-09-06, device test 0.1.9.16): keyboard-avoidance seam constants. Two
-//   gaps were reported at the nav bar when the on-screen keyboard is up — page pixels visible
-//   between the nav bar and the keyboard, and between the suggestion dropdown and the nav bar.
-//   Root cause of the first: the InputPane Showing handler shifted the nav bar up by the raw
-//   OccludedRect.Height, but the nav bar's resting position is already `m_lastInsetBottom` DIP
-//   above the true window edge (RootGrid's bottom Padding, see ApplyViewInsets) — that inset was
-//   being counted twice (once via the Padding, once implicitly missing from the shift), leaving a
-//   gap of exactly that size. The fix subtracts it (see the Showing handler). The second gap has
-//   no single provable cause (two independently-rendered visuals — the nav bar Grid and the
-//   suggestion/title-row overlay — translated by nominally identical DIP values can still round to
-//   different device pixels), so rather than chase sub-pixel rounding, the nav bar is shifted a
-//   couple of DIPs *further* up than the suggestion panel needs (kSeamOverlapDip) so its opaque
-//   background overlaps down onto the suggestion panel's bottom edge — it already paints on top of
-//   the content row at the RootGrid level (declared after it), so the overlap is invisible. That
-//   extra upward reach would in turn open a gap versus the keyboard, so the nav bar also carries a
-//   plain decorative bleed strip (kSeamBleedDip, in the XAML, unnamed child of the nav bar Grid)
-//   that extends its opaque area a few DIP below its own Height="62" box; at rest, or with the
-//   keyboard hidden, that strip lands below the row entirely (in the reserved bottom inset, or past
-//   the screen edge when there is none), so nothing about the idle layout changes.
-static const double kSeamOverlapDip = 3.0;   // nav bar reaches this much further up than exact
-static const double kSeamBleedDip = 6.0;     // >= kSeamOverlapDip, see the nav bar XAML bleed strip
+// Apotheosis (bug fix 2026-09-06, device test 0.1.9.16): keyboard-avoidance seam. 0.1.9.16 shifted
+//   the nav bar up by (OccludedRect.Height - m_lastInsetBottom) — both already in DIP, see the units
+//   note on the Showing handler below — but then added an extra couple of DIP of upward reach on the
+//   nav bar alone plus a decorative bleed strip to paper over a seam against the suggestion panel,
+//   on the theory that two independently-set TranslateTransforms driven by nominally identical
+//   values could still round to different device pixels. On device that extra reach was itself the
+//   bug: it is pure guesswork with no way to verify which direction (if any) the two transforms
+//   actually diverge. Replaced with the structurally sound fix — ONE rounded DIP value (shiftUp),
+//   computed once in the Showing handler and applied verbatim to both NavBarShift->Y and
+//   ShiftSuggestPanel(); see ComputeKeyboardShift(). Two transforms fed the identical already-quantised
+//   double cannot disagree, so there is no seam left to paper over — the XAML bleed Border and the
+//   kSeamOverlapDip/kSeamBleedDip constants are gone.
+//   The nav bar stays a RenderTransform (not a layout Margin/Padding): Row 1 (nav bar) and Row 0
+//   (content, which owns GpuPanel) share RootGrid's row list, so growing Row 1 to make room for the
+//   keyboard would shrink Row 0 and resize GpuPanel — the ANGLE swap-chain-rebuild crash class the
+//   2026-09-04 review already fixed once (see ApplyViewInsets' GpuPanel comment). A translate leaves
+//   every row's size untouched.
 
 // DIP -> nearest whole device pixel, using the same double back. RenderTransform (unlike layout)
-//   is never rounded by the XAML layout engine, so two independently-set TranslateTransforms can
-//   each land on a different fractional device pixel even for the same DIP value; snapping the
-//   value first makes the composited result deterministic. Falls back to 1:1 if DisplayInformation
-//   is unavailable (XamlReader::Load fallback path, or an odd Insider build).
-static double RoundToDevicePixel(double dip)
+//   is never rounded by the XAML layout engine, so an unrounded DIP value can land on a different
+//   fractional device pixel depending on which element's transform carries it; snapping once, before
+//   handing the same value to both transforms, makes the composited result deterministic. Falls back
+//   to 1:1 if DisplayInformation is unavailable (XamlReader::Load fallback path, or an odd Insider
+//   build) — shared by RoundToDevicePixel and the stage.txt diagnostic below.
+static double CurrentDeviceScale()
 {
     double scale = 1.0;
     try {
@@ -721,7 +718,45 @@ static double RoundToDevicePixel(double dip)
         if (di) scale = di->RawPixelsPerViewPixel;
     } catch (...) {}
     if (!(scale > 0.0)) scale = 1.0;
+    return scale;
+}
+
+static double RoundToDevicePixel(double dip)
+{
+    double scale = CurrentDeviceScale();
     return std::round(dip * scale) / scale;
+}
+
+// Apotheosis (bug fix 2026-09-06): both m_lastInsetBottom (from ApplicationView::VisibleBounds vs
+//   CoreWindow::Bounds, see ApplyViewInsets) and InputPane::OccludedRect are documented as DIP in the
+//   same CoreWindow coordinate space — no px/DIP conversion needed here, only the subtraction below.
+//   The nav bar's resting bottom edge already sits m_lastInsetBottom DIP above the physical screen
+//   edge (RootGrid's bottom Padding); OccludedRect.Height is measured from that same screen edge, so
+//   shifting the bar by the raw height double-counts the inset. shiftUp is the additional distance —
+//   clamped to 0 (keyboard shorter than the existing inset -> nothing to do) and rounded once so both
+//   consumers agree down to the device pixel.
+//   Some builds report OccludedRect.Height == 0 on the very first Showing dispatch (rect not yet
+//   computed) — re-query the InputPane's own property (not the event args) as a same-call fallback;
+//   if that is also 0 there is nothing usable and the bar does not move (logged either way).
+static double ComputeKeyboardShift(Windows::UI::ViewManagement::InputPane^ ip,
+                                    Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e,
+                                    double insetBottom, const char* who)
+{
+    double occluded = e ? e->OccludedRect.Height : 0.0;
+    const char* source = "event";
+    if (!(occluded > 0.0) && ip) {
+        try { occluded = ip->OccludedRect.Height; source = "requery"; } catch (...) {}
+    }
+    if (!(occluded > 0.0)) { occluded = 0.0; source = "unavailable"; }
+    double shiftUp = occluded - insetBottom;
+    if (!(shiftUp > 0.0)) shiftUp = 0.0;
+    shiftUp = RoundToDevicePixel(shiftUp);
+    WriteStage((std::string(who) + " occluded=" + std::to_string(occluded)
+                + " inset=" + std::to_string(insetBottom)
+                + " scale=" + std::to_string(CurrentDeviceScale())
+                + " shift=" + std::to_string(shiftUp)
+                + " src=" + source).c_str());
+    return shiftUp;
 }
 
 // One axis of the live-pinch clamp (ApplyLiveZoom). Works entirely in engine px (WebCoreGetScrollState
@@ -940,31 +975,24 @@ MainPage::MainPage()
         auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
         ip->Showing += ref new Windows::Foundation::TypedEventHandler<
             Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^>(
-            [this](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
+            [this, ip](Windows::UI::ViewManagement::InputPane^, Windows::UI::ViewManagement::InputPaneVisibilityEventArgs^ e) {
                 // Apotheosis (2026-09-04): the title row must stay visible for as long as the
                 //   on-screen keyboard is up - it rides above the address bar through
                 //   ShiftSuggestPanel(), so hiding it while typing is what leaves the strip empty.
                 m_titleRowPinned = true;
                 RevealTitleRow();
                 if (m_urlFocused && NavBarShift) {
-                    // Apotheosis (bug fix 2026-09-06): the nav bar's resting bottom edge is already
-                    //   m_lastInsetBottom DIP above the true window edge (RootGrid's bottom Padding
-                    //   from ApplyViewInsets) — shifting by the raw OccludedRect.Height double-counts
-                    //   that inset and leaves a gap of exactly that size below the bar. Subtract it,
-                    //   then snap to a whole device pixel (see kSeamOverlapDip's comment above).
-                    double shiftUp = e->OccludedRect.Height - m_lastInsetBottom;
-                    if (!(shiftUp > 0.0)) shiftUp = 0.0;
-                    shiftUp = RoundToDevicePixel(shiftUp);
-                    // The nav bar reaches a little further up than the suggestion panel needs, so
-                    //   its background (painted after/over the content row) overlaps the seam
-                    //   against the suggestion dropdown instead of exactly abutting it; the matching
-                    //   downward bleed strip in its own XAML keeps its bottom edge at the keyboard
-                    //   regardless (see kSeamBleedDip).
-                    NavBarShift->Y = -(shiftUp + kSeamOverlapDip);
+                    // Apotheosis (bug fix 2026-09-06): ONE rounded shift value, applied verbatim to
+                    //   both the nav bar and the suggestion panel — see ComputeKeyboardShift() above
+                    //   for the derivation (occluded height minus the inset already reserved by
+                    //   RootGrid's Padding) and for the units note (both inputs are DIP already).
+                    double shiftUp = ComputeKeyboardShift(ip, e, m_lastInsetBottom, "keyboard-show");
+                    NavBarShift->Y = -shiftUp;
                     // Apotheosis (review 2026-09-03): the suggestion dropdown is anchored to the
                     //   bottom of the *content* row, i.e. it floats right on top of the nav bar.
                     //   Shifting only the nav bar left it behind the keyboard while typing, so it
-                    //   rides along by the same amount (its own transform — different subtree).
+                    //   rides along by the identical value (its own transform — different subtree) —
+                    //   no seam is possible when both consumers receive the same already-rounded double.
                     ShiftSuggestPanel(-shiftUp);
                     e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
                 }
@@ -977,6 +1005,11 @@ MainPage::MainPage()
                 //   usual grace period.
                 if (!m_urlFocused) { m_titleRowPinned = false; RevealTitleRow(); }
                 if (NavBarShift && NavBarShift->Y != 0) {   // 仅当我们上移过才复位+认领(设置页文本框靠系统自身滚动恢复,别干扰)
+                    // Apotheosis (bug fix 2026-09-06): one diagnostic line to match keyboard-show, so
+                    //   a device log always has a matched show/hide pair to compare.
+                    WriteStage(("keyboard-hide occluded=" + std::to_string(e ? e->OccludedRect.Height : 0.0)
+                                + " inset=" + std::to_string(m_lastInsetBottom)
+                                + " prevshift=" + std::to_string(-NavBarShift->Y)).c_str());
                     NavBarShift->Y = 0;
                     ShiftSuggestPanel(0.0);
                     e->EnsuredFocusedElementInView = true;
