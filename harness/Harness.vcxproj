@@ -189,6 +189,16 @@
     <None Include="Assets\fonts\arial.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arial.ttf</Link></None>
     <None Include="Assets\fonts\times.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\times.ttf</Link></None>
     <None Include="Assets\fonts\cour.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\cour.ttf</Link></None>
+    <!-- Apotheosis: the bold cuts. Without them fontconfig answers every `font-weight: bold` with
+         the regular file, WebCore turns that into a *synthetic* bold and draws the whole glyph run
+         twice, offset by one CSS pixel - which the page-scale factor multiplies, so a pinch-zoomed
+         headline shows two copies of every letter about ten device pixels apart (the "doubled
+         text" of packages 11-16). Real bold faces make syntheticBold false and cost ~3.8 MB.
+         Conditional like SimHei below: fonts are gitignored, so a fresh clone may not have them. -->
+    <None Include="Assets\fonts\segoeuib.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\segoeuib.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeuib.ttf</Link></None>
+    <None Include="Assets\fonts\arialbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\arialbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arialbd.ttf</Link></None>
+    <None Include="Assets\fonts\timesbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\timesbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\timesbd.ttf</Link></None>
+    <None Include="Assets\fonts\courbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\courbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\courbd.ttf</Link></None>
     <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
     <!-- Apotheosis: fonts are gitignored; skip SimHei on machines that do not have it instead of failing the package step. -->
     <None Include="Assets\fonts\simhei.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\simhei.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
