@@ -686,23 +686,37 @@ static float SnapAndClampPageScale(float s)
 //   release, exactly like the ±33% page-scale snap band above is eased.
 static const double kZoomRubberBandDip = 40.0;
 
-// Apotheosis (long-press latency, device feedback 0.1.9.18: "about 1 s feels long, it's really a
-//   right-click"): how long WebCoreLongPressAt keeps the mouse button down before releasing with the
-//   click and the contextmenu event. This is only HALF the total the finger feels - the other half
-//   already elapsed before OnPageHolding even runs: XAML's own Holding gesture recognizer needs
-//   roughly 500 ms-1 s of stationary touch before it raises Started at all, and ForwardClickToEngine
-//   is called only then. That system stage cannot be shortened from here.
-//   The 600 ms this used to pass was sized to be safe for a page's own press-and-hold timer (Google
-//   Maps' mobile "drop pin" reacts to a sustained pointerdown), but that timer starts counting from
-//   when the engine dispatches mousedown - i.e. from this call, not from when the finger physically
-//   landed - so it does not need the system's threshold repeated on top of it. And on Maps in
-//   particular, what actually places the pin/opens "What's here?" is very likely the contextmenu
-//   event this call still sends after the release (WEBCORE_LONGPRESS_CONTEXTMENU), the same path a
-//   desktop right-click uses; the held-mousedown is Maps' touch-only pin timer, a secondary or
-//   redundant trigger for a mouse-shaped press. 250 ms is comfortably above that JS timer's usual
-//   ~200-300 ms while cutting the engine-side stage well over half, so the two-stage total drops from
-//   roughly 1.1-1.6 s to 0.75-1.25 s without starving either trigger.
-static const int kLongPressEngineHoldMs = 250;
+// Apotheosis (Google Maps pin): how long WebCoreLongPressAt keeps the mouse button down before
+//   releasing with the click and the contextmenu event.
+//
+//   REVERTED to 600 ms on 2026-09-07 after the device A/B this value accidentally became. The
+//   0.1.9.18 shortening to 250 ms was an inference - "the contextmenu is the more likely trigger on
+//   a mouse-shaped press, the held mousedown is Maps' touch-only pin timer" - and the two sessions
+//   disprove it, because the driver logs both halves of the gesture (WebCoreDriver.cpp inputNote):
+//     0.1.9.18, pin worked:      long-press ... hold=600 down=0 up=0 click=1 ctx=1/1
+//     0.1.9.19, pin never came:  long-press ... hold=250 down=0 up=0 click=1 ctx=1/1  (x4)
+//   Same point class (wants=1, i.e. the map canvas), same click, and the contextmenu was sent AND
+//   swallowed by the page's own listener (ctx=1/1) in both. So Maps does consume the contextmenu and
+//   still does not drop a pin for it: what places the pin is the pointerdown being held long enough
+//   for Maps' own press-and-hold timer to fire, and that timer wants roughly half a second. 250 ms is
+//   below it, 600 ms is above it - nothing else about the gesture differs.
+//
+//   Why the hold is not started earlier to win the latency back: WebCoreLongPressAt runs on the
+//   engine thread under PumpGuard (g_inPump) and holdPump spins a nested RunLoop for the whole
+//   duration, while the harness holds m_interacting for the same span. Beginning the press
+//   speculatively on PointerPressed would therefore be uncancellable - a ManipulationDelta arriving
+//   150 ms later could not stop it, DragMoveTo/PumpDrag would be dropped by m_interacting, and the
+//   drag route's phase-0 press (whose return value is what decides whether the gesture belongs to
+//   the page at all, see PumpDrag) would never be sent. Every pan that starts from a stationary
+//   finger - the normal way one pans a map - would lose its first ~600 ms and then end in a stray
+//   click/contextmenu. Smooth panning outranks half a second of pin latency, so the trigger stays
+//   XAML's Holding.
+//
+//   The finger therefore still feels two stages: XAML's own recognizer needs roughly 500 ms-1 s of
+//   stationary touch before it raises Started at all (not shortenable from here), then this hold.
+//   If the latency is worth another A/B, 500 is the next value to try - the "long-press ... hold="
+//   line in crash.txt always says which one actually ran.
+static const int kLongPressEngineHoldMs = 600;
 
 // Apotheosis (bug fix 2026-09-06 evening, device tests 0.1.9.16/0.1.9.18): keyboard avoidance.
 //   TWO mechanisms can move the bottom chrome when the on-screen keyboard appears and NEITHER of
@@ -2071,18 +2085,50 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
 //
 // XAML raises Holding for touch/pen while the finger is still down (HoldingState::Started), and
 // again as Completed when it leaves or Canceled when the gesture turns into a manipulation. Only
-// Started is acted on, so a hold that becomes a pan is never delivered as one. Whether the point
-// deserves a long press at all is decided in the engine (WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY): a
+// Started is acted on. Note that this does NOT mean a hold that later becomes a pan is never
+// delivered: Started arrives while the finger is still stationary and is acted on at once, so a
+// finger that rests and then pans gets the long press anyway and only afterwards the Canceled the
+// gesture really deserved. The new stage.txt line below makes that sequence visible (state=0 then
+// state=2 for the same gesture) - if it turns out to cost real pans, the fix is to defer the engine
+// call by a beat and drop it on Canceled, not to widen these gates. Whether the point deserves a
+// long press at all is decided in the engine (WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY): a
 // hold over ordinary article text must keep doing nothing, or press-hold-release over a link would
 // open it. The route is deliberately ForwardClickToEngine's - it already owns the busy flag, the
 // watchdog, the navigation/title/link resync and the keyboard handling for an engine-side gesture.
 void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e)
 {
-    if (e == nullptr || e->HoldingState != Windows::UI::Input::HoldingState::Started) return;
+    // Apotheosis (diagnostics 2026-09-07): one stage.txt line per Holding event, written
+    //   UNCONDITIONALLY here, before any gate, with every gate's answer on it. Until now the only
+    //   trace of a hold was the driver's "long-press" line, and that is emitted at the END of
+    //   WebCoreLongPressAt - so any of the five early returns below produced complete silence, and a
+    //   report of "the pin does nothing" could not be told apart from "XAML never raised Holding",
+    //   "the gesture was swallowed as Canceled", or "m_interacting was still set from the previous
+    //   gesture". state is HoldingState (0 Started, 1 Completed, 2 Canceled; -1 = null args), and
+    //   the volume is low because XAML only raises Completed/Canceled after it has raised Started.
+    //   sincehold is the age of the last delivered hold, i.e. the input to the tap suppression in
+    //   OnPageTapped. Read together with crash.txt: a "holding ... state=0 ... gates all clear" line
+    //   with no "long-press" line after it means the engine call itself never landed.
+    const int holdState = (e == nullptr) ? -1 : static_cast<int>(e->HoldingState);
+    const bool started = (holdState == static_cast<int>(Windows::UI::Input::HoldingState::Started));
+    int px = -1, py = -1;
+    if (started) {
+        auto pt = e->GetPosition(ContentArea);
+        MapTapToEngine(pt.X, pt.Y, px, py);
+    }
+    const bool inBounds = (px >= 0 && py >= 0 && px < kW && py < kH);
+    const unsigned long long sinceHold = m_holdAtMs ? (GetTickCount64() - m_holdAtMs) : 0ULL;
+    WriteStage((std::string("holding state=") + std::to_string(holdState)
+        + " at=" + std::to_string(px) + "," + std::to_string(py)
+        + " session=" + (m_sessionActive ? "1" : "0")
+        + " loading=" + (m_loading ? "1" : "0")
+        + " interacting=" + (m_interacting ? "1" : "0")
+        + " inbounds=" + (inBounds ? "1" : "0")
+        + " sincehold=" + std::to_string(sinceHold)
+        + " hold=" + std::to_string(kLongPressEngineHoldMs)).c_str());
+
+    if (!started) return;
     if (!m_sessionActive || m_loading || m_interacting) return;
-    auto pt = e->GetPosition(ContentArea);
-    int px, py; MapTapToEngine(pt.X, pt.Y, px, py);
-    if (px < 0 || py < 0 || px >= kW || py >= kH) return;
+    if (!inBounds) return;
     HideSuggestions();
     m_holdAtMs = GetTickCount64();
     e->Handled = true;
