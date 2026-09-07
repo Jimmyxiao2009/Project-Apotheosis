@@ -1643,7 +1643,17 @@ void MainPage::ApplyViewInsets()
     //   this re-evaluates on every loading start/stop) — an idle page gets that space back instead
     //   of permanently losing it to a strip nothing is drawing in.
     //   (2837ce0 review item 1) The bottom edge now works the same way for the title/toast row.
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + 6, 6, titleH);
+    // Apotheosis (bug fix 2026-09-07, first-load loading-strip band): the "+6" breathing gap below
+    //   is meant for the IDLE top edge (card look between the status bar and the white content),
+    //   but was added unconditionally, so it also landed *below the loading strip itself* — visible
+    //   as an extra thin PageBg-coloured band under the dots. That only showed up wherever this
+    //   software path is what's on screen while loading — about:home (always software, so every
+    //   first-run/new-tab load) and the cold-start window before GPU turns on — because the GPU
+    //   panel's translate below (top + stripH, no "+6") has never had that gap, and once GPU takes
+    //   over for real navigations the strip already reads flush. Drop the gap while the strip is
+    //   visible so both paths match: flush under the dots, breathing room back once idle.
+    const double contentTopGap = (stripH > 0.0) ? 0.0 : 6.0;
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + contentTopGap, 6, titleH);
     // Apotheosis (2837ce0 review item 1): the suggestion dropdown is anchored to the same bottom
     //   edge as TitleRow and would otherwise cover it while the user types over a loading page.
     //   Lift it by titleH so the two stack (XAML Margin is "8,0" = the left/right 8 stays).
