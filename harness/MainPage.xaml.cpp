@@ -4531,7 +4531,21 @@ void MainPage::DispatchLiveFrame()
 void MainPage::OnGo(Platform::Object^, RoutedEventArgs^) { NavigateTo(NormalizeUrl(UrlBox->Text), true); }
 void MainPage::OnUrlKeyDown(Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e)
 {
-    if (e->Key == Windows::System::VirtualKey::Enter) NavigateTo(NormalizeUrl(UrlBox->Text), true);
+    if (e->Key == Windows::System::VirtualKey::Enter) {
+        NavigateTo(NormalizeUrl(UrlBox->Text), true);
+        // Apotheosis (2026-09-07): confirming with Enter must also put the on-screen keyboard away —
+        //   TryHide() alone is not enough while UrlBox still holds focus (same reasoning as
+        //   DismissKeyboardForOverlay(): any control regaining focus re-evaluates the input pane and
+        //   can bring it right back). Move focus onto the page's own focus sink first; that runs
+        //   OnUrlLostFocus synchronously, which already restores the address-bar chrome/blur state
+        //   and — since NavigateTo() above wrote m_currentUrl/UrlBox->Text together before returning —
+        //   finds nothing to revert. CloseKeyboard()'s TryHide() then fires the InputPane's Hiding
+        //   handler, which calls ApplyKeyboardShift("hide") and slides the bottom chrome back down.
+        //   This is a separate path from suggestion-button navigation (Button::Click), so nothing
+        //   here double-navigates.
+        try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
+        CloseKeyboard();
+    }
 }
 void MainPage::OnHome(Platform::Object^, RoutedEventArgs^) { NavigateTo(ref new String(g_homeUrl.c_str()), true); }
 void MainPage::OnBack(Platform::Object^, RoutedEventArgs^)
@@ -4941,6 +4955,24 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
     //   pure function of (keyboard geometry, current inset, editing state) now, so simply re-running
     //   it whenever any of the three changes covers every ordering.
     ApplyKeyboardShift("url-focus");
+    // Apotheosis (2026-09-07): tapping into the bar should select the whole URL so typing replaces
+    //   it outright. A SelectAll() called right here is undone a moment later: the same tap that
+    //   raised focus also delivers its PointerReleased to the TextBox at Normal priority, which
+    //   places the caret where the finger landed — and that runs AFTER GotFocus, clobbering any
+    //   selection made here. Defer to a Low-priority dispatch (same trick as the suggestion-collapse
+    //   below) so it runs once the tap has finished moving the caret. The token guards against a
+    //   LostFocus/GotFocus pair completing before the deferred item runs; GotFocus only fires once
+    //   per focus session in XAML, so a second tap on an already-focused box never re-enters here and
+    //   the caret it places is left alone. Programmatic focus (OnUrlClear, the keyboard-restore path)
+    //   goes through this same handler and gets identical treatment.
+    ++m_urlSelectToken;
+    unsigned long long selectToken = m_urlSelectToken;
+    Platform::Agile<MainPage^> selectSelf(this);
+    this->Dispatcher->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([selectSelf, selectToken]() {
+        MainPage^ s = selectSelf.Get(); if (!s) return;
+        if (s->m_urlSelectToken != selectToken || !s->m_urlFocused || !s->UrlBox) return;
+        try { s->UrlBox->SelectAll(); } catch (...) {}
+    }));
 }
 // Apotheosis (review 2026-09-04 item 4): the collapse used to happen only from explicit callers
 //   (tap the page / open the menu-settings-etc — still true, see the other HideSuggestions() call
