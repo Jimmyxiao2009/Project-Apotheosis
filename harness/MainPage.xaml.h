@@ -268,7 +268,15 @@ namespace Harness {
         // Apotheosis (touch-lag diagnostic): called wherever InstantPanApplied() has just refreshed
         //   m_scrollX/m_scrollY from a real engine present, folding the newly-applied delta into the
         //   running gesture stats opened by OnImageManipStarted/closed by OnImageManipCompleted.
-        void NoteScrollLagPresented();
+        //   Apotheosis (2026-09-07, clamp fix): appliedDx/Dy is what m_scrollX/Y actually moved THIS
+        //   round trip (new minus old, in the caller's own hands right before it overwrites them);
+        //   requestedDx/Dy is the coarse batched delta that round trip's WebCoreScrollBy was asked
+        //   for (PumpScroll's dx/dy, already threaded through as InstantPanApplied's own
+        //   fallbackDx/fallbackDy parameter at every call site). When the engine could not honour the
+        //   request in full — clamped at a document edge, the one case its position answer can
+        //   legitimately disagree with what was sent — the shortfall is not a real lag and is folded
+        //   out of the base instead of being left to inflate max/avg forever.
+        void NoteScrollLagPresented(int appliedDx, int appliedDy, int requestedDx, int requestedDy);
         // Apotheosis (owed-frame remainder): remainder := m_panFinger* − (frameScroll* − m_panBase*)
         //   — what the finger asked for minus what the frame at that position really moved. False
         //   when no base has been taken yet. Computes only; the caller clamps and applies.
@@ -551,9 +559,13 @@ namespace Harness {
         //   branch takes; nested-scroll/drag/pinch gestures are a different question and are not
         //   tracked here). Zero cost when g_perfLogEnabled is off — every touch point below this
         //   comment is skipped entirely, same convention as imedebug.txt/perf.txt.
-        //   m_scrollLagActive: a free-scroll gesture is open and being tracked (set in
-        //     OnImageManipStarted while perf logging is on, cleared in OnImageManipCompleted after
-        //     the stage.txt line is written).
+        //   m_scrollLagActive: a free-scroll gesture is open and STILL COMPARING finger to engine
+        //     (set in OnImageManipStarted while perf logging is on; also cleared the moment inertia
+        //     begins — see m_scrollLagStarted below for why that is a separate flag).
+        //   m_scrollLagStarted: the gesture-scoped "was this ever tracked at all" flag OnImageManip
+        //     Completed gates the stage.txt line on. m_scrollLagActive freezes early (first inertial
+        //     delta), but the write must still happen — decoupled so the line for an ordinary swipe
+        //     that ends in inertia (nearly all of them) is not silently dropped.
         //   m_scrollLagBaseX/Y: m_scrollX/m_scrollY (engine px) at the moment the base was taken —
         //     "applied so far" is m_scrollX/Y minus this, so it is a plain delta and needs no
         //     separate accumulator.
@@ -580,7 +592,16 @@ namespace Harness {
         //     caught up yet" and the next engine present landing (NoteScrollLagPresented) — opened
         //     on the first move after each present, closed (and folded into MsMax) by the next one.
         //     This is present time, not screen scan-out — see the commit message for the caveat.
+        //   m_scrollLagClamped (2026-09-07, device bug — "n=28 max=2045" / "n=187 max=2709" at
+        //     ps=1.0): counts round trips where the engine could not apply the full requested delta
+        //     — a document-edge (or nested-scroller) clamp, not a real lag — and the shortfall was
+        //     folded out of the base by NoteScrollLagPresented instead of being left in max/avg.
+        //   m_scrollLagFlingMoves (same bug, second cause): ManipulationDelta keeps firing during
+        //     TranslateInertia — a synthetic deceleration curve, not the finger — so those deltas are
+        //     no longer summed into m_scrollLagFingerX/Y at all; this just counts how many arrived,
+        //     reported as its own fling= field instead of masquerading as finger travel.
         bool   m_scrollLagActive { false };
+        bool   m_scrollLagStarted { false };
         bool   m_scrollLagBaseValid { false };
         float  m_scrollLagScale { 1.0f };
         int    m_scrollLagBaseX { 0 }, m_scrollLagBaseY { 0 };
@@ -588,6 +609,8 @@ namespace Harness {
         int    m_scrollLagMoves { 0 };
         double m_scrollLagMax { 0.0 }, m_scrollLagSum { 0.0 }, m_scrollLagLast { 0.0 };
         unsigned long long m_scrollLagPendingSinceMs { 0 }, m_scrollLagMsMax { 0 };
+        int    m_scrollLagClamped { 0 };
+        int    m_scrollLagFlingMoves { 0 };
         // Apotheosis (drag as pointer events): state of the WebCoreDragAt route. m_dragGen is bumped
         // only at ManipulationStarted (NOT at ManipulationCompleted like m_nestedScrollGen), because
         // the release is posted while the gesture is still current and its answer must not be dropped.

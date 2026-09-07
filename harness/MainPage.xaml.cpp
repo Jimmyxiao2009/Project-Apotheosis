@@ -2784,6 +2784,9 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     //   down guarantees one arrives shortly. m_scrollLagScale records which scale this gesture is
     //   being measured at (fixed for the gesture's lifetime — pan and pinch cannot overlap).
     m_scrollLagActive = g_perfLogEnabled;
+    m_scrollLagStarted = m_scrollLagActive;   // Apotheosis (2026-09-07, clamp/fling fix): gesture-scoped
+        // "write the line" gate — m_scrollLagActive itself now freezes early on the first inertial
+        // delta (OnImageManipDelta), so OnImageManipCompleted must not gate the write on it too.
     if (m_scrollLagActive) {
         m_scrollLagScale = m_pageScale;
         m_scrollLagBaseValid = (m_scrollStateScale == m_pageScale);
@@ -2792,6 +2795,7 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
         m_scrollLagMoves = 0;
         m_scrollLagMax = m_scrollLagSum = m_scrollLagLast = 0.0;
         m_scrollLagPendingSinceMs = 0; m_scrollLagMsMax = 0;
+        m_scrollLagClamped = 0; m_scrollLagFlingMoves = 0;   // Apotheosis (2026-09-07, clamp/fling fix)
     }
     // Apotheosis (drag as pointer events): a new gesture — drop whatever the previous one left
     // behind before the probe below can answer Drag for this one.
@@ -3021,11 +3025,15 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     //   the scroll/bounds cache is kept, because MapTapToEngine()/ScrollStateUsable() read it.
     if (!m_instantPan || !m_instantPanXaml) {
         if (haveScrollState) {
+            // Apotheosis (2026-09-07, clamp fix): capture what the engine actually moved THIS round
+            //   trip (new minus the still-old m_scrollX/Y) before overwriting them, so the lag diagnostic
+            //   can tell a real lag apart from a document-edge clamp — see NoteScrollLagPresented().
+            const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
             m_scrollX = newScrollX;
             m_scrollY = newScrollY;
             m_scrollStateValid = true;
             m_scrollStateScale = m_pageScale;
-            NoteScrollLagPresented();   // Apotheosis (touch-lag diagnostic): the shipping default path
+            NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic): the shipping default path
         } else
             m_scrollStateValid = false;
         if (m_panRemX || m_panRemY) { m_panRemX = 0; m_panRemY = 0; ApplyPanTransform(); }
@@ -3056,11 +3064,14 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     // present: at most one frame of mismatch, in the forward direction, instead of two backwards.
     const bool deferTransform = haveOwedSwap && m_panDefer && m_panBaseValid;
     if (deferTransform) {
+        // Apotheosis (2026-09-07, clamp fix): see the appliedDx/Dy comment on the shipping-default
+        //   call site above — same capture, same reason.
+        const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
         m_scrollX = newScrollX;
         m_scrollY = newScrollY;
         m_scrollStateValid = true;
         m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2)
-        NoteScrollLagPresented();           // Apotheosis (touch-lag diagnostic)
+        NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic)
         return;
     }
     if (!(haveOwedSwap && PanRemainderFromFrame(swapScrollX, swapScrollY))) {
@@ -3074,11 +3085,13 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
             m_panRemY -= fallbackDy;
         }
     }
+    // Apotheosis (2026-09-07, clamp fix): same appliedDx/Dy capture as the two call sites above.
+    const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
     m_scrollX = newScrollX;
     m_scrollY = newScrollY;
     m_scrollStateValid = true;
     m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
-    NoteScrollLagPresented();           // Apotheosis (touch-lag diagnostic)
+    NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic)
     // Apotheosis (owed-frame remainder): the gesture began before there was any scroll state to
     // measure against, so no base was taken (InstantPanBy). This frame is the first thing that
     // knows where the document is — adopt its position as the base and the incremental remainder
@@ -3100,7 +3113,12 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
 // hasn't caught up yet" timing window opened in OnImageManipDelta. A no-op outside an active,
 // perf-logging-gated free-scroll gesture (m_scrollLagActive), so the three call sites above cost
 // one branch when the diagnostic is off.
-void MainPage::NoteScrollLagPresented()
+// Apotheosis (2026-09-07, clamp fix): appliedDx/Dy is what m_scrollX/Y actually moved THIS round
+//   trip (the caller's new minus its still-old m_scrollX/Y, captured right before it overwrites
+//   them); requestedDx/Dy is the same round trip's coalesced ask (InstantPanApplied's own
+//   fallbackDx/fallbackDy parameter — PumpScroll's dx/dy, valid in every branch regardless of its
+//   "fallback" name). Both are 0/0-safe no-ops on the lazy-base-adopt path below.
+void MainPage::NoteScrollLagPresented(int appliedDx, int appliedDy, int requestedDx, int requestedDy)
 {
     if (!m_scrollLagActive) return;
     // Apotheosis (2026-09-07, device bug fix): m_scrollX/Y just refreshed above is only comparable
@@ -3116,6 +3134,25 @@ void MainPage::NoteScrollLagPresented()
         m_scrollLagBaseValid = true;
         m_scrollLagPendingSinceMs = 0;   // this span's "waiting for the base" is not a real gap
         return;
+    }
+    // Apotheosis (2026-09-07, device bug fix — "n=28 max=2045 ps=1.0" / "n=187 max=2709 ps=1.0",
+    //   both alongside a low, sane ms_max): WebCoreScrollBy clamps at the document's own edges (this
+    //   is the main-frame free-scroll path only — a nested scroller routes through NestedScrollBy
+    //   instead and is not tracked here), so appliedDx/Dy can legitimately fall short of requestedDx/Dy —
+    //   the finger sum below was built from the SAME requested amount, so a sustained swipe held past
+    //   the end of the page keeps adding to m_scrollLagFingerX/Y with nothing on the applied side to
+    //   match, growing "lag" without bound even though the engine answered every round trip promptly.
+    //   That shortfall is not lag, it is pixels that do not exist — shift the base by it so appliedX/Y
+    //   below read as if the request had landed in full, leaving m_scrollX/Y (the real position) and
+    //   m_scrollLagFingerX/Y (the real finger total) untouched: base -= shortfall makes
+    //   (m_scrollX - base) grow by shortfall, cancelling exactly the finger pixels that could never
+    //   have been applied.
+    const int shortfallX = requestedDx - appliedDx;
+    const int shortfallY = requestedDy - appliedDy;
+    if (shortfallX != 0 || shortfallY != 0) {
+        m_scrollLagBaseX -= shortfallX;
+        m_scrollLagBaseY -= shortfallY;
+        ++m_scrollLagClamped;
     }
     const double appliedX = (double)(m_scrollX - m_scrollLagBaseX);
     const double appliedY = (double)(m_scrollY - m_scrollLagBaseY);
@@ -3802,7 +3839,20 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     //   summed raw (pre-axis-lock would double count the locked-out axis as "finger asked, engine
     //   never told" — using the post-lock values keeps this the same "what did we actually ask the
     //   engine for" question FreeScrollBy is answering). No allocation, two adds and a compare.
-    if (m_scrollLagActive) {
+    // Apotheosis (2026-09-07, device bug fix — same "n=28 max=2045"/"n=187 max=2709" report): the
+    //   comment above InstantPanApplied already notes it — "OnImageManipDelta keeps firing translation
+    //   deltas during TranslateInertia" — a synthetic deceleration curve the platform plays out after
+    //   the finger has already left the glass, not the finger itself. Summing those into the finger
+    //   total answered a different question than "does the page keep up with the finger": once inertia
+    //   starts, freeze the comparison here (m_scrollLagActive off) rather than let the engine's own
+    //   continued catch-up — now with nothing on the finger side to match it — read as ever-growing
+    //   lag in the other direction. m_scrollLagStarted (set once in OnImageManipStarted) is untouched,
+    //   so OnImageManipCompleted still writes the line for the tracked part of the gesture; fling=
+    //   counts what followed instead of folding it into n=/max=/avg=.
+    if (e->IsInertial) {
+        if (m_scrollLagStarted) ++m_scrollLagFlingMoves;
+        m_scrollLagActive = false;
+    } else if (m_scrollLagActive) {
         m_scrollLagFingerX += idx; m_scrollLagFingerY += idy;
         ++m_scrollLagMoves;
         if (m_scrollLagPendingSinceMs == 0) m_scrollLagPendingSinceMs = GetTickCount64();
@@ -4098,18 +4148,31 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     //   nested-scroll/pinch, or moved less than half a device px) — expected, not a bug. The final
     //   coarse-step flush PanGestureEnd() just posted lands asynchronously, after this line is
     //   written, so it is not counted here (see the commit message).
-    if (m_scrollLagActive) {
+    // Apotheosis (2026-09-07, clamp/fling fix): gated on m_scrollLagStarted, not m_scrollLagActive —
+    //   the latter now freezes as soon as inertia begins (OnImageManipDelta), which is true of nearly
+    //   every swipe, and gating the write on it too would have silently dropped the line for all of
+    //   them. m_scrollLagActive itself may already be false here; still clear it (a gesture that ends
+    //   without ever going inertial leaves it set) so a stale true cannot survive into the next.
+    if (m_scrollLagStarted) {
         m_scrollLagActive = false;
+        m_scrollLagStarted = false;
         if (m_scrollLagMoves > 0) {
             const double avg = m_scrollLagSum / m_scrollLagMoves;
             // Apotheosis (2026-09-07): ps= is the page scale this gesture was measured at (always
             //   present, not just when zoomed — a reader should never have to assume 1:1) so a
             //   zoomed gesture's numbers are recognisable at a glance instead of looking like a
             //   regression against the "0-60 px at 1:1" sanity baseline.
+            // Apotheosis (2026-09-07, clamp/fling fix): clamped= is how many round trips this gesture
+            //   hit a document-edge/nested-scroll clamp (folded out of max/avg/last, not left in them
+            //   — see NoteScrollLagPresented); fling= is how many ManipulationDelta events arrived
+            //   during TranslateInertia after tracking froze (not folded into n=/max=/avg=/last=
+            //   either — see OnImageManipDelta). A sane 1:1 gesture should read clamped=0.
             WriteStage(("scrolllag n=" + std::to_string(m_scrollLagMoves)
                 + " max=" + Dip(m_scrollLagMax) + " avg=" + Dip(avg) + " last=" + Dip(m_scrollLagLast)
                 + " ms_max=" + std::to_string(m_scrollLagMsMax)
-                + " ps=" + Dip(m_scrollLagScale)).c_str());
+                + " ps=" + Dip(m_scrollLagScale)
+                + " clamped=" + std::to_string(m_scrollLagClamped)
+                + " fling=" + std::to_string(m_scrollLagFlingMoves)).c_str());
         }
     }
     // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count
