@@ -28,8 +28,8 @@
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
             <Setter Property="FontSize" Value="20"/>
-            <Setter Property="Width" Value="52"/>
-            <Setter Property="Height" Value="62"/>
+            <Setter Property="Width" Value="44"/>
+            <Setter Property="Height" Value="48"/>
             <Setter Property="Padding" Value="0"/>
             <Setter Property="VerticalAlignment" Value="Stretch"/>
         </Style>
@@ -343,7 +343,11 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <Border Grid.Column="0" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="18">
+                        <!-- Apotheosis (bar tightening, 0.1.9.21 feedback): same missing-Stretch bug as
+                             UrlBox below (see the address pill comment) — add it here too so FindBox
+                             fills its column instead of sizing to content. -->
                         <TextBox x:Name="FindBox" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="36" BorderThickness="0" Background="Transparent"
+                                 HorizontalAlignment="Stretch"
                                  Foreground="{StaticResource TxtHi}" VerticalContentAlignment="Center" MinHeight="0" Padding="10,8,10,6"
                                  PlaceholderText="页内查找" KeyDown="OnFindKeyDown" TextChanged="OnFindChanged"/>
                     </Border>
@@ -405,8 +409,11 @@
         <!-- Apotheosis (2837ce0 review item 1): the thin status row (title/toast) moved into the
              content row as a bottom-anchored overlay (see TitleRow above) so an idle page gets its
              ~24 DIP back — the bottom chrome is the nav row and nothing else again, no wrapper Grid.
-             软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理)。 -->
-        <Grid Grid.Row="1" Height="62" Background="{StaticResource Chrome}">
+             软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理)。
+             Apotheosis (bar tightening, 0.1.9.21 feedback): bar 62 -> 48 DIP now that the address
+             pill itself only needs 36 (see below) — kNavBarHeightDip in MainPage.xaml.cpp (the
+             keyboard-shift safety clamp) MUST track this literal. -->
+        <Grid Grid.Row="1" Height="48" Background="{StaticResource Chrome}">
             <Grid.RenderTransform>
                 <TranslateTransform x:Name="NavBarShift" Y="0"/>
             </Grid.RenderTransform>
@@ -422,7 +429,7 @@
                  in whole device pixels (ApplyKeyboardShift / KeyboardShiftFor in MainPage.xaml.cpp),
                  but the shell's own keyboard top edge is not ours to round, so a sub-DIP sliver of
                  page can still show between this bar and the keyboard. This strip extends the bar's
-                 opaque background 6 DIP BELOW its own Height="62" box (negative bottom margin — a
+                 opaque background 6 DIP BELOW its own Height="48" box (negative bottom margin — a
                  Grid does not clip its children), which is always covered: at rest by RootGrid's
                  reserved bottom inset (or past the screen edge when there is none), with the keyboard
                  up by the keyboard itself. Purely decorative — never bleed upward instead, that would
@@ -431,7 +438,7 @@
                     Background="{StaticResource Chrome}" IsHitTestVisible="False"/>
 
             <!-- 标签键:方框数字,点开标签切换器 -->
-            <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="54" Height="62" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
+            <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="44" Height="48" Padding="0" IsHoldingEnabled="False" Click="OnTabs">
                 <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
                     <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource Accent}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
@@ -442,8 +449,23 @@
                  the pill's own rounded border already separates it from the two keys. The
                  Auto columns stay (empty = zero width) so no Grid.Column index moves. -->
 
-            <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。三者统一 40 高。UWP TextBox 不理会 VerticalContentAlignment(模板没绑),文字靠 Padding 上下值居中。 -->
-            <Border Grid.Column="2" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="20" Margin="7,9" Padding="0" Height="42">
+            <!-- 地址胶囊:锁标 + 地址输入 + 上下文键(Go/刷新/停止)。UWP TextBox 不理会 VerticalContentAlignment(模板没绑),文字靠 Padding 上下值居中。
+                 Apotheosis (bar tightening, 0.1.9.21 feedback): root cause of "UrlBox stops short of
+                 the X" — UrlBox had no explicit HorizontalAlignment. Every OTHER TextBox/ComboBox in
+                 this file that needs to fill its cell already carries HorizontalAlignment="Stretch"
+                 (SetHomeBox, SetUaCustomBox, SetLangCombo, SetSearchCombo, SetPrefetchCombo) — UrlBox
+                 (and FindBox above, fixed alongside it) were the two exceptions, so the TextBox sized
+                 to its own content/minimum inside the Grid.Column="1" "*" cell instead of filling it,
+                 leaving the raw transparent Grid background between the shrunk box and the button in
+                 column 2 — exactly the gap reported.
+                 Metrics (62 -> 48 DIP bar): pill 42 -> 36 high, Margin 7,9 -> 4,6 (tighter outer
+                 margin, still centred in the bar); UrlBox 40 -> 32 high, Padding 6,10,6,8 -> 4,5,4,4
+                 (halves the vertical whitespace above/below the text; ~4 DIP left before the button
+                 column instead of the old unstretched gap); UrlActionBtn/UrlClearBtn 42x40/44x40 ->
+                 both 40x36 (>=40 DIP touch width; height capped by the pill — the bar's own 48 DIP
+                 height is what keeps the *outer* Tabs/Menu keys at a full 48 DIP tap target, not extra
+                 padding here). kNavBarHeightDip in MainPage.xaml.cpp updated to match (48.0). -->
+            <Border Grid.Column="2" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="18" Margin="4,6" Padding="0" Height="36">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
@@ -453,9 +475,10 @@
                     <!-- 锁标:固定居中槽,glyph 与地址文字同基线 -->
                     <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
                                FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight"
-                               VerticalAlignment="Center" HorizontalAlignment="Center" Margin="10,0,2,0"/>
-                    <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="40" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
-                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="6,10,6,8"
+                               VerticalAlignment="Center" HorizontalAlignment="Center" Margin="8,0,4,0"/>
+                    <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
+                             HorizontalAlignment="Stretch"
+                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,4,4"
                              InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
                              KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
                              GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
@@ -465,7 +488,7 @@
                          2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
                          own ink still sits ~2px low inside it (font-specific) — nudge up. -->
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="42" Height="40" Padding="0"
+                            Width="40" Height="36" Padding="0"
                             VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlAction">
                         <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
@@ -478,7 +501,7 @@
                          same technique as UrlActionGlyph above — plain Button.Content centred on the
                          ✕'s full font line box sat ~2px high. -->
                     <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="44" Height="40" Padding="0"
+                            Width="40" Height="36" Padding="0"
                             IsTabStop="False" Visibility="Collapsed"
                             VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlClear">

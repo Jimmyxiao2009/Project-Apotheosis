@@ -771,7 +771,10 @@ static double RoundToDevicePixel(double dip)
 
 // The bottom chrome row's declared Height in MainPage.xaml. Only used as the safety clamp below —
 //   the shift may never carry the bar so far up that less than one bar's worth of window is left.
-static const double kNavBarHeightDip = 62.0;
+// Apotheosis (bar tightening, 0.1.9.21 feedback): bar shrunk from 62 to 48 DIP (address pill went
+//   from 42 to 36 high, its own vertical margin from 9 to 6) — keep this literal in sync with the
+//   Grid.Row="1" Height in MainPage.xaml or the keyboard-shift clamp allows too much travel.
+static const double kNavBarHeightDip = 48.0;
 
 // Compact DIP formatting for the stage.txt diagnostics — std::to_string(double) writes six decimals
 //   per number, which turns one keyboard line into 200 characters of noise. One decimal is finer than
