@@ -2729,6 +2729,34 @@ static void panSwapDropNote(int nowX, int nowY)
     std::fclose(fp);
 }
 
+// Apotheosis (2026-09-07): the escalation ledger of the unpainted-tile repair. See gpuArmRepair().
+static const double kRepairEscalateCooldownSec = 3.0;   // at most one forced whole-tree repaint per window
+static double g_gpuLastEscalateSec = -1e9;
+static unsigned g_gpuEscalateSuppressed = 0;            // escalations the cooldown / pan rule refused
+
+// Apotheosis (2026-09-07): one readable line in stage.txt when the repair loop is being throttled,
+// so the next device run can say whether the runaway is gone without reading the whole perf.csv.
+// Rate-limited to one line per second and capped, so a long pan cannot fill the file. Grep for
+// "repairloop". n= is how many escalations have been refused in this session, ps= the page scale
+// (the loop only runs away when it is != 1, see gpuArmRepair()), pan= whether a gesture is running.
+static void gpuRepairLoopNote(double nowSec)
+{
+    ++g_gpuEscalateSuppressed;
+    static double lastNoteSec = -1e9;
+    static int notes = 0;
+    if (g_stagePath.empty() || notes >= 24 || nowSec - lastNoteSec < 1.0)
+        return;
+    lastNoteSec = nowSec;
+    ++notes;
+    const float ps = g_session && g_session->page ? g_session->page->pageScaleFactor() : -1.f;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "repairloop n=%u misses=%u ps=%.3f pan=%d\n",
+        g_gpuEscalateSuppressed, g_gpuRepairMisses, ps, g_panGesture ? 1 : 0);
+    std::fclose(fp);
+}
+
 // Apotheosis (2026-09-06): arm the composite that repairs a frame which came up short of content,
 // and say whether it is the escalated one. Ordinary case (g_gpuRepairMisses == 0): targeted - only
 // the stores that reported unpainted visible tiles repaint themselves, everything else early-outs,
@@ -2736,10 +2764,44 @@ static void panSwapDropNote(int nowX, int nowY)
 // targeted repair did not settle it, the next one force-dirties the tree once, as before.
 static bool gpuArmRepair()
 {
-    const bool escalate = g_gpuRepairMisses > 0;
-    if (escalate)
+    // Apotheosis (2026-09-07, "panning github.com while pinch-zoomed is extremely slow"):
+    // the escalation is rate-limited, and it never fires while the finger is on the glass.
+    //
+    // What the device log showed (build-driver\logs\20260907-211135, github.com at page scale
+    // ~2.85): scroll and tick rows alternating between dirty_full=53..58 - i.e. EVERY composited
+    // layer repainted in full - at 1.2-1.6 s of ms_backing, and rows with dirty_full=0..13 at
+    // 100-250 ms. Nothing in WebCore dirtied those 55 layers: ms_style_layout is 0.01 ms on every
+    // one of them, so there was no layout and no style resolution. The only thing that dirties a
+    // whole tree here is forceDirtyTree() in gpuPrepare(), and on a live tick the only caller that
+    // can still ask for it is this escalation (WebCoreLiveTick sets g_gpuScrollFast for every tick).
+    //
+    // Why it ran away exactly when zoomed: TextureMapperTiledBackingStore::wkUnpaintedCompositeBudget()
+    // is 4 composites at page scale 1 and *1* composite as soon as the page is zoomed. With threaded
+    // raster on, a tile whose replay is still in flight draws nothing, so at the zoomed budget every
+    // freshly posted tile reports itself unpainted on the very next composite (raster_deferred was
+    // 26-81 per row in that log). That makes gpuPresent() repair on essentially every composite, and
+    // a repair whose predecessor also missed escalates - so every second composite force-dirtied the
+    // tree. The escalated repaint then posts a few hundred new tile paints, which are in flight on
+    // the next composite, which reports them unpainted... The loop feeds itself, and each turn costs
+    // page-scale-squared pixels: the same whole-tree repaint is ~260 ms at 1:1 and ~1.3-1.6 s at 2.85x.
+    //
+    // The escalation cannot fix what it is reacting to here. A tile that has run out of budget is
+    // already back on the synchronous path and its store already answers wkHasUnpaintedVisibleTiles(),
+    // so the TARGETED repair repaints exactly the layers that owe pixels; every other layer in the
+    // tree has lost nothing and is repainted for nothing. Keep the sledgehammer for the case it was
+    // written for - a repair that genuinely does not settle while the page is still - by allowing it
+    // at most once per cooldown window and never during a pan gesture, which is precisely when tiles
+    // are legitimately in flight and when the stall is felt.
+    const double nowSec = monotonicSeconds();
+    bool escalate = g_gpuRepairMisses > 0;
+    if (escalate && (g_panGesture || nowSec - g_gpuLastEscalateSec < kRepairEscalateCooldownSec)) {
+        escalate = false;
+        gpuRepairLoopNote(nowSec);
+    }
+    if (escalate) {
+        g_gpuLastEscalateSec = nowSec;
         g_gpuForceFullNext = true;
-    else
+    } else
         g_gpuTargetedNext = true;
     return escalate;
 }
@@ -3150,6 +3212,8 @@ static void teardownSession()
     g_gpuForceFullNext = true;
     g_gpuTargetedNext = false;
     g_gpuRepairMisses = 0;
+    // Apotheosis (2026-09-07): the escalation cooldown belonged to the page that is going away.
+    g_gpuLastEscalateSec = -1e9;
     g_gpuLastCompositeFull = false;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
     // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
