@@ -4752,6 +4752,17 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // "toggle full-screen map view" action. A touch pan never produces a click in a real
         // browser; a gesture that stayed inside the slop is a tap that only reached this route
         // because XAML raised a manipulation, and it keeps its click.
+        // Apotheosis (2026-09-07): g_dragMoved is only ever updated in phase 1 (above), which assumed
+        // every intermediate move gets dispatched before the release. That is not guaranteed — a
+        // coalesced or dropped PumpDrag move, or a gesture whose whole travel happened between two
+        // posts, would reach here with g_dragMoved still false and fire a click at the release point
+        // regardless of how far the finger actually travelled from the press. Compare the release
+        // point to the press point directly so the click decision does not depend on move delivery.
+        if (phase == 2 && !g_dragMoved) {
+            const int rdx = x - g_dragPressX, rdy = y - g_dragPressY;
+            if (rdx * rdx + rdy * rdy > kDragTapSlopPx * kDragTapSlopPx)
+                g_dragMoved = true;   // travelled, however the moves were coalesced
+        }
         const bool fireClick = (phase == 2 && !g_dragMoved);
         if (!fireClick)
             lf->eventHandler().invalidateClick();

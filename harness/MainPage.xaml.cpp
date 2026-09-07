@@ -3940,6 +3940,16 @@ void MainPage::EndGesture(GestureEnd reason)
     // reason including Completed - there is nothing to commit, the page zoomed itself notch by
     // notch while the fingers moved. A post still in flight is harmless: its completion clears
     // m_zoomWheelBusy and, seeing m_pinchPage gone, settles the page instead of pumping more.
+    // Apotheosis (review 2026-09-07 M5): the settle for THIS route lives entirely in PumpZoomWheel's
+    // completion (`else if (!s->m_pinchPage) { SyncLinksAfterScroll(); StartLiveMode(); }`) —
+    // OnImageManipCompleted's `if (!wasPinching) return;` skips it whenever the gesture never became
+    // a real pinch. If the last PumpZoomWheel completion lands while the fingers are still down and
+    // produces no further notch, EndGesture clears m_pinchPage here with nothing left in flight to
+    // run that settle — link table goes stale and, on a pinch held past the idle cut-off, the live
+    // loop retires with nothing left to restart it. Capture the flag before clearing it and, once a
+    // post is no longer in flight, run the same settle here for every non-abort exit (Completed is
+    // the only reason this route ends outside of an abort).
+    const bool wasPinchPage = m_pinchPage;
     m_pinchPage = false;
     m_pinchPageAccum = 1.0f;
     m_zoomWheelNotches = 0;
@@ -3978,6 +3988,13 @@ void MainPage::EndGesture(GestureEnd reason)
     m_manipActive = false;
     if (abort)
         ApplyPresentTransform();   // whatever preview transform is left goes with the gesture
+    // Apotheosis (review 2026-09-07 M5): the pinch-to-map route's own settle (see the comment above)
+    // never runs when this exit is the one that ends the gesture. A post still in flight will run it
+    // itself on completion (and will find m_pinchPage already false, so it will not double it).
+    if (wasPinchPage && !abort && !m_zoomWheelBusy) {
+        SyncLinksAfterScroll();
+        StartLiveMode();
+    }
 }
 
 // 捏合结束:把累计缩放提交给引擎(WebCoreSetPageScale 按新尺度重栅格 → 文字清晰),回 UI 后复位变换 + 显示清晰帧。
