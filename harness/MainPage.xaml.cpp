@@ -4735,7 +4735,11 @@ void MainPage::OnToggleGpu(Platform::Object^, RoutedEventArgs^)
     //   (scrollPos/contents/view/docBg/usesCompositing),供定位"背景丢失 / 不能滚动"。
     HideDrawer();
     WebEngine::instance().post([disp, self]() {
-        auto buf = std::make_shared<std::vector<char>>(65536, 0);
+        // Apotheosis (2026-09-07): 512 KB, not 64. The driver now writes the texmap per-store
+        // diagnostics first and the layer tree into what is left (WebCoreGpuLayerInfo), and a real
+        // page's tree alone is well over 64 KB - at the old size layertree.txt was exactly 65535
+        // bytes of tree and nothing else. Allocated per dump, on the engine thread's task.
+        auto buf = std::make_shared<std::vector<char>>(512 * 1024, 0);
         try { WebCoreGpuLayerInfo(buf->data(), (int)buf->size()); } catch (...) {}
         std::string info(buf->data());
         try {

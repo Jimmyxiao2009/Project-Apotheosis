@@ -142,6 +142,13 @@ unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
 // have not been read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine
 // thread, allocation-free. Declared by hand for the same reason as everything above.
 size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
+// Apotheosis (2026-09-07, ghost strip on ntv.de): one line per live tiled backing store - size,
+// contents scale, page scale, visible and cover rect, how many tiles it holds, owes, or draws
+// nothing with, how many placeholders of a previous contents scale it still keeps, and the first
+// tile drawn with a texture that is not its own. This is the dump a device session takes *while*
+// the artefact is on screen, so WebCoreGpuLayerInfo() writes it before the layer tree rather than
+// after it. Declared by hand for the same reason as everything above.
+size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -5868,11 +5875,8 @@ int WebCoreGpuLayerInfo(char* out, int len)
     std::string s;
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     RefPtr<LocalFrameView> view = lf ? lf->view() : nullptr;
-    IntPoint origScroll;
-    bool didProbe = false;
     if (view) {
         IntPoint sp = view->scrollPosition();
-        origScroll = sp;
         IntPoint minP = view->minimumScrollPosition();
         IntPoint maxP = view->maximumScrollPosition();
         IntSize cs = view->contentsSize();
@@ -5888,29 +5892,38 @@ int WebCoreGpuLayerInfo(char* out, int len)
                  sp.x(), sp.y(), minP.x(), minP.y(), maxP.x(), maxP.y(),
                  cs.width(), cs.height(), g_session->w, g_session->h, usesComp ? 1 : 0);
         s += h;
-        // 探针滚动:setScrollPosition(0,300)+frameViewDidScroll,看 ① 滚动量是否被钳到 0(maxScroll=0?)
-        // ② scrolled-contents 层是否真移到 (0,-300)。其后的 layerTreeAsText 即反映探针后的层位置。最后复位。
-        view->setScrollPosition(ScrollPosition(0, 300));
-        if (auto* rv = view->renderView())
-            rv->compositor().frameViewDidScroll();
-        IntPoint sp2 = view->scrollPosition();
-        char h2[160];
-        snprintf(h2, sizeof h2, "-- after setScrollPosition(0,300)+frameViewDidScroll: scrollPos=%d,%d (层树为此刻状态) --\n",
-                 sp2.x(), sp2.y());
-        s += h2;
-        didProbe = true;
+        // Apotheosis (2026-09-07): the scroll probe this used to do here - setScrollPosition(0,300)
+        // + frameViewDidScroll, to see whether the scrolled-contents layer really moves - is gone.
+        // It was bring-up code for "the page does not scroll" and it is actively harmful now: the
+        // dump is taken *while* a rendering artefact is on screen, and scrolling the view moves
+        // every visible rect, re-tiles the backing stores and repaints the tree, so the state the
+        // dump is supposed to describe is destroyed before it is written. It also left the layer
+        // tree below describing scroll position 300 rather than the page the user is looking at.
+    }
+    // Apotheosis (2026-09-07): the texmap diagnostics before the layer tree, and the tree capped to
+    // whatever is left. Device (0.1.9.25, build-driver\logs\20260907-140444\layertree.txt): the file
+    // was exactly 65535 bytes of layerTreeAsText() and did not contain a single texmap line - the
+    // tree of a real page fills any buffer, so everything appended after it is lost. The per-store
+    // block is the smaller and, for a ghost/stale-tile question, the only useful half.
+    {
+        std::vector<char> texmap(64 * 1024, 0);
+        const size_t used = WebCore::wkWinUWPDumpTexmap(texmap.data(), texmap.size());
+        s.append(texmap.data(), used);
     }
     if (GraphicsLayer* root = g_session->chrome->rootLayer()) {
         String tree = root->layerTreeAsText(AllLayerTreeAsTextOptions);   // 全调试标志:paintsIntoWindow/tileCache/drawsContent/backingStoreAttached
         CString u = tree.utf8();
-        s.append(u.data(), u.length());
+        // Truncated here rather than by the memcpy below, so that "the tree was cut off" is visible
+        // in the file instead of looking like a dump that simply ends.
+        const size_t room = (s.size() + 1 < static_cast<size_t>(len)) ? static_cast<size_t>(len) - 1 - s.size() : 0;
+        if (u.length() <= room)
+            s.append(u.data(), u.length());
+        else if (room > 64) {
+            s.append(u.data(), room - 64);
+            s += "\n-- layer tree truncated --\n";
+        }
     } else {
         s += "(no root GraphicsLayer)\n";
-    }
-    if (didProbe && view) {   // 复位滚动,别让调试 tap 把页面留在 300
-        view->setScrollPosition(origScroll);
-        if (auto* rv = view->renderView())
-            rv->compositor().frameViewDidScroll();
     }
     int n = static_cast<int>(s.size());
     if (n > len - 1) n = len - 1;
