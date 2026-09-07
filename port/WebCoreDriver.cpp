@@ -157,6 +157,7 @@ size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 #include <WebCore/LocalFrameView.h>      // WebCore::LocalFrameView
 #include <WebCore/DocumentView.h>        // inline LocalFrame::view()/protectedView()
 #include <WebCore/FrameLoader.h>         // FrameLoader::activeDocumentLoader
+#include <WebCore/FrameLoaderStateMachine.h> // Apotheosis (M4 settle): committedFirstRealDocumentLoad()
 #include <WebCore/DocumentLoader.h>      // DocumentLoader::writer()
 #include <WebCore/DocumentWriter.h>      // DocumentWriter setMIMEType/begin/addData/end
 #include <WebCore/Document.h>            // Document::updateLayout / updateLayoutIgnorePendingStylesheets
@@ -209,7 +210,9 @@ size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 #include <WebCore/ScrollView.h>              // setScrollPosition/maximumScrollPosition(LocalFrameView 基类)
 #include <WebCore/DoublePoint.h>             // PlatformMouseEvent 的坐标类型
 #include <wtf/MonotonicTime.h>               // PlatformMouseEvent 时间戳
+#include <wtf/WallTime.h>                    // Apotheosis (M4 settle): CachedResource::apoRequestTimestamp()
 #include <wtf/ApoLoadPhase.h>                // Apotheosis (M4 load): engine-thread phase buckets
+#include <wtf/ApoLoadThrottle.h>             // Apotheosis (M4 load): DOM timer alignment while the pump runs
 #include <wtf/OptionSet.h>                   // OptionSet<PlatformEvent::Modifier>
 #include <WebCore/PlatformWheelEvent.h>      // PlatformWheelEvent(WebCoreWheelAt)
 #include <WebCore/ScrollingCoordinatorTypes.h> // WheelEventProcessingSteps(full definition; EventHandler.h only forward-declares it)
@@ -1301,7 +1304,15 @@ static const char* const kPerfHeader =
     //                hop per response and per body chunk; off_disp_n is how many ran
     //   off_other    ms_offpump minus the six, i.e. the run loop's own overhead and whatever
     //                still has no scope. A large off_other means this list is incomplete
-    "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other\n";
+    "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other,"
+    // Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2.10): how often, not how long. off_style
+    // is one number for two very different things, and 1.4 s of it on heise.de reads the same
+    // whether one style resolution was expensive or the pump forced twenty. Counted in
+    // wtf/ApoLoadPhase.h at the same scopes, over the same window as the buckets:
+    //   style_n   Document::resolveStyle entries          (> ~10 per navigation = the driver is
+    //   layout_n  LocalFrameViewLayoutContext::layout      forcing passes, not the page)
+    //   timer_n   DOMTimer::fired entries                 (drops when the C2.9 alignment works)
+    "style_n,layout_n,timer_n\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1369,6 +1380,9 @@ struct PerfRow {
     double offJs = -1, offParse = -1, offStyle = -1, offDecode = -1, offTimer = -1,
            offDispatch = -1, offOther = -1;
     int offDispatchN = -1;
+    // Apotheosis (M4 load, 2026-09-07): pass counts over the same window as the buckets above;
+    // see kPerfHeader and wtf/ApoLoadPhase.h. -1 = not a nav row.
+    int styleN = -1, layoutN = -1, timerN = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1391,6 +1405,21 @@ static char g_settleWhy[16] = { 0 };
 // perfNavVisuallyNonEmpty and cleared at navLoadBegin. pumpLoop's wall-clock cap on the
 // pre-load phase only fires once the user actually has a page to look at.
 static std::atomic<int> g_navSawFirstPaint { 0 };
+// Apotheosis (M4 load, 2026-09-07): the wall clock of the two events pumpLoop's caps are counted
+// from, taken *at the event* instead of at the settle tick that happens to notice it. Both are
+// perf-independent (the caps run with logging off) and 0 = "not reached in this navigation".
+//
+// This is a real bug, not tidiness. The settle timer ticks every 50 ms plus its callback plus
+// whatever the run loop does in between, which on ntv.de is 160 ms on average and over a second
+// when an ad timer chain runs; anchoring a 1 s deadline on the first tick that observed the event
+// therefore pushed the deadline out by a whole gap. Measured (log 20260907-100044): ntv.de warm
+// fired its load event at 1820 ms and cap-load ended the pump at 4124 ms - 2.3 s for a 1 s cap.
+static std::atomic<double> g_navLoadEventSec { 0 };   // dispatchDidFinishLoad
+static std::atomic<double> g_navDomReadySec { 0 };    // dispatchDidFinishDocumentLoad
+// Apotheosis (M4 load, PERF-OPTIONS.md C2.9): the DOM timer alignment the load window asks for.
+// Declared here because the stage.txt timeline line prints it; used by loadTimerThrottleSet().
+static constexpr unsigned kLoadTimerAlignMs = 250;
+static constexpr unsigned kLoadTimerNestedAlignMs = 1000;
 
 // Scoped phase timer: adds its own lifetime to one PerfRow field (accumulating,
 // so repeated phases inside one operation sum up). Reads no clock at all when
@@ -1526,9 +1555,14 @@ static void perfFlushLocked()
             perfFmtD(of[k], sizeof of[k], offVals[k]);
         char ofn[12];
         perfFmtI(ofn, sizeof ofn, r.offDispatchN);
+        // M4 load C2.10: style / layout / DOM timer pass counts.
+        const int passInts[3] = { r.styleN, r.layoutN, r.timerN };
+        char pc[3][12];
+        for (int k = 0; k < 3; ++k)
+            perfFmtI(pc[k], sizeof pc[k], passInts[k]);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
                          "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
@@ -1537,7 +1571,8 @@ static void perfFlushLocked()
             tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf,
             sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
             tcb, offp, pt,
-            of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6]);
+            of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6],
+            pc[0], pc[1], pc[2]);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1690,13 +1725,20 @@ static void perfWriteStageTimeline(const PerfRow& r)
         r.pumpTicks, r.msTickCb < 0 ? 0.0 : r.msTickCb, r.msOffPump < 0 ? 0.0 : r.msOffPump);
     // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the same split as the off_* columns, on a line
     // of its own so the timeline line above keeps the shape the existing notes quote.
+    // Apotheosis (M4 load, 2026-09-07): style_n/layout_n/timer_n are pass *counts* over the
+    // same window (wtf/ApoLoadPhase.h). A style time that is large because one resolution is
+    // expensive and one that is large because the pump forces twenty need opposite fixes, and
+    // timer_n is how the C2.9 timer alignment shows up: the same work in fewer, larger runs.
+    // tthr= is the alignment the load window asked for, so a log says which build it is.
     std::fprintf(fp, "offpump url=%s total=%.0f js=%.0f parse=%.0f style=%.0f decode=%.0f"
-                     " timers=%.0f dispatch=%.0f/%d other=%.0f\n",
+                     " timers=%.0f dispatch=%.0f/%d other=%.0f"
+                     " style_n=%d layout_n=%d timer_n=%d tthr=%u\n",
         r.url, r.msOffPump < 0 ? 0.0 : r.msOffPump,
         r.offJs < 0 ? 0.0 : r.offJs, r.offParse < 0 ? 0.0 : r.offParse,
         r.offStyle < 0 ? 0.0 : r.offStyle, r.offDecode < 0 ? 0.0 : r.offDecode,
         r.offTimer < 0 ? 0.0 : r.offTimer, r.offDispatch < 0 ? 0.0 : r.offDispatch,
-        r.offDispatchN < 0 ? 0 : r.offDispatchN, r.offOther < 0 ? 0.0 : r.offOther);
+        r.offDispatchN < 0 ? 0 : r.offDispatchN, r.offOther < 0 ? 0.0 : r.offOther,
+        r.styleN, r.layoutN, r.timerN, kLoadTimerAlignMs);
     std::fclose(fp);
 }
 
@@ -1782,6 +1824,10 @@ static void perfEnd()
             + g_perfCur.offDecode + g_perfCur.offTimer + g_perfCur.offDispatch;
         const double offTotal = g_perfCur.msOffPump < 0 ? 0.0 : g_perfCur.msOffPump;
         g_perfCur.offOther = offTotal > offSum ? offTotal - offSum : 0.0;
+        // Apotheosis (M4 load C2.10): pass counts over the same window.
+        g_perfCur.styleN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::StyleRecalc));
+        g_perfCur.layoutN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::Layout));
+        g_perfCur.timerN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::DomTimer));
     } else
         g_perfCur.frames = 1;
     g_perfCur.gpu = g_gpuActive ? 1 : 0;
@@ -1840,6 +1886,8 @@ void perfNavStart()
     // "main document is loading" edge the present throttle above is keyed on.
     navLoadBegin();
     g_navSawFirstPaint.store(0, std::memory_order_release);   // M4 load: per navigation
+    g_navLoadEventSec.store(0, std::memory_order_relaxed);    // M4 load: pumpLoop's cap anchors
+    g_navDomReadySec.store(0, std::memory_order_relaxed);
     if (!g_perfOn || !g_perfInOp || g_perfNavT0Set)
         return;
     g_perfNavT0 = MonotonicTime::now();
@@ -1859,6 +1907,9 @@ void perfNavCommit()
 
 void perfNavDocumentReady()
 {
+    // Apotheosis (M4 load): perf-independent - pumpLoop's cap-dcl deadline is counted from here.
+    if (!g_navDomReadySec.load(std::memory_order_relaxed))
+        g_navDomReadySec.store(monotonicSeconds(), std::memory_order_relaxed);
     if (!g_perfOn || !g_perfInOp || g_perfCur.domReady >= 0)
         return;
     g_perfCur.domReady = perfSinceNavStart();
@@ -1867,6 +1918,9 @@ void perfNavDocumentReady()
 void perfNavLoadEvent()
 {
     navLoadEnd();   // Apotheosis (M4 load throttle): full present rate from here on (perf-independent)
+    // Apotheosis (M4 load): perf-independent - pumpLoop's cap-load deadline is counted from here.
+    if (!g_navLoadEventSec.load(std::memory_order_relaxed))
+        g_navLoadEventSec.store(monotonicSeconds(), std::memory_order_relaxed);
     if (!g_perfOn || !g_perfInOp || g_perfCur.netLoad >= 0)
         return;
     g_perfCur.netLoad = perfSinceNavStart();
@@ -2061,11 +2115,20 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 // CachedResourceClient carries no geometry. Lazy image loading (C1.1) is what keeps that honest:
 // on a page that marks its images the off-screen ones are never requested in the first place, and
 // ntv.de went from 261 subresources to 88 because of it.
-static bool apoIsRenderAffecting(WebCore::CachedResource::Type type)
+//
+// Apotheosis (2026-09-07, second pass): images stop blocking once the load event has fired.
+// The load event is by definition "every subresource the document declared is done", so an image
+// that is still pending after it is a lazy one, a JS-inserted one or a late `srcset` pick - all
+// of them below the fold or invisible, none of them worth holding the engine thread for. Before
+// the load event images still block: that is the article's own imagery and the first screen.
+// Measured motivation: ntv.de warm fired `load` at 1820 ms and settled at 4124 ms on the cap,
+// with only image and beacon traffic left (the new settle-pending line below names it).
+static bool apoIsRenderAffecting(WebCore::CachedResource::Type type, bool afterLoadEvent)
 {
     switch (type) {
-    case WebCore::CachedResource::Type::MainResource:
     case WebCore::CachedResource::Type::ImageResource:
+        return !afterLoadEvent;
+    case WebCore::CachedResource::Type::MainResource:
     case WebCore::CachedResource::Type::CSSStyleSheet:
     case WebCore::CachedResource::Type::Script:
     case WebCore::CachedResource::Type::FontResource:
@@ -2077,7 +2140,21 @@ static bool apoIsRenderAffecting(WebCore::CachedResource::Type type)
     }
 }
 
-static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame)
+static const char* apoResourceTypeName(WebCore::CachedResource::Type type)
+{
+    switch (type) {
+    case WebCore::CachedResource::Type::MainResource:        return "main";
+    case WebCore::CachedResource::Type::ImageResource:       return "img";
+    case WebCore::CachedResource::Type::CSSStyleSheet:       return "css";
+    case WebCore::CachedResource::Type::Script:              return "js";
+    case WebCore::CachedResource::Type::FontResource:        return "font";
+    case WebCore::CachedResource::Type::SVGFontResource:     return "svgfont";
+    case WebCore::CachedResource::Type::SVGDocumentResource: return "svgdoc";
+    default:                                                 return "other";
+    }
+}
+
+static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame, bool afterLoadEvent)
 {
     RefPtr<WebCore::Document> doc = frame.document();
     if (!doc)
@@ -2096,10 +2173,97 @@ static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame)
         auto status = res->status();
         if (status != WebCore::CachedResource::Unknown && status != WebCore::CachedResource::Pending)
             continue;
-        if (apoIsRenderAffecting(res->type()))
+        if (apoIsRenderAffecting(res->type(), afterLoadEvent))
             return true;
     }
     return false;
+}
+
+// Apotheosis (M4 load, 2026-09-07): "settle-pending" - what was still open when a settle cap
+// fired. The caps exist because the viewport-quiet rule did not trip, and until now nothing said
+// what kept it from tripping: on ntv.de and heise.de every navigation of log 20260907-100044
+// ended on cap-load / cap-dcl, never on quiet-vp. One line per capped navigation, listing up to
+// eight pending render-affecting loads with type, age and the tail of the URL, plus the count of
+// the pending loads the rule already ignores. Read it as: many old `img` entries mean the page
+// does not mark its images lazy (C1.1 cannot help it, and the after-load rule above should);
+// an old `js` entry is a long-poll or a stalled tracker script; an old `css`/`font` entry is a
+// genuine reason to keep waiting and would argue for raising the cap instead of lowering it.
+static void perfWriteStagePending(WebCore::LocalFrame& frame, const char* why, bool afterLoadEvent)
+{
+    if (!g_perfOn || g_stagePath.empty())
+        return;
+    RefPtr<WebCore::Document> doc = frame.document();
+    if (!doc)
+        return;
+    struct Entry { char name[40]; const char* type; double ageMs; };
+    Entry entries[8];
+    int used = 0, blocking = 0, ignored = 0;
+    const WallTime now = WallTime::now();
+    for (auto& kv : doc->cachedResourceLoader().allCachedResources()) {
+        WebCore::CachedResource* res = kv.value.get();
+        if (!res)
+            continue;
+        auto status = res->status();
+        if (status != WebCore::CachedResource::Unknown && status != WebCore::CachedResource::Pending)
+            continue;
+        if (!apoIsRenderAffecting(res->type(), afterLoadEvent)) {
+            ++ignored;
+            continue;
+        }
+        ++blocking;
+        const double ageMs = (now - res->apoRequestTimestamp()).milliseconds();
+        // Keep the eight oldest: those are the ones that made the cap fire.
+        int at = used < 8 ? used : 7;
+        if (used == 8 && ageMs <= entries[7].ageMs)
+            continue;
+        while (at > 0 && entries[at - 1].ageMs < ageMs) {
+            entries[at] = entries[at - 1];
+            --at;
+        }
+        netSubShortName(entries[at].name, sizeof entries[at].name, res->url().string().utf8().data());
+        entries[at].type = apoResourceTypeName(res->type());
+        entries[at].ageMs = ageMs;
+        if (used < 8)
+            ++used;
+    }
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "settle-pending why=%s parsing=%d blocking=%d ignored=%d oldest=[",
+        why ? why : "-", doc->parsing() ? 1 : 0, blocking, ignored);
+    for (int i = 0; i < used; ++i)
+        std::fprintf(fp, "%s%s age=%.0f %s", i ? " | " : "",
+            entries[i].type, entries[i].ageMs, entries[i].name);
+    std::fputs("]\n", fp);
+    std::fclose(fp);
+}
+
+// ---- Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2.9): DOM timer throttle -------------
+// Between the commit of a real document and t_settle, align every DOM timer of every document
+// onto a 250 ms grid (1 s for the maximally nested ones WebCore already treats as pollers). The
+// engine thread is the only thread there is here, and during a load it has to serve the parser,
+// the first style resolution and the first paint *and* the ad/consent stack's setTimeout chains:
+// the ms_offpump split of a warm ntv.de load is timers=1030 js=867 style=911 of 2508 ms.
+// Alignment does not drop a timer and delays none by more than one grid step; it makes a burst
+// of unrelated timers land in one wake-up, so the page pays one script entry and one style
+// resolution for the lot. See wtf/ApoLoadThrottle.h for the engine half.
+//
+// The window is opened and closed by pumpLoop alone, so it cannot outlive the navigation. User
+// input cannot be starved by it either: while the pump owns the engine thread no C ABI call is
+// serviced at all, so by the time input is processed the window is already closed.
+static void loadTimerThrottleSet(WebCore::Page* page, bool on)
+{
+    const unsigned align = on ? kLoadTimerAlignMs : 0;
+    if (WTF::g_apoLoadTimerAlignMs.load(std::memory_order_relaxed) == align)
+        return;
+    WTF::g_apoLoadTimerAlignMs.store(align, std::memory_order_relaxed);
+    WTF::g_apoLoadTimerNestedAlignMs.store(on ? kLoadTimerNestedAlignMs : 0, std::memory_order_relaxed);
+    // Re-align what is already scheduled - without this the new grid would only apply to timers
+    // installed after the edge, which on the closing edge means the throttle lingers.
+    if (page)
+        page->forEachDocument([](WebCore::Document& document) {
+            document.didChangeTimerAlignmentInterval();
+        });
 }
 
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
@@ -2120,12 +2284,18 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     WTF::g_apoPhaseEnabled = g_perfOn;
     bool stopped = false;
     // Apotheosis (M4 load, 2026-09-07): every stop takes a reason, recorded in g_settleWhy and
-    // printed as why= in the stage.txt timeline / settle_why in perf.csv.
-    auto stopLoop = [&stopped](const char* why) {
+    // printed as why= in the stage.txt timeline / settle_why in perf.csv. A stop on one of the
+    // caps also dumps what was still pending (settle-pending), because a cap is by definition
+    // "the quiet rule never tripped" and that is the thing to fix next.
+    RefPtr<LocalFrame> frameForStop = &frame;
+    auto stopLoop = [&stopped, frameForStop](const char* why) {
         if (stopped)
             return;
         stopped = true;
         std::snprintf(g_settleWhy, sizeof g_settleWhy, "%s", why);
+        if (frameForStop && why && (!std::strncmp(why, "cap", 3) || !std::strcmp(why, "watchdog")))
+            perfWriteStagePending(*frameForStop, why,
+                g_navLoadEventSec.load(std::memory_order_relaxed) != 0);
         RunLoop::currentSingleton().stop();
     };
     int settleTicks = 0;
@@ -2136,14 +2306,15 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     // warm fired its load event at 1716 ms and the pump did not return until 4849 ms - 3.1 s of
     // "1 s hard cap"; google.de/maps 2034 -> 3427 ms. Deadlines are therefore wall clock now,
     // and the tick counts stay only as the secondary guard they always were.
-    MonotonicTime navDoneAt;      // first tick that saw the load event
-    MonotonicTime domReadyAt;     // first tick that saw DOMContentLoaded
+    MonotonicTime navDoneAt;      // the load event (fallback: first tick that saw it)
+    MonotonicTime domReadyAt;     // DOMContentLoaded (fallback: first tick that saw it)
     // Apotheosis (M4 load, 2026-09-07): ms_tick_cb / ms_offpump accounting - see kPerfHeader.
     MonotonicTime lastTickStart;
     double cbTotalAtLastTick = 0;
+    bool timerThrottleArmed = false;   // Apotheosis (M4 load C2.9): see loadTimerThrottleSet()
     RefPtr<LocalFrame> frameRef = &frame;
     RunLoop::Timer settle(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.settle"_s,
-        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, &navDoneAt, &domReadyAt, &lastTickStart, &cbTotalAtLastTick, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, &navDoneAt, &domReadyAt, &lastTickStart, &cbTotalAtLastTick, &timerThrottleArmed, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
             // Apotheosis (M4 load C2.1): this callback is already measured as ms_tick_cb.
             // Opening the Pump scope keeps the RunLoop Timer scope that contains it from
             // charging itself our work, so the buckets describe the *other* run-loop work only.
@@ -2206,8 +2377,29 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             RefPtr<Document> frameDoc = frameRef->document();
             // Apotheosis (M4 settle): "parser finished on a committed document" = DOMContentLoaded.
             // The loader may still be pulling subresources; the quiet-tick hysteresis below decides.
-            bool domReady = committedLoader && committedLoader->isCommitted()
-                && frameDoc && !frameDoc->parsing();
+            //
+            // Apotheosis (2026-09-07): committedFirstRealDocumentLoad() is not decoration. Until
+            // the navigation commits, loader().documentLoader() is still the *initial empty
+            // document* that LocalFrame::init() created - committed, parsed, and holding no
+            // resources - so this expression was true on the very first tick of every load. That
+            // anchored cap-dcl at the start of the pump instead of at DOMContentLoaded (heise.de
+            // in log 20260907-100044: dcl at 2390 ms, cap-dcl at 3184 ms, i.e. 0.8 s after a
+            // "3 s" cap), and with the viewport-quiet rule of 831097a it could also let a
+            // navigation settle on the empty document's zero pending resources after 500 ms.
+            bool realDocCommitted = committedLoader && committedLoader->isCommitted()
+                && frameRef->loader().stateMachine().committedFirstRealDocumentLoad();
+            bool domReady = realDocCommitted && frameDoc && !frameDoc->parsing();
+            // Apotheosis (M4 load, PERF-OPTIONS.md C2.9): the DOM timer window opens at the
+            // commit of the real document - the parse is exactly where the ad timers hurt most -
+            // and closes when this pump returns. Navigation pumps only.
+            // The apoLoadTimerThrottleActive() term keeps a nested pump (isolatedUpdateRendering
+            // can reach one) from taking ownership of a window the outer pump opened and then
+            // closing it early - same reasoning as the g_apoPhaseEnabled save/restore above.
+            if (!timerThrottleArmed && realDocCommitted && !allowEarlyStopWithoutNav
+                && !WTF::apoLoadTimerThrottleActive()) {
+                timerThrottleArmed = true;
+                loadTimerThrottleSet(pageForRendering, true);
+            }
             bool ready = navDone || allowEarlyStopWithoutNav || domReady;
 
             // Apotheosis (M4 settle): how long the pump keeps the UI hostage after the page is
@@ -2248,11 +2440,30 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             //     3 s (not 1) because a page that is merely slow to finish should still finish
             //     inside the pump; this is meant to catch the pathological tail, and settle_why
             //     = cap-dcl in the next log says how often it does.
+            //
+            // Apotheosis (2026-09-07, second pass): and anchor them on the *events*, not on the
+            // tick that noticed them. A tick is 50 ms plus the callback plus whatever the run
+            // loop did in between, which on ntv.de averages 160 ms and exceeds a second when an
+            // ad timer chain runs, so "first tick that saw the load event" was up to a full gap
+            // late and the 1 s cap measured 2.3 s (log 20260907-100044: load 1820, cap-load
+            // 4124). perfNavLoadEvent / perfNavDocumentReady now stamp the wall clock at the
+            // event itself; the tick time stays as the fallback for a pump that has no
+            // navigation of its own (click/type). The deadline is still only *checked* on a tick,
+            // so a run loop blocked inside one long script still overshoots by that script - that
+            // is C2.1's problem, not this one's.
             const MonotonicTime nowT = MonotonicTime::now();
-            if (navDone && !navDoneAt)
-                navDoneAt = nowT;
-            if (domReady && !domReadyAt)
-                domReadyAt = nowT;
+            const double navEventSec = g_navLoadEventSec.load(std::memory_order_relaxed);
+            const double domEventSec = g_navDomReadySec.load(std::memory_order_relaxed);
+            if (navDone && !navDoneAt) {
+                navDoneAt = navEventSec ? MonotonicTime::fromRawSeconds(navEventSec) : nowT;
+                if (navDoneAt > nowT)
+                    navDoneAt = nowT;
+            }
+            if (domReady && !domReadyAt) {
+                domReadyAt = domEventSec ? MonotonicTime::fromRawSeconds(domEventSec) : nowT;
+                if (domReadyAt > nowT)
+                    domReadyAt = nowT;
+            }
             if (navDone && navDoneAt && (nowT - navDoneAt) > 1_s) {
                 stopLoop("cap-load");
                 return;
@@ -2270,9 +2481,12 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             // Apotheosis (M4 load, 2026-09-07): once the document has parsed, "quiet" means the
             // viewport is quiet - see apoHasRenderAffectingLoads() above. Before that, and for the
             // click/type pumps that have no navigation semantics, the old all-loads rule stands.
+            // Apotheosis (2026-09-07, second pass): after the load event images no longer count -
+            // everything the document declared is done by then, so what is left is lazy or
+            // script-inserted and belongs to the live tick. See apoIsRenderAffecting().
             bool loadingForQuiet = loading;
             if (loading && !allowEarlyStopWithoutNav && (navDone || domReady))
-                loadingForQuiet = apoHasRenderAffectingLoads(*frameRef);
+                loadingForQuiet = apoHasRenderAffectingLoads(*frameRef, navDone);
             if (loadingForQuiet)
                 quietTicks = 0;
             else
@@ -2296,6 +2510,10 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RunLoop::run();
     settle.stop();
     watchdog.stop();
+    // Apotheosis (M4 load C2.9): t_settle closes the DOM timer window. Unconditional, so the
+    // alignment cannot survive a pump that ended on the watchdog or on frame-gone.
+    if (timerThrottleArmed)
+        loadTimerThrottleSet(pageForRendering, false);
     WTF::g_apoPhaseEnabled = apoPhaseWasOn;   // M4 load C2.1: see the top of this function
     // Apotheosis (M4 load throttle): catch-all end of the loading window. The load event
     // normally ends it (perfNavLoadEvent); this covers the pump that stopped on the settle
