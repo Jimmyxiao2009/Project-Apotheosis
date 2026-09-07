@@ -476,9 +476,20 @@
                     <TextBlock x:Name="LockIcon" Grid.Column="0" Text="" FontFamily="Segoe MDL2 Assets"
                                FontSize="14" Foreground="{StaticResource Warm}" TextLineBounds="Tight"
                                VerticalAlignment="Center" HorizontalAlignment="Center" Margin="8,0,4,0"/>
+                    <!-- Apotheosis (0.1.9.22 feedback): text still stopped 1-2 chars short of the
+                         icon. Root cause was NOT the TextBox's built-in DeleteButton (that one is
+                         zeroed out at runtime by HideUrlBoxDeleteButton() on first focus, see
+                         MainPage.xaml.cpp) — it was the combination of UrlBox's own right Padding
+                         (4) plus the action/clear buttons centring their glyph inside a 40-wide box
+                         (~12 DIP of dead space each side of a 16px glyph). Dropped UrlBox's right
+                         Padding to 0 and re-anchored both button glyphs to the left edge of their
+                         (unchanged, still 40x36 = full touch target) button via
+                         HorizontalContentAlignment="Left" + a 4 DIP left Padding on the button
+                         itself, so the glyph sits ~4 DIP off the column boundary instead of ~12+.
+                         Button Width/Height untouched — this only moves the glyph, not the tap area. -->
                     <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
                              HorizontalAlignment="Stretch"
-                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,4,4"
+                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,0,4"
                              InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
                              KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
                              GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
@@ -488,12 +499,12 @@
                          2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
                          own ink still sits ~2px low inside it (font-specific) — nudge up. -->
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="40" Height="36" Padding="0"
-                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                            Width="40" Height="36" Padding="4,0,0,0"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Left" VerticalContentAlignment="Center"
                             Click="OnUrlAction">
                         <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
                                    Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
-                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                   HorizontalAlignment="Left" VerticalAlignment="Center"/>
                     </Button>
                     <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
                          输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
@@ -501,13 +512,13 @@
                          same technique as UrlActionGlyph above — plain Button.Content centred on the
                          ✕'s full font line box sat ~2px high. -->
                     <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="40" Height="36" Padding="0"
+                            Width="40" Height="36" Padding="4,0,0,0"
                             IsTabStop="False" Visibility="Collapsed"
-                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Left" VerticalContentAlignment="Center"
                             Click="OnUrlClear">
                         <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
                                    Foreground="{StaticResource TxtHi}"
-                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                   HorizontalAlignment="Left" VerticalAlignment="Center"/>
                     </Button>
                 </Grid>
             </Border>
