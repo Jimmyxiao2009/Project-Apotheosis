@@ -532,12 +532,31 @@
                          children so the extra 2 DIP top/bottom simply pokes past the pill's own 36 DIP
                          height, same "may extend past the visible pill" allowance already used for the
                          bar's 6 DIP keyboard-seam bleed strip above. -->
+                    <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 unfocused pill,
+                         wp_ss_20260907_0007.png, measured with a System.Drawing pixel scan): the
+                         c989fd6 column-centred glyph is NOT symmetric with LockIcon. Measured
+                         (1440x2560 device px, /3 for DIP): pill inner left edge px=191 (63.7 DIP),
+                         pill inner right edge px=1247 (415.7 DIP); LockIcon glyph bbox x=[235,276]
+                         -> centre px=255.5 (85.2 DIP) = 21.5 DIP right of the pill's left edge;
+                         UrlActionGlyph bbox x=[1144,1184] -> centre px=1164 (388.0 DIP) = 27.7 DIP
+                         left of the pill's right edge. The reload glyph sits 6.2 DIP further from
+                         its edge than the lock sits from its own — LockIcon is pinned by an
+                         explicit Margin (asymmetric 8,0,4,0, not centred in its Auto column) while
+                         UrlActionGlyph/the X glyph below were simply column-centred in the fixed
+                         40 DIP button column, which is not the same point once the lock's own
+                         glyph ink and left margin are accounted for. Shifting right by a 12 DIP
+                         left-margin bias under Center alignment moves the rendered glyph +6 DIP
+                         (bias/2, not the raw 12) without touching Button Width/Height (still
+                         40x40, tap target unchanged) — lands the reload centre at ~394 DIP,
+                         matching LockIcon's ~21.5 DIP-from-edge spacing to within a DIP. Applied
+                         to both UrlActionBtn (reload/stop) and UrlClearBtn (focused X) so both
+                         states land the glyph at the same x, per the c989fd6 requirement. -->
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
                             Width="40" Height="40" Padding="0"
                             VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlAction">
                         <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
-                                   Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
+                                   Foreground="{StaticResource Accent}" Margin="12,-2,0,0"
                                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Button>
                     <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
@@ -547,14 +566,17 @@
                          ✕'s full font line box sat ~2px high.
                          Apotheosis (2026-09-07): same re-centring as UrlActionBtn above, and for the
                          same reason — the focused state must land the X in the same spot the unfocused
-                         state now lands the reload glyph. Height 40, no left Padding. -->
+                         state now lands the reload glyph. Height 40, no left Padding.
+                         Apotheosis (2026-09-07, symmetry pass): same +12 DIP left-margin bias as
+                         UrlActionGlyph above (no vertical nudge needed for &#x2715;, unlike &#x21BB;) —
+                         keeps the X glyph at the same x as the reload glyph it replaces on focus. -->
                     <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
                             Width="40" Height="40" Padding="0"
                             IsTabStop="False" Visibility="Collapsed"
                             VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlClear">
                         <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
-                                   Foreground="{StaticResource TxtHi}"
+                                   Foreground="{StaticResource TxtHi}" Margin="12,0,0,0"
                                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Button>
                 </Grid>
