@@ -148,6 +148,7 @@ size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
 #include "PortChromeClient.h"            // WebCorePort::PortChromeClient(开合成,捕获根图层)
+#include "PortWebSocket.h"              // WebCorePort::PortSocketProvider(WebSocket,见该头文件)
 #include <WebCore/LayoutMilestone.h>     // Apotheosis (M4 load timeline): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
@@ -3203,6 +3204,15 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // cookie 持久化:DOM(document.cookie)路换成真 jar(默认是 EmptyStorageSessionProvider→nullptr→cookie 被丢)。
     // HTTP(Cookie/Set-Cookie 头)路由 LoadingFrameLoaderClient::createNetworkingContext 提供,二者共用同一 jar。
     pageConfiguration.cookieJar = WebCore::CookieJar::create(WebCorePort::makeStorageSessionProvider());
+
+    // Apotheosis (2026-09-07): WebSocket. pageConfigurationWithEmptyClients installs
+    // EmptyClients.cpp's EmptySocketProvider, whose createWebSocketChannel() returns nullptr -
+    // and WebSocket.cpp:288 answers that with RELEASE_ASSERT(m_channel) ("Every
+    // ScriptExecutionContext should have a SocketProvider"). So the first `new WebSocket(...)`
+    // on a page killed the app: mapy.com every time, and any SPA with a live connection.
+    // PortSocketProvider hands out a real channel that speaks the protocol over curl streams;
+    // see PortWebSocket.h.
+    pageConfiguration.socketProvider = WebCorePort::PortSocketProvider::create();
 
     // GPU 合成:仅当 GPU(GL 上下文 + TextureMapper)已初始化才用真 ChromeClient(PortChromeClient,
     // 它在 attachRootGraphicsLayer 捕获根 GraphicsLayer)+ 下面开合成。GPU 未起时保持
