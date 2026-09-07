@@ -2771,12 +2771,23 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     m_axisLockState = AxisLock::Deciding;
     m_axisAccumX = 0.0; m_axisAccumY = 0.0;
     // Apotheosis (touch-lag diagnostic): a new gesture starts a fresh lag window, based from
-    //   wherever the engine's last known position was (m_scrollX/Y — may be stale, but it is the
-    //   same base InstantPanApplied() will subtract from, so the delta the stats compute is
-    //   consistent even if the absolute number is a frame or two old).
+    //   wherever the engine's last known position was (m_scrollX/Y).
+    // Apotheosis (2026-09-07, device bug fix — "1781 px lag at ps=5.699"): m_scrollX/Y is engine px
+    //   (CSS px * page scale), so it is only a valid base if it was stamped at THIS gesture's page
+    //   scale (m_scrollStateScale == m_pageScale) — grabbing it unconditionally, as before, meant a
+    //   gesture that started right after a pinch commit (which leaves the m_scrollX/Y NUMBERS at
+    //   their pre-pinch scale until the first post-pinch engine round trip) measured against a base
+    //   off by roughly the pinch's own scale ratio, not a frame or two. If the cache is not at the
+    //   current scale, defer: m_scrollLagBaseValid stays false and NoteScrollLagPresented() takes the
+    //   first same-scale sample it sees as the base instead (same lazy-base idiom as
+    //   m_panBaseValid/ScrollStateUsable in InstantPanBy below) — RequestScrollState() a few lines
+    //   down guarantees one arrives shortly. m_scrollLagScale records which scale this gesture is
+    //   being measured at (fixed for the gesture's lifetime — pan and pinch cannot overlap).
     m_scrollLagActive = g_perfLogEnabled;
     if (m_scrollLagActive) {
-        m_scrollLagBaseX = m_scrollX; m_scrollLagBaseY = m_scrollY;
+        m_scrollLagScale = m_pageScale;
+        m_scrollLagBaseValid = (m_scrollStateScale == m_pageScale);
+        if (m_scrollLagBaseValid) { m_scrollLagBaseX = m_scrollX; m_scrollLagBaseY = m_scrollY; }
         m_scrollLagFingerX = 0.0; m_scrollLagFingerY = 0.0;
         m_scrollLagMoves = 0;
         m_scrollLagMax = m_scrollLagSum = m_scrollLagLast = 0.0;
@@ -3092,6 +3103,20 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
 void MainPage::NoteScrollLagPresented()
 {
     if (!m_scrollLagActive) return;
+    // Apotheosis (2026-09-07, device bug fix): m_scrollX/Y just refreshed above is only comparable
+    //   to this gesture's base (or fit to BECOME the base) if it was stamped at the gesture's own
+    //   scale — engine px is CSS px * page scale, so a sample from a different scale epoch is a
+    //   different unit, not a stale-by-a-frame number. Should not happen mid free-scroll-gesture
+    //   (pinch cannot overlap it) but costs one compare to rule out for certain.
+    if (m_scrollStateScale != m_scrollLagScale) return;
+    if (!m_scrollLagBaseValid) {
+        // First same-scale sample since gesture start — this becomes the base (0 lag on the hop
+        // that supplies it, exactly like a gesture that already had a valid cache to start from).
+        m_scrollLagBaseX = m_scrollX; m_scrollLagBaseY = m_scrollY;
+        m_scrollLagBaseValid = true;
+        m_scrollLagPendingSinceMs = 0;   // this span's "waiting for the base" is not a real gap
+        return;
+    }
     const double appliedX = (double)(m_scrollX - m_scrollLagBaseX);
     const double appliedY = (double)(m_scrollY - m_scrollLagBaseY);
     const double lagX = m_scrollLagFingerX - appliedX;
@@ -4077,9 +4102,14 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
         m_scrollLagActive = false;
         if (m_scrollLagMoves > 0) {
             const double avg = m_scrollLagSum / m_scrollLagMoves;
+            // Apotheosis (2026-09-07): ps= is the page scale this gesture was measured at (always
+            //   present, not just when zoomed — a reader should never have to assume 1:1) so a
+            //   zoomed gesture's numbers are recognisable at a glance instead of looking like a
+            //   regression against the "0-60 px at 1:1" sanity baseline.
             WriteStage(("scrolllag n=" + std::to_string(m_scrollLagMoves)
                 + " max=" + Dip(m_scrollLagMax) + " avg=" + Dip(avg) + " last=" + Dip(m_scrollLagLast)
-                + " ms_max=" + std::to_string(m_scrollLagMsMax)).c_str());
+                + " ms_max=" + std::to_string(m_scrollLagMsMax)
+                + " ps=" + Dip(m_scrollLagScale)).c_str());
         }
     }
     // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count

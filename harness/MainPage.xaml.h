@@ -554,8 +554,23 @@ namespace Harness {
         //   m_scrollLagActive: a free-scroll gesture is open and being tracked (set in
         //     OnImageManipStarted while perf logging is on, cleared in OnImageManipCompleted after
         //     the stage.txt line is written).
-        //   m_scrollLagBaseX/Y: m_scrollX/m_scrollY (engine px) at gesture start — "applied so far"
-        //     is m_scrollX/Y minus this, so it is a plain delta and needs no separate accumulator.
+        //   m_scrollLagBaseX/Y: m_scrollX/m_scrollY (engine px) at the moment the base was taken —
+        //     "applied so far" is m_scrollX/Y minus this, so it is a plain delta and needs no
+        //     separate accumulator.
+        //   m_scrollLagBaseValid/m_scrollLagScale (2026-09-07, device bug — "1781 px lag at
+        //     ps=5.699"): engine px is CSS px * page scale (GraphicsLayerTextureMapper.cpp's
+        //     WK_WINUWP page-scale transform; same convention ScrollStateUsable()/ClampPanRemainder
+        //     enforce elsewhere via m_scrollStateScale), so a base and a sample taken at DIFFERENT
+        //     page scales are not comparable — their difference is dominated by the scale jump, not
+        //     by anything the finger did. OnImageManipStarted used to grab m_scrollX/Y unconditionally
+        //     as the base; right after a pinch commit (PinchCommit invalidates m_scrollStateValid but
+        //     leaves the m_scrollX/Y NUMBERS at their pre-pinch scale until the first post-pinch
+        //     engine round trip) that base was stale by a factor of roughly the pinch's own scale
+        //     ratio — exactly the observed magnitude. m_scrollLagScale is the page scale this
+        //     gesture is being measured at (stamped once, at gesture start — pan and pinch are
+        //     mutually exclusive gestures so it cannot change mid-gesture); m_scrollLagBaseValid is
+        //     false until a sample stamped at that same scale (m_scrollStateScale) is seen, mirroring
+        //     the m_panBaseValid/ScrollStateUsable lazy-base idiom InstantPanBy already uses above.
         //   m_scrollLagFingerX/Y: cumulative engine-px finger delta (the same idx/idy
         //     OnImageManipDelta already computes for InstantPanBy/FreeScrollBy) since gesture start.
         //   m_scrollLagMoves/Max/Sum/Last: the n=/max=/avg=/last= fields of the stage.txt line, in
@@ -566,6 +581,8 @@ namespace Harness {
         //     on the first move after each present, closed (and folded into MsMax) by the next one.
         //     This is present time, not screen scan-out — see the commit message for the caveat.
         bool   m_scrollLagActive { false };
+        bool   m_scrollLagBaseValid { false };
+        float  m_scrollLagScale { 1.0f };
         int    m_scrollLagBaseX { 0 }, m_scrollLagBaseY { 0 };
         double m_scrollLagFingerX { 0.0 }, m_scrollLagFingerY { 0.0 };
         int    m_scrollLagMoves { 0 };
