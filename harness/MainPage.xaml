@@ -242,7 +242,23 @@
                                               Foreground="{StaticResource TxtLo}"
                                               Content="{TemplateBinding Header}" ContentTemplate="{TemplateBinding HeaderTemplate}"
                                               TextWrapping="{TemplateBinding TextWrapping}"/>
-                            <ScrollViewer x:Name="ContentElement" Grid.Row="1"
+                            <!-- Apotheosis (address-bar X gap, 0.1.9.22/23 feedback): this ScrollViewer
+                                 is the actual editable text area — BorderElement and
+                                 PlaceholderTextContentPresenter both already carry Grid.ColumnSpan="2"
+                                 (see below/above) but ContentElement never did, an asymmetry versus the
+                                 real SDK 15063 default template. Column 1 is Auto, sized to DeleteButton
+                                 (MinWidth 44 by default); confined to column 0 only, ContentElement's
+                                 real text/caret width silently stopped ~44 DIP short of UrlBox's own
+                                 right edge whenever the native TextBox control's built-in "ButtonVisible"
+                                 visual state fired (it does so from native code on focus+non-empty text,
+                                 independent of our HideUrlBoxDeleteButton() Width=0 override on the
+                                 Button itself, and independent of Auto-column measurement of that
+                                 Button) — exactly the ~60 DIP gap between the visible URL text and the
+                                 address pill's own X seen on device, well beyond the ~4 DIP the button
+                                 padding alone explains. ColumnSpan="2" makes the text area's width the
+                                 full Grid width regardless of how the two columns split internally,
+                                 decoupling it from the DeleteButton column's state entirely. -->
+                            <ScrollViewer x:Name="ContentElement" Grid.Row="1" Grid.ColumnSpan="2"
                                           HorizontalScrollMode="{TemplateBinding ScrollViewer.HorizontalScrollMode}"
                                           HorizontalScrollBarVisibility="{TemplateBinding ScrollViewer.HorizontalScrollBarVisibility}"
                                           VerticalScrollMode="{TemplateBinding ScrollViewer.VerticalScrollMode}"
