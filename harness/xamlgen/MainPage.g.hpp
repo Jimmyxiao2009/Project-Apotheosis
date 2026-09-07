@@ -452,7 +452,33 @@ static ::Platform::String^ __MainPageXaml() {
                          itself, so the glyph sits ~4 DIP off the c)APO",
         LR"APO(olumn boundary instead of ~12+.
                          Button Width/Height untouched — this only moves the glyph, not the tap area. -->
-                    <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent" HorizontalAlignment="Stretch" Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,0,4" InputScope="Url" Text="" PlaceholderText="搜索或输入网址" />
+                    <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 focused/select-all state,
+                         wp_ss_20260907_0008.png, measured with a System.Drawing pixel scan, 1440x2560
+                         device px, /3 for DIP): the c989fd6/15c30fc column-centring fixes put the lock
+                         and reload/X glyphs in the right place, but the text area still stops well
+                         short of them. Measured: selection highlight (= UrlBox's real content-area
+                         right edge) x=[..,1083] -> 361.0 DIP; pill inner right edge x=[1244,1247] ->
+                         ~415.2 DIP; UrlActionGlyph bbox x=[1164,1211] -> centre 395.8 DIP, LEFT edge
+                         388.0 DIP. So text stops 34 DIP short of the glyph's centre (27 DIP short of
+                         its own left edge) even though ee52b38 already spans UrlBox's internal
+                         ContentElement across DarkFieldBox's two template columns — the gap is UrlBox's
+                         OWN Grid.Column="1" cell ending at the button column's left edge (~376 DIP by
+                         the outer grid's own math), well short of the glyph itself, which is
+                         deliberately column-centred (plus the 15c30fc bias) further right still, inside
+                         the fixed 40 DIP button column. Root cause is therefore structural, not a
+                         leftover padding/template bug: no amount of internal TextBox tightening can
+                         put the text past the boundary of the single grid cell UrlBox itself occupies.
+                         Fix: give UrlBox Grid.ColumnSpan="2" so it also occupies the button's own
+                         column (Button Background is Transparent and paints after UrlBox in z-order, so
+                         a scrolled-in tail of text is simply covered by the button's own 40x40 hit area,
+                         not visible on top of it or stealing its taps), and grow its own right Padding
+                         to 27 DIP so the ContentElement boundary this buys back lands just before the
+                         glyph instead of at the pill's own outer edge: 415.2 (measured pill edge) - 27 =
+                         388.2 DIP, matching the glyph's own measured left edge (388.0 DIP) to within a
+                         DIP - "almost the width of the whole X" (its measured width is 15.7 DIP) further
+                         right than before, per the ask. Expected after this change: text/caret area ends
+                         at ~388 DIP, glyph centre unchanged at ~396 DIP (~8 DIP gap, no overlap). -->
+                    <TextBox x:Name="UrlBox" Grid.Column="1" Grid.ColumnSpan="2" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent" HorizontalAlignment="Stretch" Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,27,4" InputScope="Url" Text="" PlaceholderText="搜索或输入网址" />
                     <!-- Apotheosis: glyph in its own TextBlock (TextLineBounds="Tight", like LockIcon) —
                          plain Button.Content centred on the font's line box, not its glyph ink, which
                          sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
@@ -479,7 +505,8 @@ static ::Platform::String^ __MainPageXaml() {
                     <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 unfocused pill,
                          wp_ss_20260907_0007.png, measured with a System.Drawing pixel scan): the
                          c989fd6 column-centred glyph is NOT symmetric with LockIcon. Measured
-                         (1440x2560 device px, /3 for DIP): pill inner left edge px=191 (63.7 DIP),
+                         (1440x2560 device px, /3 for DIP): pill inner left edge px=19)APO",
+        LR"APO(1 (63.7 DIP),
                          pill inner right edge px=1247 (415.7 DIP); LockIcon glyph bbox x=[235,276]
                          -> centre px=255.5 (85.2 DIP) = 21.5 DIP right of the pill's left edge;
                          UrlActionGlyph bbox x=[1144,1184] -> centre px=1164 (388.0 DIP) = 27.7 DIP
@@ -506,8 +533,7 @@ static ::Platform::String^ __MainPageXaml() {
                          Apotheosis (2026-09-07): same re-centring as UrlActionBtn above, and for the
                          same reason — the focused state must land the X in the same spot the unfocused
                          state now lands the reload glyph. Height 40, no left Padding.
-         )APO",
-        LR"APO(                Apotheosis (2026-09-07, symmetry pass): same +12 DIP left-margin bias as
+                         Apotheosis (2026-09-07, symmetry pass): same +12 DIP left-margin bias as
                          UrlActionGlyph above (no vertical nudge needed for &#x2715;, unlike &#x21BB;) —
                          keeps the X glyph at the same x as the reload glyph it replaces on focus. -->
                     <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="40" Height="40" Padding="0" IsTabStop="False" Visibility="Collapsed" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
@@ -546,7 +572,8 @@ static ::Platform::String^ __MainPageXaml() {
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
+                  )APO",
+        LR"APO(          </Grid.ColumnDefinitions>
                             <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource QuickBtn}" IsEnabled="False">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
                                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
@@ -573,8 +600,7 @@ static ::Platform::String^ __MainPageXaml() {
                             </Button>
                         </Grid>
 
-                        <TextBlock Text="BROWSE" Foreground="{StaticResource TxtLo}" FontSize="10" Charact)APO",
-        LR"APO(erSpacing="120" Margin="18,8,18,3" />
+                        <TextBlock Text="BROWSE" Foreground="{StaticResource TxtLo}" FontSize="10" CharacterSpacing="120" Margin="18,8,18,3" />
 
                         <Button Tag="newtab" Style="{StaticResource MenuRow}" x:Name="_ev6">
                             <StackPanel Orientation="Horizontal">
@@ -614,7 +640,8 @@ static ::Platform::String^ __MainPageXaml() {
                         </Button>
                         <Button Tag="download" Style="{StaticResource MenuRow}" x:Name="_ev12">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock Text="" FontFamily="Segoe M)APO",
+        LR"APO(DL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载此页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
@@ -654,8 +681,7 @@ static ::Platform::String^ __MainPageXaml() {
         </Grid>
 
         <!-- ===== 抽屉:收藏/历史/下载 ===== -->
-        <Grid x:Name="Drawe)APO",
-        LR"APO(r" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
+        <Grid x:Name="Drawer" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
@@ -705,7 +731,8 @@ static ::Platform::String^ __MainPageXaml() {
             <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="8,8" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
+                    <ColumnDefi)APO",
+        LR"APO(nition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="" x:Name="_ev18" />
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="7,0">
@@ -739,8 +766,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <ToggleSwitch x:Name="SetUaSwitch" Header="启动请求桌面版网站" Foreground="{StaticResource TxtHi}" Margin="0,18,0,0" />
 
                     <TextBlock Text="自定义 User-Agent(留空=用上面的开关;改后刷新网页生效)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,16,0,4" />
-                    <TextBox x:Name="SetUaCustomBox" HorizontalAlignment="Stretch" TextWrapping="Wrap" AcceptsReturn="False" PlaceholderText="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/120 Safari/5)APO",
-        LR"APO(37.36 Edg/120" />
+                    <TextBox x:Name="SetUaCustomBox" HorizontalAlignment="Stretch" TextWrapping="Wrap" AcceptsReturn="False" PlaceholderText="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/120 Safari/537.36 Edg/120" />
 
                     <Grid Margin="0,16,0,0">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
@@ -773,7 +799,8 @@ static ::Platform::String^ __MainPageXaml() {
                     <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev23" />
 
                     <!-- 自动检查更新：唯一一条非用户发起的外部请求（api.github.com），默认关。 -->
-                    <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticResource TxtHi}" Margin="0,12,0,2" />
+                    <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticRe)APO",
+        LR"APO(source TxtHi}" Margin="0,12,0,2" />
                     <TextBlock Text="开启后每次启动会连接 api.github.com 一次" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,8" />
                     <Button Tag="checkupdate" Style="{StaticResource SetRow}" Content="立即检查更新" x:Name="_ev24" />
 
@@ -802,8 +829,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <ToggleSwitch x:Name="SetDragPointerSwitch" Header="拖拽作为指针事件（地图/画布）" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis: 瓦片重建/失效时先垫一块陈旧占位而不是空白，默认开；下发到引擎的
                          WebCoreSetStaleTiles(int)，启动时和这里改动时各调一次(ApplyStaleTilesSetting)。 -->
-                    <ToggleSwitch x:Name="SetStaleTilesSwitc)APO",
-        LR"APO(h" Header="陈旧瓦片占位符" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <ToggleSwitch x:Name="SetStaleTilesSwitch" Header="陈旧瓦片占位符" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <!-- Apotheosis (axis lock / rail scrolling): one-finger pan locks to the
                          dominant axis once the accumulated delta clears a small threshold, like
                          Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock). -->
@@ -841,7 +867,8 @@ static ::Platform::String^ __MainPageXaml() {
             <Button Grid.Row="2" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Background="{StaticResource AccentDim}" Foreground="{StaticResource Accent}" BorderBrush="{StaticResource Accent}" BorderThickness="0,1,0,0" Padding="0,16" x:Name="_ev27">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
-                    <TextBlock Text="新建标签页" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
+                    <TextBlock)APO",
+        LR"APO( Text="新建标签页" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
                 </StackPanel>
             </Button>
         </Grid>
@@ -950,24 +977,24 @@ void MainPage::InitializeComponent() {
     ContentArea = safe_cast<::Windows::UI::Xaml::Controls::Grid^>(__root->FindName(L"ContentArea"));
     RenderImage = safe_cast<::Windows::UI::Xaml::Controls::Image^>(__root->FindName(L"RenderImage"));
     // ---- 挂事件 ----
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev1"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollUp);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev2"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollDown);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindPrev"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindPrev);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"MenuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnMenu);

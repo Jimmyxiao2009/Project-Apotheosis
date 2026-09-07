@@ -503,9 +503,35 @@
                          HorizontalContentAlignment="Left" + a 4 DIP left Padding on the button
                          itself, so the glyph sits ~4 DIP off the column boundary instead of ~12+.
                          Button Width/Height untouched — this only moves the glyph, not the tap area. -->
-                    <TextBox x:Name="UrlBox" Grid.Column="1" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
+                    <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 focused/select-all state,
+                         wp_ss_20260907_0008.png, measured with a System.Drawing pixel scan, 1440x2560
+                         device px, /3 for DIP): the c989fd6/15c30fc column-centring fixes put the lock
+                         and reload/X glyphs in the right place, but the text area still stops well
+                         short of them. Measured: selection highlight (= UrlBox's real content-area
+                         right edge) x=[..,1083] -> 361.0 DIP; pill inner right edge x=[1244,1247] ->
+                         ~415.2 DIP; UrlActionGlyph bbox x=[1164,1211] -> centre 395.8 DIP, LEFT edge
+                         388.0 DIP. So text stops 34 DIP short of the glyph's centre (27 DIP short of
+                         its own left edge) even though ee52b38 already spans UrlBox's internal
+                         ContentElement across DarkFieldBox's two template columns — the gap is UrlBox's
+                         OWN Grid.Column="1" cell ending at the button column's left edge (~376 DIP by
+                         the outer grid's own math), well short of the glyph itself, which is
+                         deliberately column-centred (plus the 15c30fc bias) further right still, inside
+                         the fixed 40 DIP button column. Root cause is therefore structural, not a
+                         leftover padding/template bug: no amount of internal TextBox tightening can
+                         put the text past the boundary of the single grid cell UrlBox itself occupies.
+                         Fix: give UrlBox Grid.ColumnSpan="2" so it also occupies the button's own
+                         column (Button Background is Transparent and paints after UrlBox in z-order, so
+                         a scrolled-in tail of text is simply covered by the button's own 40x40 hit area,
+                         not visible on top of it or stealing its taps), and grow its own right Padding
+                         to 27 DIP so the ContentElement boundary this buys back lands just before the
+                         glyph instead of at the pill's own outer edge: 415.2 (measured pill edge) - 27 =
+                         388.2 DIP, matching the glyph's own measured left edge (388.0 DIP) to within a
+                         DIP - "almost the width of the whole X" (its measured width is 15.7 DIP) further
+                         right than before, per the ask. Expected after this change: text/caret area ends
+                         at ~388 DIP, glyph centre unchanged at ~396 DIP (~8 DIP gap, no overlap). -->
+                    <TextBox x:Name="UrlBox" Grid.Column="1" Grid.ColumnSpan="2" Style="{StaticResource DarkFieldBox}" FontSize="15" Height="32" MinHeight="0" Margin="0" BorderThickness="0" Background="Transparent"
                              HorizontalAlignment="Stretch"
-                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,0,4"
+                             Foreground="{StaticResource TxtHi}" VerticalAlignment="Center" VerticalContentAlignment="Center" Padding="4,5,27,4"
                              InputScope="Url" Text="" PlaceholderText="搜索或输入网址"
                              KeyDown="OnUrlKeyDown" TextChanged="OnUrlChanged"
                              GotFocus="OnUrlGotFocus" LostFocus="OnUrlLostFocus"/>
