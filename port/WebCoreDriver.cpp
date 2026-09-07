@@ -135,6 +135,13 @@ void wkWinUWPSetStaleTiles(bool);
 // version of the pixel probe this replaces. Declared by hand for the same reason as everything
 // above - the texmap header would drag in TextureMapperGLHeaders.h.
 unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
+// Apotheosis (2026-09-07, ghost after a pinch): the engine's zoom trace. For a few composites
+// after a contents-scale change every tiled layer store records one line - what the new tile grid
+// holds, how many placeholders of the previous scale it drew, and the device-pixel quads of one
+// placeholder and of the live tile covering the same content - and this hands over the lines that
+// have not been read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine
+// thread, allocation-free. Declared by hand for the same reason as everything above.
+size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -1693,6 +1700,27 @@ static void perfWriteStageTimeline(const PerfRow& r)
     std::fclose(fp);
 }
 
+// Apotheosis (2026-09-07, ghost after a pinch): the engine's zoom trace into stage.txt. WebCore
+// writes one "zoom ..." line per composite for the few composites that follow a contents-scale
+// change (TextureMapperTiledBackingStore::wkTraceZoomComposite) and this drains whatever is
+// pending. Called at the end of every operation, not only of a navigation: the composites the
+// trace describes happen on the ticks *after* the pinch, never on the pinch's own row. Between
+// two zooms the take returns 0 and the file is not opened at all.
+static void perfWriteStageZoomTrace()
+{
+    if (g_stagePath.empty())
+        return;
+    char buf[2048];
+    const size_t used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
+    if (!used)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fwrite(buf, 1, used, fp);
+    std::fclose(fp);
+}
+
 static void perfBegin(const char* kind, const char* url, int w, int h)
 {
     if (!g_perfOn)
@@ -1766,6 +1794,9 @@ static void perfEnd()
         perfWriteStageTimeline(g_perfCur);
         perfWriteStageWaterfall(g_perfCur);
     }
+    // Apotheosis (2026-09-07): ... and the engine's zoom trace on any operation - see
+    // perfWriteStageZoomTrace(); it is a no-op unless a pinch happened a few frames ago.
+    perfWriteStageZoomTrace();
     if (g_perfRows < kPerfRingSize)
         g_perfRing[g_perfRows++] = g_perfCur;
     // Flush on nav completion, and every 32 rows so a crash mid-session (seen
