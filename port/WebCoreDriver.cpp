@@ -202,6 +202,7 @@ unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
 #include <WebCore/ScrollView.h>              // setScrollPosition/maximumScrollPosition(LocalFrameView 基类)
 #include <WebCore/DoublePoint.h>             // PlatformMouseEvent 的坐标类型
 #include <wtf/MonotonicTime.h>               // PlatformMouseEvent 时间戳
+#include <wtf/ApoLoadPhase.h>                // Apotheosis (M4 load): engine-thread phase buckets
 #include <wtf/OptionSet.h>                   // OptionSet<PlatformEvent::Modifier>
 #include <WebCore/PlatformWheelEvent.h>      // PlatformWheelEvent(WebCoreWheelAt)
 #include <WebCore/ScrollingCoordinatorTypes.h> // WheelEventProcessingSteps(full definition; EventHandler.h only forward-declares it)
@@ -1278,7 +1279,22 @@ static const char* const kPerfHeader =
     //                cold ntv.de load, and it is invisible in every other column
     //   pump_ticks   settle callbacks (same number as `frames`, kept next to the two above so
     //                the row is readable on its own)
-    "ms_tick_cb,ms_offpump,pump_ticks\n";
+    "ms_tick_cb,ms_offpump,pump_ticks,"
+    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the split of ms_offpump, from the scoped
+    // accounting in wtf/ApoLoadPhase.h (armed by pumpLoop, only with perf logging on). Each
+    // bucket holds the *self* time of its scopes, so they never overlap and an inner scope
+    // always beats the generic run-loop one around it:
+    //   off_js       DOMTimer::fired + ScriptController::evaluateInWorld - third-party script
+    //   off_parse    HTMLDocumentParser::pumpTokenizer, including the yield timer's slices
+    //   off_style    Document::resolveStyle + LocalFrameViewLayoutContext::layout that no
+    //                script or parser scope was already paying for
+    //   off_decode   synchronous image decode on the engine thread
+    //   off_timer    a RunLoop timer none of the above named (WebCore has many small ones)
+    //   off_dispatch RunLoop::dispatch / callOnMainThread functions - the loader makes one
+    //                hop per response and per body chunk; off_disp_n is how many ran
+    //   off_other    ms_offpump minus the six, i.e. the run loop's own overhead and whatever
+    //                still has no scope. A large off_other means this list is incomplete
+    "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1341,6 +1357,11 @@ struct PerfRow {
     // Apotheosis (M4 load): engine-thread accounting of the pump; see kPerfHeader.
     double msTickCb = -1, msOffPump = -1;
     int pumpTicks = -1;
+    // Apotheosis (M4 load, 2026-09-07): the ms_offpump split; see kPerfHeader and
+    // wtf/ApoLoadPhase.h. -1 = not a nav row.
+    double offJs = -1, offParse = -1, offStyle = -1, offDecode = -1, offTimer = -1,
+           offDispatch = -1, offOther = -1;
+    int offDispatchN = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1490,8 +1511,17 @@ static void perfFlushLocked()
         perfFmtD(tcb, sizeof tcb, r.msTickCb);
         perfFmtD(offp, sizeof offp, r.msOffPump);
         perfFmtI(pt, sizeof pt, r.pumpTicks);
+        // M4 load C2.1: the ms_offpump split (empty cells on non-nav rows).
+        const double offVals[7] = { r.offJs, r.offParse, r.offStyle, r.offDecode, r.offTimer,
+                                    r.offDispatch, r.offOther };
+        char of[7][16];
+        for (int k = 0; k < 7; ++k)
+            perfFmtD(of[k], sizeof of[k], offVals[k]);
+        char ofn[12];
+        perfFmtI(ofn, sizeof ofn, r.offDispatchN);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                         "%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
@@ -1499,7 +1529,8 @@ static void perfFlushLocked()
             rs[0], rs[1], rs[2], rs[3], rs[4], wk,
             tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf,
             sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
-            tcb, offp, pt);
+            tcb, offp, pt,
+            of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6]);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1650,6 +1681,15 @@ static void perfWriteStageTimeline(const PerfRow& r)
         r.settleWhy[0] ? r.settleWhy : "-",
         r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts,
         r.pumpTicks, r.msTickCb < 0 ? 0.0 : r.msTickCb, r.msOffPump < 0 ? 0.0 : r.msOffPump);
+    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the same split as the off_* columns, on a line
+    // of its own so the timeline line above keeps the shape the existing notes quote.
+    std::fprintf(fp, "offpump url=%s total=%.0f js=%.0f parse=%.0f style=%.0f decode=%.0f"
+                     " timers=%.0f dispatch=%.0f/%d other=%.0f\n",
+        r.url, r.msOffPump < 0 ? 0.0 : r.msOffPump,
+        r.offJs < 0 ? 0.0 : r.offJs, r.offParse < 0 ? 0.0 : r.offParse,
+        r.offStyle < 0 ? 0.0 : r.offStyle, r.offDecode < 0 ? 0.0 : r.offDecode,
+        r.offTimer < 0 ? 0.0 : r.offTimer, r.offDispatch < 0 ? 0.0 : r.offDispatch,
+        r.offDispatchN < 0 ? 0 : r.offDispatchN, r.offOther < 0 ? 0.0 : r.offOther);
     std::fclose(fp);
 }
 
@@ -1666,6 +1706,7 @@ static void perfBegin(const char* kind, const char* url, int w, int h)
     g_perfPumpTicks = 0;
     g_perfNavT0Set = false;
     netSubReset();          // M4 load waterfall: the slow-transfer table is per navigation
+    WTF::apoPhaseReset();   // M4 load C2.1: the ms_offpump split is per operation too
     g_settleWhy[0] = '\0';
     g_perfInOp = true;
     g_perfOpStart = MonotonicTime::now();
@@ -1698,6 +1739,21 @@ static void perfEnd()
         std::snprintf(g_perfCur.settleWhy, sizeof g_perfCur.settleWhy, "%s",
                       g_settleWhy[0] ? g_settleWhy : "-");
         g_perfCur.pumpTicks = g_perfPumpTicks;
+        // M4 load C2.1: the ms_offpump split. The buckets are self times and therefore disjoint;
+        // off_other is what ms_offpump has left over - run-loop overhead plus anything that still
+        // has no scope. It is the number that says whether the attribution can be trusted: a load
+        // whose off_other dominates has not been explained.
+        g_perfCur.offJs = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Js);
+        g_perfCur.offParse = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Parse);
+        g_perfCur.offStyle = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Style);
+        g_perfCur.offDecode = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Decode);
+        g_perfCur.offTimer = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Timer);
+        g_perfCur.offDispatch = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Dispatch);
+        g_perfCur.offDispatchN = static_cast<int>(WTF::apoPhaseEntries(WTF::ApoPhaseBucket::Dispatch));
+        const double offSum = g_perfCur.offJs + g_perfCur.offParse + g_perfCur.offStyle
+            + g_perfCur.offDecode + g_perfCur.offTimer + g_perfCur.offDispatch;
+        const double offTotal = g_perfCur.msOffPump < 0 ? 0.0 : g_perfCur.msOffPump;
+        g_perfCur.offOther = offTotal > offSum ? offTotal - offSum : 0.0;
     } else
         g_perfCur.frames = 1;
     g_perfCur.gpu = g_gpuActive ? 1 : 0;
@@ -1951,6 +2007,70 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 
 } // namespace WebCorePort
 
+// ---- Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2 settle) ------------------------
+// Can a pending load still change what the user is looking at?
+//
+// pumpLoop's "quiet" rule used to be DocumentLoader::isLoadingInAPISense(), i.e. "the frame tree
+// has any load in flight at all". On a news site that is never satisfied: the consent and
+// analytics stack keeps firing beacons and XHRs for as long as the page is open, so every
+// navigation ran to a cap instead. Measured on build-driver\logs\20260907-084407, ntv.de warm:
+// the load event fired at 1645 ms, the pump held the engine thread until 3501 ms, and the six
+// transfers still open at that moment were draws / count / raw / get_site_data - trackers, none
+// of which paints a pixel.
+//
+// So judge the loads by type instead. Render-affecting = the main resource, stylesheets, scripts,
+// fonts, SVG documents and images; ignored = RawResource (XHR/fetch), Beacon, Ping, LinkPrefetch,
+// Icon, media and the rest. Nothing is cancelled either way - what is still running keeps
+// streaming into the live tick and repaints there, exactly as after the post-load cap.
+//
+// Two deliberate simplifications. (1) Only the main frame is inspected: a subframe that is still
+// loading is an ad or a social embed far more often than it is the article, and letting one hold
+// the pump is the behaviour being removed. (2) "images intersecting the viewport" is approximated
+// by "images", because a pending CachedResource cannot be walked back to a renderer cheaply -
+// CachedResourceClient carries no geometry. Lazy image loading (C1.1) is what keeps that honest:
+// on a page that marks its images the off-screen ones are never requested in the first place, and
+// ntv.de went from 261 subresources to 88 because of it.
+static bool apoIsRenderAffecting(WebCore::CachedResource::Type type)
+{
+    switch (type) {
+    case WebCore::CachedResource::Type::MainResource:
+    case WebCore::CachedResource::Type::ImageResource:
+    case WebCore::CachedResource::Type::CSSStyleSheet:
+    case WebCore::CachedResource::Type::Script:
+    case WebCore::CachedResource::Type::FontResource:
+    case WebCore::CachedResource::Type::SVGFontResource:
+    case WebCore::CachedResource::Type::SVGDocumentResource:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame)
+{
+    RefPtr<WebCore::Document> doc = frame.document();
+    if (!doc)
+        return false;
+    if (doc->parsing())
+        return true;
+    RefPtr<WebCore::DocumentLoader> dl = frame.loader().documentLoader();
+    if (dl && dl->isLoadingMainResource())
+        return true;
+    // Same walk as countPendingResources() above: Unknown = not started, Pending = in flight.
+    // A few hundred entries once per 50 ms tick, no allocation.
+    for (auto& kv : doc->cachedResourceLoader().allCachedResources()) {
+        WebCore::CachedResource* res = kv.value.get();
+        if (!res)
+            continue;
+        auto status = res->status();
+        if (status != WebCore::CachedResource::Unknown && status != WebCore::CachedResource::Pending)
+            continue;
+        if (apoIsRenderAffecting(res->type()))
+            return true;
+    }
+    return false;
+}
+
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
 //  allowEarlyStopWithoutNav: 若未发生导航完成,连续 ~0.5s 无加载活动即停(点击/滚动用)。
@@ -1961,6 +2081,12 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
                      int settleCapTicks, double watchdogSeconds, WebCore::Page* pageForRendering)
 {
     using namespace WebCore;
+    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the ms_offpump split is accounted only while a
+    // pump is running - that is exactly the window ms_offpump measures. Saved and restored rather
+    // than cleared, because isolatedUpdateRendering() can reach a nested pump. See
+    // wtf/ApoLoadPhase.h; with perf logging off this stays false and every scope is a branch.
+    const bool apoPhaseWasOn = WTF::g_apoPhaseEnabled;
+    WTF::g_apoPhaseEnabled = g_perfOn;
     bool stopped = false;
     // Apotheosis (M4 load, 2026-09-07): every stop takes a reason, recorded in g_settleWhy and
     // printed as why= in the stage.txt timeline / settle_why in perf.csv.
@@ -1987,6 +2113,10 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RefPtr<LocalFrame> frameRef = &frame;
     RunLoop::Timer settle(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.settle"_s,
         WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, &navDoneAt, &domReadyAt, &lastTickStart, &cbTotalAtLastTick, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+            // Apotheosis (M4 load C2.1): this callback is already measured as ms_tick_cb.
+            // Opening the Pump scope keeps the RunLoop Timer scope that contains it from
+            // charging itself our work, so the buckets describe the *other* run-loop work only.
+            WTF::ApoPhase apoPumpPhase(WTF::ApoPhaseBucket::Pump);
             // Apotheosis (M4 load): PerfPhase accumulates this callback's own duration into
             // ms_tick_cb on every exit path; the block below turns the spacing between two
             // callbacks into ms_offpump = run-loop work that was not ours.
@@ -2106,14 +2236,23 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             //   重定向后最终文档的样式表应用都发生在"加载器空闲之后",经 ScriptRunner/WindowEventLoop 的
             //   0_s 定时器 + 微任务级联触发——这要求 RunLoop 继续转若干 tick。改为"加载器持续静默 ~0.8s
             //   才停":期间求值/挂载会引发新活动(渲染/拉字体),重置静默计数,自然等到真稳定。
-            if (loading)
+            // Apotheosis (M4 load, 2026-09-07): once the document has parsed, "quiet" means the
+            // viewport is quiet - see apoHasRenderAffectingLoads() above. Before that, and for the
+            // click/type pumps that have no navigation semantics, the old all-loads rule stands.
+            bool loadingForQuiet = loading;
+            if (loading && !allowEarlyStopWithoutNav && (navDone || domReady))
+                loadingForQuiet = apoHasRenderAffectingLoads(*frameRef);
+            if (loadingForQuiet)
                 quietTicks = 0;
             else
                 ++quietTicks;
             if (navDone)
                 ++settleTicks;
             if (ready && quietTicks >= quietNeeded) {    // 加载器静默 → 异步级联已跑完,停
-                stopLoop("quiet");
+                // "quiet-vp": the loader is still busy, but only with things that cannot change
+                // the viewport. Distinguished from "quiet" so the device log says how often the
+                // new rule is what ended the navigation.
+                stopLoop(loading ? "quiet-vp" : "quiet");
                 return;
             }
             if (navDone && settleTicks > capTicks)        // 硬封顶,防长连接/永久活动拖到看门狗
@@ -2126,6 +2265,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     RunLoop::run();
     settle.stop();
     watchdog.stop();
+    WTF::g_apoPhaseEnabled = apoPhaseWasOn;   // M4 load C2.1: see the top of this function
     // Apotheosis (M4 load throttle): catch-all end of the loading window. The load event
     // normally ends it (perfNavLoadEvent); this covers the pump that stopped on the settle
     // cap, the watchdog or "committed but no load event", so a page can never leave the
