@@ -3030,6 +3030,23 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setLoadsImagesAutomatically(true);
     page->settings().setAcceleratedCompositingEnabled(g_gpuActive);   // 仅 GPU 就绪才开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层),经 TextureMapper GPU 呈现
     page->settings().setForceCompositingMode(g_gpuActive);            // 同上;GPU 未起时关闭 → 纯软件 cairo,零回归
+    // Apotheosis (fixed/sticky at scroll, 2026-09-07): WebCore's own default for this preference is
+    // false off iOS, and we build the Page directly - so position:fixed and position:sticky elements
+    // never got a composited layer of their own. They are painted into the scrolled-contents tile
+    // grid instead, and because the grid is translated by -scrollPosition on every scroll frame,
+    // WebCore has to REPAINT them into it at their new place every single frame
+    // (LocalFrameView::scrollContentsFastPath -> setBackingNeedsRepaintInRect of the old-plus-new
+    // band). With off-thread raster and the per-composite tile-upload budget that repaint lands one
+    // or more composites late, so a fixed/sticky header is drawn where it was, rides the page down
+    // (or up) and snaps back when the replay arrives - the "header comes down piecewise and jumps
+    // back" of 0.1.9.21/22, worst exactly where the raster workers are busy with something else
+    // (n-tv's lazy images in the lower page, claude.ai's polling bot check, Maps' tiles).
+    // With the preference on, RenderLayerCompositor::updateCompositingLayers(OnScroll) - which
+    // WebCore runs for us because there is no ScrollingCoordinator - re-positions those layers
+    // instead: a layer move per scroll frame, no raster and no upload. Sticky needs the WK_WINUWP
+    // branch in RenderLayerCompositor::isAsyncScrollableStickyLayer() as well. Gated on g_gpuActive
+    // like the two above: without compositing there is nothing to promote.
+    page->settings().setAcceleratedCompositingForFixedPositionEnabled(g_gpuActive);
     page->settings().setShouldAllowUserInstalledFonts(false);
     // Apotheosis (M4): never let a web font hold text back. CSSFontFace::fontLoadTiming() maps the
     // default (FontLoadTimingOverride::None with font-display:auto/block, which is what most sites
