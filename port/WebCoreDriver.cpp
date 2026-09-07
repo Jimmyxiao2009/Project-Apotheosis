@@ -446,6 +446,11 @@ static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判
 static int g_lastPendingResources = 0; // 最近文档仍在加载/未知状态的缓存资源数(防实时循环过早停)
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobile/desktop。WebCoreSetUserAgentString 设。
+// Apotheosis (M4 load waterfall, 2026-09-07): "perf logging is armed", read by WebKit's
+// CurlRequest::didReceiveHeader (WK_WINUWP) on the curl worker thread. Set together with
+// g_perfOn in WebCoreSetPerfLogPath; off in the shipping default, so the per-response URL copy
+// and main-thread hop that feed the waterfall cost nothing on a normal run.
+extern "C" bool g_apoNetTimingOn = false;
 // Apotheosis (PRIVACY-AUDIT.md recommended action 4): speculation-rules prefetch.
 //   WebCore defaults speculationRulesPrefetchEnabled to true, so a page's
 //   <script type="speculationrules"> may issue full requests for URLs the user never clicked.
@@ -1243,7 +1248,37 @@ static const char* const kPerfHeader =
     // analysis notes and scripts address the existing columns by index (the raster_ block starts at
     // column 31 counting from one), and shifting eight of them to group one new one with them would
     // break every one of those.
-    "raster_deferred\n";
+    "raster_deferred,"
+    // Apotheosis (M4 load waterfall, 2026-09-07): the subresource side of the network, which
+    // the four net_* columns above never covered (they are the main document only). Filled on
+    // "nav" rows from WebCorePortNetTiming, empty everywhere else.
+    //   net_sub_n        subresource responses whose headers arrived during this navigation
+    //   net_sub_conn     of those, how many had to open a TCP connection. With HTTP/2 and a
+    //                    working connection cache this is ~ the number of distinct hosts; if
+    //                    it tracks net_sub_n instead, connection reuse/multiplexing is broken
+    //   net_sub_h1       how many came back over HTTP/1.x (h2 negotiation failed for that host)
+    //   net_sub_ttfb     sum of the per-transfer waits. Divided by the wall time between commit
+    //                    and load it gives the effective parallelism: ~1 means the loader is
+    //                    serialised, ~6-8 means the connection limits are actually being used
+    //   net_sub_last     ms since nav start of the LAST subresource header. Close to t_load =
+    //                    the load event waited for the network; far below it = it waited for us
+    //   settle_why       which pumpLoop rule ended the navigation (quiet / cap-load / cap-dcl /
+    //                    watchdog / frame-gone) - the difference between "the page was done" and
+    //                    "we gave up on it"
+    "net_sub_n,net_sub_conn,net_sub_h1,net_sub_ttfb,net_sub_last,settle_why,"
+    // Apotheosis (M4 load, 2026-09-07): where the *engine thread* was during a navigation. The
+    // pump's settle timer repeats every 50 ms, and RunLoopGeneric schedules the next fire from
+    // the moment the callback starts - so the spacing between two callbacks is 50 ms plus
+    // whatever else ran on the run loop in between (WebCore's own timers: the HTML parser's
+    // yield timer, DOM timers, ScriptRunner, plus every callOnMainThread hop the loader makes
+    // per response). That is the one large bucket nothing measured:
+    //   ms_tick_cb   sum of the settle callbacks themselves (ms_render_update is inside this)
+    //   ms_offpump   sum of max(0, period - max(50 ms, callback)) = main-thread work that was
+    //                NOT ours. On the 2026-09-07 log this is the biggest single bucket of a
+    //                cold ntv.de load, and it is invisible in every other column
+    //   pump_ticks   settle callbacks (same number as `frames`, kept next to the two above so
+    //                the row is readable on its own)
+    "ms_tick_cb,ms_offpump,pump_ticks\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1298,6 +1333,14 @@ struct PerfRow {
     double tFirstByte = -1, tFirstPaint = -1, tLoad = -1, tSettle = -1;
     // Cumulative at t_load: <script> elements in the document, subresources completed.
     int nScripts = -1, nSubres = -1;
+    // Apotheosis (M4 load waterfall): subresource network aggregate of this navigation; see the
+    // net_sub_* block in kPerfHeader. -1 = not a nav row / nothing reported.
+    int netSubN = -1, netSubConn = -1, netSubH1 = -1;
+    double netSubTtfb = -1, netSubLast = -1;
+    char settleWhy[16] = { 0 };   // pumpLoop's stop reason, "" on non-nav rows
+    // Apotheosis (M4 load): engine-thread accounting of the pump; see kPerfHeader.
+    double msTickCb = -1, msOffPump = -1;
+    int pumpTicks = -1;
 };
 
 static constexpr int kPerfRingSize = 256;
@@ -1312,6 +1355,14 @@ static MonotonicTime g_perfOpStart;       // C ABI entry of the current operatio
 static MonotonicTime g_perfNavT0;         // first provisional load start of the operation
 static bool g_perfNavT0Set = false;
 static int g_perfPumpTicks = 0;           // pumpLoop settle ticks of the current operation
+// Apotheosis (M4 load, 2026-09-07): which pumpLoop rule ended the navigation - see the
+// settle_why column in kPerfHeader. Written by pumpLoop (perf-independent, it is also the
+// cheapest breadcrumb when a load feels stuck), read by perfEnd.
+static char g_settleWhy[16] = { 0 };
+// Perf-independent "this navigation has painted something readable" flag, set from
+// perfNavVisuallyNonEmpty and cleared at navLoadBegin. pumpLoop's wall-clock cap on the
+// pre-load phase only fires once the user actually has a page to look at.
+static std::atomic<int> g_navSawFirstPaint { 0 };
 
 // Scoped phase timer: adds its own lifetime to one PerfRow field (accumulating,
 // so repeated phases inside one operation sum up). Reads no clock at all when
@@ -1426,14 +1477,29 @@ static void perfFlushLocked()
         perfFmtI(nsr, sizeof nsr, r.nSubres);
         char rdf[12];
         perfFmtI(rdf, sizeof rdf, r.rasterDeferred);
+        // M4 load waterfall: subresource network aggregate (nav rows only).
+        const int subInts[3] = { r.netSubN, r.netSubConn, r.netSubH1 };
+        char sb[3][12];
+        for (int k = 0; k < 3; ++k)
+            perfFmtI(sb[k], sizeof sb[k], subInts[k]);
+        char sbt[16], sbl[16];
+        perfFmtD(sbt, sizeof sbt, r.netSubTtfb);
+        perfFmtD(sbl, sizeof sbl, r.netSubLast);
+        // M4 load: engine-thread accounting of the pump.
+        char tcb[16], offp[16], pt[12];
+        perfFmtD(tcb, sizeof tcb, r.msTickCb);
+        perfFmtD(offp, sizeof offp, r.msOffPump);
+        perfFmtI(pt, sizeof pt, r.pumpTicks);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
             nt[0], nt[1], nt[2], nt[3], hv,
             rs[0], rs[1], rs[2], rs[3], rs[4], wk,
-            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf);
+            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf,
+            sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
+            tcb, offp, pt);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1446,6 +1512,113 @@ static void perfFlush()
         return;
     perfFlushLocked();
     g_perfFlushBusy.store(0);
+}
+
+// ---- Apotheosis (M4 load waterfall, 2026-09-07) ------------------------------------------
+// The slowest subresource transfers of the current navigation, kept as a tiny insertion-sorted
+// table (no allocation, no lock - every entry arrives on the engine thread from
+// WebCorePortNetTiming). Sorted by TTFB, which on this port is the interesting number: a
+// resource whose own transfer was fast but whose headers arrived late was queued, and the pair
+// (t, b) below shows exactly that. Printed once per navigation as a "loadwaterfall" line.
+struct NetSubEntry {
+    char name[40];    // last path segment, truncated - enough to recognise the resource
+    double tHeader;   // ms since nav start when the response headers landed
+    double dns, connect, tls, ttfb;
+    int ver;
+};
+static constexpr int kNetTopN = 8;
+static NetSubEntry g_netTop[kNetTopN];
+static int g_netTopUsed = 0;
+static double perfSinceNavStart();   // defined below, next to the navigation phase marks
+
+static void netSubReset()
+{
+    g_netTopUsed = 0;
+}
+
+// Copy the last path segment of a URL (query stripped) into a fixed buffer.
+static void netSubShortName(char* out, size_t cap, const char* url)
+{
+    out[0] = '\0';
+    if (!url || !*url)
+        return;
+    const char* end = std::strpbrk(url, "?#");
+    const char* stop = end ? end : url + std::strlen(url);
+    const char* begin = stop;
+    while (begin > url && begin[-1] != '/')
+        --begin;
+    size_t n = static_cast<size_t>(stop - begin);
+    if (!n) {                       // directory URL ("https://host/") - fall back to the host
+        begin = url;
+        n = static_cast<size_t>(stop - url);
+    }
+    if (n > cap - 1)
+        n = cap - 1;
+    std::memcpy(out, begin, n);
+    out[n] = '\0';
+}
+
+static void netSubAdd(double dnsMs, double connectMs, double tlsMs, double ttfbMs,
+                      int httpVersion, const char* url)
+{
+    const double now = perfSinceNavStart();
+    // Aggregate first - it counts every response, not just the slow ones.
+    if (g_perfCur.netSubN < 0) {
+        g_perfCur.netSubN = 0;
+        g_perfCur.netSubConn = 0;
+        g_perfCur.netSubH1 = 0;
+        g_perfCur.netSubTtfb = 0;
+    }
+    ++g_perfCur.netSubN;
+    if (connectMs > 0 || tlsMs > 0)          // a new TCP/TLS connection had to be opened
+        ++g_perfCur.netSubConn;
+    if (httpVersion && httpVersion < 20)     // 0 = curl could not tell; do not blame it on h1
+        ++g_perfCur.netSubH1;
+    g_perfCur.netSubTtfb += ttfbMs;
+    if (now > g_perfCur.netSubLast)
+        g_perfCur.netSubLast = now;
+
+    // Then the top-N by TTFB.
+    if (g_netTopUsed == kNetTopN && ttfbMs <= g_netTop[kNetTopN - 1].ttfb)
+        return;
+    int at = g_netTopUsed < kNetTopN ? g_netTopUsed : kNetTopN - 1;
+    while (at > 0 && g_netTop[at - 1].ttfb < ttfbMs) {
+        g_netTop[at] = g_netTop[at - 1];
+        --at;
+    }
+    NetSubEntry& e = g_netTop[at];
+    netSubShortName(e.name, sizeof e.name, url);
+    e.tHeader = now;
+    e.dns = dnsMs;
+    e.connect = connectMs;
+    e.tls = tlsMs;
+    e.ttfb = ttfbMs;
+    e.ver = httpVersion;
+    if (g_netTopUsed < kNetTopN)
+        ++g_netTopUsed;
+}
+
+// One "loadwaterfall" line per navigation, next to the "timeline" line. Read it as: n/conn/h1
+// say whether the connection cache and HTTP/2 are doing their job, ttfbsum/(load-commit) is the
+// effective parallelism, last is when the network actually went quiet, and the entries are the
+// eight transfers that waited longest - "name t=<header arrived> b=<ttfb> d/c/s=<dns/tcp/tls> v=<http>".
+static void perfWriteStageWaterfall(const PerfRow& r)
+{
+    if (g_stagePath.empty() || r.netSubN < 0)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "loadwaterfall url=%s n=%d conn=%d h1=%d ttfbsum=%.0f last=%.0f slowest=[",
+        r.url, r.netSubN, r.netSubConn, r.netSubH1,
+        r.netSubTtfb < 0 ? 0.0 : r.netSubTtfb, r.netSubLast < 0 ? 0.0 : r.netSubLast);
+    for (int i = 0; i < g_netTopUsed; ++i) {
+        const NetSubEntry& e = g_netTop[i];
+        std::fprintf(fp, "%s%s t=%.0f b=%.0f d=%.0f c=%.0f s=%.0f v=%d",
+            i ? " | " : "", e.name, e.tHeader, e.ttfb, e.dns, e.connect, e.tls, e.ver);
+    }
+    std::fputs("]\n", fp);
+    std::fclose(fp);
 }
 
 // Apotheosis (M4 load timeline): the same navigation timeline as one readable line in
@@ -1468,10 +1641,15 @@ static void perfWriteStageTimeline(const PerfRow& r)
     FILE* fp = nullptr;
     if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
         return;
+    // Apotheosis (M4 load, 2026-09-07): why= is pumpLoop's stop reason. Without it a long
+    // settle and a settle that hit a cap look identical in this line, and they call for
+    // opposite fixes (wait longer vs. stop waiting).
     std::fprintf(fp, "timeline url=%s firstbyte=%s commit=%s dcl=%s fp=%s load=%s settle=%s"
-                     " total=%.0f subres=%d/%d scripts=%d\n",
+                     " why=%s total=%.0f subres=%d/%d scripts=%d ticks=%d cb=%.0f offpump=%.0f\n",
         r.url, t[0], t[1], t[2], t[3], t[4], t[5],
-        r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts);
+        r.settleWhy[0] ? r.settleWhy : "-",
+        r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts,
+        r.pumpTicks, r.msTickCb < 0 ? 0.0 : r.msTickCb, r.msOffPump < 0 ? 0.0 : r.msOffPump);
     std::fclose(fp);
 }
 
@@ -1487,6 +1665,8 @@ static void perfBegin(const char* kind, const char* url, int w, int h)
     g_perfOpIsNav = kind && !std::strcmp(kind, "nav");
     g_perfPumpTicks = 0;
     g_perfNavT0Set = false;
+    netSubReset();          // M4 load waterfall: the slow-transfer table is per navigation
+    g_settleWhy[0] = '\0';
     g_perfInOp = true;
     g_perfOpStart = MonotonicTime::now();
 }
@@ -1515,6 +1695,9 @@ static void perfEnd()
         if (g_perfCur.nSubres < 0)
             g_perfCur.nSubres = g_loadComplete;
         g_perfCur.nScripts = g_lastScriptCount;
+        std::snprintf(g_perfCur.settleWhy, sizeof g_perfCur.settleWhy, "%s",
+                      g_settleWhy[0] ? g_settleWhy : "-");
+        g_perfCur.pumpTicks = g_perfPumpTicks;
     } else
         g_perfCur.frames = 1;
     g_perfCur.gpu = g_gpuActive ? 1 : 0;
@@ -1523,8 +1706,10 @@ static void perfEnd()
         g_perfCur.w = g_session->w;
         g_perfCur.h = g_session->h;
     }
-    if (g_perfOpIsNav)
+    if (g_perfOpIsNav) {
         perfWriteStageTimeline(g_perfCur);
+        perfWriteStageWaterfall(g_perfCur);
+    }
     if (g_perfRows < kPerfRingSize)
         g_perfRing[g_perfRows++] = g_perfCur;
     // Flush on nav completion, and every 32 rows so a crash mid-session (seen
@@ -1567,6 +1752,7 @@ void perfNavStart()
     // Apotheosis (M4 load throttle): runs with perf logging off too — this is the
     // "main document is loading" edge the present throttle above is keyed on.
     navLoadBegin();
+    g_navSawFirstPaint.store(0, std::memory_order_release);   // M4 load: per navigation
     if (!g_perfOn || !g_perfInOp || g_perfNavT0Set)
         return;
     g_perfNavT0 = MonotonicTime::now();
@@ -1616,6 +1802,8 @@ void perfNavVisuallyNonEmpty()
         g_navFirstPaintPending.store(1, std::memory_order_release);
         presentRequested();
     }
+    // Apotheosis (M4 load): perf-independent, pumpLoop's pre-load cap is keyed on it.
+    g_navSawFirstPaint.store(1, std::memory_order_release);
     if (!g_perfOn || !g_perfInOp || g_perfCur.tFirstPaint >= 0)
         return;
     g_perfCur.tFirstPaint = perfSinceNavStart();
@@ -1630,11 +1818,22 @@ void perfNavVisuallyNonEmpty()
 // too, so the FIRST report inside a nav operation wins (that is the main resource:
 // nothing else can have finished its headers before it). Only recorded for "nav"
 // rows; scroll/tick/click operations have no main resource of their own.
+//
+// Apotheosis (M4 load waterfall, 2026-09-07): every other response lands here too and feeds
+// two things - the net_sub_* aggregate of the perf row, and a small "slowest transfers" table
+// that perfWriteStageWaterfall() prints into stage.txt. Both exist to answer the one question
+// the old main-resource-only columns could not: on a page like ntv.de, whose load event is 6.6 s
+// after DOMContentLoaded and whose engine-thread work in that window is ~1.1 s, are the 261
+// subresources waiting on the network or on us?
 extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double connectMs,
-    double tlsMs, double ttfbMs, int httpVersion)
+    double tlsMs, double ttfbMs, int httpVersion, const char* url)
 {
-    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav || !isMainResource)
+    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav)
         return;
+    if (!isMainResource) {
+        netSubAdd(dnsMs, connectMs, tlsMs, ttfbMs, httpVersion, url);
+        return;
+    }
     if (g_perfCur.netTtfb >= 0)   // first main-resource report of this navigation wins
         return;
     // M4 load timeline: t_firstbyte. The response headers of the main resource are in hand
@@ -1763,19 +1962,54 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
 {
     using namespace WebCore;
     bool stopped = false;
-    auto stopLoop = [&stopped] {
+    // Apotheosis (M4 load, 2026-09-07): every stop takes a reason, recorded in g_settleWhy and
+    // printed as why= in the stage.txt timeline / settle_why in perf.csv.
+    auto stopLoop = [&stopped](const char* why) {
         if (stopped)
             return;
         stopped = true;
+        std::snprintf(g_settleWhy, sizeof g_settleWhy, "%s", why);
         RunLoop::currentSingleton().stop();
     };
     int settleTicks = 0;
     int quietTicks = 0;
+    // Apotheosis (M4 load, 2026-09-07): the tick counters below were written as time budgets
+    // ("20 ticks = 1 s") but a tick is 50 ms *plus* whatever isolatedUpdateRendering costs, and
+    // on a heavy page that is 100-200 ms. Measured on the Lumia (logs 20260907-023940): ntv.de
+    // warm fired its load event at 1716 ms and the pump did not return until 4849 ms - 3.1 s of
+    // "1 s hard cap"; google.de/maps 2034 -> 3427 ms. Deadlines are therefore wall clock now,
+    // and the tick counts stay only as the secondary guard they always were.
+    MonotonicTime navDoneAt;      // first tick that saw the load event
+    MonotonicTime domReadyAt;     // first tick that saw DOMContentLoaded
+    // Apotheosis (M4 load, 2026-09-07): ms_tick_cb / ms_offpump accounting - see kPerfHeader.
+    MonotonicTime lastTickStart;
+    double cbTotalAtLastTick = 0;
     RefPtr<LocalFrame> frameRef = &frame;
     RunLoop::Timer settle(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.settle"_s,
-        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
-            if (g_perfOn)
+        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, &navDoneAt, &domReadyAt, &lastTickStart, &cbTotalAtLastTick, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+            // Apotheosis (M4 load): PerfPhase accumulates this callback's own duration into
+            // ms_tick_cb on every exit path; the block below turns the spacing between two
+            // callbacks into ms_offpump = run-loop work that was not ours.
+            PerfPhase perfTickCb(&g_perfCur.msTickCb);
+            if (g_perfOn) {
+                const MonotonicTime tickStart = MonotonicTime::now();
+                const double cbTotal = g_perfCur.msTickCb < 0 ? 0.0 : g_perfCur.msTickCb;
+                if (lastTickStart) {
+                    const double period = (tickStart - lastTickStart).milliseconds();
+                    const double prevCb = cbTotal - cbTotalAtLastTick;
+                    // The timer re-arms from the START of the previous callback (RunLoopGeneric
+                    // ScheduledTask::fired -> updateReadyTime), so an idle loop gives a period of
+                    // max(50 ms, previous callback). Anything beyond that ran on the run loop
+                    // between the two ticks: WebCore timers, the parser, loader dispatches.
+                    const double expected = prevCb > 50.0 ? prevCb : 50.0;
+                    const double off = period - expected;
+                    if (off > 0)
+                        g_perfCur.msOffPump = (g_perfCur.msOffPump < 0 ? off : g_perfCur.msOffPump + off);
+                }
+                lastTickStart = tickStart;
+                cbTotalAtLastTick = cbTotal;
                 ++g_perfPumpTicks;   // Apotheosis: settle ticks of the current operation (M4)
+            }
             // EmptyChromeClient 下自动 RenderingUpdateScheduler 是 no-op;不显式调它则 rAF /
             // IntersectionObserver / 懒加载图片永不触发(滚动加载与 SPA 渲染必需)。
             if (pageForRendering) {
@@ -1787,7 +2021,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
                 // 避免在同一 tick 里对脱离的 frameRef->loader() 解引用半毁状态。
                 RefPtr<LocalFrame> mf = pageForRendering->localMainFrame();
                 if (mf.get() != frameRef.get()) {
-                    stopLoop();
+                    stopLoop("frame-gone");
                     return;
                 }
             }
@@ -1834,6 +2068,40 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             } else if (domReady)
                 quietNeeded = 10;                                    // 500 ms after DOMContentLoaded
 
+            // Apotheosis (M4 load, 2026-09-07): wall-clock deadlines. Two of them.
+            //
+            // (1) after the load event: the "1 s hard cap" above is 20 ticks, and a tick on a
+            //     heavy page is 150-200 ms, so it was really 3 s. Make it 1 s of real time.
+            //
+            // (2) before the load event: nothing bounded this phase at all except the 30 s
+            //     watchdog, and on a page whose load event waits for hundreds of images it is
+            //     the whole problem. ntv.de cold (same log): DOMContentLoaded 2349 ms, first
+            //     paint 1311 ms, load event 8961 ms - 6.6 s in which the page was already on
+            //     screen but every C ABI call (scroll, tap, the next navigation) queued behind
+            //     this pump on the engine thread. That is the "initial page load is still quite
+            //     slow" the user reports; the pixels were there at 1.3 s.
+            //     So: once the document has parsed AND something readable has been painted,
+            //     give the rest of the subresource cascade 3 s and then hand the page over.
+            //     Nothing is cancelled - the loads keep running and keep repainting through
+            //     WebCoreLiveTick, exactly as they already do after the post-load cap fires.
+            //     3 s (not 1) because a page that is merely slow to finish should still finish
+            //     inside the pump; this is meant to catch the pathological tail, and settle_why
+            //     = cap-dcl in the next log says how often it does.
+            const MonotonicTime nowT = MonotonicTime::now();
+            if (navDone && !navDoneAt)
+                navDoneAt = nowT;
+            if (domReady && !domReadyAt)
+                domReadyAt = nowT;
+            if (navDone && navDoneAt && (nowT - navDoneAt) > 1_s) {
+                stopLoop("cap-load");
+                return;
+            }
+            if (!navDone && domReadyAt && (nowT - domReadyAt) > 3_s
+                && g_navSawFirstPaint.load(std::memory_order_acquire)) {
+                stopLoop("cap-dcl");
+                return;
+            }
+
             // ★ 关键:绝不在 isLoadingInAPISense 一转 false 就停。模块求值(<script type=module>)和
             //   重定向后最终文档的样式表应用都发生在"加载器空闲之后",经 ScriptRunner/WindowEventLoop 的
             //   0_s 定时器 + 微任务级联触发——这要求 RunLoop 继续转若干 tick。改为"加载器持续静默 ~0.8s
@@ -1845,15 +2113,15 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             if (navDone)
                 ++settleTicks;
             if (ready && quietTicks >= quietNeeded) {    // 加载器静默 → 异步级联已跑完,停
-                stopLoop();
+                stopLoop("quiet");
                 return;
             }
             if (navDone && settleTicks > capTicks)        // 硬封顶,防长连接/永久活动拖到看门狗
-                stopLoop();
+                stopLoop("cap-ticks");
         } });
     settle.startRepeating(0.05_s);
     RunLoop::Timer watchdog(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.watchdog"_s,
-        WTF::Function<void()> { [&stopLoop] { stopLoop(); } });
+        WTF::Function<void()> { [&stopLoop] { stopLoop("watchdog"); } });
     watchdog.startOneShot(WTF::Seconds(watchdogSeconds));
     RunLoop::run();
     settle.stop();
@@ -2602,6 +2870,17 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // and it cannot be exempted (the timing is per-face and nothing tells us a face is an icon
     // font). Readable text at first paint is worth more here than icons arriving at the same time.
     page->settings().setFontLoadTimingOverride(FontLoadTimingOverride::Swap);
+    // Apotheosis (M4 load, 2026-09-07): honour loading="lazy". WebCore's own default for this
+    // preference is false (UnifiedWebPreferences.yaml: WebKit true, WebCore false) and we build
+    // the Page directly, so we inherited the off state and fetched every image of a document up
+    // front. On ntv.de that is 261 subresources for a 42424 px tall page whose viewport is 1080
+    // px - the load event waits 6.6 s past DOMContentLoaded for images ~39 screens down. The
+    // implementation is complete in this tree (html/LazyLoadImageObserver.cpp): a deferred image
+    // is observed by an IntersectionObserver with a 100 % root margin, i.e. it loads one screen
+    // before it is reached, and the observer is driven by the isolatedUpdateRendering that
+    // pumpLoop and WebCoreLiveTick already call every tick. Sites that do not use the attribute
+    // are unaffected.
+    page->settings().setLazyImageLoadingEnabled(true);
     page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
@@ -3033,11 +3312,17 @@ void WebCoreSetPerfLogPath(const char* path)
 {
     if (!path || !*path) {
         g_perfOn = false;
+        g_apoNetTimingOn = false;
         g_perfPath.clear();
         return;
     }
     g_perfPath = path;
     g_perfOn = true;
+    // Apotheosis (M4 load waterfall): WebKit's CurlRequest reads this flag on the curl worker
+    // thread to decide whether a response is worth a URL copy + a main-thread hop. It is a
+    // plain bool written once here, before any load; a torn read would only cost one missing
+    // or one extra waterfall entry, so no atomic.
+    g_apoNetTimingOn = true;
     // Write the CSV header only into a fresh file (the log is appended across runs).
     g_perfHeaderDone = false;
     FILE* fp = nullptr;
