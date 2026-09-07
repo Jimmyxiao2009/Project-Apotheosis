@@ -2770,6 +2770,18 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     // Apotheosis (axis lock / rail scrolling): a new gesture decides its own axis from scratch.
     m_axisLockState = AxisLock::Deciding;
     m_axisAccumX = 0.0; m_axisAccumY = 0.0;
+    // Apotheosis (touch-lag diagnostic): a new gesture starts a fresh lag window, based from
+    //   wherever the engine's last known position was (m_scrollX/Y — may be stale, but it is the
+    //   same base InstantPanApplied() will subtract from, so the delta the stats compute is
+    //   consistent even if the absolute number is a frame or two old).
+    m_scrollLagActive = g_perfLogEnabled;
+    if (m_scrollLagActive) {
+        m_scrollLagBaseX = m_scrollX; m_scrollLagBaseY = m_scrollY;
+        m_scrollLagFingerX = 0.0; m_scrollLagFingerY = 0.0;
+        m_scrollLagMoves = 0;
+        m_scrollLagMax = m_scrollLagSum = m_scrollLagLast = 0.0;
+        m_scrollLagPendingSinceMs = 0; m_scrollLagMsMax = 0;
+    }
     // Apotheosis (drag as pointer events): a new gesture — drop whatever the previous one left
     // behind before the probe below can answer Drag for this one.
     ++m_dragGen;
@@ -3002,6 +3014,7 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
             m_scrollY = newScrollY;
             m_scrollStateValid = true;
             m_scrollStateScale = m_pageScale;
+            NoteScrollLagPresented();   // Apotheosis (touch-lag diagnostic): the shipping default path
         } else
             m_scrollStateValid = false;
         if (m_panRemX || m_panRemY) { m_panRemX = 0; m_panRemY = 0; ApplyPanTransform(); }
@@ -3036,6 +3049,7 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
         m_scrollY = newScrollY;
         m_scrollStateValid = true;
         m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2)
+        NoteScrollLagPresented();           // Apotheosis (touch-lag diagnostic)
         return;
     }
     if (!(haveOwedSwap && PanRemainderFromFrame(swapScrollX, swapScrollY))) {
@@ -3053,6 +3067,7 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     m_scrollY = newScrollY;
     m_scrollStateValid = true;
     m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
+    NoteScrollLagPresented();           // Apotheosis (touch-lag diagnostic)
     // Apotheosis (owed-frame remainder): the gesture began before there was any scroll state to
     // measure against, so no base was taken (InstantPanBy). This frame is the first thing that
     // knows where the document is — adopt its position as the base and the incremental remainder
@@ -3066,6 +3081,30 @@ void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScroll
     }
     ClampPanRemainder();
     ApplyPanTransform();
+}
+
+// Apotheosis (touch-lag diagnostic): m_scrollX/m_scrollY were just refreshed from a real engine
+// present a few lines above, in whichever of InstantPanApplied's three branches got there — fold
+// the newly-applied delta into the gesture's running stats and close out the "finger moved, engine
+// hasn't caught up yet" timing window opened in OnImageManipDelta. A no-op outside an active,
+// perf-logging-gated free-scroll gesture (m_scrollLagActive), so the three call sites above cost
+// one branch when the diagnostic is off.
+void MainPage::NoteScrollLagPresented()
+{
+    if (!m_scrollLagActive) return;
+    const double appliedX = (double)(m_scrollX - m_scrollLagBaseX);
+    const double appliedY = (double)(m_scrollY - m_scrollLagBaseY);
+    const double lagX = m_scrollLagFingerX - appliedX;
+    const double lagY = m_scrollLagFingerY - appliedY;
+    const double lag = std::sqrt(lagX * lagX + lagY * lagY);
+    m_scrollLagLast = lag;
+    if (lag > m_scrollLagMax) m_scrollLagMax = lag;
+    m_scrollLagSum += lag;
+    if (m_scrollLagPendingSinceMs != 0) {
+        const unsigned long long gap = GetTickCount64() - m_scrollLagPendingSinceMs;
+        if (gap > m_scrollLagMsMax) m_scrollLagMsMax = gap;
+        m_scrollLagPendingSinceMs = 0;   // this span is closed; the next move opens a new one
+    }
 }
 
 void MainPage::InstantPanReset()
@@ -3734,6 +3773,15 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     // Apotheosis (instant pan): move the presented frame with the finger right now; the engine
     // still gets the same coalesced WebCoreScrollBy it always did.
     ApplyAxisLock(idx, idy);   // Apotheosis (axis lock / rail scrolling)
+    // Apotheosis (touch-lag diagnostic): same idx/idy InstantPanBy/FreeScrollBy are about to see,
+    //   summed raw (pre-axis-lock would double count the locked-out axis as "finger asked, engine
+    //   never told" — using the post-lock values keeps this the same "what did we actually ask the
+    //   engine for" question FreeScrollBy is answering). No allocation, two adds and a compare.
+    if (m_scrollLagActive) {
+        m_scrollLagFingerX += idx; m_scrollLagFingerY += idy;
+        ++m_scrollLagMoves;
+        if (m_scrollLagPendingSinceMs == 0) m_scrollLagPendingSinceMs = GetTickCount64();
+    }
     InstantPanBy(idx, idy);
     FreeScrollBy(idx, idy);
 }
@@ -4020,6 +4068,20 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
     // coarse gate held back in one step and let its frame release the last swap, so the final
     // present and the snap of the translation to identity happen in the same UI frame.
     PanGestureEnd();
+    // Apotheosis (touch-lag diagnostic): one line per free-scroll gesture, "did the page keep up
+    //   with the finger". n=0 means the gesture never took the free-scroll branch at all (drag/
+    //   nested-scroll/pinch, or moved less than half a device px) — expected, not a bug. The final
+    //   coarse-step flush PanGestureEnd() just posted lands asynchronously, after this line is
+    //   written, so it is not counted here (see the commit message).
+    if (m_scrollLagActive) {
+        m_scrollLagActive = false;
+        if (m_scrollLagMoves > 0) {
+            const double avg = m_scrollLagSum / m_scrollLagMoves;
+            WriteStage(("scrolllag n=" + std::to_string(m_scrollLagMoves)
+                + " max=" + Dip(m_scrollLagMax) + " avg=" + Dip(avg) + " last=" + Dip(m_scrollLagLast)
+                + " ms_max=" + std::to_string(m_scrollLagMsMax)).c_str());
+        }
+    }
     // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count
     //   as part of the gesture. From here on nothing may re-enter pan-gesture mode: a late engine
     //   completion (PumpDrag's fallback) would arm m_panGestureOn/m_panDefer with no gesture left to

@@ -265,6 +265,10 @@ namespace Harness {
                                int swapScrollX, int swapScrollY,
                                unsigned long long swapId, bool haveOwedSwap);   // an engine frame landed
         void InstantPanReset();                       // remainder → 0, transform → identity
+        // Apotheosis (touch-lag diagnostic): called wherever InstantPanApplied() has just refreshed
+        //   m_scrollX/m_scrollY from a real engine present, folding the newly-applied delta into the
+        //   running gesture stats opened by OnImageManipStarted/closed by OnImageManipCompleted.
+        void NoteScrollLagPresented();
         // Apotheosis (owed-frame remainder): remainder := m_panFinger* − (frameScroll* − m_panBase*)
         //   — what the finger asked for minus what the frame at that position really moved. False
         //   when no base has been taken yet. Computes only; the caller clamps and applies.
@@ -542,6 +546,31 @@ namespace Harness {
         // engine-px dx/dy the accumulated decision is later applied to.
         AxisLock m_axisLockState { AxisLock::Deciding };
         double m_axisAccumX { 0.0 }, m_axisAccumY { 0.0 };
+        // Apotheosis (touch-lag diagnostic, 2026-09-07): "does the finger and the page agree" —
+        //   per-gesture, main-frame free-scroll path only (the fast path OnImageManipDelta's final
+        //   branch takes; nested-scroll/drag/pinch gestures are a different question and are not
+        //   tracked here). Zero cost when g_perfLogEnabled is off — every touch point below this
+        //   comment is skipped entirely, same convention as imedebug.txt/perf.txt.
+        //   m_scrollLagActive: a free-scroll gesture is open and being tracked (set in
+        //     OnImageManipStarted while perf logging is on, cleared in OnImageManipCompleted after
+        //     the stage.txt line is written).
+        //   m_scrollLagBaseX/Y: m_scrollX/m_scrollY (engine px) at gesture start — "applied so far"
+        //     is m_scrollX/Y minus this, so it is a plain delta and needs no separate accumulator.
+        //   m_scrollLagFingerX/Y: cumulative engine-px finger delta (the same idx/idy
+        //     OnImageManipDelta already computes for InstantPanBy/FreeScrollBy) since gesture start.
+        //   m_scrollLagMoves/Max/Sum/Last: the n=/max=/avg=/last= fields of the stage.txt line, in
+        //     engine px (the |finger − applied| 2D distance at each move; a straight Euclidean norm
+        //     rather than a single axis, since axis lock can pick either one per gesture).
+        //   m_scrollLagPendingSinceMs/MsMax: wall-clock gap between "finger moved, engine hasn't
+        //     caught up yet" and the next engine present landing (NoteScrollLagPresented) — opened
+        //     on the first move after each present, closed (and folded into MsMax) by the next one.
+        //     This is present time, not screen scan-out — see the commit message for the caveat.
+        bool   m_scrollLagActive { false };
+        int    m_scrollLagBaseX { 0 }, m_scrollLagBaseY { 0 };
+        double m_scrollLagFingerX { 0.0 }, m_scrollLagFingerY { 0.0 };
+        int    m_scrollLagMoves { 0 };
+        double m_scrollLagMax { 0.0 }, m_scrollLagSum { 0.0 }, m_scrollLagLast { 0.0 };
+        unsigned long long m_scrollLagPendingSinceMs { 0 }, m_scrollLagMsMax { 0 };
         // Apotheosis (drag as pointer events): state of the WebCoreDragAt route. m_dragGen is bumped
         // only at ManipulationStarted (NOT at ManipulationCompleted like m_nestedScrollGen), because
         // the release is posted while the gesture is still current and its answer must not be dropped.
