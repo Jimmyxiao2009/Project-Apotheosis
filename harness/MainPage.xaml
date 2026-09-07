@@ -513,28 +513,49 @@
                          plain Button.Content centred on the font's line box, not its glyph ink, which
                          sat visibly low for U+21BB. UpdateUrlActionGlyph sets UrlActionGlyph->Text now.
                          2026-09-04 review item 5: TextLineBounds="Tight" got the box right but U+21BB's
-                         own ink still sits ~2px low inside it (font-specific) — nudge up. -->
+                         own ink still sits ~2px low inside it (font-specific) — nudge up.
+                         Apotheosis (2026-09-07 device feedback on 0.1.9.23, wp_ss_20260907_0006.png):
+                         left-anchoring (544eea7) was needed only because UrlBox's real text area still
+                         stopped ~44 DIP short of this column at the time — the actual root cause, fixed
+                         separately by ee52b38 (ContentElement ColumnSpan="2"), makes the text now run
+                         all the way to this column's own left edge with zero slack. Left-anchoring the
+                         glyph on top of that fix put it back against the text side of an otherwise-empty
+                         40 DIP column, leaving ~39 DIP of dead rounded-corner space unused at the pill's
+                         own right edge (measured: glyph centre ~375 DIP vs pill right edge ~414 DIP).
+                         Both ends of this 40 DIP column are now exactly where they should be — text ends
+                         at the column's left edge, the pill's rounded corner sits at its right edge — so
+                         simply centring the glyph in the column (its original pre-544eea7 alignment)
+                         lands it at column-left + 20 DIP = ~394 DIP, i.e. ~20 DIP off the pill's edge,
+                         matching the target "sits in the curve of the pill" position without touching
+                         UrlBox or the outer grid at all. Height 36 -> 40 (Padding dropped so it stays
+                         centred) so the invisible tap target clears 40x40 DIP; a Grid does not clip its
+                         children so the extra 2 DIP top/bottom simply pokes past the pill's own 36 DIP
+                         height, same "may extend past the visible pill" allowance already used for the
+                         bar's 6 DIP keyboard-seam bleed strip above. -->
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="40" Height="36" Padding="4,0,0,0"
-                            VerticalAlignment="Center" HorizontalContentAlignment="Left" VerticalContentAlignment="Center"
+                            Width="40" Height="40" Padding="0"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlAction">
                         <TextBlock x:Name="UrlActionGlyph" Text="&#x21BB;" FontSize="17" TextLineBounds="Tight"
                                    Foreground="{StaticResource Accent}" Margin="0,-2,0,0"
-                                   HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Button>
                     <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
                          输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
                          2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
                          same technique as UrlActionGlyph above — plain Button.Content centred on the
-                         ✕'s full font line box sat ~2px high. -->
+                         ✕'s full font line box sat ~2px high.
+                         Apotheosis (2026-09-07): same re-centring as UrlActionBtn above, and for the
+                         same reason — the focused state must land the X in the same spot the unfocused
+                         state now lands the reload glyph. Height 40, no left Padding. -->
                     <Button x:Name="UrlClearBtn" Grid.Column="2" Background="Transparent" BorderThickness="0"
-                            Width="40" Height="36" Padding="4,0,0,0"
+                            Width="40" Height="40" Padding="0"
                             IsTabStop="False" Visibility="Collapsed"
-                            VerticalAlignment="Center" HorizontalContentAlignment="Left" VerticalContentAlignment="Center"
+                            VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                             Click="OnUrlClear">
                         <TextBlock Text="&#x2715;" FontSize="17" TextLineBounds="Tight"
                                    Foreground="{StaticResource TxtHi}"
-                                   HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Button>
                 </Grid>
             </Border>
