@@ -1010,21 +1010,168 @@ void traceFormat()
     out.visibleHoles = 9;
     out.backdropKind = 'p';
     out.backdropAge = 3;
+    out.refused = 2;
     CHECK_EQ(model.traceOut(out),
-        std::string("tg S3 out   miss=1 rast=2 land=3 ready=4 jobs=5/6 cancel=1 rm=8 holes=9 bd=p3"));
+        std::string("tg S3 out   miss=1 rast=2 land=3 ready=4 jobs=5/6 cancel=1 rm=8 holes=9 bd=p3 ref=2"));
 
     out.backdropKind = '-';
+    out.refused = 0;
     CHECK_EQ(model.traceOut(out),
-        std::string("tg S3 out   miss=1 rast=2 land=3 ready=4 jobs=5/6 cancel=1 rm=8 holes=9 bd=-"));
+        std::string("tg S3 out   miss=1 rast=2 land=3 ready=4 jobs=5/6 cancel=1 rm=8 holes=9 bd=- ref=0"));
 
     IllegalArrow arrow { MachineKind::Tile, "Rastering", "Uploaded", 0, CellIndex() };
     CHECK_EQ(formatIllegalArrow(3, arrow), std::string("tg S3 ev    tile:Rastering->Uploaded"));
+}
+
+// -------------------------------------------------------------------------
+// Device round 1 (0.1.9.29, n-tv.de) - the three failures the first v2 package
+// showed on the Lumia, as tests. Each one is written so that it fails against
+// the model as it was shipped in that package.
+// -------------------------------------------------------------------------
+
+// F2(a). A store whose visible rect is unknown (a mask, a replica, the n-tv
+// sticky header S100, the 508x1080 layers S2000/S2001) composites against all
+// of B. Holes used to be counted over cells(B), so every cell beyond the budget
+// was a hole for ever - and the driver's "holes > 0 => one more composite" rule
+// turned that into a busy loop on a page at rest (2749 perf rows with
+// tg_holes=3). Holes are counted over the DESIRED cells: a cell R2 has decided
+// not to have is not a hole, it is a decision.
+void deviceRound1_unknownVisibleRectSettles()
+{
+    check::currentTest = "deviceRound1_unknownVisibleRectSettles";
+    Harness harness;
+    const IntSize bounds(8192, 8192);          // 64 cells, budget 24
+    PassInput in = input(bounds, 1.0f, std::nullopt);
+    in.tileBudget = 24;
+
+    PassOutput out = harness.pass(in, "unknown V pass");
+    CHECK_EQ(harness.model.primaryGrid()->tileCount, 24u);
+    CHECK_EQ(out.paints.size(), 24u);
+    harness.finishAll(out);
+
+    // R4 with an unknown V: the composite rect is all of B, so every desired
+    // cell counts as visible and is exempt from the upload budget - a budget of
+    // zero still uploads all 24.
+    const IntRect wholeBounds(0, 0, bounds.width, bounds.height);
+    DrawList draw = harness.composite(wholeBounds, 0, "unknown V composite");
+    CHECK_EQ(draw.uploads.size(), 24u);
+    CHECK_EQ(draw.visibleHoles, 0u);
+    CHECK_EQ(harness.model.visibleHoles(), 0u);
+
+    // ... and it stays settled: the next identical frame asks for nothing.
+    PassOutput idle = harness.pass(in, "unknown V idle pass");
+    CHECK_EQ(idle.paints.size(), 0u);
+    CHECK(!idle.wantsPass);
+    CHECK_EQ(idle.visibleHoles, 0u);
+    EXPECT_NO_ARROWS(harness);
+}
+
+// F1. The raster backend refused the job the model had already handed it. The
+// core used to drop the refusal, which left the tile in Rastering with no job
+// behind it - and R5 says a tile leaves Rastering only through
+// ReplayFinished / ReplayFailed / Cancelled, so it stayed there. On the device:
+// `rast=4 land=0 ready=0` and `holes=3` for thousands of consecutive passes.
+void deviceRound1_refusedRequestIsMissingAgain()
+{
+    check::currentTest = "deviceRound1_refusedRequestIsMissingAgain";
+    Harness harness;
+    const IntSize bounds(2048, 3072);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+    const PassInput in = input(bounds, 1.0f, visible);
+
+    const PassOutput first = harness.pass(in, "refused pass 1");
+    CHECK(!first.paints.empty());
+    for (const PaintRequest& request : first.paints)
+        harness.model.noteRequestRefused(request.job);
+
+    // The refusal is applied at the start of the next pass; every tile is
+    // Missing again and asks again (I12), instead of never asking again.
+    const PassOutput second = harness.pass(in, "refused pass 2");
+    CHECK_EQ(second.refused, static_cast<unsigned>(first.paints.size()));
+    CHECK_EQ(second.paints.size(), first.paints.size());
+    CHECK(second.wantsPass);
+    harness.finishAll(second);
+    const DrawList draw = harness.composite(visible, 64, "refused composite");
+    CHECK_EQ(draw.visibleHoles, 0u);
+    EXPECT_NO_ARROWS(harness);
+}
+
+// F1, patch half. A refused patch goes back to Pending with its rect intact and
+// is requested again; the tile keeps drawing throughout (R10).
+void deviceRound1_refusedPatchIsPendingAgain()
+{
+    check::currentTest = "deviceRound1_refusedPatchIsPendingAgain";
+    Harness harness;
+    const IntSize bounds(2048, 2048);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+    settle(harness, bounds, 1.0f, visible);
+    CHECK(readyCount(harness.model, harness.model.primaryGrid()->id) > 0);
+
+    PassInput dirty = input(bounds, 1.0f, visible);
+    dirty.dirty = IntRect(64, 64, 200, 200);
+    const PassOutput patched = harness.pass(dirty, "patch pass");
+    CHECK_EQ(patched.paints.size(), 1u);
+    CHECK(patched.paints[0].isPatch);
+    harness.model.noteRequestRefused(patched.paints[0].job);
+
+    const PassOutput again = harness.pass(input(bounds, 1.0f, visible), "patch retry pass");
+    CHECK_EQ(again.refused, 1u);
+    CHECK_EQ(again.paints.size(), 1u);
+    CHECK(again.paints[0].isPatch);
+    CHECK(again.paints[0].rect.isSameGeometry(patched.paints[0].rect));
+    // The tile never stopped drawing: it is Ready throughout (R10).
+    CHECK_EQ(again.visibleHoles, 0u);
+    EXPECT_NO_ARROWS(harness);
+}
+
+// F3. The store could not carry out an upload the model had already committed
+// (commitUpload() moved the tile to Ready and gave it a fresh TextureId). The
+// tile was then Ready with a texture that had only been acquired - a pooled
+// texture, reset() and therefore empty - so it drew nothing and was not counted
+// as a hole: `ready=10 holes=0` over a white screen at 4x on the device.
+void deviceRound1_failedUploadUndoesReady()
+{
+    check::currentTest = "deviceRound1_failedUploadUndoesReady";
+    Harness harness;
+    const IntSize bounds(2048, 2048);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+    const PassInput in = input(bounds, 1.0f, visible);
+
+    PassOutput out = harness.pass(in, "upload fail pass");
+    harness.finishAll(out);
+    DrawList draw = harness.composite(visible, 64, "upload fail composite");
+    CHECK(!draw.tiles.empty());
+    CHECK_EQ(draw.visibleHoles, 0u);
+
+    // One of the uploads never reached a texture.
+    const GridId grid = draw.tiles[0].grid;
+    const CellIndex cell = draw.tiles[0].cell;
+    harness.model.noteUploadFailed(grid, cell);
+
+    const PassOutput after = harness.pass(in, "upload fail pass 2");
+    CHECK_EQ(after.refused, 1u);
+    // The cell is a hole now, which is the honest answer, and it is requested
+    // again in the same pass rather than staying Ready-but-blank.
+    CHECK_EQ(after.paints.size(), 1u);
+    CHECK(!after.paints[0].isPatch);
+    CHECK(after.paints[0].cell == cell);
+    const TileInfo* tile = findTile(harness.model.tiles(), grid, cell);
+    CHECK(tile && tile->state == TileState::Rastering);
+    CHECK(tile && tile->texture == invalidTextureId);
+    harness.finishAll(after);
+    CHECK_EQ(harness.composite(visible, 64, "upload fail composite 2").visibleHoles, 0u);
+    EXPECT_NO_ARROWS(harness);
 }
 
 } // namespace
 
 void runScenarios()
 {
+    deviceRound1_unknownVisibleRectSettles();
+    deviceRound1_refusedRequestIsMissingAgain();
+    deviceRound1_refusedPatchIsPendingAgain();
+    deviceRound1_failedUploadUndoesReady();
+
     scenario1_scroll();
     scenario2_fling();
     scenario3_pinchAndPanFar();

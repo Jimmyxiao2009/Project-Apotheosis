@@ -86,6 +86,10 @@ public:
     // (or Watchdog) instead of finishing.
     void failNextRecords(unsigned count);
     void watchdogNextRecords(unsigned count);
+    // ... and the next `count` records are refused outright (invalidJobHandle):
+    // no source layer, no buffer memory. R5 says the model must survive it.
+    void refuseNextRecords(unsigned count);
+    unsigned refusedRecords() const;
 
     // The order jobs were started in, for the priority assertions of I9.
     const std::vector<JobHandle>& startOrder() const;
@@ -128,6 +132,10 @@ public:
     unsigned uploadsThisComposite() const;
     unsigned totalUploads() const;
     unsigned budget() const;
+
+    // The next `count` acquires come up empty: the pool is exhausted. R4's
+    // upload then cannot happen at all, which the model has to be told about.
+    void failNextAcquires(unsigned count);
 
     // Pool reclaim: the next drain reports these as TextureLost.
     void reclaim(TextureHandle);

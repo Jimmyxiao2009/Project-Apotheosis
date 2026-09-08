@@ -248,7 +248,22 @@ void checkDrawList(const TileGridModel& model, const DrawList& draw, const IntRe
     for (const BackdropClip& clip : draw.backdrop)
         ++drawnBy[std::make_pair(clip.cell.column, clip.cell.row)];
 
-    const std::vector<CellIndex> visibleCells = model.cellsOf(visible, primary->bounds);
+    // The draw list covers the visible cells the model has DECIDED to have -
+    // R2 gives a tile only to a desired cell, so a visible cell outside the
+    // desired set can never become Ready and reporting it as a hole reports the
+    // budget as a failure (device round 1: a store with an unknown V then held
+    // the driver in a permanent extra-composite loop). I3 keeps this honest:
+    // while the budget covers V, every cell of V is desired.
+    std::set<std::pair<int, int>> desiredCells;
+    for (const TileInfo& info : model.tiles()) {
+        if (info.grid == primary->id && info.desired)
+            desiredCells.insert(std::make_pair(info.cell.column, info.cell.row));
+    }
+    std::vector<CellIndex> visibleCells;
+    for (CellIndex cell : model.cellsOf(visible, primary->bounds)) {
+        if (desiredCells.count(std::make_pair(cell.column, cell.row)))
+            visibleCells.push_back(cell);
+    }
     CHECK_EQ(draw.visibleCells, static_cast<unsigned>(visibleCells.size()));
     unsigned uncovered = 0;
     for (CellIndex cell : visibleCells) {

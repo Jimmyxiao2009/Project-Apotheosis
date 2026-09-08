@@ -219,6 +219,8 @@ public:
     unsigned peakInFlight { 0 };
     unsigned failNext { 0 };
     unsigned watchdogNext { 0 };
+    unsigned refuseNext { 0 };
+    unsigned refused { 0 };
 };
 
 FakeRasterBackend::FakeRasterBackend(unsigned storeId, unsigned latency, unsigned workers, unsigned inFlightCap)
@@ -232,6 +234,17 @@ JobHandle FakeRasterBackend::record(GridId grid, CellIndex cell, const IntRect& 
 {
     Impl& impl = *m_impl;
     ++impl.recorded;
+
+    // Device round 1: the real backend refuses when it has no source layer, no
+    // buffer memory - and, before the fix, whenever the global in-flight cap was
+    // reached, which a pinch hits on every pass. R5 says the model must survive
+    // it; before deviceRound1_refusedRequestIsMissingAgain() nothing here could
+    // produce one, which is exactly why the device found it instead.
+    if (impl.refuseNext) {
+        --impl.refuseNext;
+        ++impl.refused;
+        return invalidJobHandle;
+    }
 
     Impl::Job job;
     job.handle = impl.nextHandle++;
@@ -322,6 +335,8 @@ unsigned FakeRasterBackend::finished() const { return m_impl->finishedJobs; }
 unsigned FakeRasterBackend::cancelled() const { return m_impl->cancelledJobs; }
 void FakeRasterBackend::failNextRecords(unsigned count) { m_impl->failNext = count; }
 void FakeRasterBackend::watchdogNextRecords(unsigned count) { m_impl->watchdogNext = count; }
+void FakeRasterBackend::refuseNextRecords(unsigned count) { m_impl->refuseNext = count; }
+unsigned FakeRasterBackend::refusedRecords() const { return m_impl->refused; }
 const std::vector<JobHandle>& FakeRasterBackend::startOrder() const { return m_impl->startOrder; }
 const std::vector<std::string>& FakeRasterBackend::illegalArrows() const { return m_impl->arrows; }
 
@@ -352,6 +367,7 @@ public:
     unsigned totalUploads { 0 };
     unsigned acquired { 0 };
     unsigned released { 0 };
+    unsigned failAcquireNext { 0 };
     TextureHandle nextHandle { 1 };
     std::map<TextureHandle, Texture> textures;
     std::vector<TextureHandle> reclaimed;
@@ -370,6 +386,13 @@ TextureHandle FakeTextureBackend::acquire(IntSize size)
     Impl& impl = *m_impl;
     if (size.isEmpty()) {
         impl.error("acquire of an empty texture");
+        return invalidTextureHandle;
+    }
+    // Device round 1: the pool can come up empty (a 32-bit App Container with a
+    // bounded texture pool). R4 has to hear about it, because the model has
+    // already moved the tile to Ready by the time the core asks for a handle.
+    if (impl.failAcquireNext) {
+        --impl.failAcquireNext;
         return invalidTextureHandle;
     }
     const TextureHandle handle = impl.nextHandle++;
@@ -513,6 +536,8 @@ std::vector<std::string> FakeTextureBackend::takeErrors()
     taken.swap(m_impl->errors);
     return taken;
 }
+
+void FakeTextureBackend::failNextAcquires(unsigned count) { m_impl->failAcquireNext = count; }
 
 void FakeTextureBackend::reclaim(TextureHandle handle)
 {

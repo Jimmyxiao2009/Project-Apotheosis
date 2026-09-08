@@ -2993,9 +2993,47 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
                 g_perfCur.tgHoles = 0;
             g_perfCur.tgHoles += static_cast<int>(holes);
         }
-        if (holes && g_session && g_session->chrome) {
-            g_session->chrome->setNeedsPresent();
-            WebCorePort::presentRequested();
+        // Apotheosis (device round 1, 0.1.9.29): PresentOwed has a bound. R12 promises that a
+        // constant input converges, and the guard above is written as if it always does - but a
+        // store whose hole count is *stuck* (in 0.1.9.29: a store with an unknown visible rect
+        // reporting holes over cells beyond its own budget) turned "holes > 0 => one more
+        // composite" into a busy loop on a page at rest: 2749 perf rows with tg_holes=3 and
+        // nothing on screen changing. So the composite is owed only while the number is still
+        // moving, or for kTgMaxOwedComposites in a row after it stopped moving; after that the
+        // driver goes quiet until something actually changes. Anything that closes a hole changes
+        // the count, so a converging store is never cut short - the bound only ends a loop that is
+        // not converging, and it is released again the moment the count moves.
+        static unsigned tgHolesPrevious = 0;
+        static unsigned tgOwedRun = 0;
+        static bool tgLoopNoted = false;
+        const unsigned kTgMaxOwedComposites = 8;
+        if (holes != tgHolesPrevious) {
+            tgOwedRun = 0;
+            tgLoopNoted = false;
+        }
+        tgHolesPrevious = holes;
+        if (!holes) {
+            tgOwedRun = 0;
+            tgLoopNoted = false;
+        } else if (tgOwedRun < kTgMaxOwedComposites) {
+            ++tgOwedRun;
+            if (g_session && g_session->chrome) {
+                g_session->chrome->setNeedsPresent();
+                WebCorePort::presentRequested();
+            }
+        } else if (!tgLoopNoted) {
+            // Grep for "tgloop": the hole count did not move for kTgMaxOwedComposites composites,
+            // so the extra present is not helping and is not asked for again until it does.
+            tgLoopNoted = true;
+            if (!g_stagePath.empty()) {
+                FILE* fp = nullptr;
+                if (fopen_s(&fp, g_stagePath.c_str(), "ab") == 0 && fp) {
+                    const float ps = g_session && g_session->page ? g_session->page->pageScaleFactor() : -1.f;
+                    std::fprintf(fp, "tgloop holes=%u owed=%u ps=%.3f pan=%d\n",
+                        holes, tgOwedRun, ps, g_panGesture ? 1 : 0);
+                    std::fclose(fp);
+                }
+            }
         }
         // The v1 ledger must not carry state across a session that runs on v2 stores: a page loaded
         // with the switch on leaves it wherever the previous page stopped, and flipping back would

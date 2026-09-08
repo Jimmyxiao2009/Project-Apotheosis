@@ -648,10 +648,95 @@ void coreScenario15_syncCommitInParallel(unsigned latency)
     EXPECT_NO_CORE_ARROWS(harness);
 }
 
+// -------------------------------------------------------------------------
+// Device round 1 (0.1.9.29) at the core level: the two things the store can
+// fail to do after the model has already committed to them. Both were a silent
+// `continue` in TileGridCore, and both are cells that are white while the model
+// reports no hole - the shape of failure the traces could not see.
+// -------------------------------------------------------------------------
+
+// F1. Every request of the first pass is refused. The tiles must be Missing at
+// the start of the next pass and must ask again; before the fix they sat in
+// Rastering with no job behind them and never asked again (R5, I9).
+void coreDeviceRound1_refusedRecord(const CoreVariant& variant)
+{
+    name("coreDeviceRound1_refusedRecord", variant);
+    CoreHarness harness(variant);
+    const IntSize bounds(2048, 4096);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+
+    harness.raster.refuseNextRecords(64);
+    const PassInput in = input(bounds, 1.0f, visible);
+    const PassOutput refused = harness.pass(in, "refused pass");
+    CHECK(!refused.paints.empty());
+    CHECK_EQ(harness.core.outstandingJobs(), 0u);
+    CHECK_EQ(harness.raster.refusedRecords(), static_cast<unsigned>(refused.paints.size()));
+
+    harness.composite("refused composite");
+    // Nothing is on screen, and the model says so rather than claiming coverage.
+    CHECK(harness.lastComposite.visibleHoles > 0);
+
+    // The backend takes jobs again; the store recovers on its own, with no
+    // dirty rect, no scale change and no help from the driver (R12). Before the
+    // fix this pass asked for nothing at all: every tile was still Rastering.
+    const PassOutput retry = harness.pass(in, "refused retry pass");
+    CHECK_EQ(retry.refused, static_cast<unsigned>(refused.paints.size()));
+    CHECK_EQ(retry.paints.size(), refused.paints.size());
+    if (lands(variant)) {
+        harness.settle(in, 24, "refused settle");
+        CHECK_EQ(harness.core.visibleHoles(), 0u);
+        CHECK_EQ(harness.screen.unpaintedCells, 0u);
+    }
+    checkScreen(harness, "refused screen");
+    EXPECT_NO_CORE_ARROWS(harness);
+}
+
+// F3. The pool comes up empty for one upload the model has already committed.
+// The tile must not stay Ready with an empty texture - that draws nothing and
+// is not a hole, which is `ready=10 holes=0` over a white screen at 4x.
+void coreDeviceRound1_failedAcquire(const CoreVariant& variant)
+{
+    if (!lands(variant))
+        return;
+    name("coreDeviceRound1_failedAcquire", variant);
+    CoreHarness harness(variant);
+    const IntSize bounds(2048, 2048);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+    const PassInput in = input(bounds, 1.0f, visible);
+
+    harness.apply(in);
+    harness.pass(in, "acquire fail pass");
+    harness.textures.failNextAcquires(1);
+    // Drive frames until the first upload is attempted and refused. checkScreen
+    // runs inside every composite: the frame in which the acquire fails must
+    // still not be a white cell over holes=0, which is what makes this test the
+    // device symptom rather than a bookkeeping detail.
+    unsigned failed = 0;
+    for (unsigned round = 0; round < 8 && !failed; ++round) {
+        harness.frame(in, "acquire fail frame");
+        failed += harness.lastComposite.uploadsFailed;
+    }
+    CHECK_EQ(failed, 1u);
+    CHECK(harness.lastComposite.visibleHoles > 0);
+
+    // Every tile that draws has a texture behind it, and the store closes the
+    // hole by itself.
+    harness.settle(in, 24, "acquire fail settle");
+    CHECK_EQ(harness.core.visibleHoles(), 0u);
+    CHECK_EQ(harness.screen.unpaintedCells, 0u);
+    CHECK_EQ(harness.lastComposite.drawsWithoutTexture, 0u);
+    checkScreen(harness, "acquire fail screen 2");
+    EXPECT_NO_CORE_ARROWS(harness);
+}
+
 } // namespace
 
 void runCoreScenarios()
 {
+    for (const CoreVariant& variant : coreVariants()) {
+        coreDeviceRound1_refusedRecord(variant);
+        coreDeviceRound1_failedAcquire(variant);
+    }
     for (const CoreVariant& variant : coreVariants()) {
         coreScenario1_scroll(variant);
         coreScenario2_fling(variant);
