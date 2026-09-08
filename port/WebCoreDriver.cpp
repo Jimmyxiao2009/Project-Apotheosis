@@ -149,6 +149,12 @@ size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 // the artefact is on screen, so WebCoreGpuLayerInfo() writes it before the layer tree rather than
 // after it. Declared by hand for the same reason as everything above.
 size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
+// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0", GraphicsLayerTextureMapper.cpp):
+// per-cause breakdown of the wkTexmapDirtyFull count above - which of updateBackingStoreIfNeeded's
+// full-repaint conditions fired (a layer that hits more than one adds to more than one counter),
+// plus how many GraphicsLayerTextureMapper::setNeedsDisplay() calls actually flipped m_needsDisplay
+// false->true. Both reset on read. Declared by hand for the same reason as everything above.
+void wkWinUWPTexmapDirtySrcStats(unsigned& needsDisplay, unsigned& storeCreated, unsigned& sizeChange, unsigned& scaleChange, unsigned& setNeedsDisplayCalls);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -1320,7 +1326,22 @@ static const char* const kPerfHeader =
     //   style_n   Document::resolveStyle entries          (> ~10 per navigation = the driver is
     //   layout_n  LocalFrameViewLayoutContext::layout      forcing passes, not the page)
     //   timer_n   DOMTimer::fired entries                 (drops when the C2.9 alignment works)
-    "style_n,layout_n,timer_n\n";
+    "style_n,layout_n,timer_n,"
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): why the layers dirty_full
+    // counts were repainted in full, one string cell instead of six more columns so existing
+    // scripts that address raster_deferred and everything before it by index (see the raster_
+    // comment above) keep working - appended at the very END for the same reason. Format
+    // "a/b/c/d/e/f", each a running sum over this operation except f (0 or 1):
+    //   a  layers where m_needsDisplay was set (GraphicsLayerTextureMapper::wkTexmapDirtySrcStats)
+    //   b  layers whose backing store was just created (m_wkNeedsFullRepaint)
+    //   c  layers whose backing store size changed (m_wkBackingStoreSize != m_size)
+    //   d  layers whose contents scale changed (m_wkBackingStoreScale != wkContentsScale)
+    //   e  GraphicsLayerTextureMapper::setNeedsDisplay() calls that flipped m_needsDisplay
+    //      false->true (a superset of forceDirtyTree()'s own calls - see f)
+    //   f  1 if any composite in this operation was one forceDirtyTree() had just walked
+    //      (g_gpuLastCompositeFull), else 0 - the only field NOT counted inside WebCore, so a
+    //      row with e > 0 and f = 0 means WebCore itself asked for the repaint, not the driver
+    "dirty_src\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1336,6 +1357,13 @@ struct PerfRow {
     // Apotheosis (M4): TextureMapper layers repainted in full vs. by dirty rect in this operation
     // (wkWinUWPTexmapDirtyStats, WebKit winuwp f14d05ff1f); -1 = no composite happened.
     int dirtyFull = -1, dirtyPartial = -1;
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): per-cause breakdown of
+    // dirtyFull above (wkWinUWPTexmapDirtySrcStats — see dirty_src in kPerfHeader),
+    // accumulated across this operation the same way dirtyFull/dirtyPartial are. -1 = no
+    // composite happened. dirtySrcForceDirty is not a sum: it is 1 if ANY composite in this
+    // operation was one forceDirtyTree() had just walked (g_gpuLastCompositeFull).
+    int dirtySrcNeedsDisplay = -1, dirtySrcStoreCreated = -1, dirtySrcSizeChange = -1,
+        dirtySrcScaleChange = -1, dirtySrcSetNeedsDisplay = -1, dirtySrcForceDirty = -1;
     // Apotheosis (M4): curl's breakdown of the main resource of this navigation
     // (WebCorePortNetTiming, WebKit CurlRequest::didReceiveHeader). Milliseconds since
     // the transfer started; net_connect is the TCP handshake only, net_tls the TLS one,
@@ -1568,9 +1596,21 @@ static void perfFlushLocked()
         char pc[3][12];
         for (int k = 0; k < 3; ++k)
             perfFmtI(pc[k], sizeof pc[k], passInts[k]);
+        // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): dirty_src, appended at the
+        // very end - see the comment on the column in kPerfHeader. -1 on dirtySrcNeedsDisplay means
+        // no composite happened this operation, same convention as dirtyFull/dirtyPartial -> empty
+        // cell rather than "0/0/0/0/0/0", which would misleadingly claim a composite ran clean.
+        char ds[48];
+        if (r.dirtySrcNeedsDisplay < 0)
+            ds[0] = '\0';
+        else
+            std::snprintf(ds, sizeof ds, "%d/%d/%d/%d/%d/%d",
+                r.dirtySrcNeedsDisplay, r.dirtySrcStoreCreated, r.dirtySrcSizeChange,
+                r.dirtySrcScaleChange, r.dirtySrcSetNeedsDisplay,
+                r.dirtySrcForceDirty > 0 ? 1 : 0);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
                          "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
@@ -1580,7 +1620,7 @@ static void perfFlushLocked()
             sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
             tcb, offp, pt,
             of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6],
-            pc[0], pc[1], pc[2]);
+            pc[0], pc[1], pc[2], ds);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -2636,6 +2676,35 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
                 if (g_perfCur.dirtyFull < 0) { g_perfCur.dirtyFull = 0; g_perfCur.dirtyPartial = 0; }
                 g_perfCur.dirtyFull += static_cast<int>(full);
                 g_perfCur.dirtyPartial += static_cast<int>(partial);
+            }
+        }
+        {
+            // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): per-cause breakdown of
+            // the full-repaint count above, plus whether THIS composite is the one forceDirtyTree()
+            // just walked (g_gpuLastCompositeFull, set two lines above from wkFullDirty) - together
+            // they tell "WebCore dirtied it" apart from "forceDirtyTree ran", which is what the
+            // github dirty_full=54 rows need (the repair-escalation cap, 9df4438, never fired for
+            // them, so something else is force-dirtying the tree). Accumulated across this
+            // operation like dirtyFull/dirtyPartial above; dirtySrcForceDirty is an OR, not a sum -
+            // one force-dirtied composite in the operation is enough to answer "did it happen".
+            unsigned nd = 0, sc = 0, sz = 0, scl = 0, snd = 0;
+            WebCore::wkWinUWPTexmapDirtySrcStats(nd, sc, sz, scl, snd);
+            if (g_perfOn) {
+                if (g_perfCur.dirtySrcNeedsDisplay < 0) {
+                    g_perfCur.dirtySrcNeedsDisplay = 0;
+                    g_perfCur.dirtySrcStoreCreated = 0;
+                    g_perfCur.dirtySrcSizeChange = 0;
+                    g_perfCur.dirtySrcScaleChange = 0;
+                    g_perfCur.dirtySrcSetNeedsDisplay = 0;
+                    g_perfCur.dirtySrcForceDirty = 0;
+                }
+                g_perfCur.dirtySrcNeedsDisplay += static_cast<int>(nd);
+                g_perfCur.dirtySrcStoreCreated += static_cast<int>(sc);
+                g_perfCur.dirtySrcSizeChange += static_cast<int>(sz);
+                g_perfCur.dirtySrcScaleChange += static_cast<int>(scl);
+                g_perfCur.dirtySrcSetNeedsDisplay += static_cast<int>(snd);
+                if (g_gpuLastCompositeFull)
+                    g_perfCur.dirtySrcForceDirty = 1;
             }
         }
         g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
