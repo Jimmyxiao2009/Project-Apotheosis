@@ -26,8 +26,11 @@ std::string describe(CellIndex cell)
 
 namespace {
 
-std::set<TextureId> g_releasedTextures;
-std::set<JobId> g_cancelledJobs;
+// Keyed by store id: every model numbers its textures and jobs from 1, so two
+// harnesses alive at the same time (replay.cpp keeps one per store) would
+// otherwise collide in these ledgers.
+std::set<std::pair<unsigned, TextureId>> g_releasedTextures;
+std::set<std::pair<unsigned, JobId>> g_cancelledJobs;
 
 bool sameScale(float a, float b)
 {
@@ -47,10 +50,12 @@ std::optional<GridInfo> gridOf(const TileGridModel& model, GridId id)
 
 } // namespace
 
-void resetReleaseLedger()
+void resetReleaseLedger(unsigned storeId)
 {
-    g_releasedTextures.clear();
-    g_cancelledJobs.clear();
+    for (auto it = g_releasedTextures.begin(); it != g_releasedTextures.end();)
+        it = it->first == storeId ? g_releasedTextures.erase(it) : std::next(it);
+    for (auto it = g_cancelledJobs.begin(); it != g_cancelledJobs.end();)
+        it = it->first == storeId ? g_cancelledJobs.erase(it) : std::next(it);
 }
 
 void checkInvariants(const TileGridModel& model, const char* where)
@@ -96,14 +101,25 @@ void checkInvariants(const TileGridModel& model, const char* where)
         }
     }
 
-    // I4 ready is true: a Ready tile's texture belongs to this cell at this
-    // grid's scale. There is no such thing as a foreign texture in v2.
+    // I4 ready is true: a Ready tile's texture holds pixels rasterised for this
+    // cell at this grid's scale. "For this cell" is paintedRect (R6): the rect
+    // the pixels were rasterised for, which after a partial-cell resize is not
+    // the current cell rect. The texture is exactly that big - it is never
+    // stretched over a rect it was not rasterised for. There is no such thing
+    // as a foreign texture in v2.
+    const int edge = model.config().tileEdge;
     for (const TileInfo& tile : tiles) {
         if (tile.state != TileState::Ready)
             continue;
         const auto grid = gridOf(model, tile.grid);
         CHECK(tile.texture != invalidTextureId);
-        CHECK(tile.textureSize == tile.rect.size());
+        CHECK(!tile.paintedRect.isEmpty());
+        CHECK(tile.textureSize == tile.paintedRect.size());
+        // paintedRect belongs to THIS cell of the lattice: same origin, never
+        // bigger than one cell.
+        const IntRect lattice(tile.cell.column * edge, tile.cell.row * edge, edge, edge);
+        CHECK(tile.paintedRect.location() == lattice.location());
+        CHECK(lattice.contains(tile.paintedRect));
         if (grid)
             CHECK(sameScale(tile.textureScale, grid->scale));
     }
@@ -173,13 +189,14 @@ void checkPassOutput(const TileGridModel& model, const PassOutput& out, const ch
     (void)where;
 
     // I13 removal: a texture is released exactly once, a job cancelled exactly
-    // once. Both ledgers are global for the lifetime of one harness.
+    // once. Both ledgers live for the lifetime of one harness, keyed by store.
+    const unsigned store = model.storeId();
     for (TextureId id : out.released) {
         CHECK(id != invalidTextureId);
-        CHECK(g_releasedTextures.insert(id).second);
+        CHECK(g_releasedTextures.insert(std::make_pair(store, id)).second);
     }
     for (JobId id : out.cancels)
-        CHECK(g_cancelledJobs.insert(id).second);
+        CHECK(g_cancelledJobs.insert(std::make_pair(store, id)).second);
 
     // I12, second half: a pass creates at most one job per tile, and every
     // request carries a fresh job id.
@@ -246,10 +263,19 @@ void checkDrawList(const TileGridModel& model, const DrawList& draw, const IntRe
         CHECK_EQ(uncovered, 0u);
 
     // I6 no foreign pixels: every drawn texture belongs to the cell and the
-    // scale it is drawn for.
+    // scale it is drawn for, and it is drawn at exactly the rect it was
+    // rasterised for (paintedRect, R6) - never stretched onto another rect.
+    std::map<std::pair<int, int>, IntRect> paintedOf;
+    for (const TileInfo& info : model.tiles()) {
+        if (info.grid == primary->id)
+            paintedOf[std::make_pair(info.cell.column, info.cell.row)] = info.paintedRect;
+    }
     for (const TileDraw& tile : draw.tiles) {
         CHECK(tile.texture != invalidTextureId);
-        CHECK(tile.target.isSameGeometry(model.cellRect(tile.cell, primary->bounds)));
+        const auto painted = paintedOf.find(std::make_pair(tile.cell.column, tile.cell.row));
+        CHECK(painted != paintedOf.end());
+        if (painted != paintedOf.end())
+            CHECK(tile.target.isSameGeometry(painted->second));
         CHECK(sameScale(tile.scale, primary->scale));
     }
     for (const BackdropClip& clip : draw.backdrop) {
@@ -282,12 +308,13 @@ void checkDrawList(const TileGridModel& model, const DrawList& draw, const IntRe
     CHECK_EQ(draw.visibleHoles, holes);
 
     // I13 again, on the composite side.
+    const unsigned store = model.storeId();
     for (TextureId id : draw.released) {
         CHECK(id != invalidTextureId);
-        CHECK(g_releasedTextures.insert(id).second);
+        CHECK(g_releasedTextures.insert(std::make_pair(store, id)).second);
     }
     for (JobId id : draw.cancels)
-        CHECK(g_cancelledJobs.insert(id).second);
+        CHECK(g_cancelledJobs.insert(std::make_pair(store, id)).second);
 
     // I4 on what is actually uploaded.
     for (const UploadRecord& upload : draw.uploads) {

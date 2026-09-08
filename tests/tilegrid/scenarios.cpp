@@ -110,16 +110,35 @@ void scenario2_fling()
     IntRect visible(0, 0, screenWidth, screenHeight);
     harness.step(input(bounds, 1.0f, visible), 64, "fling warmup");
 
+    // panGesture is deliberately false throughout: a fling after the finger has
+    // left the glass is the fastest movement there is, and R1's pan-side margin
+    // follows the model's own direction, not the flag (package 1 review).
     for (int i = 1; i <= 12; ++i) {
         visible = IntRect(0, i * step, screenWidth, screenHeight);
         PassInput in = input(bounds, 1.0f, visible);
-        in.panGesture = true;
+        in.panGesture = false;
         PassOutput out = harness.pass(in, "fling pass");
         harness.finishAll(out);
         DrawList draw = harness.composite(visible, 64, "fling composite");
         // A jump of a third of the screen is inside the half-screen margin, so
         // the cells it reveals were already tiled.
         CHECK_EQ(draw.visibleHoles, 0u);
+    }
+
+    // R1: with no finger down, the grid still reaches further ahead of V than
+    // behind it - the doubled margin is on the side V is travelling towards.
+    {
+        const std::vector<CellIndex> visibleCells = harness.model.cellsOf(visible, bounds);
+        CHECK(!visibleCells.empty());
+        int visibleTop = visibleCells.front().row;
+        int visibleBottom = visibleCells.back().row;
+        int topmost = visibleTop;
+        int bottommost = visibleBottom;
+        for (const TileInfo& tile : harness.model.tiles()) {
+            topmost = std::min(topmost, tile.cell.row);
+            bottommost = std::max(bottommost, tile.cell.row);
+        }
+        CHECK((bottommost - visibleBottom) > (visibleTop - topmost));
     }
 
     // Convergence once the finger leaves the glass.
@@ -396,40 +415,56 @@ void scenario8_stickyHeader()
     harness.step(input(IntSize(720, 80), 1.0f, visible), 64, "header warmup");
     const GridId grid = harness.model.primaryGrid()->id;
     CHECK_EQ(readyCount(harness.model, grid), 1u);
-    const TextureId texture = harness.model.tiles().front().texture;
+    CHECK(harness.model.tiles().front().paintedRect.isSameGeometry(IntRect(0, 0, 720, 80)));
 
+    int previousHeight = 80;
     for (int i = 0; i < 12; ++i) {
         const int height = 80 + (i % 3) * 10;
         PassInput in = input(IntSize(720, height), 1.0f, visible);
         in.dirty = IntRect(0, 0, 720, height);
         PassOutput out = harness.pass(in, "header pass");
-        // R6: the one cell keeps its tile and its state; only what changed is
-        // repainted. It never goes back to Missing, so it never draws nothing.
+        // R6: the one cell keeps its tile and its state. It never goes back to
+        // Missing, so it never draws nothing.
         CHECK_EQ(harness.model.primaryGrid()->tileCount, 1u);
-        const std::vector<TileInfo> tiles = harness.model.tiles();
-        CHECK_EQ(static_cast<int>(tiles.front().state), static_cast<int>(TileState::Ready));
+        const std::vector<TileInfo> midPass = harness.model.tiles();
+        CHECK_EQ(static_cast<int>(midPass.front().state), static_cast<int>(TileState::Ready));
+        // Until the patch lands it keeps drawing the pixels it has, at the rect
+        // they were rasterised for - the texture is never stretched onto the
+        // new height (package 1 review, R6).
+        CHECK_EQ(midPass.front().paintedRect.height, previousHeight);
+        CHECK(midPass.front().textureSize == midPass.front().paintedRect.size());
+        if (height != previousHeight) {
+            // And the repair is a whole-cell patch, not a growth strip.
+            bool wholeCell = false;
+            for (const PaintRequest& request : out.paints)
+                wholeCell |= request.isPatch && request.rect.isSameGeometry(IntRect(0, 0, 720, height));
+            CHECK(wholeCell);
+        }
+
         harness.finishAll(out);
         DrawList draw = harness.composite(visible, 64, "header composite");
         CHECK_EQ(draw.visibleHoles, 0u);
         CHECK_EQ(draw.tiles.size(), 1u);
+        // The patch landed: texture and paintedRect are replaced together, and
+        // the draw follows immediately.
+        CHECK_EQ(harness.model.tiles().front().paintedRect.height, height);
+        CHECK_EQ(draw.tiles.front().target.height, height);
+        previousHeight = height;
     }
-    // Same texture throughout: no reallocation storm, no flicker.
-    CHECK_EQ(harness.model.tiles().front().texture, texture);
     EXPECT_NO_ARROWS(harness);
 
-    // The other reading of R6 is testable too, and it is the one that makes the
-    // header flicker: with missingOnPartialCellResize the tile is thrown away.
-    ModelConfig strict;
-    strict.missingOnPartialCellResize = true;
-    Harness strictHarness(strict);
-    strictHarness.step(input(IntSize(720, 80), 1.0f, visible), 64, "strict warmup");
-    PassOutput out = strictHarness.pass(input(IntSize(720, 90), 1.0f, visible), "strict resize");
-    // The tile lost its pixels: it is either Missing or already re-requested,
-    // but it is not Ready any more, so the header shows nothing for a frame.
-    CHECK(strictHarness.model.tiles().front().state != TileState::Ready);
-    CHECK_EQ(strictHarness.model.tiles().front().texture, invalidTextureId);
-    CHECK_EQ(readyCount(strictHarness.model, strictHarness.model.primaryGrid()->id), 0u);
-    (void)out;
+    // A whole-cell repaint that does not change the size keeps the texture:
+    // no reallocation storm when the header only redraws itself.
+    const TextureId stable = harness.model.tiles().front().texture;
+    for (int i = 0; i < 3; ++i) {
+        PassInput in = input(IntSize(720, previousHeight), 1.0f, visible);
+        in.dirty = IntRect(0, 0, 720, previousHeight);
+        PassOutput out = harness.pass(in, "header repaint");
+        harness.finishAll(out);
+        harness.composite(visible, 64, "header repaint composite");
+    }
+    CHECK_EQ(harness.model.tiles().front().texture, stable);
+    EXPECT_NO_ARROWS(harness);
 }
 
 // -------------------------------------------------------------------------
@@ -658,14 +693,15 @@ void ruleR1_marginIsThePreRender()
     const std::vector<CellIndex> visibleCells = harness.model.cellsOf(visible, bounds);
     CHECK(harness.model.primaryGrid()->tileCount > visibleCells.size());
 
-    // And the margin is doubled on the pan side while a pan is running: the
-    // same viewport tiles further ahead with panGesture than without it.
-    auto rowsBelow = [&](bool panGesture) {
+    // And the margin is doubled on the pan side, where "the pan side" is the
+    // sign of the last movement of V and nothing else (package 1 review, R1):
+    // two passes ending on the same viewport tile differently depending on
+    // whether V moved to get there, and the panGesture flag changes nothing.
+    auto maxRowAfter = [&](int firstY, bool panGesture) {
         Harness local;
-        const IntRect a(0, 2000, screenWidth, screenHeight);
-        const IntRect b(0, 2600, screenWidth, screenHeight);
-        local.pass(input(IntSize(screenWidth, 20000), 1.0f, a), "pan a");
-        PassInput second = input(IntSize(screenWidth, 20000), 1.0f, b);
+        const IntSize tall(screenWidth, 20000);
+        local.pass(input(tall, 1.0f, IntRect(0, firstY, screenWidth, screenHeight)), "pan a");
+        PassInput second = input(tall, 1.0f, IntRect(0, 2600, screenWidth, screenHeight));
         second.panGesture = panGesture;
         local.pass(second, "pan b");
         int maxRow = 0;
@@ -673,7 +709,9 @@ void ruleR1_marginIsThePreRender()
             maxRow = std::max(maxRow, tile.cell.row);
         return maxRow;
     };
-    CHECK(rowsBelow(true) > rowsBelow(false));
+    CHECK(maxRowAfter(2000, false) > maxRowAfter(2600, false));
+    CHECK_EQ(maxRowAfter(2000, true), maxRowAfter(2000, false));
+    CHECK_EQ(maxRowAfter(2600, true), maxRowAfter(2600, false));
 }
 
 // R2: reconcile without hysteresis. A tile that leaves the desired set goes,

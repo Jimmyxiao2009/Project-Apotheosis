@@ -56,7 +56,7 @@ std::string describe(CellIndex);
 void checkInvariants(const TileGridModel&, const char* where);
 void checkPassOutput(const TileGridModel&, const PassOutput&, const char* where);
 void checkDrawList(const TileGridModel&, const DrawList&, const IntRect& visible, const char* where);
-void resetReleaseLedger();
+void resetReleaseLedger(unsigned storeId);
 
 struct Harness {
     explicit Harness(const ModelConfig& config = ModelConfig(), unsigned storeId = 1)
@@ -65,7 +65,7 @@ struct Harness {
         model.setIllegalArrowObserver([this](const IllegalArrow& arrow) {
             arrows.push_back(std::string(machineKindName(arrow.machine)) + ":" + arrow.from + "->" + arrow.event);
         });
-        resetReleaseLedger();
+        resetReleaseLedger(storeId);
     }
 
     TileGridModel model;
