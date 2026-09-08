@@ -21,6 +21,8 @@ foreach(required
     "${TEXMAP_DIR}/TextureMapperTileGridModel.h"
     "${TEXMAP_DIR}/TextureMapperTileGridModel.cpp"
     "${TEXMAP_DIR}/TextureMapperTileGridMachines.h"
+    "${TEXMAP_DIR}/TextureMapperTileGridCore.h"
+    "${TEXMAP_DIR}/TextureMapperTileGridCore.cpp"
     "${SML_DIR}/sml.hpp")
     if(NOT EXISTS "${required}")
         message(FATAL_ERROR "Not found: ${required}\nPass -DWEBKIT_SOURCE_DIR=<your WebKit tree>.")
@@ -32,9 +34,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(tilegrid-tests
     "${TEXMAP_DIR}/TextureMapperTileGridModel.cpp"
+    "${TEXMAP_DIR}/TextureMapperTileGridCore.cpp"
     main.cpp
     invariants.cpp
     scenarios.cpp
+    fakes.cpp
+    core-scenarios.cpp
     fuzz.cpp
     replay.cpp
 )

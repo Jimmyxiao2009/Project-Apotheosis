@@ -465,6 +465,46 @@ void scenario8_stickyHeader()
     }
     CHECK_EQ(harness.model.tiles().front().texture, stable);
     EXPECT_NO_ARROWS(harness);
+
+    // R6 on its own. The loop above passes a dirty rect for the whole header,
+    // which would repaint the cell anyway and mask the rule; here the layer
+    // resizes and says nothing else, and the whole-cell patch has to come from
+    // R6 or the tile keeps drawing the old height forever.
+    {
+        Harness resized;
+        resized.step(input(IntSize(720, 80), 1.0f, visible), 64, "resize warmup");
+        CHECK(resized.model.tiles().front().paintedRect.isSameGeometry(IntRect(0, 0, 720, 80)));
+
+        PassOutput out = resized.pass(input(IntSize(720, 140), 1.0f, visible), "resize without a dirty rect");
+        bool wholeCell = false;
+        for (const PaintRequest& request : out.paints)
+            wholeCell |= request.isPatch && request.rect.isSameGeometry(IntRect(0, 0, 720, 140));
+        CHECK(wholeCell);
+        // Still drawing the pixels it has, at the rect they were made for.
+        CHECK_EQ(resized.model.tiles().front().paintedRect.height, 80);
+
+        resized.finishAll(out);
+        DrawList draw = resized.composite(visible, 64, "resize composite");
+        CHECK_EQ(resized.model.tiles().front().paintedRect.height, 140);
+        CHECK_EQ(draw.tiles.size(), 1u);
+        CHECK_EQ(draw.tiles.front().target.height, 140);
+        EXPECT_NO_ARROWS(resized);
+    }
+
+    // And a composite taken while that whole-cell patch is still in flight:
+    // the tile draws the pixels it has, at the rect they were rasterised for.
+    // Stretching an 80-pixel-tall texture over the 140-pixel cell is exactly
+    // what the first cut of R6 did and what I4 now forbids.
+    {
+        Harness stretched;
+        stretched.step(input(IntSize(720, 80), 1.0f, visible), 64, "stretch warmup");
+        stretched.pass(input(IntSize(720, 140), 1.0f, visible), "grow, patch in flight");
+        DrawList draw = stretched.composite(visible, 64, "grow composite");
+        CHECK_EQ(draw.tiles.size(), 1u);
+        CHECK_EQ(draw.tiles.front().target.height, 80);
+        CHECK(draw.tiles.front().target.size() == stretched.model.tiles().front().textureSize);
+        EXPECT_NO_ARROWS(stretched);
+    }
 }
 
 // -------------------------------------------------------------------------
