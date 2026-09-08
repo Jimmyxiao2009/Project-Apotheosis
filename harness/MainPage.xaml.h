@@ -345,6 +345,11 @@ namespace Harness {
         //   whenever Settings closes with the switch changed — same wiring as ApplyThreadedRasterSetting,
         //   never called from the UI thread without a post.
         void ApplyStaleTilesSetting();
+        // Apotheosis (TILING-REWRITE-PLAN.md 5.2): push the "Tile grid v2" developer setting
+        //   (WebCoreSetTileGridV2) to the engine thread — same wiring and same two call sites as
+        //   ApplyThreadedRasterSetting/ApplyStaleTilesSetting above. The engine reads the flag when
+        //   it creates a tiled backing store, so a flip takes effect on the next page load.
+        void ApplyTileGridV2Setting();
         void ApplyLiveZoom();
         void PinchCommit(float newScale, int focalX, int focalY);
         // Apotheosis: the layer that shows the engine output (GpuPanel in direct-present mode,
@@ -465,6 +470,10 @@ namespace Harness {
         //   settings.ini instantpanxaml
         bool m_instantPanXaml { false };
         bool m_threadedRaster { true }; // settings.ini threadraster (default ON since 0.1.9.18: 2.9 ms vs 25 ms per scroll tick on device)
+        // Apotheosis (TILING-REWRITE-PLAN.md 5.2): the rewritten tile management (TileGrid v2).
+        //   Default OFF in package A (0.1.9.29) — v1 stays the shipping path until the device round
+        //   of section 7 is green. settings.ini tilegridv2; applies from the next page load.
+        bool m_tileGridV2 { false };
         // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
         //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles
         bool m_staleTiles { true };

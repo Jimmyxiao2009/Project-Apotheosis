@@ -300,6 +300,12 @@ int WebCoreGpuLayerInfo(char* outBuf, int len);
 // Takes effect from the next composite and may be flipped at any time. Engine thread only.
 void WebCoreSetThreadedRaster(int enabled);
 
+// Apotheosis (TILING-REWRITE-PLAN.md 5.2): TileGrid v2 - the rewritten tile management (index-
+// addressed lattice, one primary grid plus at most one backdrop, no timeouts). Experimental,
+// default OFF. The engine reads the flag when a tiled backing store is created, so a flip applies
+// to the layers of the NEXT page load, not to the ones on screen. Engine thread only.
+void WebCoreSetTileGridV2(int enabled);
+
 // Apotheosis (2026-09-04): stale tiles. ON (the default) a TextureMapper backing store keeps the
 // tiles it drops out of its cover rect and keeps drawing them, scaled to the current content rect,
 // until real ones have been rasterised - so a composite that takes the scroll fast path after the

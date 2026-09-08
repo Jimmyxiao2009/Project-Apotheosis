@@ -888,6 +888,9 @@
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <!-- Apotheosis (TILING-REWRITE-PLAN.md 5.2): 重写的瓦片管理(TileGrid v2),默认关;
+                         引擎在创建瓦片存储时读开关 → 下次加载页面才生效(WebCoreSetTileGridV2)。 -->
+                    <ToggleSwitch x:Name="SetTileGridV2Switch" Header="瓦片网格 v2(下次加载页面生效)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <!-- Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 引擎有变化才合成，代替固定 200ms tick，默认开。 -->
                     <ToggleSwitch x:Name="SetEventPresentSwitch" Header="事件驱动呈现" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <!-- Apotheosis: 地图/画布类控件自己处理指针事件平移内容，默认开。 -->

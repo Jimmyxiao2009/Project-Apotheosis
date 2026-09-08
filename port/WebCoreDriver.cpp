@@ -155,6 +155,20 @@ size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
 // plus how many GraphicsLayerTextureMapper::setNeedsDisplay() calls actually flipped m_needsDisplay
 // false->true. Both reset on read. Declared by hand for the same reason as everything above.
 void wkWinUWPTexmapDirtySrcStats(unsigned& needsDisplay, unsigned& storeCreated, unsigned& sizeChange, unsigned& scaleChange, unsigned& setNeedsDisplayCalls);
+// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md sections 3 and 5.2, package 3): the TileGrid v2
+// switch and the two numbers the driver reads from it (TextureMapperTiledStore.h). Declared by hand
+// for the same reason as everything above - that header pulls in the texmap GL headers.
+//   wkWinUWPSetTileGridV2 / wkWinUWPTileGridV2   the runtime switch. Read at store CREATION, so a
+//     flip applies to the layers of the next page load, not to the ones on screen.
+//   wkWinUWPTexmapVisibleHoles                   the sum of visibleHoles() over every v2 store that
+//     has composited since the last call - visible cells drawing nothing with no backdrop behind
+//     them. Reading resets it. This is the ONLY number the v2 repair reacts to (gpuPresent).
+//   wkWinUWPSetTileGridPanGesture                a level mirroring g_panGesture, forwarded to every
+//     live v2 store; recorded in the `tg` trace, does not gate the cover margin.
+void wkWinUWPSetTileGridV2(bool);
+bool wkWinUWPTileGridV2();
+unsigned wkWinUWPTexmapVisibleHoles();
+void wkWinUWPSetTileGridPanGesture(bool);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -1341,7 +1355,15 @@ static const char* const kPerfHeader =
     //   f  1 if any composite in this operation was one forceDirtyTree() had just walked
     //      (g_gpuLastCompositeFull), else 0 - the only field NOT counted inside WebCore, so a
     //      row with e > 0 and f = 0 means WebCore itself asked for the repaint, not the driver
-    "dirty_src\n";
+    "dirty_src,"
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.5/3, package 3): TileGrid v2's only output
+    // the driver reacts to - the sum over this operation's composites of visible cells that drew
+    // NOTHING and had no backdrop behind them (wkWinUWPTexmapVisibleHoles, read once per composite
+    // in gpuPresent). Empty while the v2 switch is off. 0 = every visible cell had pixels; a small
+    // number for a frame or two after a pinch or a fast pan is the model working (each of those
+    // composites also asks for one more present); a row that stays non-zero with the finger off the
+    // glass is the thing to chase. Appended at the very END for the same reason as dirty_src.
+    "tg_holes\n";
 
 struct PerfRow {
     unsigned seq = 0;
@@ -1364,6 +1386,11 @@ struct PerfRow {
     // operation was one forceDirtyTree() had just walked (g_gpuLastCompositeFull).
     int dirtySrcNeedsDisplay = -1, dirtySrcStoreCreated = -1, dirtySrcSizeChange = -1,
         dirtySrcScaleChange = -1, dirtySrcSetNeedsDisplay = -1, dirtySrcForceDirty = -1;
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): tg_holes - the sum of
+    // wkWinUWPTexmapVisibleHoles() over this operation's composites (see the column in
+    // kPerfHeader). -1 = the TileGrid v2 switch was off, i.e. nobody could have reported a hole,
+    // which is a different statement from "no hole was reported" and therefore a different cell.
+    int tgHoles = -1;
     // Apotheosis (M4): curl's breakdown of the main resource of this navigation
     // (WebCorePortNetTiming, WebKit CurlRequest::didReceiveHeader). Milliseconds since
     // the transfer started; net_connect is the TCP handshake only, net_tls the TLS one,
@@ -1608,9 +1635,14 @@ static void perfFlushLocked()
                 r.dirtySrcNeedsDisplay, r.dirtySrcStoreCreated, r.dirtySrcSizeChange,
                 r.dirtySrcScaleChange, r.dirtySrcSetNeedsDisplay,
                 r.dirtySrcForceDirty > 0 ? 1 : 0);
+        // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): tg_holes, after it. Same
+        // convention: -1 (the v2 switch was off for every composite of this operation) -> empty
+        // cell, so a 0 always means "v2 ran and saw no hole".
+        char tgh[12];
+        perfFmtI(tgh, sizeof tgh, r.tgHoles);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
                          "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
             r.seq, r.kind, r.url,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
             n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
@@ -1620,7 +1652,7 @@ static void perfFlushLocked()
             sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
             tcb, offp, pt,
             of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6],
-            pc[0], pc[1], pc[2], ds);
+            pc[0], pc[1], pc[2], ds, tgh);
     }
     std::fclose(fp);
     g_perfRows = 0;
@@ -1796,18 +1828,28 @@ static void perfWriteStageTimeline(const PerfRow& r)
 // pending. Called at the end of every operation, not only of a navigation: the composites the
 // trace describes happen on the ticks *after* the pinch, never on the pinch's own row. Between
 // two zooms the take returns 0 and the file is not opened at all.
+// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 5.3, package 3): the same take now also drains the
+// TileGrid v2 input trace ("tg ..."), whose ring is 256 lines of up to 320 characters - up to ~82 kB
+// against the 2 kB buffer this used to pass, i.e. one call could carry seven lines and the model's
+// replay input (§5.4) would be full of gaps. The take copies WHOLE lines and leaves the rest in the
+// ring for the next call, so draining is a loop: keep an 8 kB buffer off the stack pressure of a
+// single 82 kB one and go round until the ring is empty. The cap only exists so a bug in the engine
+// ring cannot spin here; 16 rounds is twice the worst case (three full rings).
 static void perfWriteStageZoomTrace()
 {
     if (g_stagePath.empty())
         return;
-    char buf[2048];
-    const size_t used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
+    char buf[8192];
+    size_t used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
     if (!used)
         return;
     FILE* fp = nullptr;
     if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
         return;
-    std::fwrite(buf, 1, used, fp);
+    for (int round = 0; used && round < 16; ++round) {
+        std::fwrite(buf, 1, used, fp);
+        used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
+    }
     std::fclose(fp);
 }
 
@@ -2931,6 +2973,35 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         unpaintedDirect = gpuPaintTree(glRoot);
         g_textureMapper->endPainting();
     }
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.2b "driver repair machine" and 3): with
+    // TileGrid v2 the repair below is gone. The v2 model answers one question after a composite -
+    // how many VISIBLE cells drew nothing and had no backdrop behind them - and a cell can only be
+    // in that state while its replay is in flight or its texture is waiting for the upload budget,
+    // i.e. while work the model has already scheduled is running. R5 and R12 guarantee that work
+    // converges, so the only thing missing is a frame to show the result in: exactly one more
+    // composite, requested the way gpuNoteRepairResult() requests it. No dirtying (dirtying is what
+    // made the v1 loop feed itself, 9df4438), no second paint in this call, no cooldown, no
+    // escalation ledger - two states, Settled and PresentOwed.
+    //
+    // The reading also drains the engine-side accumulator, so it has to happen on every composite
+    // while v2 is on, not only when something is owed. It stays at 0 while the switch is off (no v2
+    // store exists to add to it), so the v1 path below is byte-identical to what it was.
+    if (wkWinUWPTileGridV2()) {
+        const unsigned holes = wkWinUWPTexmapVisibleHoles();
+        if (g_perfOn) {
+            if (g_perfCur.tgHoles < 0)
+                g_perfCur.tgHoles = 0;
+            g_perfCur.tgHoles += static_cast<int>(holes);
+        }
+        if (holes && g_session && g_session->chrome) {
+            g_session->chrome->setNeedsPresent();
+            WebCorePort::presentRequested();
+        }
+        // The v1 ledger must not carry state across a session that runs on v2 stores: a page loaded
+        // with the switch on leaves it wherever the previous page stopped, and flipping back would
+        // then escalate on the first composite for no reason.
+        g_gpuRepairMisses = 0;
+    } else {
     // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): a coarse WebCoreScrollBy step can move the
     // visible rect past the painted cover, and the scroll fast path has no way to paint the tiles
     // that were dropped, so the composite above may hold nothing but the page background. The back
@@ -2957,6 +3028,7 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         gpuNoteRepairResult(escalated, unpaintedRepair);
     } else if (!unpaintedDirect)
         g_gpuRepairMisses = 0;
+    }
     // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
     // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
     // TranslateTransform on screen, or the two disagree for a frame. WebCorePresent() does the swap.
@@ -2989,7 +3061,17 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
 // whether the worker pool kept up. No-op (and no counter read) while the feature is off.
 static void notePendingRasterTiles()
 {
-    if (!WebCore::wkWinUWPThreadedRaster())
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): TileGrid v2 needs this even with
+    // threaded raster OFF. With the switch off v2 replays inline, so nothing is pending and nothing
+    // finishes on a worker (both counters stay at 0, as before) - but the tile still has to be
+    // UPLOADED, and the per-composite upload budget applies to the inline path too. A pass that
+    // rasterises more cells than the budget uploads leaves the rest Landed: pixels that exist and
+    // that only the next composite's drain can put on screen. On a page that has stopped dirtying
+    // itself nobody would ask for that composite (the visible-holes present in gpuPresent covers a
+    // hole, not a Landed tile behind an already drawn one), so the last tiles of every burst would
+    // sit in memory, off the screen. Reading the three counters costs three loads; keep the early
+    // return for the v1 + no-threading combination, where they are all provably 0.
+    if (!WebCore::wkWinUWPThreadedRaster() && !WebCore::wkWinUWPTileGridV2())
         return;
     // Both are needed. `pending` covers "a replay is still running" — one more composite will be
     // owed. `finished` (edge-triggered, reading resets) covers the replay that started AND ended
@@ -4802,6 +4884,15 @@ void WebCoreSetThreadedRaster(int enabled)
     WebCore::wkWinUWPSetThreadedRaster(enabled != 0);
 }
 
+// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 5.2): the TileGrid v2 switch, same shape as
+// WebCoreSetThreadedRaster above - engine thread, one plain forward. The engine reads the flag when
+// a tiled backing store is CREATED, so flipping it does not touch the layers on screen: it applies
+// to the next page load. Default off in package A (0.1.9.29).
+void WebCoreSetTileGridV2(int enabled)
+{
+    WebCore::wkWinUWPSetTileGridV2(enabled != 0);
+}
+
 // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): stale tiles on/off. ON (the default) a backing
 // store keeps the tiles it drops out of its cover rect and keeps drawing them - scaled to the
 // current content rect - until real ones have been rasterised, so a fast-path composite whose tiles
@@ -5872,6 +5963,13 @@ void WebCoreSetPanGesture(int active)
     if (g_panGesture == on)
         return;
     g_panGesture = on;
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 3, package 3): mirror the level into the
+    // TileGrid v2 stores. It is a level, not an event: every live v2 store records it in its `tg`
+    // pass line and it is reserved for R11-style idle work. It deliberately does NOT gate the cover
+    // margin - the model derives the pan direction from consecutive visible rects itself, so a
+    // fling after the finger has left the glass gets the same treatment as the drag before it.
+    // No-op while the switch is off. Engine thread, like everything else in this function.
+    WebCore::wkWinUWPSetTileGridPanGesture(on);
     if (!on && g_session && g_session->chrome) {
         // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make sure that composite repaints what
         // the gesture cost the backing stores (2026-09-06: targeted, no longer the whole tree).

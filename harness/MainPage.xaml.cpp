@@ -3634,6 +3634,18 @@ void MainPage::ApplyStaleTilesSetting()
     WebEngine::instance().post([en]() { try { WebCoreSetStaleTiles(en); } catch (...) {} });
 }
 
+// Apotheosis (TILING-REWRITE-PLAN.md 5.2): DEVELOPER toggle "Tile grid v2 (next page load)",
+//   default OFF. Same shape and the same two call sites as the two above (ApplySettings, i.e. once
+//   at startup and again whenever the Settings page closes). The engine reads the switch when a
+//   tiled backing store is CREATED, so flipping it leaves the page on screen alone and the next
+//   navigation is the one that runs on the new tile management — which is what the toggle's own
+//   label says, so nobody reads a flip that changes nothing as a broken switch.
+void MainPage::ApplyTileGridV2Setting()
+{
+    const int en = m_tileGridV2 ? 1 : 0;
+    WebEngine::instance().post([en]() { try { WebCoreSetTileGridV2(en); } catch (...) {} });
+}
+
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
 //   The engine calls PresentWakeThunk whenever something wants to be presented. It may run on the
 //   ENGINE thread (every WebCore invalidation) or on a RASTER WORKER (a tile replay landing), so
@@ -5433,6 +5445,7 @@ void MainPage::ApplySettings()
     UpdateScrollFab();
     ApplyPrefetchSetting();
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
+    ApplyTileGridV2Setting();                // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyStaleTilesSetting();                // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
@@ -5470,6 +5483,7 @@ void MainPage::LoadSettings()
             else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
             else if (k == "instantpanxaml") m_instantPanXaml = (atoi(v.c_str()) != 0);
             else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
+            else if (k == "tilegridv2") m_tileGridV2 = (atoi(v.c_str()) != 0);
             else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
@@ -5503,6 +5517,7 @@ void MainPage::SaveSettings()
     s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
     s += "instantpanxaml=" + std::to_string(m_instantPanXaml ? 1 : 0) + "\n";
     s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
+    s += "tilegridv2=" + std::to_string(m_tileGridV2 ? 1 : 0) + "\n";
     s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
@@ -5532,6 +5547,7 @@ void MainPage::ShowSettings()
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
     if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
+    if (SetTileGridV2Switch) SetTileGridV2Switch->IsOn = m_tileGridV2;
     if (SetEventPresentSwitch) SetEventPresentSwitch->IsOn = m_eventPresent;
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
@@ -5576,6 +5592,7 @@ void MainPage::HideSettings()
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
     if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
+    if (SetTileGridV2Switch) m_tileGridV2 = SetTileGridV2Switch->IsOn;
     if (SetEventPresentSwitch) m_eventPresent = SetEventPresentSwitch->IsOn;
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
@@ -5626,6 +5643,7 @@ static const wchar_t* const kI18n[][2] = {
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
     { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
     { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
+    { L"瓦片网格 v2(下次加载页面生效)", L"Tile grid v2 (next page load)" },
     { L"事件驱动呈现", L"Event-driven present" },
     { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
     { L"陈旧瓦片占位符", L"Stale tile placeholders" },
@@ -6258,12 +6276,17 @@ void MainPage::EnableGpu()
         std::wstring fd = LocalStateDir();
         if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
     }
-    WebEngine::instance().post([disp, self, win]() {
+    // Apotheosis (TILING-REWRITE-PLAN.md 5.2): which tile management this session runs on, read here
+    //   on the UI thread while the setting is being applied, so gpuinit.txt says what the session
+    //   STARTED with — the engine only picks the implementation up when it creates a store, so a
+    //   later flip in Settings does not belong on this line.
+    const bool tileGridV2 = m_tileGridV2;
+    WebEngine::instance().post([disp, self, win, tileGridV2]() {
         int rc = -999;
         try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
         try {
             std::wstring d = LocalStateDir();
-            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
+            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + " tilegrid=" + (tileGridV2 ? "v2" : "v1") + "\n"; f.write(s.data(), s.size()); } }
         } catch (...) {}
         int rcCopy = rc;
         try {
