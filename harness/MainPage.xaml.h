@@ -199,7 +199,10 @@ namespace Harness {
         void MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy);
         // 把位图像素 (px,py) 的点击转发到引擎活会话(WebCoreClickAt),完成后同步地址栏/历史/链接表。
         // longPress = hold the button down first (WebCoreLongPressAt) instead of clicking.
-        void ForwardClickToEngine(int px, int py, bool longPress = false);
+        // Apotheosis (double-tap zoom, 2026-09-09): clickCount is forwarded to WebCoreClickAtCount
+        //   (2 = a real DOM 'dblclick', see OnPageTapped's m_dtapLastClickMs follow-up); default 1
+        //   keeps every existing call site (ordinary tap, long press) unchanged.
+        void ForwardClickToEngine(int px, int py, bool longPress = false, int clickCount = 1);
         // 引擎滚动 dy 像素(触发懒加载图片)后重绘。dy>0 向下。
         void EngineScroll(int dy);
         // Apotheosis: show/hide the floating page up/down buttons (developer setting, off by default).
@@ -323,6 +326,13 @@ namespace Harness {
         // Apotheosis: ease the preview from where the fingers left it to the scale we commit
         //   (overview below 1:1, ±6 % snap), then call PinchCommit. Composition-thread animation.
         void SpringBackZoom(float targetLive, float commitScale);
+        // Apotheosis (double-tap zoom, 2026-09-09): commit a double-tap zoom through the same
+        //   anchor/animate/commit path a pinch release uses — SetPinchAnchor(dipX,dipY) then
+        //   SpringBackZoom to targetScale (clamped/snapped), which calls PinchCommit when done.
+        void RunDoubleTapZoom(double dipX, double dipY, float targetScale);
+        // Apotheosis (double-tap zoom, 2026-09-09): m_dtapHoldTimer's one-shot Tick — no second tap
+        //   arrived within the hold interval, so the tap OnPageTapped held is just an ordinary click.
+        void OnDtapHoldTimer(Platform::Object^ sender, Platform::Object^ e);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
@@ -597,6 +607,25 @@ namespace Harness {
         //   scale by ApplyPresentTransform, so it stays in screen DIPs.
         Windows::UI::Xaml::Media::TranslateTransform^ m_panTranslate;
         Windows::UI::Xaml::Media::TransformGroup^ m_presentGroup;
+        // Apotheosis (double-tap zoom, 2026-09-09): OnPageTapped's tap-hold state machine, active
+        //   only while m_dtapZoomEnabled is on. A tap WebCoreTapPolicyAt said is zoomable is held
+        //   (m_dtapPending) instead of dispatched: m_dtapHoldTimer fires the plain click if no second
+        //   tap follows (OnDtapHoldTimer); a second tap near (m_dtapPx,m_dtapPy) while pending cancels
+        //   the timer and zooms via RunDoubleTapZoom (SetPinchAnchor/ApplyLiveZoom/SpringBackZoom —
+        //   the same commit path a pinch release uses, see PinchCommit). A tap the policy call said is
+        //   NOT zoomable is dispatched right away (as before this feature existed) and remembered in
+        //   m_dtapLastClickMs/Px/Py so a following rapid tap dispatches with clickCount=2 (a real
+        //   'dblclick' for pages that want one) instead of being silently forgotten.
+        bool   m_dtapZoomEnabled { true };   // SCROLLING toggle, default ON; settings.ini dtapzoom
+        bool   m_dtapPending { false };
+        bool   m_dtapZoomable { false };
+        int    m_dtapPx { -1 }, m_dtapPy { -1 };         // held tap, engine px (proximity + click target)
+        double m_dtapDipX { 0.0 }, m_dtapDipY { 0.0 };   // held tap, ContentArea DIPs (SetPinchAnchor input)
+        float  m_dtapTargetScale { 1.0f };
+        unsigned long long m_dtapGen { 0 };   // bumped per fresh tap; drops a stale WebCoreTapPolicyAt answer
+        Windows::UI::Xaml::DispatcherTimer^ m_dtapHoldTimer;
+        unsigned long long m_dtapLastClickMs { 0 };
+        int    m_dtapLastClickPx { -1 }, m_dtapLastClickPy { -1 };
         // Apotheosis (review 2026-09-04 item 1): the status-bar/title-row inset of the direct
         //   present surface. GpuPanel's SIZE must never change once ANGLE has a swap chain on it
         //   (a resize rebuilds the swap chain on the engine thread's next swap, which is the

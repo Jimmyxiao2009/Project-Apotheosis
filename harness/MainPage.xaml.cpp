@@ -668,6 +668,15 @@ static const int kTitleRowSlideMs = 200;   // Apotheosis (title row slide): was 
 //   clearly wants a different scale, so the real value is committed. The 180 ms spring animates the
 //   preview across the snap gap so it reads as a release rather than a jump (SpringBackZoom).
 static const float kPageScaleSnapTol = 0.33f;
+// Apotheosis (double-tap zoom, 2026-09-09): how long OnPageTapped holds a click on zoomable content
+// waiting for a second tap, and the window a following tap on NON-zoomable content still counts as
+// completing a double tap (clickCount=2). Windows has no UWP-surface equivalent of the classic
+// GetDoubleClickTime() (Windows::UI::ViewManagement::UISettings carries cursor/caret timings, not
+// this one) — 300 ms matches the interval mobile Safari/Chrome use for double-tap-to-zoom.
+static const int kDoubleTapHoldMs = 300;
+// How close (engine px, out of kW=720) a second tap must land to the first to count as the same
+// double tap — generous finger-tap tolerance, same order of magnitude as the axis-lock threshold.
+static const int kDoubleTapSlopPx = 60;
 
 // 钳到引擎接受的区间，并把接近 1:1 的结果吸附成精确 1.0。
 static float SnapAndClampPageScale(float s)
@@ -2069,7 +2078,91 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
     // 以及链接(锚点默认动作=导航)。链接表感知不到模态层覆盖,故不再"链接表优先"(否则点模态关闭按钮
     // 会被误判成点中被它盖住的下层链接 → 弹窗关不掉)。ForwardClickToEngine 内含链接表兜底。
     if (m_sessionActive) {
-        ForwardClickToEngine(px, py);
+        if (!m_dtapZoomEnabled) {
+            ForwardClickToEngine(px, py);   // 双击缩放关:一切照旧
+            return;
+        }
+        // Apotheosis (double-tap zoom, 2026-09-09): a second tap landing close to a still-pending
+        // one completes the double tap — cancel the hold and either zoom (WebCoreTapPolicyAt said
+        // the point is zoomable) or forward a real clickCount=2 click otherwise. See the state
+        // machine comment on m_dtapPending in MainPage.xaml.h.
+        if (m_dtapPending
+            && std::abs(px - m_dtapPx) <= kDoubleTapSlopPx && std::abs(py - m_dtapPy) <= kDoubleTapSlopPx) {
+            if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
+            m_dtapPending = false;
+            const bool zoomable = m_dtapZoomable;
+            const float target = m_dtapTargetScale;
+            const double anchorDipX = m_dtapDipX, anchorDipY = m_dtapDipY;
+            const int firstPx = m_dtapPx, firstPy = m_dtapPy;
+            WriteStage(("dtap zoomable=" + std::to_string(zoomable ? 1 : 0)
+                + " scale=" + Dip(m_pageScale) + "->" + Dip(zoomable ? target : m_pageScale)).c_str());
+            if (zoomable) {
+                m_dtapLastClickMs = 0;   // this pair ended in a zoom, not a click — nothing to follow up
+                RunDoubleTapZoom(anchorDipX, anchorDipY, target);
+            } else {
+                m_dtapLastClickMs = 0;
+                ForwardClickToEngine(firstPx, firstPy, /*longPress*/ false, /*clickCount*/ 2);
+            }
+            return;
+        }
+        // Apotheosis: a tap the harness already dispatched as an ordinary click landed here recently
+        // — this one completes that pair as a real dblclick. No policy re-check needed: the decision
+        // here is only the clickCount WebCoreClickAtCount forwards, not whether to zoom (a tap that
+        // was dispatched immediately was already found not-zoomable).
+        if (m_dtapLastClickMs && GetTickCount64() - m_dtapLastClickMs <= (unsigned long long)kDoubleTapHoldMs
+            && std::abs(px - m_dtapLastClickPx) <= kDoubleTapSlopPx
+            && std::abs(py - m_dtapLastClickPy) <= kDoubleTapSlopPx) {
+            m_dtapLastClickMs = 0;
+            WriteStage(("dtap zoomable=0 scale=" + Dip(m_pageScale) + "->" + Dip(m_pageScale)).c_str());
+            ForwardClickToEngine(px, py, /*longPress*/ false, /*clickCount*/ 2);
+            return;
+        }
+        // Apotheosis: a fresh, independent tap — ask the engine whether it wants to zoom before
+        // deciding to hold it. WebCoreWantsDragAt is the SAME drag-widget probe the pinch/drag
+        // routing already uses (dragWidgetAtPoint): a map/canvas keeps taking plain clicks, never
+        // harness-level zoom, exactly like a real touch browser leaves map pinch-to-zoom to the map.
+        if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
+        m_dtapPending = false;
+        m_dtapDipX = pt.X; m_dtapDipY = pt.Y;
+        const unsigned long long gen = ++m_dtapGen;
+        CoreDispatcher^ disp = this->Dispatcher;
+        Platform::Agile<MainPage^> self(this);
+        WebEngine::instance().post([disp, self, px, py, gen]() {
+            int drag = 0;
+            try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; }
+            int zoomable = 0; float target = 1.0f;
+            // outAnchorX/Y not needed here — the harness already has this tap's own anchor in
+            // ContentArea DIPs (m_dtapDipX/Y, stashed before this post()) for RunDoubleTapZoom, and
+            // the driver only ever echoes back the (px,py) we already passed in.
+            if (!drag) {
+                try { WebCoreTapPolicyAt(px, py, &zoomable, &target, nullptr, nullptr); } catch (...) { zoomable = 0; }
+            }
+            try {
+                disp->RunAsync(CoreDispatcherPriority::Normal,
+                    ref new DispatchedHandler([self, px, py, zoomable, target, gen]() {
+                        MainPage^ s = self.Get(); if (!s) return;
+                        if (s->m_dtapGen != gen) return;   // superseded by a later tap: drop
+                        if (!zoomable) {
+                            s->m_dtapLastClickMs = GetTickCount64();
+                            s->m_dtapLastClickPx = px; s->m_dtapLastClickPy = py;
+                            s->ForwardClickToEngine(px, py);   // not zoomable: dispatch immediately, as today
+                            return;
+                        }
+                        s->m_dtapPending = true;
+                        s->m_dtapZoomable = true;
+                        s->m_dtapPx = px; s->m_dtapPy = py;
+                        s->m_dtapTargetScale = target;
+                        if (s->m_dtapHoldTimer == nullptr) {
+                            s->m_dtapHoldTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+                            s->m_dtapHoldTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                                s, &MainPage::OnDtapHoldTimer);
+                        }
+                        Windows::Foundation::TimeSpan iv; iv.Duration = (long long)kDoubleTapHoldMs * 10000;
+                        s->m_dtapHoldTimer->Interval = iv;
+                        try { s->m_dtapHoldTimer->Start(); } catch (...) {}
+                    }));
+            } catch (...) {}
+        });
         return;
     }
     // 无会话(主页/错误页):链接表命中导航。
@@ -2145,7 +2238,11 @@ void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::Holdin
 
 // 把 (px,py) 点击转发给引擎活会话。引擎派发真实鼠标事件并处理默认动作;若触发了会话内导航
 // (URL 变化),回 UI 后同步地址栏/前进后退栈/历史。引擎点击失败但命中了链接表 → 退回经典导航。
-void MainPage::ForwardClickToEngine(int px, int py, bool longPress)
+// Apotheosis (double-tap zoom, 2026-09-09): clickCount>=2 forwards to WebCoreClickAtCount instead of
+// WebCoreClickAt, so the engine dispatches a real DOM 'dblclick' (see OnPageTapped's
+// m_dtapLastClickMs follow-up). longPress and clickCount>=2 never happen together — a long press is
+// its own gesture, checked first.
+void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCount)
 {
     if (m_interacting) return;
     m_interacting = true;
@@ -2171,7 +2268,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress)
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
 
-    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress]() {
+    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress, clickCount]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
@@ -2180,12 +2277,17 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress)
         // releases with the click and sends a contextmenu at the same point - the two things a map
         // can turn into a dropped pin. DRAG_WIDGET_ONLY makes it a no-op (kOK, current frame painted)
         // anywhere else on the page.
+        // Apotheosis (double-tap zoom, 2026-09-09): clickCount>=2 (the second tap of a double tap
+        // WebCoreTapPolicyAt said is NOT zoomable) goes through WebCoreClickAtCount so the page gets
+        // a real 'dblclick'; an ordinary tap (clickCount=1, the overwhelming common case) still calls
+        // plain WebCoreClickAt, unchanged.
         try {
             rc = longPress
                 ? WebCoreLongPressAt(px, py, kLongPressEngineHoldMs,
                                      WEBCORE_LONGPRESS_CONTEXTMENU | WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY,
                                      rgba->data())
-                : WebCoreClickAt(px, py, rgba->data());
+                : (clickCount >= 2 ? WebCoreClickAtCount(px, py, clickCount, rgba->data())
+                                   : WebCoreClickAt(px, py, rgba->data()));
         } catch (...) { rc = -1000; }
         unsigned hashAfter = (rc == 0) ? WebCoreGetFrameHash() : hashBefore;
         bool changed = (hashAfter != hashBefore);   // 引擎点击是否改变了画面(区分模态关闭/按钮 vs 死链接)
@@ -3515,6 +3617,16 @@ void MainPage::EndGesture(GestureEnd reason)
         ++m_dragGen;
         DragReset();
     }
+    // --- double-tap zoom (Apotheosis, 2026-09-09): a click OnPageTapped is holding, waiting for a
+    //     possible second tap, must not fire into whatever this reason is turning the page into
+    //     (navigation, session teardown, tab switch, background) — cancel the hold and bump the
+    //     generation so a WebCoreTapPolicyAt answer still in flight is dropped too. Unconditional,
+    //     for every reason including Completed: a tap-hold has nothing to do with the pinch this
+    //     Completed belongs to, and the whole point is that it must not survive them either.
+    if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
+    m_dtapPending = false;
+    m_dtapLastClickMs = 0;
+    ++m_dtapGen;
     // --- and the master flag: no finger owns the page any more.
     m_manipActive = false;
     if (abort)
@@ -3664,6 +3776,39 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
             }));
         } catch (...) {}
     });
+}
+
+// Apotheosis (double-tap zoom, 2026-09-09): commit a double-tap zoom through the SAME anchor/
+// animate/commit path a pinch release uses — there is only one zoom path in this harness, pinch and
+// double-tap both end up on SetPinchAnchor -> ApplyLiveZoom (seeds the animation's start frame) ->
+// SpringBackZoom (eases to the target, then calls PinchCommit). dipX/dipY are ContentArea DIPs —
+// SetPinchAnchor does its own conversion into the presenting layer's space, exactly as it does for
+// e->Position in OnImageManipDelta; targetScale is the absolute page scale WebCoreTapPolicyAt asked
+// for (already clamped to [1.0, 3.0], a subrange of SnapAndClampPageScale's own [0.5, 6.0]).
+void MainPage::RunDoubleTapZoom(double dipX, double dipY, float targetScale)
+{
+    if (!m_sessionActive || m_loading || m_interacting) return;
+    SetPinchAnchor(dipX, dipY);
+    m_liveScale = 1.0f;
+    ApplyLiveZoom();   // seeds the preview at scale 1 around this anchor before the spring animates it
+    float target = SnapAndClampPageScale(targetScale);
+    float targetLive = (m_pageScale > 0.0f) ? target / m_pageScale : 1.0f;
+    if (!(targetLive > 0.0f)) targetLive = 1.0f;
+    SpringBackZoom(targetLive, target);   // eases the preview to targetLive, then PinchCommit(target)
+}
+
+// Apotheosis (double-tap zoom, 2026-09-09): m_dtapHoldTimer's one-shot Tick — no second tap arrived
+// within the hold interval, so the tap OnPageTapped held really was just one tap. WebCoreTapPolicyAt
+// having said this point is zoomable does not mean a SINGLE tap here should zoom or be suppressed —
+// a real mobile browser dispatches the click either way and only decides late whether a second tap
+// also arrived to zoom.
+void MainPage::OnDtapHoldTimer(Platform::Object^, Platform::Object^)
+{
+    if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }   // one-shot
+    if (!m_dtapPending) return;
+    m_dtapPending = false;
+    if (!m_sessionActive || m_loading || m_interacting) return;   // session torn down/busy while held
+    ForwardClickToEngine(m_dtapPx, m_dtapPy);
 }
 
 // ---- GPU 路径1 探针 ----
@@ -4779,6 +4924,7 @@ void MainPage::LoadSettings()
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
             else if (k == "axislock") m_axisLockEnabled = (atoi(v.c_str()) != 0);
+            else if (k == "dtapzoom") m_dtapZoomEnabled = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -4804,6 +4950,7 @@ void MainPage::SaveSettings()
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
     s += "axislock=" + std::to_string(m_axisLockEnabled ? 1 : 0) + "\n";
+    s += "dtapzoom=" + std::to_string(m_dtapZoomEnabled ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -4826,6 +4973,7 @@ void MainPage::ShowSettings()
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
     if (SetAxisLockSwitch) SetAxisLockSwitch->IsOn = m_axisLockEnabled;
+    if (SetDtapZoomSwitch) SetDtapZoomSwitch->IsOn = m_dtapZoomEnabled;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -4863,6 +5011,7 @@ void MainPage::HideSettings()
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
     if (SetAxisLockSwitch) m_axisLockEnabled = SetAxisLockSwitch->IsOn;
+    if (SetDtapZoomSwitch) m_dtapZoomEnabled = SetDtapZoomSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -4903,8 +5052,9 @@ static const wchar_t* const kI18n[][2] = {
     { L"清除 Cookie(退出全部登录)", L"Clear cookies (sign out everywhere)" },
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
-    { L"滚动", L"Scrolling" },
+    { L"交互", L"Interaction" },
     { L"轴锁定(单指滚动吸附方向)", L"Axis lock" },
+    { L"双击缩放", L"Double-tap to zoom" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },

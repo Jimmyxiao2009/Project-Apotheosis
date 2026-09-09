@@ -77,6 +77,7 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::ComboBox^ SetPrefetchCombo;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetAxisLockSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetDtapZoomSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideNavBarSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideStatusBarSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;

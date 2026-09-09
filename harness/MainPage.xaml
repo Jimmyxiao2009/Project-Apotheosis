@@ -857,9 +857,13 @@
                          Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock).
                          A shipped scrolling behaviour, so it lives in its own normal section rather
                          than under DEVELOPER. -->
-                    <TextBlock Text="SCROLLING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
-                    <TextBlock Text="滚动" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
+                    <TextBlock Text="INTERACTION" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
+                    <TextBlock Text="交互" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
                     <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
+                    <!-- Apotheosis (double-tap zoom, 2026-09-09): mirrors SetAxisLockSwitch exactly —
+                         default ON, pure harness-side decision (WebCoreTapPolicyAt is read-only), own
+                         normal INTERACTION section, not DEVELOPER. -->
+                    <ToggleSwitch x:Name="SetDtapZoomSwitch" Header="双击缩放" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
