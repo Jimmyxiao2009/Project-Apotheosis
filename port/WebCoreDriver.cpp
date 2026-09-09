@@ -102,11 +102,10 @@
 namespace WebCore {
 void wkWinUWPTexmapTextureStats(uint64_t& bytes, unsigned& count);   // BitmapTexture.h
 void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTexturePool.h
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §4): off-thread tile rasterisation switch and its in-flight
-// counter (TextureMapperTile.h, WebKit winuwp 54db7b8987). Declared here for the same reason as
-// the two above — including the texmap header would drag in TextureMapperGLHeaders.h.
-void wkWinUWPSetThreadedRaster(bool);
-bool wkWinUWPThreadedRaster();
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §4): the in-flight counter of the off-thread tile
+// rasterisation (TextureMapperTiledStore.h). Declared here for the same reason as the two above —
+// including the texmap header would drag in TextureMapperGLHeaders.h. The runtime switch that used
+// to sit beside it is gone with package 5: a layer pass is always rastered on the worker pool.
 unsigned wkWinUWPTexmapPendingRasterTiles();
 // Apotheosis (OFFTHREAD-RASTER-LOG.md §10, WebKit winuwp 099064a24d..c0608a6353): step 4 made
 // first paints asynchronous too, so a tile whose replay has not landed draws NOTHING. Missing the
@@ -142,20 +141,17 @@ size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
 // plus how many GraphicsLayerTextureMapper::setNeedsDisplay() calls actually flipped m_needsDisplay
 // false->true. Both reset on read. Declared by hand for the same reason as everything above.
 void wkWinUWPTexmapDirtySrcStats(unsigned& needsDisplay, unsigned& storeCreated, unsigned& sizeChange, unsigned& scaleChange, unsigned& setNeedsDisplayCalls);
-// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md sections 3 and 5.2, package 3): the TileGrid v2
-// switch and the two numbers the driver reads from it (TextureMapperTiledStore.h). Declared by hand
-// for the same reason as everything above - that header pulls in the texmap GL headers.
-//   wkWinUWPSetTileGridV2 / wkWinUWPTileGridV2   the runtime switch. Read at store CREATION, so a
-//     flip applies to the layers of the next page load, not to the ones on screen.
-//   wkWinUWPTexmapVisibleHoles                   the sum of visibleHoles() over every v2 store that
+// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md sections 3 and 5.2, package 3): the one number
+// the driver reads from the TileGrid (TextureMapperTiledStore.h). Declared by hand for the same
+// reason as everything above - that header pulls in the texmap GL headers. The v1/v2 switch that
+// used to sit here is gone with package 5; the TileGrid is the only store there is.
+//   wkWinUWPTexmapVisibleHoles                   the sum of visibleHoles() over every store that
 //     has composited since the last call - visible cells drawing nothing with no backdrop behind
-//     them. Reading resets it. This is the ONLY number the v2 repair reacts to (gpuPresent).
-//   wkWinUWPSetTileGridPanGesture                a level mirroring g_panGesture, forwarded to every
-//     live v2 store; recorded in the `tg` trace, does not gate the cover margin.
-void wkWinUWPSetTileGridV2(bool);
-bool wkWinUWPTileGridV2();
+//     them. Reading resets it. This is the ONLY number the repair reacts to (gpuPresent).
+// (wkWinUWPSetTileGridPanGesture, the level that mirrored a pan gesture into every live store, went
+// with the pan present handshake in package 5 - see the block at g_dragActive. The engine-side
+// setter is still there and simply never called; it comes out with the next engine rebuild.)
 unsigned wkWinUWPTexmapVisibleHoles();
-void wkWinUWPSetTileGridPanGesture(bool);
 }
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
@@ -506,49 +502,14 @@ static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即�
 static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
-// Apotheosis (pan present handshake): during a main-frame touch pan the harness moves the already
-// presented pixels itself with a XAML TranslateTransform (instant pan) while the engine catches up
-// in coarse steps. The SwapChainPanel content and that transform are composed by DWM
-// independently, so ANY present the harness did not ask for shows new content under the old
-// translation for a frame - the "it briefly jumps back" flicker seen on device. While g_panGesture
-// is set the engine therefore presents nothing on its own: eglSwapBuffers is deferred (g_swapOwed)
-// and released by WebCorePresent(), which the harness posts once XAML has committed the matching
-// translation. Engine thread only, like every other flag here.
-static bool g_panGesture = false;
-static bool g_swapOwed = false;       // a composite ran whose swap was deferred and is still owed
-// Apotheosis (stale deferred swap, 2026-09-04): a deferred swap is only correct for the scroll
-// position it was composited at. The harness releases it two XAML frames after the completion of
-// the scroll job it belongs to, and a newer scroll frame may supersede that wait and release both
-// at once (MainPage::DisarmPanAck) - so the WebCorePresent() that arrives can be the acknowledgement
-// of a job that is no longer the newest one the engine has applied. Swapping then puts the older
-// composite on screen underneath a translation that has already been reduced by the newer delta,
-// i.e. the content jumps back towards where the gesture started for one frame. Tag every owed swap
-// with the scroll generation (and position) it was composited at; WebCorePresent() releases it only
-// if it still belongs to the newest applied scroll, and otherwise drops the frame and asks for a
-// fresh composite. Engine thread only, like every other flag here.
-//
-// Apotheosis (XAML-path consistency review, 2026-09-04): that tag is also the frame's IDENTITY, and
-// the harness now names it when it acknowledges (WebCorePresentFrame). Two holes the "is it still
-// the newest scroll?" test alone cannot close:
-//   * the acknowledgement and a newer WebCoreScrollBy can reach the engine queue in either order.
-//     Arriving after it, an ack meant for frame N releases frame N+1 - which is exactly the frame
-//     under an older translation the whole handshake exists to prevent.
-//   * the composite the ack names need not be a scroll composite at all. Every export that paints
-//     while a gesture runs (WebCoreClickAt, WebCoreWheelAt, WebCoreDragAt, WebCoreSetPageScale,
-//     WebCoreSessionPaint, WebCoreComposite) also defers its swap and re-arms g_swapOwed with the
-//     current generation, so a pan ack could put a double-tap-zoom frame on screen under a pan
-//     translation.
-// Every owed swap therefore carries a swap id the harness reads back with
-// WebCoreGetOwedSwapScroll() and hands to WebCorePresentFrame(); an id that does not match is
-// dropped WITHOUT clearing g_swapOwed - the composite in the back buffer is newer than the ack and
-// is still owed to its own acknowledgement, and nothing would ever recomposite it during a gesture
-// (WebCoreLiveTick skips its composite while g_panGesture is set).
-static uint64_t g_scrollGen = 0;      // bumped by every main-frame scroll the engine applies
-static uint64_t g_swapOwedGen = 0;    // g_scrollGen as it was when the owed composite ran
-static uint64_t g_swapOwedId = 0;     // identity of the owed frame; what WebCorePresentFrame matches on
-static uint64_t g_swapIdNext = 1;     // 0 stays reserved for "no frame" / "any frame" (legacy WebCorePresent)
-static int g_swapOwedScrollX = 0;     // scroll position that composite is showing (diagnostics + harness residual)
-static int g_swapOwedScrollY = 0;
+// Apotheosis (package 5, CLEANUP-LOG.md): the pan present handshake is gone. It let a gesture take
+// the presents away from the engine (defer eglSwapBuffers, release each frame by hand) so that the
+// engine's own composites could not race the XAML TranslateTransform the harness drew the pan with.
+// That preview is deleted, and with it the only caller WebCoreSetPanGesture(1) ever had: on the
+// shipping default (instantpanxaml OFF since package 13) the harness never armed the mode, so every
+// flag, the owed-swap ledger and the scroll generation that dated it were provably unreachable.
+// Presents are unconditional again. If a future gesture path wants the engine to hold frames back,
+// take the mechanism from the history of this file rather than from a flag nothing sets.
 // Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
 // consumed is still in flight — moves/releases only reach the page while this is set, and
 // teardownSession() clears it. Engine thread only, like every other flag here.
@@ -2796,28 +2757,6 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     return kOK;
 }
 
-// Apotheosis (stale deferred swap): confirmation on device that the guard in WebCorePresent()
-// actually fires, and by how much the dropped frame was out of date. Written as a plain line
-// into crash.txt (no crash record, no crash-entry budget), capped so a long pan cannot
-// fill the file. Grep for "pan-swap-drop".
-static void panSwapDropNote(int nowX, int nowY)
-{
-    static int notes = 0;
-    if (!g_crashLogPath[0] || notes >= 8)
-        return;
-    ++notes;
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
-        return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    std::fprintf(fp, "pan-swap-drop %02u:%02u:%02u.%03u owed_gen=%llu scroll_gen=%llu owed=%d,%d now=%d,%d\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        static_cast<unsigned long long>(g_swapOwedGen), static_cast<unsigned long long>(g_scrollGen),
-        g_swapOwedScrollX, g_swapOwedScrollY, nowX, nowY);
-    std::fclose(fp);
-}
-
 // Apotheosis: paint the layer tree into whatever framebuffer is bound.
 static void gpuPaintTree(WebCore::GraphicsLayerTextureMapper& glRoot)
 {
@@ -2900,27 +2839,12 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
                 FILE* fp = nullptr;
                 if (fopen_s(&fp, g_stagePath.c_str(), "ab") == 0 && fp) {
                     const float ps = g_session && g_session->page ? g_session->page->pageScaleFactor() : -1.f;
-                    std::fprintf(fp, "tgloop holes=%u owed=%u ps=%.3f pan=%d\n",
-                        holes, tgOwedRun, ps, g_panGesture ? 1 : 0);
+                    std::fprintf(fp, "tgloop holes=%u owed=%u ps=%.3f\n",
+                        holes, tgOwedRun, ps);
                     std::fclose(fp);
                 }
             }
         }
-    }
-    // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
-    // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
-    // TranslateTransform on screen, or the two disagree for a frame. WebCorePresent() does the swap.
-    if (g_panGesture) {
-        g_swapOwed = true;
-        // Apotheosis (stale deferred swap): remember which scroll this frame is showing, so
-        // WebCorePresent() can tell "the frame the harness is acknowledging" from "a frame the
-        // engine has already moved past". See the block at g_scrollGen.
-        g_swapOwedGen = g_scrollGen;
-        g_swapOwedId = g_swapIdNext++;   // identity the harness acknowledges (WebCorePresentFrame)
-        const IntPoint owedScroll = view.scrollPosition();
-        g_swapOwedScrollX = owedScroll.x();
-        g_swapOwedScrollY = owedScroll.y();
-        return kOK;
     }
     {
         PerfPhase perfSwap(&g_perfCur.swap);        // M4: eglSwapBuffers → SwapChainPanel
@@ -2929,28 +2853,24 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     return kOK;
 }
 
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2/§4.3): call right after a composite. With threaded
-// raster on, a replay that finishes after this composite has no one to upload it — the tile would
-// keep its old pixels until the page happens to be dirtied again. Arming m_needsPresent makes the
-// harness' next live tick composite (and the tick's own peekNeedsPresent() fast-path check take the
-// heavy branch), where wkFinishPendingPaints() picks the finished buffers up. Bumping the frame
-// hash keeps the live loop from judging the frame static and stopping before that tick happens.
-// The count also becomes the perf row's raster_pending column, which is the only way to see
-// whether the worker pool kept up. No-op (and no counter read) while the feature is off.
+// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2/§4.3): call right after a composite. A replay that
+// finishes after this composite has no one to upload it — the tile would keep its old pixels until
+// the page happens to be dirtied again. Arming m_needsPresent makes the harness' next live tick
+// composite (and the tick's own peekNeedsPresent() fast-path check take the heavy branch), where
+// wkFinishPendingPaints() picks the finished buffers up. Bumping the frame hash keeps the live loop
+// from judging the frame static and stopping before that tick happens. The count also becomes the
+// perf row's raster_pending column, which is the only way to see whether the worker pool kept up.
 static void notePendingRasterTiles()
 {
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): TileGrid v2 needs this even with
-    // threaded raster OFF. With the switch off v2 replays inline, so nothing is pending and nothing
-    // finishes on a worker (both counters stay at 0, as before) - but the tile still has to be
-    // UPLOADED, and the per-composite upload budget applies to the inline path too. A pass that
-    // rasterises more cells than the budget uploads leaves the rest Landed: pixels that exist and
-    // that only the next composite's drain can put on screen. On a page that has stopped dirtying
-    // itself nobody would ask for that composite (the visible-holes present in gpuPresent covers a
-    // hole, not a Landed tile behind an already drawn one), so the last tiles of every burst would
-    // sit in memory, off the screen. Reading the three counters costs three loads; keep the early
-    // return for the v1 + no-threading combination, where they are all provably 0.
-    if (!WebCore::wkWinUWPThreadedRaster() && !WebCore::wkWinUWPTileGridV2())
-        return;
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): the TileGrid needs this even for
+    // the passes it replays inline (an image store never goes to a worker), where nothing is
+    // pending and nothing finishes on a worker - the tile still has to be UPLOADED, and the
+    // per-composite upload budget applies to the inline path too. A pass that rasterises more cells
+    // than the budget uploads leaves the rest Landed: pixels that exist and that only the next
+    // composite's drain can put on screen. On a page that has stopped dirtying itself nobody would
+    // ask for that composite (the visible-holes present in gpuPresent covers a hole, not a Landed
+    // tile behind an already drawn one), so the last tiles of every burst would sit in memory, off
+    // the screen.
     // Both are needed. `pending` covers "a replay is still running" — one more composite will be
     // owed. `finished` (edge-triggered, reading resets) covers the replay that started AND ended
     // between two composites, which leaves `pending` at zero although nothing has uploaded the new
@@ -3242,16 +3162,6 @@ static void teardownSession()
     g_gpuTargetedNext = false;
     g_gpuLastCompositeFull = false;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
-    // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
-    // the deferral (a new session must present normally) and the swap it may still owe - the back
-    // buffer is about to be redrawn by the next session anyway.
-    g_panGesture = false;
-    g_swapOwed = false;
-    // Apotheosis (stale deferred swap): the scroll ledger belonged to the page that is going away.
-    ++g_scrollGen;
-    g_swapOwedGen = g_scrollGen;
-    g_swapOwedId = 0;   // no frame is owed: a late ack from the old page must match nothing
-    g_swapOwedScrollX = g_swapOwedScrollY = 0;
     // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
     // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
     // mousemove/mouseup into a document that never saw the press.
@@ -4679,10 +4589,6 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     if (ty < minP.y()) ty = minP.y();
     if (ty > maxP.y()) ty = maxP.y();
     view->setScrollPosition(ScrollPosition(tx, ty));
-    // Apotheosis (stale deferred swap): this job's composite, further down, is the only frame that
-    // shows this scroll position - anything composited before this line is now out of date. See
-    // the block at g_scrollGen.
-    ++g_scrollGen;
 
     // ★ M3 快滚:不再每帧跑 pumpLoop(8s 看门狗的多轮 rendering-update)+ 重取帧 + resize + 二次 layout
     //   —— 那是"很卡"的元凶。这里只一次 isolatedUpdateRendering(驱动 scroll steps/IntersectionObserver 注册,
@@ -4734,10 +4640,6 @@ int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* vie
     return kOK;
 }
 
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.1): flip off-thread tile rasterisation. The engine-side
-// switch is a plain file-static bool read once per tile update, so this is safe between composites
-// and needs no teardown when it goes off (in-flight replays are still collected by
-// wkFinishPendingPaints/the 4-composite deadline).
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): register the harness' present wake-up. Pass
 // nullptr to go back to pure polling (the fixed-interval live tick). See the "event-driven
 // present" block near the top of this file for the threading contract: the callback can be
@@ -4749,24 +4651,6 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void*), void* ctx)
     g_presentCbCtx.store(ctx, std::memory_order_release);
     g_presentCb.store(cb, std::memory_order_release);
     g_presentWakeArmed.store(0, std::memory_order_release);
-}
-
-void WebCoreSetThreadedRaster(int enabled)
-{
-    // The completion handler is installed together with the feature (and removed with it) so that
-    // no worker can call into a driver that has stopped expecting it. Both calls are engine thread.
-    WebCore::wkWinUWPSetRasterCompletionHandler(enabled ? &rasterCompletedOnWorker : nullptr);
-    WebCore::wkWinUWPSetThreadedRaster(enabled != 0);
-}
-
-// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 5.2): the TileGrid v2 switch, same shape as
-// WebCoreSetThreadedRaster above - engine thread, one plain forward. The engine reads the flag when
-// a tiled backing store is CREATED, so flipping it does not touch the layers on screen: it applies
-// to the next page load. Default ON since package 4 (0.1.9.33); the switch is kept so a device
-// round can still fall back to v1.
-void WebCoreSetTileGridV2(int enabled)
-{
-    WebCore::wkWinUWPSetTileGridV2(enabled != 0);
 }
 
 // Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
@@ -5760,6 +5644,11 @@ int WebCoreGpuInit(void* nativeWindow, int w, int h)
     if (g_gpuActive)
         return kOK;   // 幂等
     ensureWebCoreInitialized();
+    // Apotheosis (package 5): tile rasterisation always runs on the engine's worker pool, so the
+    // completion hook is installed once here rather than by a runtime switch. It is called ON A
+    // WORKER THREAD (see rasterCompletedOnWorker) and must exist before the first composite can
+    // post a replay; WebCoreGpuInit is idempotent and is the only way a tile ever gets created.
+    wkWinUWPSetRasterCompletionHandler(&rasterCompletedOnWorker);
     PlatformDisplay& display = PlatformDisplay::sharedDisplay();   // WIN → PlatformDisplayWin,起 ANGLE EGLDisplay
 
     std::unique_ptr<GLContext> ctx = nativeWindow
@@ -5794,142 +5683,6 @@ int WebCoreComposite()
     if (!view || !root)
         return kErrNoView;
     return gpuPresent(*view, g_gpuW, g_gpuH, *root);
-}
-
-// Apotheosis (pan present handshake): tell the engine that a main-frame pan gesture owns the
-// screen. While it does, nothing presents on its own initiative:
-//   - gpuPresent() composites into the back buffer but defers the eglSwapBuffers (g_swapOwed),
-//   - WebCoreLiveTick() skips its composite altogether, which also leaves the engine thread free
-//     for the harness' scroll jobs on a heavy page (github),
-// and the harness releases each swap with WebCorePresent() at the moment its own
-// TranslateTransform for that scroll position has been committed by XAML. Anything a wake-up,
-// timer, rAF or image decode changes in the meantime still happens - it simply becomes visible
-// with the next scroll present instead of racing the transform.
-// Engine thread only (post it like every other export); active=0 hands presents back and asks for
-// one settling composite, because the ticks that ran during the gesture produced no pixels.
-//
-// Apotheosis (2026-09-06): that composite is a TARGETED one, not a forced full-tree repaint. The
-// forced version was one 400-1000 ms tree repaint per gesture on n-tv.de/github.com - "smooth for
-// about a quarter page, then a stall, then smooth again" - and it repaints layers that are
-// perfectly fine, because a gesture does not change content, it moves the visible rect. Everything
-// a pan can actually cost a store is detected per layer and repaired by the ordinary composite:
-//   - tiles created for the area the gesture scrolled to -> m_wkVisibleRectChanged, and a new tile
-//     paints itself in full (GraphicsLayerTextureMapper.cpp:650/:741)
-//   - a store created during the gesture              -> m_wkNeedsFullRepaint (:413)
-//   - a layer resized or rescaled mid-gesture         -> m_wkBackingStoreSize/Scale (:718)
-//   - tiles whose rasterisation was dropped while the cover rect moved
-//                                                     -> wkHasUnpaintedVisibleTiles() (:741)
-// and a settling frame that still comes up short of pixels is repaired by the unpainted-tile
-// branch in gpuPresent(), which now escalates to the full repaint only if the targeted one did not
-// settle it. So the sledgehammer is still reachable, it is just no longer the first move.
-void WebCoreSetPanGesture(int active)
-{
-    const bool on = (active != 0);
-    if (g_panGesture == on)
-        return;
-    g_panGesture = on;
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 3, package 3): mirror the level into the
-    // TileGrid v2 stores. It is a level, not an event: every live v2 store records it in its `tg`
-    // pass line and it is reserved for R11-style idle work. It deliberately does NOT gate the cover
-    // margin - the model derives the pan direction from consecutive visible rects itself, so a
-    // fling after the finger has left the glass gets the same treatment as the drag before it.
-    // No-op while the switch is off. Engine thread, like everything else in this function.
-    WebCore::wkWinUWPSetTileGridPanGesture(on);
-    if (!on && g_session && g_session->chrome) {
-        // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): and make sure that composite repaints what
-        // the gesture cost the backing stores (2026-09-06: targeted, no longer the whole tree).
-        g_gpuTargetedNext = true;
-        g_session->chrome->setNeedsPresent();
-        // Apotheosis (XAML-path consistency review, 2026-09-04): and ASK for that composite. Every
-        // tick during the gesture disarmed the present wake at its top (presentWakeDisarm) and then
-        // returned before the `peekNeedsPresent -> presentRequested` re-arm at the bottom, so in
-        // event-driven mode the loop is idle here and setNeedsPresent alone is a flag nobody reads.
-        // Without this the page stays on the last gesture frame until the user touches it again -
-        // "the flicker comes back a few seconds later" is partly this: the frame on screen is stale
-        // and the next unrelated wake finally replaces it in one jump.
-        WebCorePort::presentRequested();
-    }
-}
-
-// Apotheosis (pan present handshake): perform the swap a composite deferred while g_panGesture was
-// set. Cheap and idempotent - with nothing owed it does nothing, so the harness may post it freely
-// (it also flushes a swap left over after the gesture ended). Engine thread only.
-static int presentOwedSwap(uint64_t ackId)
-{
-    if (!g_swapOwed)
-        return kOK;
-    // Apotheosis (XAML-path consistency review, 2026-09-04): an acknowledgement that names a frame
-    // other than the one in the back buffer is not this frame's acknowledgement. Releasing it puts
-    // content on screen under a translation that was committed for a different scroll position -
-    // the artefact this whole handshake exists to prevent, only in the other direction. Drop the
-    // ACK, not the frame: g_swapOwed stays set, so the composite is still released by the
-    // acknowledgement that does belong to it (or by the WebCoreLiveTick / WebCoreSetPanGesture(0)
-    // safety nets once the gesture is over). ackId 0 = "whatever is owed", the legacy
-    // WebCorePresent() contract.
-    if (ackId && ackId != g_swapOwedId)
-        return kOK;
-    if (!g_gpuActive || !g_gpuPresentMode || !g_glContext) {
-        g_swapOwed = false;
-        return kOK;
-    }
-    // Apotheosis (stale deferred swap, 2026-09-04): only release a frame that still belongs to the
-    // newest scroll the engine has applied. If a newer WebCoreScrollBy has already run, this
-    // acknowledgement belongs to a job the engine has moved past: its composite shows the OLD
-    // scroll position, while the harness' translation has already been reduced by the newer delta,
-    // and swapping it puts the content back where the gesture came from for one frame. Drop it
-    // instead - the back buffer is about to be redrawn anyway - and arm a present so the next
-    // composite (at the current position) reaches the screen without waiting for a wake-up.
-    if (g_swapOwedGen != g_scrollGen) {
-        g_swapOwed = false;
-        int nowX = 0, nowY = 0;
-        if (g_session && g_session->mainFrame) {
-            if (WebCore::LocalFrameView* v = g_session->mainFrame->view()) {
-                nowX = v->scrollPosition().x();
-                nowY = v->scrollPosition().y();
-            }
-        }
-        panSwapDropNote(nowX, nowY);
-        if (g_session && g_session->chrome)
-            g_session->chrome->setNeedsPresent();
-        // Apotheosis: setNeedsPresent() alone is a flag nobody polls in event-driven mode - the
-        // tick that would notice it is exactly the one that returns early while g_panGesture is
-        // set. Arm a real wake so the replacement composite happens.
-        WebCorePort::presentRequested();
-        return kOK;
-    }
-    g_swapOwed = false;
-    g_glContext->makeContextCurrent();
-    g_glContext->swapBuffers();
-    return kOK;
-}
-
-int WebCorePresent()
-{
-    return presentOwedSwap(0);
-}
-
-// Apotheosis (XAML-path consistency review, 2026-09-04): release the owed swap only if it is still
-// the frame `swapId` names (an id from WebCoreGetOwedSwapScroll). Anything else is left owed - see
-// presentOwedSwap(). swapId 0 behaves exactly like WebCorePresent(). Engine thread only.
-int WebCorePresentFrame(unsigned long long swapId)
-{
-    return presentOwedSwap(static_cast<uint64_t>(swapId));
-}
-
-// Apotheosis (XAML-path consistency review, 2026-09-04): what the deferred frame in the back buffer
-// actually shows. Called from the same engine hop as the WebCoreScrollBy it belongs to (next to
-// WebCoreGetScrollState), it lets the harness build the pan translation from the FRAME's own scroll
-// position - offset - (swapScroll - gestureStartScroll) - instead of from "wherever the engine
-// happens to be now", which is what made a coarse engine step visible as a jump. The id comes back
-// with it and is handed to WebCorePresentFrame() when XAML has committed that translation.
-// Returns 1 when a swap is owed, 0 otherwise. Cheap: no layout, no paint. Engine thread only.
-int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long long* outSwapId)
-{
-    const bool owed = g_swapOwed;
-    if (outScrollX) *outScrollX = owed ? g_swapOwedScrollX : 0;
-    if (outScrollY) *outScrollY = owed ? g_swapOwedScrollY : 0;
-    if (outSwapId)  *outSwapId  = owed ? static_cast<unsigned long long>(g_swapOwedId) : 0ull;
-    return owed ? 1 : 0;
 }
 
 // M2(离屏验证):把当前会话图层树经 TextureMapper 合成到离屏纹理,readback 出 RGBA 到 outRGBA(>= w*h*4)。
@@ -6241,12 +5994,6 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
 
-    // Apotheosis (pan present handshake): safety net for an acknowledgement that never came back
-    // (a lost RunAsync, the app going to the background mid-gesture). The gesture is over, so a
-    // composited-but-unswapped frame must not stay invisible.
-    if (!g_panGesture && g_swapOwed)
-        WebCorePresent();
-
     // Apotheosis (event-driven present): the composite the last wake-up asked for starts here, so
     // re-arm the wake path. Anything invalidated from now on - including from inside this very
     // tick's isolatedUpdateRendering (a rAF callback re-registering, a CSS animation asking for the
@@ -6282,15 +6029,7 @@ int WebCoreLiveTick(uint8_t* outRGBA)
         doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });   // see gpuPrepare
     }
     g_lastPendingResources = countPendingResources(*doc);
-    // Apotheosis (pan present handshake): a pan gesture owns the screen. Everything above (rAF, WTF
-    // timers, finished decodes, style/layout) has run and stays in the tree; only the composite is
-    // skipped, because the sole thing allowed to reach the panel during a gesture is a present the
-    // harness asked for. That also leaves the engine thread to the scroll jobs, which is what the
-    // finger actually sees. needsPresent stays set (nothing consumed takeNeedsPresent), so the
-    // first composite after the gesture is a full one.
-    if (g_panGesture)
-        return kOK;
-    // Apotheosis (M4 load throttle): same idea while the main document loads. Everything above has
+    // Apotheosis (M4 load throttle): while the main document loads everything above has
     // run (parser-driven layout, rAF, finished decodes), only the composite - the most expensive
     // thing on this thread - is limited to one per 250 ms, so the arriving subresources get the
     // engine thread instead of repeatedly rasterising a half-built page. The frame that first

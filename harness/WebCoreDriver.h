@@ -294,56 +294,17 @@ void WebCoreGpuSetFlip(int flipH, int flipV);
 // 调试:把 FrameView 滚动/内容尺寸 + 合成图层树文本写入 outBuf(定位背景丢失/滚动失效)。返回 0 成功。
 int WebCoreGpuLayerInfo(char* outBuf, int len);
 
-// Apotheosis (OFFTHREAD-RASTER-LOG.md): rasterise TextureMapper tiles on a worker pool instead of
-// on the engine thread (experimental, default OFF). Only tiles that already hold valid content go
-// async; first paints and recycled tiles stay synchronous, so no tile is ever composited empty.
-// Takes effect from the next composite and may be flipped at any time. Engine thread only.
-void WebCoreSetThreadedRaster(int enabled);
-
-// Apotheosis (TILING-REWRITE-PLAN.md 5.2): TileGrid v2 - the rewritten tile management (index-
-// addressed lattice, one primary grid plus at most one backdrop, no timeouts). Experimental,
-// default OFF. The engine reads the flag when a tiled backing store is created, so a flip applies
-// to the layers of the NEXT page load, not to the ones on screen. Engine thread only.
-void WebCoreSetTileGridV2(int enabled);
-
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 事件驱动呈现。引擎在“有东西需要重新呈现”时
 // （调度渲染更新 / 图片加载完 / 异步栅格化瓦片落地 / 一次 tick 结束时仍脏）回调它，代替
 // harness 固定 200ms 轮询。每次合成最多回调一次（WebCoreLiveTick 开头重新武装）。
 // ★ 回调可能在引擎线程或栅格化工作线程上跑：不得阻塞、不得反过来调引擎，只能投队列。
 // 传 nullptr = 取消注册（回到纯轮询）。引擎线程上注册一次，首次导航前。
 void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
-// Apotheosis (pan present handshake): a main-frame touch pan is shown by the harness itself, as a
-// XAML TranslateTransform on the presenting element, while the engine catches up in coarse steps.
-// The panel content and that transform are composed independently, so any present the harness did
-// not ask for puts new content under the old translation for a frame (visible flicker/jump-back).
-// WebCoreSetPanGesture(1) therefore makes the engine present nothing on its own: composites still
-// happen but the eglSwapBuffers is deferred, and WebCoreLiveTick skips its composite entirely
-// (content updates - rAF, timers, decodes - still run, they just become visible with the next
-// scroll present). WebCorePresent() releases a deferred swap; the harness posts it once XAML has
-// committed the matching translation. WebCoreSetPanGesture(0) hands presents back and asks for one
-// full composite. Both engine thread only; WebCorePresent is idempotent and a no-op when nothing
-// is owed. Returns 0 (kOK).
-void WebCoreSetPanGesture(int active);
-int WebCorePresent(void);
-
-// Apotheosis (XAML-path consistency review, 2026-09-04): the deferred-swap handshake, made exact.
-// WebCorePresent() releases "whatever is owed", which is wrong twice over: an acknowledgement can
-// overtake or be overtaken by a newer scroll job, and any other export that paints during a gesture
-// (click, wheel, drag, pinch, session paint) also leaves a deferred swap behind - so the ack for
-// one frame could release a completely different one, under a translation committed for the frame
-// it was not.
-//   WebCoreGetOwedSwapScroll  1 = a swap is owed; fills the scroll position that composite is
-//                             showing and its swap id. Call it in the same engine hop as the
-//                             WebCoreScrollBy (next to WebCoreGetScrollState) and build the pan
-//                             translation from THAT position - offset - (swapScroll -
-//                             gestureStartScroll) - not from wherever the engine is now.
-//                             Cheap: no layout, no paint. Engine thread.
-//   WebCorePresentFrame       release the owed swap only if it is still the frame `swapId` names;
-//                             an id that does not match leaves the frame owed rather than showing
-//                             it under the wrong translation. swapId 0 == WebCorePresent().
-//                             Engine thread, idempotent, returns 0 (kOK).
-int WebCoreGetOwedSwapScroll(int* outScrollX, int* outScrollY, unsigned long long* outSwapId);
-int WebCorePresentFrame(unsigned long long swapId);
+// Apotheosis (package 5): the pan present handshake is gone - WebCoreSetPanGesture /
+// WebCorePresent / WebCoreGetOwedSwapScroll / WebCorePresentFrame. It let a gesture take the
+// presents away from the engine so its own composites could not race the XAML TranslateTransform
+// the harness drew a pan with; that preview is deleted, and it was the only caller the mode ever
+// had. The engine presents every composite as it makes it. See CLEANUP-LOG.md.
 
 
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。
