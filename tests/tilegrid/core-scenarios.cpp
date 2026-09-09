@@ -454,6 +454,23 @@ void coreScenario9_imageStore(const CoreVariant& variant)
     scaled.isImage = true;
     harness.frame(scaled, "image scale");
     CHECK(!harness.core.model().backdropGrid().has_value());
+
+    // Apotheosis (package 4): image stores run on TileGrid v2 now
+    // (GraphicsLayerTextureMapper::setContentsToImage), so the adapter needs one promise this
+    // scenario did not make: an image store CONVERGES. The store keeps the Image alive - and with
+    // it the source every pass records from - exactly while wantsPass() is true, and lets it go
+    // (ImageObserver::didDraw, m_image = nullptr) on the composite that ends. If wantsPass() never
+    // went false the reference would be held for the life of the layer and didDraw would never
+    // fire; if it went false too early the remaining cells would have no source left to record.
+    // 24 cells at 6000x4000 is four times the upload budget of the strictest variant, so the
+    // release depends on the drain of several composites, which is the case that matters.
+    if (harness.lands()) {
+        const unsigned rounds = harness.settle(scaled, 40, "image settle after scale");
+        CHECK(rounds < 40);
+        CHECK(!harness.core.wantsPass());
+        CHECK_EQ(harness.core.visibleHoles(), 0u);
+        CHECK_EQ(harness.screen.unpaintedCells, 0u);
+    }
     EXPECT_NO_CORE_ARROWS(harness);
 }
 

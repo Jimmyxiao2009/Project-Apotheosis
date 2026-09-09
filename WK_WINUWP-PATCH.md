@@ -75,5 +75,26 @@ On a branch carrying the changes on top of the tag:
 git diff webkitgtk-2.52.4 HEAD > wk-winuwp.patch
 ```
 
+## Current state of the Project Apotheosis `winuwp` branch
+
+The patch above is the author's original publication and is left as it is. The
+fork's own branch has moved on; `git diff webkitgtk-2.52.4` there is currently
+**140 files, 12971 insertions and 115 deletions**, and PATCHLOG.md has one row
+per commit with the reason for it.
+
+Latest structural change, TileGrid package 4 (`5e052e57f8`), in
+`Source/WebCore/platform/graphics/texmap/`:
+
+- new since the tag: `TextureMapperTiledStore.h`,
+  `TextureMapperTileGridStore.{h,cpp}`, `TextureMapperTileGridCore.{h,cpp}`,
+  `TextureMapperTileGridModel.{h,cpp}`, `TextureMapperTileGridMachines.h`
+  (plus `Source/ThirdParty/sml/`);
+- back to the tag byte for byte: `TextureMapperTile.{h,cpp}`;
+- `TextureMapperTiledBackingStore.{h,cpp}` reduced to upstream plus the store
+  interface and viewport-limited tiling (see BLOCKERS.md in the docs repo).
+
+The texmap directory's share of the diff went from 8656 added lines in 21 files
+to 6109 in 19.
+
 This is the source artifact requested in
 [Issue #3](https://github.com/MoonlightLabCN/Project-Apotheosis/issues/3).

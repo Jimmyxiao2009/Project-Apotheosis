@@ -340,14 +340,9 @@ namespace Harness {
         // Apotheosis (OFFTHREAD-RASTER-LOG.md): push the "Threaded raster" developer setting to
         //   the engine thread. Never called from the UI thread without a post.
         void ApplyThreadedRasterSetting();
-        // Apotheosis: push the "Stale tile placeholders" developer setting (WebCoreSetStaleTiles) to
-        //   the engine thread. Called once at startup (ApplySettings, via LoadSettings) and again
-        //   whenever Settings closes with the switch changed — same wiring as ApplyThreadedRasterSetting,
-        //   never called from the UI thread without a post.
-        void ApplyStaleTilesSetting();
         // Apotheosis (TILING-REWRITE-PLAN.md 5.2): push the "Tile grid v2" developer setting
         //   (WebCoreSetTileGridV2) to the engine thread — same wiring and same two call sites as
-        //   ApplyThreadedRasterSetting/ApplyStaleTilesSetting above. The engine reads the flag when
+        //   ApplyThreadedRasterSetting above. The engine reads the flag when
         //   it creates a tiled backing store, so a flip takes effect on the next page load.
         void ApplyTileGridV2Setting();
         void ApplyLiveZoom();
@@ -470,13 +465,12 @@ namespace Harness {
         //   settings.ini instantpanxaml
         bool m_instantPanXaml { false };
         bool m_threadedRaster { true }; // settings.ini threadraster (default ON since 0.1.9.18: 2.9 ms vs 25 ms per scroll tick on device)
-        // Apotheosis (TILING-REWRITE-PLAN.md 5.2): the rewritten tile management (TileGrid v2).
-        //   Default OFF in package A (0.1.9.29) — v1 stays the shipping path until the device round
-        //   of section 7 is green. settings.ini tilegridv2; applies from the next page load.
-        bool m_tileGridV2 { false };
-        // Apotheosis: stale-tile placeholders (WebCoreSetStaleTiles) — a tile being rebuilt/invalidated
-        //   shows its last (stale) content instead of going blank. Default ON. settings.ini staletiles
-        bool m_staleTiles { true };
+        // Apotheosis (TILING-REWRITE-PLAN.md 5.2, package 4): the rewritten tile management
+        //   (TileGrid v2). Default ON since 0.1.9.33 — the 0.1.9.32 device round confirmed it at
+        //   1:1 and zoomed and measured it the fastest of the three variants. Off falls back to
+        //   v1, which is now upstream's store plus viewport-limited tiling and nothing else.
+        //   settings.ini tilegridv2; applies from the next page load.
+        bool m_tileGridV2 { true };
         // Apotheosis (review 2026-09-04 item 4): the suspend deferral in flight, and the timer that
         //   bounds how long the engine may keep the shell waiting for it. Both UI thread only.
         Windows::ApplicationModel::SuspendingDeferral^ m_suspendDeferral { nullptr };
@@ -491,8 +485,8 @@ namespace Harness {
         //   Pure harness-side routing, no engine push needed. settings.ini pinchpage
         bool m_pinchToPage { true };
         // Apotheosis (axis lock / rail scrolling): DEVELOPER toggle, default ON. Pure harness-side
-        // logic (see UpdateAxisLock/ApplyAxisLock) — no engine call, so unlike threadraster/
-        // staletiles it needs no ApplyXSetting push, m_axisLockEnabled is read directly.
+        // logic (see UpdateAxisLock/ApplyAxisLock) — no engine call, so unlike threadraster it
+        // needs no ApplyXSetting push, m_axisLockEnabled is read directly.
         // settings.ini axislock
         bool m_axisLockEnabled { true };
         // Apotheosis (review 2026-09-03): DISPLAY toggle. Off = the phone keeps its software

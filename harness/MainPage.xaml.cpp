@@ -3624,18 +3624,9 @@ void MainPage::ApplyThreadedRasterSetting()
     WebEngine::instance().post([en]() { try { WebCoreSetThreadedRaster(en); } catch (...) {} });
 }
 
-// Apotheosis: DEVELOPER toggle "Stale tile placeholders" (default ON). Engine-thread call — same
-//   shape as ApplyThreadedRasterSetting above. Called from ApplySettings(), i.e. once at startup
-//   (LoadSettings -> ApplySettings) and again whenever the Settings page closes with the switch
-//   having changed (HideSettings -> ApplySettings).
-void MainPage::ApplyStaleTilesSetting()
-{
-    const int en = m_staleTiles ? 1 : 0;
-    WebEngine::instance().post([en]() { try { WebCoreSetStaleTiles(en); } catch (...) {} });
-}
-
 // Apotheosis (TILING-REWRITE-PLAN.md 5.2): DEVELOPER toggle "Tile grid v2 (next page load)",
-//   default OFF. Same shape and the same two call sites as the two above (ApplySettings, i.e. once
+//   default ON since package 4. Same shape and the same two call sites as the one above
+//   (ApplySettings, i.e. once
 //   at startup and again whenever the Settings page closes). The engine reads the switch when a
 //   tiled backing store is CREATED, so flipping it leaves the page on screen alone and the next
 //   navigation is the one that runs on the new tile management — which is what the toggle's own
@@ -5446,7 +5437,6 @@ void MainPage::ApplySettings()
     ApplyPrefetchSetting();
     ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyTileGridV2Setting();                // Apotheosis: DEVELOPER toggle, engine-thread call
-    ApplyStaleTilesSetting();                // Apotheosis: DEVELOPER toggle, engine-thread call
     ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     ApplyHideStatusBarSetting();             // Apotheosis: DISPLAY toggle, UI thread only
@@ -5488,7 +5478,6 @@ void MainPage::LoadSettings()
             else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
-            else if (k == "staletiles") m_staleTiles = (atoi(v.c_str()) != 0);
             else if (k == "axislock") m_axisLockEnabled = (atoi(v.c_str()) != 0);
             else if (k == "pinchpage") m_pinchToPage = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
@@ -5522,7 +5511,6 @@ void MainPage::SaveSettings()
     s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
-    s += "staletiles=" + std::to_string(m_staleTiles ? 1 : 0) + "\n";
     s += "axislock=" + std::to_string(m_axisLockEnabled ? 1 : 0) + "\n";
     s += "pinchpage=" + std::to_string(m_pinchToPage ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
@@ -5552,7 +5540,6 @@ void MainPage::ShowSettings()
     if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
-    if (SetStaleTilesSwitch) SetStaleTilesSwitch->IsOn = m_staleTiles;
     if (SetAxisLockSwitch) SetAxisLockSwitch->IsOn = m_axisLockEnabled;
     if (SetPinchPageSwitch) SetPinchPageSwitch->IsOn = m_pinchToPage;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
@@ -5597,7 +5584,6 @@ void MainPage::HideSettings()
     if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
-    if (SetStaleTilesSwitch) m_staleTiles = SetStaleTilesSwitch->IsOn;
     if (SetAxisLockSwitch) m_axisLockEnabled = SetAxisLockSwitch->IsOn;
     if (SetPinchPageSwitch) m_pinchToPage = SetPinchPageSwitch->IsOn;
     if (SetUaCustomBox) {

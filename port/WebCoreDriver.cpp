@@ -123,31 +123,18 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 // shown them yet", so it owes a present exactly like wkWinUWPTexmapTakeFinishedRasterTiles();
 // reading resets it. Declared by hand for the same reason as everything above.
 unsigned wkWinUWPTexmapTakeDeferredUploads();
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): keep the tiles a layer drops out of its cover rect
-// and re-draw them, scaled, until fresh ones exist (TextureMapperTiledBackingStore). Default ON;
-// the switch is here so the device can A/B it without a rebuild. Declared by hand for the same
-// reason as everything above - the texmap header would drag in TextureMapperGLHeaders.h.
-void wkWinUWPSetStaleTiles(bool);
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): how often a visible tile has run out of composites
-// to draw something (TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles, counted inside
-// paintToTextureMapper). A LEVEL, not a snapshot - the interesting quantity is the delta across one
-// composite: "this paint walked over visible tiles that hold no pixels". That is the authoritative
-// version of the pixel probe this replaces. Declared by hand for the same reason as everything
-// above - the texmap header would drag in TextureMapperGLHeaders.h.
-unsigned wkWinUWPTexmapUnpaintedVisibleTiles();
-// Apotheosis (2026-09-07, ghost after a pinch): the engine's zoom trace. For a few composites
-// after a contents-scale change every tiled layer store records one line - what the new tile grid
-// holds, how many placeholders of the previous scale it drew, and the device-pixel quads of one
-// placeholder and of the live tile covering the same content - and this hands over the lines that
-// have not been read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine
-// thread, allocation-free. Declared by hand for the same reason as everything above.
+// Apotheosis (TILING-REWRITE-PLAN.md 5.3): the engine's TileGrid input trace - one `tg` line per
+// pass and per composite of every tiled layer store, a pass line being the complete PassInput, so
+// a device session replays on the PC (tests/tilegrid). This hands over the lines that have not been
+// read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine thread,
+// allocation-free. The name predates the rewrite (it used to drain a zoom trace as well) and is
+// kept so this file needs no change. Declared by hand for the same reason as everything above.
 size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
-// Apotheosis (2026-09-07, ghost strip on ntv.de): one line per live tiled backing store - size,
-// contents scale, page scale, visible and cover rect, how many tiles it holds, owes, or draws
-// nothing with, how many placeholders of a previous contents scale it still keeps, and the first
-// tile drawn with a texture that is not its own. This is the dump a device session takes *while*
-// the artefact is on screen, so WebCoreGpuLayerInfo() writes it before the layer tree rather than
-// after it. Declared by hand for the same reason as everything above.
+// Apotheosis (2026-09-07): one header line plus one line per live tiled backing store - size,
+// contents scale, page scale, visible rect, the tile counts, and for a TileGrid v2 store the state
+// of its grid. This is the dump a device session takes *while* an artefact is on screen, so
+// WebCoreGpuLayerInfo() writes it before the layer tree rather than after it. Declared by hand for
+// the same reason as everything above.
 size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
 // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0", GraphicsLayerTextureMapper.cpp):
 // per-cause breakdown of the wkTexmapDirtyFull count above - which of updateBackingStoreIfNeeded's
@@ -579,41 +566,26 @@ static const int kDragTapSlopPx = 8;   // engine px (~4 DIP at 720 over a 360 DI
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): a composite can come up with no content at all.
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04; TILING-REWRITE-PLAN.md section 3, package 4): a
+// composite can come up with no content at all.
 //
 // Who produces such a composite: every live tick takes the scroll fast path (WebCoreLiveTick sets
 // g_gpuScrollFast unconditionally), so gpuPrepare skips forceDirtyTree and the composite is drawn
 // entirely from the tiles the backing stores still hold. When those tiles are gone - dropped
-// outside the keep rect while the gesture moved the visible rect, recycled on a scale change, or
+// outside the cover rect while the gesture moved the visible rect, recycled on a scale change, or
 // still owed by a raster worker - the tree paints nothing at all and the whole screen is the clear
-// colour. That is the device symptom: content while the finger moves, the page background alone
-// the moment scrolling ends.
+// colour.
 //
-// The engine knows the answer exactly: wkWinUWPTexmapUnpaintedVisibleTiles() counts, inside the
-// paint itself, every visible tile that has run out of composites to produce pixels. Its delta
-// across one paint is therefore the authoritative "this frame is missing content" - a pixel probe
-// is not, because the layer background IS drawn, so "did anything get drawn" says yes while no
-// content tile exists at all.
-//
-// So the rule is: a LIGHT composite that walked over unpainted visible tiles is repaired before it
-// reaches the screen - painted again and swapped only then. A full composite is trusted
-// unconditionally, so this can never loop.
-//
-// Apotheosis (2026-09-06): the repair is TARGETED, not a forced full-tree repaint. The repair has
-// to happen - a frame holding nothing but the background must not reach the screen - but forcing
-// the WHOLE tree is a sledgehammer that costs 400-1000 ms of ms_backing on n-tv.de/github.com, and
-// the device symptom was one such stall per gesture (perf.csv 20260906-180145: 7 of 413 scroll
-// rows). The stores that lost their pixels say so themselves: the paint that came up short has
-// just put every visible tile that drew nothing back on the synchronous path
-// (TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles), so wkHasUnpaintedVisibleTiles()
-// is true for exactly those stores and false for every other layer. A repair that does NOT
-// force-dirty therefore repaints precisely the layers that are missing content
-// (GraphicsLayerTextureMapper::updateBackingStoreIfNeeded, the early-out at :741) and skips the
-// rest. The whole-tree force is kept as the escalation for the case where that does not settle it.
+// The repair ledger that used to live here - gpuArmRepair(), gpuNoteRepairResult(),
+// g_gpuRepairMisses, the escalation cooldown and the `repairloop` stage line - is gone with the v1
+// mechanics it read (CLEANUP-LOG.md, "TileGrid package 4"). The TileGrid model answers one question
+// after a composite instead: how many VISIBLE cells drew nothing and had no backdrop behind them
+// (wkWinUWPTexmapVisibleHoles). A cell can only be in that state while work the model has already
+// scheduled is running, and R5/R12 guarantee that work converges, so the only thing missing is a
+// frame to show the result in - exactly one more composite, no dirtying. See gpuPresent().
 static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tree this composite
 static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
 static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
-static unsigned g_gpuRepairMisses = 0;        // targeted repairs that still came up short (escalation counter)
 
 // ---------------------------------------------------------------------------
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
@@ -2780,6 +2752,12 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
         PerfPhase perfPaint(&g_perfCur.paint);   // M4: TextureMapper composite of the layer tree
         glRoot.layer().paint(*g_textureMapper);
     }
+    // Apotheosis (TILING-REWRITE-PLAN.md section 3, package 4): this composite added to the engine's
+    // visible-hole accumulator like any other, and nothing here would ever read it - so gpuPresent()
+    // would find this readback's holes on top of its own and owe a present for a frame the user is
+    // not looking at. Drain and discard: the readback is a snapshot (a tab thumbnail, the offscreen
+    // validation path), not the screen, and a hole in it is not a reason to composite again.
+    wkWinUWPTexmapVisibleHoles();
     // texture 的 FBO 此刻仍绑定 → 直接读回(endPainting 会还原帧缓冲绑定,故必须读在前)。
     // 读回缓冲静态复用:仅引擎线程用,免每帧 3MB 分配+释放(readback 模式滚动/实时 tick 是热路径)。
     static std::vector<uint8_t> tmp;
@@ -2840,115 +2818,10 @@ static void panSwapDropNote(int nowX, int nowY)
     std::fclose(fp);
 }
 
-// Apotheosis (2026-09-07): the escalation ledger of the unpainted-tile repair. See gpuArmRepair().
-static const double kRepairEscalateCooldownSec = 3.0;   // at most one forced whole-tree repaint per window
-static double g_gpuLastEscalateSec = -1e9;
-static unsigned g_gpuEscalateSuppressed = 0;            // escalations the cooldown / pan rule refused
-
-// Apotheosis (2026-09-07): one readable line in stage.txt when the repair loop is being throttled,
-// so the next device run can say whether the runaway is gone without reading the whole perf.csv.
-// Rate-limited to one line per second and capped, so a long pan cannot fill the file. Grep for
-// "repairloop". n= is how many escalations have been refused in this session, ps= the page scale
-// (the loop only runs away when it is != 1, see gpuArmRepair()), pan= whether a gesture is running.
-static void gpuRepairLoopNote(double nowSec)
+// Apotheosis: paint the layer tree into whatever framebuffer is bound.
+static void gpuPaintTree(WebCore::GraphicsLayerTextureMapper& glRoot)
 {
-    ++g_gpuEscalateSuppressed;
-    static double lastNoteSec = -1e9;
-    static int notes = 0;
-    if (g_stagePath.empty() || notes >= 24 || nowSec - lastNoteSec < 1.0)
-        return;
-    lastNoteSec = nowSec;
-    ++notes;
-    const float ps = g_session && g_session->page ? g_session->page->pageScaleFactor() : -1.f;
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
-        return;
-    std::fprintf(fp, "repairloop n=%u misses=%u ps=%.3f pan=%d\n",
-        g_gpuEscalateSuppressed, g_gpuRepairMisses, ps, g_panGesture ? 1 : 0);
-    std::fclose(fp);
-}
-
-// Apotheosis (2026-09-06): arm the composite that repairs a frame which came up short of content,
-// and say whether it is the escalated one. Ordinary case (g_gpuRepairMisses == 0): targeted - only
-// the stores that reported unpainted visible tiles repaint themselves, everything else early-outs,
-// so the repair costs a fraction of the full-tree repaint it replaces. If the previous frame's
-// targeted repair did not settle it, the next one force-dirties the tree once, as before.
-static bool gpuArmRepair()
-{
-    // Apotheosis (2026-09-07, "panning github.com while pinch-zoomed is extremely slow"):
-    // the escalation is rate-limited, and it never fires while the finger is on the glass.
-    //
-    // What the device log showed (build-driver\logs\20260907-211135, github.com at page scale
-    // ~2.85): scroll and tick rows alternating between dirty_full=53..58 - i.e. EVERY composited
-    // layer repainted in full - at 1.2-1.6 s of ms_backing, and rows with dirty_full=0..13 at
-    // 100-250 ms. Nothing in WebCore dirtied those 55 layers: ms_style_layout is 0.01 ms on every
-    // one of them, so there was no layout and no style resolution. The only thing that dirties a
-    // whole tree here is forceDirtyTree() in gpuPrepare(), and on a live tick the only caller that
-    // can still ask for it is this escalation (WebCoreLiveTick sets g_gpuScrollFast for every tick).
-    //
-    // Why it ran away exactly when zoomed: TextureMapperTiledBackingStore::wkUnpaintedCompositeBudget()
-    // is 4 composites at page scale 1 and *1* composite as soon as the page is zoomed. With threaded
-    // raster on, a tile whose replay is still in flight draws nothing, so at the zoomed budget every
-    // freshly posted tile reports itself unpainted on the very next composite (raster_deferred was
-    // 26-81 per row in that log). That makes gpuPresent() repair on essentially every composite, and
-    // a repair whose predecessor also missed escalates - so every second composite force-dirtied the
-    // tree. The escalated repaint then posts a few hundred new tile paints, which are in flight on
-    // the next composite, which reports them unpainted... The loop feeds itself, and each turn costs
-    // page-scale-squared pixels: the same whole-tree repaint is ~260 ms at 1:1 and ~1.3-1.6 s at 2.85x.
-    //
-    // The escalation cannot fix what it is reacting to here. A tile that has run out of budget is
-    // already back on the synchronous path and its store already answers wkHasUnpaintedVisibleTiles(),
-    // so the TARGETED repair repaints exactly the layers that owe pixels; every other layer in the
-    // tree has lost nothing and is repainted for nothing. Keep the sledgehammer for the case it was
-    // written for - a repair that genuinely does not settle while the page is still - by allowing it
-    // at most once per cooldown window and never during a pan gesture, which is precisely when tiles
-    // are legitimately in flight and when the stall is felt.
-    const double nowSec = monotonicSeconds();
-    bool escalate = g_gpuRepairMisses > 0;
-    if (escalate && (g_panGesture || nowSec - g_gpuLastEscalateSec < kRepairEscalateCooldownSec)) {
-        escalate = false;
-        gpuRepairLoopNote(nowSec);
-    }
-    if (escalate) {
-        g_gpuLastEscalateSec = nowSec;
-        g_gpuForceFullNext = true;
-    } else
-        g_gpuTargetedNext = true;
-    return escalate;
-}
-
-// Apotheosis (2026-09-06): book the result of that repair. `unpaintedAfter` counts visible tiles
-// that ran out of budget during the REPAIR paint, i.e. content the repair could not produce either.
-// The counter is only bumped on the budget edge (wkTrackUnpaintedVisibleTiles), so a hole that is
-// already forced onto the synchronous path does not keep re-reporting itself - a non-zero value
-// here really is "still losing tiles". Escalating costs one full repaint and then resets, so this
-// can rise to at most one forced tree repaint per episode and never becomes per-frame.
-static void gpuNoteRepairResult(bool escalated, unsigned unpaintedAfter)
-{
-    if (escalated || !unpaintedAfter)
-        g_gpuRepairMisses = 0;
-    else
-        ++g_gpuRepairMisses;
-    // Come back for the escalated attempt: a frame that is still missing tiles must not be the one
-    // the page settles on, and nothing else will ask (the layer is clean and the visible rect has
-    // stopped moving - the "white areas that never fill" state).
-    if (unpaintedAfter && !escalated && g_session && g_session->chrome) {
-        g_session->chrome->setNeedsPresent();
-        WebCorePort::presentRequested();
-    }
-}
-
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): paint the tree and report how many visible tiles
-// ran out of composites to produce pixels while doing so. wkWinUWPTexmapUnpaintedVisibleTiles() is
-// a level that TextureMapperTiledBackingStore::wkTrackUnpaintedVisibleTiles() bumps from inside
-// paintToTextureMapper(), so the delta across this call is exactly "this frame is missing content",
-// measured by the engine itself instead of guessed from a pixel sample. Costs nothing: two reads of
-// a static unsigned.
-static unsigned gpuPaintTree(WebCore::GraphicsLayerTextureMapper& glRoot)
-{
-    const unsigned before = WebCore::wkWinUWPTexmapUnpaintedVisibleTiles();
     glRoot.layer().paint(*g_textureMapper);
-    return WebCore::wkWinUWPTexmapUnpaintedVisibleTiles() - before;
 }
 
 // 直呈现:把图层树合成进默认帧缓冲(GpuInit 绑的窗口表面)并 eglSwapBuffers。返回 kOK / 负错误码。
@@ -2967,26 +2840,24 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         Color docBg = view.documentBackgroundColor();
         g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);   // 文档 base 背景(同 readback,见上)
     }
-    unsigned unpaintedDirect = 0;
     {
         PerfPhase perfPaint(&g_perfCur.paint);      // M4: TextureMapper composite into the default framebuffer
-        unpaintedDirect = gpuPaintTree(glRoot);
+        gpuPaintTree(glRoot);
         g_textureMapper->endPainting();
     }
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.2b "driver repair machine" and 3): with
-    // TileGrid v2 the repair below is gone. The v2 model answers one question after a composite -
-    // how many VISIBLE cells drew nothing and had no backdrop behind them - and a cell can only be
-    // in that state while its replay is in flight or its texture is waiting for the upload budget,
-    // i.e. while work the model has already scheduled is running. R5 and R12 guarantee that work
+    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.2b "driver repair machine" and 3): the
+    // present-only repair. The TileGrid model answers one question after a composite - how many
+    // VISIBLE cells drew nothing and had no backdrop behind them - and a cell can only be in that
+    // state while its replay is in flight or its texture is waiting for the upload budget, i.e.
+    // while work the model has already scheduled is running. R5 and R12 guarantee that work
     // converges, so the only thing missing is a frame to show the result in: exactly one more
-    // composite, requested the way gpuNoteRepairResult() requests it. No dirtying (dirtying is what
-    // made the v1 loop feed itself, 9df4438), no second paint in this call, no cooldown, no
-    // escalation ledger - two states, Settled and PresentOwed.
+    // composite. No dirtying (dirtying is what made the v1 repair loop feed itself, 9df4438), no
+    // second paint in this call, no cooldown, no escalation ledger - two states, Settled and
+    // PresentOwed.
     //
-    // The reading also drains the engine-side accumulator, so it has to happen on every composite
-    // while v2 is on, not only when something is owed. It stays at 0 while the switch is off (no v2
-    // store exists to add to it), so the v1 path below is byte-identical to what it was.
-    if (wkWinUWPTileGridV2()) {
+    // The reading also drains the engine-side accumulator, so it happens on every composite. A v1
+    // store never adds to it, so with the switch off this is a read of a zero.
+    {
         const unsigned holes = wkWinUWPTexmapVisibleHoles();
         if (g_perfOn) {
             if (g_perfCur.tgHoles < 0)
@@ -3035,37 +2906,6 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
                 }
             }
         }
-        // The v1 ledger must not carry state across a session that runs on v2 stores: a page loaded
-        // with the switch on leaves it wherever the previous page stopped, and flipping back would
-        // then escalate on the first composite for no reason.
-        g_gpuRepairMisses = 0;
-    } else {
-    // Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): a coarse WebCoreScrollBy step can move the
-    // visible rect past the painted cover, and the scroll fast path has no way to paint the tiles
-    // that were dropped, so the composite above may hold nothing but the page background. The back
-    // buffer is swapped, not published, so the repair has to happen before the swap: redo the
-    // composite and swap THAT. Apotheosis (2026-09-06): targeted (gpuArmRepair) - the stores that
-    // reported unpainted visible tiles repaint, the rest early-outs, and a repair that still comes
-    // up short escalates to the full repaint on the next composite. Cannot loop: one repair per
-    // composite, no retry here.
-    if (unpaintedDirect && !g_gpuLastCompositeFull) {
-        const bool escalated = gpuArmRepair();      // consumed by the gpuPrepare on the next line
-        gpuPrepare(view, glRoot);
-        glViewport(0, 0, w, h);
-        g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);
-        {
-            Color docBg = view.documentBackgroundColor();
-            g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);
-        }
-        unsigned unpaintedRepair = 0;
-        {
-            PerfPhase perfPaint(&g_perfCur.paint);
-            unpaintedRepair = gpuPaintTree(glRoot);
-            g_textureMapper->endPainting();
-        }
-        gpuNoteRepairResult(escalated, unpaintedRepair);
-    } else if (!unpaintedDirect)
-        g_gpuRepairMisses = 0;
     }
     // Apotheosis (pan present handshake): the frame is composited into the back buffer, but during
     // a pan gesture the harness decides WHEN it becomes visible - it must first put the matching
@@ -3400,9 +3240,6 @@ static void teardownSession()
     // The new session's first composite must force-dirty.
     g_gpuForceFullNext = true;
     g_gpuTargetedNext = false;
-    g_gpuRepairMisses = 0;
-    // Apotheosis (2026-09-07): the escalation cooldown belonged to the page that is going away.
-    g_gpuLastEscalateSec = -1e9;
     g_gpuLastCompositeFull = false;
     navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
     // Apotheosis (pan present handshake): the pan belonged to the page that is going away. Drop
@@ -4925,21 +4762,11 @@ void WebCoreSetThreadedRaster(int enabled)
 // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 5.2): the TileGrid v2 switch, same shape as
 // WebCoreSetThreadedRaster above - engine thread, one plain forward. The engine reads the flag when
 // a tiled backing store is CREATED, so flipping it does not touch the layers on screen: it applies
-// to the next page load. Default off in package A (0.1.9.29).
+// to the next page load. Default ON since package 4 (0.1.9.33); the switch is kept so a device
+// round can still fall back to v1.
 void WebCoreSetTileGridV2(int enabled)
 {
     WebCore::wkWinUWPSetTileGridV2(enabled != 0);
-}
-
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04): stale tiles on/off. ON (the default) a backing
-// store keeps the tiles it drops out of its cover rect and keeps drawing them - scaled to the
-// current content rect - until real ones have been rasterised, so a fast-path composite whose tiles
-// have moved on paints the old pixels instead of nothing. OFF is the pre-2026-09-04 behaviour and
-// exists so the device can A/B the two without a rebuild. Takes effect from the next composite.
-// Engine thread only.
-void WebCoreSetStaleTiles(int enabled)
-{
-    WebCore::wkWinUWPSetStaleTiles(enabled != 0);
 }
 
 // Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,

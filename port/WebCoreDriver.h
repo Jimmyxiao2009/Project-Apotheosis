@@ -293,14 +293,6 @@ void WebCoreSetThreadedRaster(int enabled);
 // to the layers of the NEXT page load, not to the ones on screen. Engine thread only.
 void WebCoreSetTileGridV2(int enabled);
 
-// Apotheosis (2026-09-04): stale tiles. ON (the default) a TextureMapper backing store keeps the
-// tiles it drops out of its cover rect and keeps drawing them, scaled to the current content rect,
-// until real ones have been rasterised - so a composite that takes the scroll fast path after the
-// tiles have moved on paints the old pixels instead of nothing (the "everything goes white when
-// scrolling ends" symptom). OFF is the previous behaviour; the switch exists so the device can A/B
-// it without a rebuild. Takes effect from the next composite. Engine thread only.
-void WebCoreSetStaleTiles(int enabled);
-
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present. Register a wake-up the
 // engine calls whenever something wants to be presented (rendering update scheduled, image
 // loaded, off-thread raster tile finished, a tick that ended still dirty) instead of having the
