@@ -108,6 +108,13 @@ bool parsePassLine(const std::string& line, ParsedPass& parsed)
     }
     if (std::sscanf(dirtyText, "%d,%d,%d,%d", &x, &y, &w, &h) == 4)
         parsed.input.dirty = IntRect(x, y, w, h);
+
+    // Apotheosis (0.1.9.34): `img=` is the last field and was added after the
+    // 0.1.9.29 log was taken, so it is optional - the sscanf above stops at
+    // budget= and ignores whatever follows.
+    const std::size_t image = line.find(" img=");
+    if (image != std::string::npos)
+        parsed.input.isImage = line[image + 5] != '0';
     return true;
 }
 
@@ -115,6 +122,7 @@ bool parsePassLine(const std::string& line, ParsedPass& parsed)
 
 // Scenario 12, defined below runReplay() because it is the long one.
 static void runDeviceReplay();
+static void runDeviceReplayOffscreen();
 
 void runReplay()
 {
@@ -179,6 +187,7 @@ void runReplay()
     CHECK(replayed > 10);
 
     runDeviceReplay();
+    runDeviceReplayOffscreen();
 }
 
 // -------------------------------------------------------------------------
@@ -349,6 +358,135 @@ static void runDeviceReplay()
     }
     std::printf("  replay 0.1.9.29: %u passes, %u composites, %u stores, %u with divergent counters\n",
         passes, composites, static_cast<unsigned>(stores.size()), divergentStores);
+}
+
+// -------------------------------------------------------------------------
+// The 0.1.9.34 session (2026-09-09, chaos.social then n-tv.de, package 4 with
+// image stores on v2), replays/lumia-0.1.9.34-offscreen.txt: the `tg` lines of
+// lines 14 047 - 32 000 of build-driver\logs\20260909-151015\stage.txt, 17 909
+// lines over ~220 stores.
+//
+// What it adds to scenario 12 is the composite side of the trace being ABSENT.
+// A store whose layer is off screen produces `pass` and `out` lines on every
+// tick and never a `comp` line, because TextureMapperLayer never paints it -
+// and an upload happens only in a composite (R4). 23 stores of this session
+// therefore sat at `land=1 ready=0` for hundreds of consecutive passes with a
+// raster buffer held, and R12 kept asking for the pass that could not help
+// them. So this replay deliberately does NOT composite a store the trace did
+// not composite, and asserts what the model owes on its own:
+//
+//   * a store whose visible rect does not meet its bounds holds no tile and
+//     wants no pass (I18, checked by the harness after every line anyway);
+//   * every store settles once its input stops changing - the settle loop
+//     below composites only the stores the device composited.
+// -------------------------------------------------------------------------
+static void runDeviceReplayOffscreen()
+{
+    check::currentTest = "replay_device_0_1_9_34_offscreen";
+    const std::string path = std::string(TILEGRID_TEST_DATA_DIR) + "/replays/lumia-0.1.9.34-offscreen.txt";
+    std::ifstream stream(path.c_str());
+    if (!stream) {
+        ::check::fail(__FILE__, __LINE__, "device replay not found", path);
+        return;
+    }
+
+    struct Store {
+        std::unique_ptr<Harness> harness;
+        PassInput lastInput;
+        bool sawPass { false };
+        bool sawComposite { false };
+        unsigned passes { 0 };
+    };
+
+    std::map<unsigned, Store> stores;
+    std::string line;
+    unsigned passes = 0;
+    unsigned composites = 0;
+
+    auto visibleOf = [](const PassInput& in) {
+        return in.visible ? *in.visible : IntRect(0, 0, in.boundsScaled.width, in.boundsScaled.height);
+    };
+    auto showsNothing = [](const PassInput& in) {
+        if (!in.visible)
+            return false;
+        return in.visible->intersection(IntRect(0, 0, in.boundsScaled.width, in.boundsScaled.height)).isEmpty();
+    };
+
+    while (std::getline(stream, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+
+        ParsedPass parsedPass;
+        if (parsePassLine(line, parsedPass)) {
+            Store& store = stores[parsedPass.storeId];
+            if (!store.harness)
+                store.harness = std::make_unique<Harness>(ModelConfig(), parsedPass.storeId);
+            store.lastInput = parsedPass.input;
+            store.sawPass = true;
+            ++store.passes;
+            ++passes;
+            PassOutput out = store.harness->pass(parsedPass.input, "0.1.9.34 replay pass");
+            store.harness->finishAll(out);
+            EXPECT_NO_ARROWS(*store.harness);
+            continue;
+        }
+
+        unsigned compositeStore = 0;
+        if (parseCompositeLine(line, compositeStore)) {
+            auto it = stores.find(compositeStore);
+            if (it == stores.end() || !it->second.sawPass)
+                continue;
+            Store& store = it->second;
+            store.sawComposite = true;
+            ++composites;
+            store.harness->composite(visibleOf(store.lastInput), 2, "0.1.9.34 replay composite");
+            EXPECT_NO_ARROWS(*store.harness);
+        }
+    }
+
+    CHECK(passes > 7000);
+    CHECK(stores.size() > 100);
+
+    unsigned offscreen = 0;
+    unsigned unsettled = 0;
+    for (auto& entry : stores) {
+        Store& store = entry.second;
+        if (!store.harness || !store.sawPass)
+            continue;
+
+        // The device's own ending: the last frame repeated, with a composite
+        // only where the device had one. A store that was never composited must
+        // come to rest all the same - that is the bug this replay carries.
+        for (unsigned round = 0; round < 24 && store.harness->model.wantsPass(); ++round) {
+            PassOutput out = store.harness->pass(store.lastInput, "0.1.9.34 replay settle");
+            store.harness->finishAll(out);
+            if (store.sawComposite)
+                store.harness->composite(visibleOf(store.lastInput), 64, "0.1.9.34 replay settle composite");
+        }
+
+        if (showsNothing(store.lastInput)) {
+            ++offscreen;
+            if (!store.harness->model.tiles().empty() || store.harness->model.wantsPass()) {
+                ++unsettled;
+                ::check::fail(__FILE__, __LINE__, "an off-screen store kept raster work alive",
+                    "S" + std::to_string(entry.first) + " tiles="
+                    + std::to_string(store.harness->model.tiles().size()) + " wantsPass="
+                    + std::to_string(store.harness->model.wantsPass() ? 1 : 0)
+                    + " passes=" + std::to_string(store.passes));
+            } else
+                ++::check::checks;
+        } else if (store.sawComposite && store.harness->model.wantsPass()) {
+            ++unsettled;
+            ::check::fail(__FILE__, __LINE__, "a composited store never settled",
+                "S" + std::to_string(entry.first) + " passes=" + std::to_string(store.passes));
+        }
+        EXPECT_NO_ARROWS(*store.harness);
+    }
+    CHECK_EQ(unsettled, 0u);
+    CHECK(offscreen > 20);
+
+    std::printf("  replay 0.1.9.34: %u passes, %u composites, %u stores, %u of them off screen\n",
+        passes, composites, static_cast<unsigned>(stores.size()), offscreen);
 }
 
 } // namespace tilegrid

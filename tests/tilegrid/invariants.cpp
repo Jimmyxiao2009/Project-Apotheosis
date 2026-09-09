@@ -184,6 +184,8 @@ void checkInvariants(const TileGridModel& model, const char* where)
     (void)prefix;
 }
 
+void checkI18NothingToShow(const TileGridModel&);
+
 void checkPassOutput(const TileGridModel& model, const PassOutput& out, const char* where)
 {
     (void)where;
@@ -228,6 +230,50 @@ void checkPassOutput(const TileGridModel& model, const PassOutput& out, const ch
         else
             CHECK(!sawBackdrop);
     }
+
+    checkI18NothingToShow(model);
+}
+
+// I18 - nothing to show, nothing to raster (0.1.9.34).
+//
+// If the visible rect is known and does not meet the layer bounds, a composite
+// of this store can draw nothing at all: R8 walks cells(V n B), and cellsOf()
+// yields no cell outside B. So neither of the two grids a pass reconciles - the
+// primary and a *persistent* backdrop - may hold a tile, and the model may not
+// ask for another pass.
+//
+// A transient backdrop is exempt: it is frozen by R7 and ends on composites
+// (R9), so it legitimately outlives the moment its layer leaves the screen.
+//
+// On the device this was 23 stores whose backdrop rastered a tile that no
+// composite ever uploaded (an off-screen layer is never painted), each holding
+// its raster buffer and forcing a pass on every tick for the rest of the
+// session. See deviceRound3_offscreenLayerNeverRasters().
+void checkI18NothingToShow(const TileGridModel& model)
+{
+    const auto visible = model.lastVisible();
+    if (!visible)
+        return;
+    const IntSize bounds = model.bounds();
+    if (!visible->intersection(IntRect(0, 0, bounds.width, bounds.height)).isEmpty())
+        return;
+
+    const auto backdrop = model.backdropGrid();
+    const bool transientAlive = backdrop && backdrop->state == GridState::TransientBackdrop;
+
+    for (const TileInfo& tile : model.tiles()) {
+        if (tile.gridState == GridState::TransientBackdrop)
+            continue;
+        ++::check::checks;
+        ::check::fail(__FILE__, __LINE__, "I18: a store that shows nothing holds a tile",
+            describe(tile.cell) + " grid " + std::to_string(tile.grid)
+            + " state " + std::to_string(static_cast<int>(tile.state))
+            + " V " + describe(*visible) + " B " + std::to_string(bounds.width) + "x"
+            + std::to_string(bounds.height));
+        break;
+    }
+    if (!transientAlive)
+        CHECK(!model.wantsPass());
 }
 
 void checkDrawList(const TileGridModel& model, const DrawList& draw, const IntRect& visible, const char* where)

@@ -990,13 +990,17 @@ void traceFormat()
     in.dirty = IntRect(1, 2, 3, 4);
     in.panGesture = true;
     in.tileBudget = 24;
-    CHECK_EQ(model.tracePass(in), std::string("tg S3 pass  s=2.85 B=720x8000 V=10,20,720,1280 d=1,2,3,4 pan=1 budget=24"));
+    CHECK_EQ(model.tracePass(in), std::string("tg S3 pass  s=2.85 B=720x8000 V=10,20,720,1280 d=1,2,3,4 pan=1 budget=24 img=0"));
 
+    // Apotheosis (0.1.9.34): an image store is V unknown AND img=1. Without the
+    // flag its trace line was indistinguishable from that of a layer store
+    // nobody ever handed a visible rect to.
     PassInput unknown = in;
     unknown.visible = std::nullopt;
     unknown.scale = 1.0f;
     unknown.panGesture = false;
-    CHECK_EQ(model.tracePass(unknown), std::string("tg S3 pass  s=1 B=720x8000 V=- d=1,2,3,4 pan=0 budget=24"));
+    unknown.isImage = true;
+    CHECK_EQ(model.tracePass(unknown), std::string("tg S3 pass  s=1 B=720x8000 V=- d=1,2,3,4 pan=0 budget=24 img=1"));
 
     PassOutput out;
     out.missing = 1;
@@ -1163,6 +1167,92 @@ void deviceRound1_failedUploadUndoesReady()
     EXPECT_NO_ARROWS(harness);
 }
 
+// -------------------------------------------------------------------------
+// Device round 3 (0.1.9.34, build-driver\logs\20260909-151015): an OFF-SCREEN
+// layer store rasters for ever.
+//
+// A post card that is scrolled out of the viewport gets an empty visible rect
+// from wkVisibleRectForChild (V = 0,1,0,0), or a 1x1 one outside its own bounds
+// (V = -1587,2,1,1) when it is just off the side. R1 answers both with an empty
+// cover, so the primary grid is correctly empty. The persistent backdrop did
+// not: it inflated V by one cell of margin before intersecting, and
+// IntRect::inflated() grows an empty rect into a real one, so the backdrop of a
+// layer that shows nothing desired a cell and rastered it. No composite ever
+// followed - an off-screen layer is not painted, and the only place an upload
+// happens is a composite (R4) - so the tile stayed Landed with its raster buffer
+// held, and R12 kept wantsPass() true, which ran a pass for that store on every
+// tick. 23 stores did this for the whole session; S310 alone logged 683
+// consecutive passes of `land=1 ready=0`.
+//
+// I18 (invariants.cpp) is the general form: nothing to show, nothing to raster.
+// -------------------------------------------------------------------------
+void deviceRound3_offscreenLayerNeverRasters()
+{
+    check::currentTest = "deviceRound3_offscreenLayerNeverRasters";
+
+    // The two device shapes: an empty V, and a degenerate V outside B.
+    const IntRect visibleShapes[] = { IntRect(0, 1, 0, 0), IntRect(-600, 1, 1, 1) };
+    const IntRect zoomedShapes[] = { IntRect(0, 2, 0, 1), IntRect(-1587, 2, 1, 1) };
+
+    for (int shape = 0; shape < 2; ++shape) {
+        Harness harness;
+
+        // S310 / S302 at 1:1, the card off screen. Nothing is desired, so
+        // nothing is painted and the store is at rest at once.
+        PassInput atOne = input(IntSize(686, 397), 1.0f, visibleShapes[shape]);
+        atOne.dirty = IntRect(0, 0, 686, 397);
+        PassOutput out = harness.pass(atOne, "off-screen at 1:1");
+        CHECK_EQ(out.paints.size(), 0u);
+        CHECK_EQ(harness.model.tiles().size(), 0u);
+        CHECK(!out.wantsPass);
+
+        // The user pinches to 2.6438x. The scale-1 grid becomes the persistent
+        // backdrop - empty, and it must stay empty: it can never be drawn,
+        // because there is no visible primary cell for R8 to draw it under.
+        PassInput zoomed = input(IntSize(1814, 1050), 2.6438f, zoomedShapes[shape]);
+        zoomed.dirty = IntRect(0, 0, 1814, 1050);
+        out = harness.pass(zoomed, "off-screen after the pinch");
+        CHECK_EQ(out.paints.size(), 0u);
+        CHECK_EQ(out.syncJobs + out.asyncJobs, 0u);
+        CHECK_EQ(harness.model.tiles().size(), 0u);
+        CHECK(!out.wantsPass);
+
+        // 30 further ticks of the same frame, with no composite in between -
+        // exactly what the device did. The store must not ask for another pass
+        // and must not accumulate a single tile.
+        PassInput idle = zoomed;
+        idle.dirty = IntRect();
+        for (int pass = 0; pass < 30; ++pass) {
+            out = harness.pass(idle, "off-screen idle");
+            CHECK_EQ(out.paints.size(), 0u);
+            CHECK_EQ(out.landed + out.rastering + out.missing + out.ready, 0u);
+            CHECK(!out.wantsPass);
+        }
+        EXPECT_NO_ARROWS(harness);
+    }
+
+    // The counter-test: the same layer scrolled back INTO the viewport keeps
+    // its backdrop. Removing the rule above must not cost the blurry-not-white
+    // guarantee of I15.
+    {
+        Harness harness;
+        const IntRect visible(0, 0, screenWidth, screenHeight);
+        settle(harness, IntSize(720, 4000), 1.0f, visible);
+        CHECK(readyCount(harness.model, harness.model.primaryGrid()->id) > 0u);
+
+        const float scale = 2.6438f;
+        PassInput zoomed = input(scaledBounds(720, 4000, scale), scale,
+            IntRect(0, 0, static_cast<int>(screenWidth * scale), static_cast<int>(screenHeight * scale)));
+        PassOutput out = harness.pass(zoomed, "zoom with the card on screen");
+        CHECK(harness.model.backdropGrid().has_value());
+        CHECK(harness.model.backdropGrid()->state == GridState::PersistentBackdrop);
+        // The backdrop is maintained under the visible cells: it has tiles.
+        CHECK(harness.model.backdropGrid()->desiredCount > 0u);
+        CHECK(!out.paints.empty());
+        EXPECT_NO_ARROWS(harness);
+    }
+}
+
 } // namespace
 
 void runScenarios()
@@ -1171,6 +1261,7 @@ void runScenarios()
     deviceRound1_refusedRequestIsMissingAgain();
     deviceRound1_refusedPatchIsPendingAgain();
     deviceRound1_failedUploadUndoesReady();
+    deviceRound3_offscreenLayerNeverRasters();
 
     scenario1_scroll();
     scenario2_fling();
