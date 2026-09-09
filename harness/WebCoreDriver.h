@@ -168,6 +168,13 @@ void WebCoreCloseSession();
 // 在 (x,y)(位图/视口像素)点一下:命中测试 + 默认动作(导航/提交/onclick),然后重绘到 outBuf。
 int WebCoreClickAt(int x, int y, uint8_t* outBuf);
 
+// Apotheosis(双击缩放,2026-09-09):同 WebCoreClickAt,但派发的 mousedown/mouseup 带 clickCount
+// (而非隐含的 1)——WebCore 的 EventHandler 在释放事件 clickCount>=2 时,'click' 后接着派发
+// 'dblclick'(见 PlatformMouseEvent::clickCount())。用于 harness 判定"不缩放"(WebCoreTapPolicyAt
+// 答 not-zoomable)的第二次点击,让双击语义的页面仍能收到真正的 dblclick。WebCoreClickAt 不变
+// (等价于 clickCount=1)。
+int WebCoreClickAtCount(int x, int y, int clickCount, uint8_t* outBuf);
+
 // 垂直滚动 dy 像素(正=向下),触发懒加载图片后重绘到 outBuf。
 int WebCoreScrollBy(int dx, int dy, uint8_t* outBuf);   // dx>0 右,dy>0 下
 
@@ -241,6 +248,22 @@ int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outBuf);
 // frame is already composited/presented into outBuf the way WebCoreWheelAt does it.
 int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 
+// Apotheosis(双击缩放,2026-09-09):命中测试 (x,y),回答这里的第二次点击是否应该缩放页面
+// (Safari/移动 Chrome 语义)而不是被当成普通的第二次点击转发。只读:不派发事件,不改会话/文档
+// 状态——可以在 harness 还没决定要不要真的点击之前,在"按住"路径里调用。
+//   *outZoomable:1=此处适用双击缩放,0=页面主动关闭了它——命中元素或某个祖先的 CSS touch-action
+//     非 auto(镜像 WebKit 自己的 Element::allowsDoubleTapGesture(),此 port 因 ENABLE_TOUCH_EVENTS=0
+//     被编掉,故在此重新实现),或文档 viewport meta 关闭了缩放(user-scalable=no,或
+//     minimum-scale == maximum-scale)。无会话/未命中也是 0。
+//   *outTargetScale:双击应动画到的尺度(已钳到本驱动自己的双击区间 [1.0, 3.0],是
+//     WebCoreSetPageScale [0.5, 6.0] 的子区间):若当前页面尺度已 > 1.05,答 1.0(双击=回到
+//     1:1,移动浏览器的通用规则);否则答 视口宽度 / (命中点最内层、比布局视口窄的块级祖先宽度)
+//     (Safari 的"缩放到栏"启发式),没有这样的祖先时答 2.0。
+//   *outAnchorX/*outAnchorY:这次缩放的锚点,同 WebCoreSetPageScale 的 focalX/focalY 一样的
+//     视口/位图像素——总是原样回传 (x,y),调用方不必在按住间隔内自己记着点击点。
+// 任一输出指针可为 null。返回 kOK,或负数错误(无会话时也把 outZoomable 置 0,只查它的调用方
+// 照样安全降级)。
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY);
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();

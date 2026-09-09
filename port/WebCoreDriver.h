@@ -177,6 +177,13 @@ void WebCoreClearCookies();
 int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA);
 void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
+// Apotheosis (double-tap zoom, 2026-09-09): like WebCoreClickAt, but the dispatched mousedown/
+// mouseup carry clickCount instead of an implicit 1 — WebCore's EventHandler dispatches 'dblclick'
+// after 'click' when the release's clickCount is >= 2 (PlatformMouseEvent::clickCount()). Used for
+// the second tap of a double tap the harness decided is NOT a zoom (WebCoreTapPolicyAt said
+// not-zoomable), so the page still gets the real dblclick a two-click page expects.
+// WebCoreClickAt above is unchanged (equivalent to clickCount=1).
+int WebCoreClickAtCount(int x, int y, int clickCount, uint8_t* outRGBA);
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
 
 // Apotheosis (instant pan): where the main frame actually is. The harness applies a touch pan to
@@ -256,6 +263,27 @@ int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA);
 // frame is already composited/presented into outRGBA the way WebCoreWheelAt does it.
 int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 
+// Apotheosis (double-tap zoom, 2026-09-09): hit-test (x,y) and answer whether a double tap there
+// should zoom the PAGE (Safari/mobile-Chrome semantics) instead of the harness treating it as two
+// ordinary clicks. Read-only: no event dispatched, no session/frame mutated, safe to call from the
+// tap-hold path before deciding whether to actually click.
+//   *outZoomable: 1 if double-tap-to-zoom applies here, 0 if the page opted out — CSS
+//     touch-action other than auto on the hit element or an ancestor (mirrors WebKit's own
+//     Element::allowsDoubleTapGesture(), compiled out on this port since ENABLE_TOUCH_EVENTS=0),
+//     or the document's viewport meta disabling zoom (user-scalable=no, or minimum-scale ==
+//     maximum-scale). 0 also on no session/no hit.
+//   *outTargetScale: the scale a double tap here should animate to (already clamped to the
+//     driver's own [1.0, 3.0] double-tap range, a subrange of WebCoreSetPageScale's [0.5, 6.0]):
+//     if the current page scale is already > 1.05, this is 1.0 (double tap = toggle back to 1:1,
+//     the universal mobile-browser rule); otherwise it is viewport-width / (width of the innermost
+//     block-level ancestor of the hit point that is narrower than the layout viewport, Safari's
+//     "zoom to column" heuristic), or 2.0 when no such ancestor exists.
+//   *outAnchorX/*outAnchorY: the anchor for that zoom, in the same viewport/bitmap px
+//     WebCoreSetPageScale takes as focalX/focalY — always just (x,y) echoed back, so the caller
+//     does not have to remember the tap point across the hold interval.
+// Any output pointer may be null. Returns kOK, or a negative error (no session prints
+// outZoomable=0 as well, so a caller that only checks *outZoomable still degrades safely).
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY);
 
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state

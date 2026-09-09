@@ -4400,7 +4400,12 @@ static void holdPump(WebCore::LocalFrame& frame, WebCore::Page* pageForRendering
 // 在 (x,y)(位图/视口像素,无需减 scroll —— EventHandler 内部 windowToContents 会加 scrollY)派发一次
 // 完整鼠标点击 move→down→up 到活文档,经真实命中测试 + 默认动作(链接导航 / 表单提交 / 按钮 onclick /
 // SPA 交互)。之后等待可能的异步导航 settle、每 tick 驱动 rAF,然后重布局/提链接/重绘。返回 0 成功。
-int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
+// Apotheosis (double-tap zoom, 2026-09-09): factored out with a clickCount parameter so
+// WebCoreClickAtCount() (the second tap of a double-tap-to-zoom decision, clickCount=2 — WebCore's
+// EventHandler dispatches 'dblclick' off exactly this number, see PlatformMouseEvent::clickCount())
+// can share every line of this with the ordinary single click. WebCoreClickAt below is unchanged
+// (clickCount=1); no existing caller's signature moves.
+static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
 {
     using namespace WebCore;
     if (!outRGBA)
@@ -4470,10 +4475,10 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     // got pointerdown/pointerup with buttons=0 and pressure=0, which is what a hover looks like.
     DriverMouseEvent move(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
     lf->eventHandler().handleMouseMoveEvent(move);     // 设 :hover / elementUnderMouse
-    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
+    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, clickCount, mods, t, kButtonsLeftDown);
     const bool tapDownHandled = lf->eventHandler().handleMousePressEvent(down).wasHandled();   // 安装 UserGestureIndicator
-    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0);
-    const bool tapUpHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();     // 派发 DOM 'click' + 默认动作(导航/提交)
+    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, clickCount, mods, MonotonicTime::now(), 0);
+    const bool tapUpHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();     // 派发 DOM 'click'(clickCount>=2 时 EventHandler 接着派发 'dblclick')+ 默认动作(导航/提交)
     // Apotheosis (map tap, 2026-09-06): settle on device what a plain tap actually delivers. The
     // sequence above IS a clean click - hover move, press (clickCount 1, buttons 1), release
     // (buttons 0, which is what makes EventHandler dispatch the DOM 'click'), all three at exactly
@@ -4483,8 +4488,8 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     // landed on a drag widget, i.e. whether the drag route would have claimed the same point.
     {
         char note[160];
-        std::snprintf(note, sizeof note, "tap at=%d,%d wants=%d down=%d up=%d unwound=%d",
-            x, y, tapWantsDrag ? 1 : 0, tapDownHandled ? 1 : 0,
+        std::snprintf(note, sizeof note, "tap at=%d,%d cc=%d wants=%d down=%d up=%d unwound=%d",
+            x, y, clickCount, tapWantsDrag ? 1 : 0, tapDownHandled ? 1 : 0,
             tapUpHandled ? 1 : 0, tapUnwound ? 1 : 0);
         inputNote(note);
     }
@@ -4541,6 +4546,20 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         return prc;
     writeDiag(*doc, *view, g_session->w, g_session->h, nonWhite);
     return kOK;
+}
+
+int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
+{
+    return clickAtImpl(x, y, /*clickCount*/ 1, outRGBA);
+}
+
+// Apotheosis (double-tap zoom, 2026-09-09): the second tap of a double tap the harness decided is
+// NOT going to zoom (WebCoreTapPolicyAt said not-zoomable) — dispatched with clickCount=2 so the
+// page gets the 'dblclick' a two-click page (e.g. text selection, some custom widgets) expects,
+// exactly like a real touch browser forwards it when double-tap-to-zoom does not apply.
+int WebCoreClickAtCount(int x, int y, int clickCount, uint8_t* outRGBA)
+{
+    return clickAtImpl(x, y, clickCount, outRGBA);
 }
 
 // 垂直滚动 dy 像素(正=向下)并重绘。每 tick isolatedUpdateRendering 驱动 IntersectionObserver,
@@ -5557,6 +5576,115 @@ int WebCoreGetPageScale()
     float s = g_session->page->pageScaleFactor();
     if (s <= 0.0f) s = 1.0f;
     return static_cast<int>(s * 1000.0f + 0.5f);
+}
+
+// Apotheosis (double-tap zoom, 2026-09-09): read-only tap policy for double-tap-to-zoom — see the
+// full contract in WebCoreDriver.h. Hit-tests (x,y) and answers whether a second tap here should
+// zoom the page (mobile-Safari/Chrome semantics) rather than being forwarded as an ordinary second
+// click, and if so, to what scale. No event dispatched, no session/document state changed — safe to
+// call from the harness' tap-hold path before it has decided whether to click at all.
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY)
+{
+    using namespace WebCore;
+    if (outZoomable) *outZoomable = 0;
+    if (outTargetScale) *outTargetScale = 1.0f;
+    if (outAnchorX) *outAnchorX = x;
+    if (outAnchorY) *outAnchorY = y;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;   // 任何返回路径复位 g_inPump
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+
+    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    if (!hit)
+        return kOK;   // nothing under the point: leave *outZoomable at 0, not an error
+
+    // Apotheosis: document-level opt-out first (cheap, one struct already on Document) — a page
+    // whose viewport meta disables zoom is asking every zoom gesture, not just pinch, to leave it
+    // alone. userZoom is a tri-state float (ValueAuto=-1 unset, else the parsed boolean as 0.0/1.0 —
+    // see ViewportArguments.h / dom/ViewportArguments.cpp findBooleanValue()); minZoom==maxZoom only
+    // counts when BOTH were actually set (ValueAuto==ValueAuto would otherwise always match).
+    ViewportArguments va = doc->viewportArguments();
+    const bool viewportDisablesZoom = (va.userZoom == 0.0f)
+        || (va.minZoom != ViewportArguments::ValueAuto && va.maxZoom != ViewportArguments::ValueAuto
+            && va.minZoom == va.maxZoom);
+    if (viewportDisablesZoom)
+        return kOK;
+
+    // Apotheosis: same open-shadow descent as dragWidgetAtPoint()/WebCoreIsScrollableAt — a point
+    // inside a web component's shadow tree would otherwise only ever see the host element.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    // Apotheosis: element-level opt-out. Mirrors WebKit's own Element::allowsDoubleTapGesture()
+    // (dom/Element.cpp) — compiled out on this port under !ENABLE_TOUCH_EVENTS, so re-derived here —
+    // which disallows the gesture when ANY ancestor (hit element included) has a touch-action other
+    // than auto, not just none/manipulation: pan-x/pan-y are as much an opt-out for double-tap-zoom
+    // as they are there, because a page that has claimed one axis for its own panning has claimed
+    // the gesture, not just a rectangle (see the same reasoning in dragWidgetAtPoint's comment).
+    Element* root = doc->documentElement();
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (RenderObject* r = e->renderer()) {
+            if (!r->style().touchAction().isAuto())
+                return kOK;   // opted out; *outZoomable stays 0
+        }
+        if (e.get() == root)
+            break;
+    }
+
+    if (outZoomable) *outZoomable = 1;
+
+    RefPtr<Page> page = g_session->page;
+    float curScale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(curScale > 0.0f)) curScale = 1.0f;
+    if (curScale > 1.05f) {
+        if (outTargetScale) *outTargetScale = 1.0f;   // already zoomed: a double tap always returns to 1:1
+        return kOK;
+    }
+
+    // Apotheosis: "zoom to column" — the innermost block-level ancestor of the hit point that is
+    // narrower than the layout viewport (Safari's own double-tap-zoom heuristic), walked from the
+    // hit element up towards <html> so the FIRST candidate found is the innermost/smallest one.
+    // boundingClientRect() and (x,y) are read in the same viewport/bitmap px space this driver
+    // already uses them in elsewhere with no extra scale conversion (extractLinks, dragWidgetAtPoint)
+    // — exact at scale 1.0 and close enough up to the 1.05 threshold just checked above; a bigger
+    // current scale would need an extra factor of curScale (see WebCoreSetPageScale's own derivation
+    // of engine-px-vs-CSS-px), which this branch never runs at.
+    const float viewportW = static_cast<float>(g_session->w);
+    const float kZoomPadding = 8.0f;   // small breathing room so the column edge is not flush with the screen edge
+    float targetScale = 2.0f;          // Safari's fallback when no narrower block ancestor exists
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (RenderObject* r = e->renderer()) {
+            if (r->isRenderBlock()) {
+                float w = e->boundingClientRect().width();
+                if (w > 0.0f && w < viewportW) {
+                    targetScale = viewportW / (w + kZoomPadding);
+                    break;
+                }
+            }
+        }
+        if (e.get() == root)
+            break;
+    }
+    if (targetScale < 1.0f) targetScale = 1.0f;
+    if (targetScale > 3.0f) targetScale = 3.0f;
+    if (outTargetScale) *outTargetScale = targetScale;
+    return kOK;
 }
 
 // 当前会话是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ harness 据此弹/收输入法。
