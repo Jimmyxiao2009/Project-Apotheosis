@@ -729,6 +729,42 @@ void coreDeviceRound1_failedAcquire(const CoreVariant& variant)
     EXPECT_NO_CORE_ARROWS(harness);
 }
 
+// Device round 2 (0.1.9.30): the backend's upload() returned without
+// uploading and without saying so, and every tile was Ready over a cleared
+// texture - background colour on every page, holes=0, no counter moving. The
+// interface now makes the backend answer, and a "no" must travel the same road
+// as a failed acquire: UploadFailed -> Missing -> re-rastered, hole reported
+// meanwhile, converged afterwards.
+void coreDeviceRound2_refusedUpload(const CoreVariant& variant)
+{
+    if (!lands(variant))
+        return;
+    name("coreDeviceRound2_refusedUpload", variant);
+    CoreHarness harness(variant);
+    const IntSize bounds(2048, 2048);
+    const IntRect visible(0, 0, screenWidth, screenHeight);
+    const PassInput in = input(bounds, 1.0f, visible);
+
+    harness.apply(in);
+    harness.pass(in, "upload fail pass");
+    harness.textures.failNextUploads(2);
+    unsigned failed = 0;
+    for (unsigned round = 0; round < 8 && failed < 2; ++round) {
+        harness.frame(in, "upload fail frame");
+        failed += harness.lastComposite.uploadsFailed;
+    }
+    CHECK_EQ(failed, 2u);
+    // The two tiles are not Ready: they are holes, not blank textures.
+    CHECK(harness.lastComposite.visibleHoles > 0);
+
+    harness.settle(in, 24, "upload fail settle");
+    CHECK_EQ(harness.core.visibleHoles(), 0u);
+    CHECK_EQ(harness.screen.unpaintedCells, 0u);
+    CHECK_EQ(harness.lastComposite.drawsWithoutTexture, 0u);
+    checkScreen(harness, "upload fail screen");
+    EXPECT_NO_CORE_ARROWS(harness);
+}
+
 } // namespace
 
 void runCoreScenarios()
@@ -736,6 +772,7 @@ void runCoreScenarios()
     for (const CoreVariant& variant : coreVariants()) {
         coreDeviceRound1_refusedRecord(variant);
         coreDeviceRound1_failedAcquire(variant);
+        coreDeviceRound2_refusedUpload(variant);
     }
     for (const CoreVariant& variant : coreVariants()) {
         coreScenario1_scroll(variant);

@@ -115,7 +115,7 @@ public:
     ~FakeTextureBackend() override;
 
     TextureHandle acquire(IntSize) override;
-    void upload(TextureHandle, const PixelBuffer&, const IntRect&) override;
+    bool upload(TextureHandle, const PixelBuffer&, const IntRect&) override;
     void release(TextureHandle) override;
     void beginComposite() override;
     unsigned uploadsRemainingThisComposite() const override;
@@ -136,6 +136,11 @@ public:
     // The next `count` acquires come up empty: the pool is exhausted. R4's
     // upload then cannot happen at all, which the model has to be told about.
     void failNextAcquires(unsigned count);
+
+    // The next `count` uploads return false without touching the texture: the
+    // backend could not perform them (no pixels, wrong job, out of bounds).
+    // Device round 2: an upload that silently does nothing is the blank page.
+    void failNextUploads(unsigned count);
 
     // Pool reclaim: the next drain reports these as TextureLost.
     void reclaim(TextureHandle);

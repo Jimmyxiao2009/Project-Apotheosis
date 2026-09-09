@@ -368,6 +368,7 @@ public:
     unsigned acquired { 0 };
     unsigned released { 0 };
     unsigned failAcquireNext { 0 };
+    unsigned failUploadNext { 0 };
     TextureHandle nextHandle { 1 };
     std::map<TextureHandle, Texture> textures;
     std::vector<TextureHandle> reclaimed;
@@ -403,24 +404,28 @@ TextureHandle FakeTextureBackend::acquire(IntSize size)
     return handle;
 }
 
-void FakeTextureBackend::upload(TextureHandle handle, const PixelBuffer& pixels, const IntRect& rect)
+bool FakeTextureBackend::upload(TextureHandle handle, const PixelBuffer& pixels, const IntRect& rect)
 {
     Impl& impl = *m_impl;
+    if (impl.failUploadNext) {
+        --impl.failUploadNext;
+        return false;
+    }
     auto it = impl.textures.find(handle);
     if (it == impl.textures.end()) {
         impl.error("upload into an unknown texture");
-        return;
+        return false;
     }
     Impl::Texture& texture = it->second;
     if (!texture.live) {
         impl.error("upload into a released texture");
-        return;
+        return false;
     }
 
     const PixelSignature signature = FakeRasterBackend::signature(pixels.signature);
     if (!signature.valid) {
         impl.error("upload of pixels without a signature");
-        return;
+        return false;
     }
 
     if (rect.size() == texture.size) {
@@ -428,12 +433,12 @@ void FakeTextureBackend::upload(TextureHandle handle, const PixelBuffer& pixels,
         texture.coverage = rect;
     } else if (texture.coverage.isEmpty()) {
         impl.error("partial upload into a texture that was never fully painted, rect " + rectText(rect));
-        return;
+        return false;
     } else if (!texture.coverage.contains(rect)) {
         // I4/R6: a texture is never written outside the rect it was
         // rasterised for.
         impl.error("upload " + rectText(rect) + " outside the texture's rect " + rectText(texture.coverage));
-        return;
+        return false;
     }
 
     if (!signature.rect.contains(rect))
@@ -445,6 +450,7 @@ void FakeTextureBackend::upload(TextureHandle handle, const PixelBuffer& pixels,
     ++impl.totalUploads;
     if (impl.budget && impl.used < impl.budget)
         ++impl.used;
+    return true;
 }
 
 void FakeTextureBackend::release(TextureHandle handle)
@@ -538,6 +544,7 @@ std::vector<std::string> FakeTextureBackend::takeErrors()
 }
 
 void FakeTextureBackend::failNextAcquires(unsigned count) { m_impl->failAcquireNext = count; }
+void FakeTextureBackend::failNextUploads(unsigned count) { m_impl->failUploadNext = count; }
 
 void FakeTextureBackend::reclaim(TextureHandle handle)
 {
