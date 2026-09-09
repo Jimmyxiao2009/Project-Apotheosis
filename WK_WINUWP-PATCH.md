@@ -82,7 +82,8 @@ fork's own branch has moved on; `git diff webkitgtk-2.52.4` there is currently
 **140 files, 12971 insertions and 115 deletions**, and PATCHLOG.md has one row
 per commit with the reason for it.
 
-Latest structural change, TileGrid package 4 (`5e052e57f8`), in
+Latest structural change, TileGrid package 4 (`5e052e57f8`, `db2302383e`,
+`fd9fb69f5c`), in
 `Source/WebCore/platform/graphics/texmap/`:
 
 - new since the tag: `TextureMapperTiledStore.h`,
@@ -94,7 +95,7 @@ Latest structural change, TileGrid package 4 (`5e052e57f8`), in
   interface and viewport-limited tiling (see BLOCKERS.md in the docs repo).
 
 The texmap directory's share of the diff went from 8656 added lines in 21 files
-to 6109 in 19.
+to 6142 in 19.
 
 This is the source artifact requested in
 [Issue #3](https://github.com/MoonlightLabCN/Project-Apotheosis/issues/3).
