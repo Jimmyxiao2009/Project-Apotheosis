@@ -841,8 +841,6 @@
                     </Grid>
                     <Slider x:Name="SetZoomSlider" Minimum="50" Maximum="200" StepFrequency="10" Value="100" ValueChanged="OnZoomChanged"/>
 
-                    <ToggleSwitch x:Name="SetTabModeSwitch" Header="并发多引擎标签(暂搁置,后续实现)" IsEnabled="False" Foreground="{StaticResource TxtHi}" Margin="0,4,0,0"/>
-
                     <!-- 屏幕:系统覆盖层(手机底部的返回/开始/搜索栏)。关掉可多出一行的高度给地址栏。 -->
                     <TextBlock Text="DISPLAY" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetHideNavBarSwitch" Header="隐藏系统导航栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2"/>
@@ -853,6 +851,15 @@
                          to 0 on its own (VisibleBoundsChanged is already wired). -->
                     <ToggleSwitch x:Name="SetHideStatusBarSwitch" Header="隐藏状态栏" Foreground="{StaticResource TxtHi}" Margin="0,0,0,2"/>
                     <TextBlock Text="隐藏顶部状态栏(时钟/信号),内容区随之上移" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                    <!-- Apotheosis (axis lock / rail scrolling): one-finger pan locks to the
+                         dominant axis once the accumulated delta clears a small threshold, like
+                         Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock).
+                         A shipped scrolling behaviour, so it lives in its own normal section rather
+                         than under DEVELOPER. -->
+                    <TextBlock Text="SCROLLING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
+                    <TextBlock Text="滚动" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
+                    <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
@@ -886,21 +893,6 @@
                     <TextBlock Text="DEVELOPER" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock Text="开发者选项" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,0,0,4"/>
                     <ToggleSwitch x:Name="SetScrollFabSwitch" Header="显示翻页按钮" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <ToggleSwitch x:Name="SetInstantPanSwitch" Header="即时跟手滚动(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <ToggleSwitch x:Name="SetThreadedRasterSwitch" Header="多线程栅格化(实验)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <!-- Apotheosis (TILING-REWRITE-PLAN.md 5.2): 重写的瓦片管理(TileGrid v2),默认开(0.1.9.33 起);
-                         关掉则回到 v1 后备实现。引擎在创建瓦片存储时读开关 → 下次加载页面才生效(WebCoreSetTileGridV2)。 -->
-                    <ToggleSwitch x:Name="SetTileGridV2Switch" Header="瓦片网格 v2(下次加载页面生效)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <!-- Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 引擎有变化才合成，代替固定 200ms tick，默认开。 -->
-                    <ToggleSwitch x:Name="SetEventPresentSwitch" Header="事件驱动呈现" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <!-- Apotheosis: 地图/画布类控件自己处理指针事件平移内容，默认开。 -->
-                    <ToggleSwitch x:Name="SetDragPointerSwitch" Header="拖拽作为指针事件（地图/画布）" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <!-- Apotheosis (axis lock / rail scrolling): one-finger pan locks to the
-                         dominant axis once the accumulated delta clears a small threshold, like
-                         Chrome/Safari — default on, pure harness-side (UpdateAxisLock/ApplyAxisLock). -->
-                    <ToggleSwitch x:Name="SetAxisLockSwitch" Header="轴锁定(单指滚动吸附方向)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
-                    <!-- Apotheosis: 在地图/画布上捏合时把手势交给页面(ctrl+滚轮)，而不是缩放整页；默认开。 -->
-                    <ToggleSwitch x:Name="SetPinchPageSwitch" Header="捏合作用于页面元素(地图)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
                     <TextBlock Text="ABOUT" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <TextBlock x:Name="VersionText" Text="版本 —" Foreground="{StaticResource TxtHi}" FontSize="15" Margin="0,0,0,8"/>

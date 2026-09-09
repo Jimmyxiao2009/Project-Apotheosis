@@ -817,7 +817,7 @@ static double KeyboardShiftFor(double winHeight, double insetBottom,
 }
 
 // One axis of the live-pinch clamp (ApplyLiveZoom). Works entirely in engine px (WebCoreGetScrollState
-//   units), like ClampPanRemainder/InstantPanBy — the caller converts the result to DIP.
+//   units) — the caller converts the result to DIP.
 //
 //   ScaleTransform(center=anchor, scale=live) with no translate shows document range
 //   [scrollPos + anchor*(1-1/live), scrollPos + anchor + (viewSize-anchor)/live] (T=0 baseline;
@@ -931,18 +931,13 @@ MainPage::MainPage()
     Window::Current->VisibilityChanged += ref new Windows::UI::Xaml::WindowVisibilityChangedEventHandler(
         [this](Platform::Object^, Windows::UI::Core::VisibilityChangedEventArgs^ e) {
             m_appForeground = e->Visible;
-            // Apotheosis (pan present handshake): a gesture cannot survive a visibility change, and
-            // its ManipulationCompleted may never arrive - hand the presents back on both edges, or
-            // the engine would stay silent on the way back in.
-            PanDeferOff();
             if (e->Visible) StartLiveMode();
             else {
                 // Apotheosis (review 2026-09-04 item 3): a manipulation cannot survive going to the
                 //   background, and its ManipulationCompleted may never arrive. Before this, the
-                //   handler cleared m_panDefer and the pan offset but left m_pinching,
-                //   m_manipActive, the nested-scroll state and the drag state set - and with
-                //   m_pinching stuck, InstantPanBy() and ApplyPanTransform() return early for the
-                //   rest of the session, i.e. nothing scrolls again until the app is restarted.
+                //   handler left m_pinching, m_manipActive, the nested-scroll state and the drag
+                //   state set - and with m_pinching stuck, ApplyLiveZoom keeps owning the presenting
+                //   layer's transform for the rest of the session.
                 EndGesture(GestureEnd::Visibility);
                 StopLiveMode();
                 // cookie 落盘(JSON Lines 快照):UWP 挂起的应用可能被系统直接终止、不会再回调任何
@@ -1807,10 +1802,10 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     m_currentUrl = isHome ? L"about:home" : wurl;
 
     // M4:导航=新页面,引擎 pageScaleFactor 复位 1.0 → harness 缩放状态/显示变换同步复位(否则下次捏合基准错)。
-    // Apotheosis (review 2026-09-04 items 3 + 6b): one exit. This used to clear the pinch flag, the
-    //   pan deferral, both pan offsets and the snap timer by hand and forget the rest - in
-    //   particular the ZOOM SPRING, whose Completed handler then ran PinchCommit() on the NEW
-    //   document (the old page's zoom applied to the new page), and the nested-scroll/drag state.
+    // Apotheosis (review 2026-09-04 items 3 + 6b): one exit. This used to clear the pinch flag and
+    //   the preview offset by hand and forget the rest - in particular the ZOOM SPRING, whose
+    //   Completed handler then ran PinchCommit() on the NEW document (the old page's zoom applied
+    //   to the new page), and the nested-scroll/drag state.
     EndGesture(GestureEnd::Navigate);
     m_pageScale = 1.0f;
     m_zoomTransform = nullptr;
@@ -2396,14 +2391,9 @@ void MainPage::FreeScrollBy(int dx, int dy)
     if (!m_sessionActive || (dx == 0 && dy == 0)) return;
     m_scrollAccumX += dx;
     m_scrollAccum += dy;
-    // Apotheosis (pan present handshake, coarse engine steps): while the finger owns the screen the
-    // TranslateTransform carries the motion at display rate, so the engine does not have to be fed
-    // every coalesced delta - it only has to catch up before the preview runs out of pixels. Every
-    // engine present is a moment where composited content and XAML transform can disagree for a
-    // frame, so the fewer of them a gesture costs the better: hold the offset here until it is
-    // worth a step (PanFlushDue) or the gesture ends (PanGestureEnd). m_scrollAccum* IS the ledger
-    // of what the engine has not been told about yet, so nothing can be sent twice or lost.
-    if (m_panGestureOn && !PanFlushDue()) return;
+    // m_scrollAccum* IS the ledger of what the engine has not been told about yet: every delta that
+    // arrives while a WebCoreScrollBy is in flight is added here and goes out with the next one, so
+    // nothing can be sent twice or lost.
     if (!m_scrollBusy) PumpScroll();
 }
 void MainPage::PumpScroll()
@@ -2412,11 +2402,6 @@ void MainPage::PumpScroll()
     int dy = m_scrollAccum; m_scrollAccum = 0;
     int dx = m_scrollAccumX; m_scrollAccumX = 0;
     m_scrollBusy = true;
-    // Apotheosis (pan present handshake): a composite may still be waiting for its translation to
-    // be committed. This job overwrites the back buffer, so releasing that older swap now would
-    // show the newer content under the older translation - exactly the artefact. Drop the wait;
-    // this job's own completion arms a fresh one and releases both at once.
-    DisarmPanAck();
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // 不自增:被动滚动不作废点击/导航令牌,但被它们作废(导航后丢弃迟到滚动帧)
@@ -2427,51 +2412,33 @@ void MainPage::PumpScroll()
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
-        // Apotheosis (instant pan): read back where the engine ended up, in the same engine-thread
-        // hop that just scrolled and presented. This is the "a frame was presented" point the pan
-        // preview reduces itself at; the engine clamps at the document edges, so what it actually
-        // applied is generally NOT the delta we sent — only the position tells the truth. Cheap:
-        // WebCoreGetScrollState does no layout and no paint.
+        // Apotheosis: read back where the engine ended up, in the same engine-thread hop that just
+        // scrolled and presented. The engine clamps at the document edges, so what it actually
+        // applied is generally NOT the delta we sent — only the position tells the truth, and the
+        // cache it feeds (m_scroll*/m_content*/m_view*) is what MapTapToEngine, ScrollStateUsable
+        // and the pinch clamp read. Cheap: WebCoreGetScrollState does no layout and no paint.
         int sx = 0, sy = 0, cw = 0, ch = 0, vw = 0, vh = 0;
         bool haveState = false;
-        // Apotheosis (owed-frame identity, driver b531043): and what the frame this hop just
-        // composited actually SHOWS. WebCoreGetScrollState says where the engine is now, which is
-        // not the same thing the moment anything else scrolls between the composite and the
-        // acknowledgement; the deferred swap carries its own scroll position and an id. Read both
-        // here, in the same engine hop as the WebCoreScrollBy - equally cheap (no layout, no paint)
-        // - and let the UI thread build the pan translation from the FRAME, and name that frame
-        // when it acknowledges it (WebCorePresentFrame).
-        int swx = 0, swy = 0;
-        unsigned long long swapId = 0;
-        bool haveOwed = false;
         if (rc == 0) {
             int src = -1;
             try { src = WebCoreGetScrollState(&sx, &sy, &cw, &ch, &vw, &vh); } catch (...) { src = -1; }
             haveState = (src == 0);
-            int owed = 0;
-            try { owed = WebCoreGetOwedSwapScroll(&swx, &swy, &swapId); } catch (...) { owed = 0; }
-            haveOwed = (owed == 1);
         }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState, swx, swy, swapId, haveOwed]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState]() {
                 MainPage^ s = self.Get(); if (!s) return;
-                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; s->m_scrollAccumX = 0; s->InstantPanReset(); return; }   // 被导航/点击取代,丢弃迟到帧+全部残留位移
+                if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; s->m_scrollAccumX = 0; return; }   // 被导航/点击取代,丢弃迟到帧+全部残留位移
                 if (rcCopy == 0) {
                     if (!present) s->PresentSoftwareFrame(rgba);
                     s->m_lastFrameHash = 0;
                     if (haveState) { s->m_contentW = cw; s->m_contentH = ch; s->m_viewW = vw; s->m_viewH = vh; }
-                    s->InstantPanApplied(sx, sy, haveState, dx, dy, swx, swy, swapId, haveOwed);
+                    s->EngineScrollFrameApplied(sx, sy, haveState, dx, dy);
                 }
                 s->m_scrollBusy = false;
-                // Apotheosis (pan present handshake): the transform above was just corrected by the
-                // distance the engine really scrolled. The engine composited that frame but has NOT
-                // shown it (WebCoreSetPanGesture) - release the swap only once XAML has this
-                // translation on screen, otherwise the new content appears under the old one.
-                if (s->m_panDefer) s->ArmPanPresentAck();
-                if (s->m_scrollAccum != 0 || s->m_scrollAccumX != 0) {
-                    if (!s->m_panGestureOn || s->PanFlushDue()) s->PumpScroll();   // 拖拽期间又攒了位移(含纯横向),继续冲刷
-                } else if (!s->m_panGestureOn) {
+                if (s->m_scrollAccum != 0 || s->m_scrollAccumX != 0)
+                    s->PumpScroll();   // 拖拽期间又攒了位移(含纯横向),继续冲刷
+                else {
                     s->SyncLinksAfterScroll(); s->StartLiveMode();   // 滚动停了 → 补链接表 + 重启实时(新视口懒加载/动画)
                 }
             }));
@@ -2650,16 +2617,10 @@ void MainPage::PumpDrag()
                         s->m_dragBusy = false;
                         int fdx = s->m_dragFallbackDx, fdy = s->m_dragFallbackDy;
                         s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;
-                        // Apotheosis (review 2026-09-04 item 3): this completion is asynchronous and
-                        //   can land AFTER OnImageManipCompleted. Entering pan-gesture mode then
-                        //   (InstantPanBy -> PanGestureBegin -> WebCoreSetPanGesture(1)) would stop
-                        //   the engine presenting with no gesture left to hand the presents back,
-                        //   and the swallowed delta would jump in on the next touch. If the gesture
-                        //   is over, the buffered movement goes to the engine as a plain scroll.
-                        if (fdx != 0 || fdy != 0) {
-                            if (s->m_manipActive) s->InstantPanBy(fdx, fdy);
+                        // This completion is asynchronous and can land AFTER OnImageManipCompleted;
+                        //   the buffered movement goes to the engine as a plain scroll either way.
+                        if (fdx != 0 || fdy != 0)
                             s->FreeScrollBy(fdx, fdy);
-                        }
                         return;
                     }
                     s->m_dragFallbackDx = 0; s->m_dragFallbackDy = 0;   // the page owns it now
@@ -2790,7 +2751,7 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     //   off by roughly the pinch's own scale ratio, not a frame or two. If the cache is not at the
     //   current scale, defer: m_scrollLagBaseValid stays false and NoteScrollLagPresented() takes the
     //   first same-scale sample it sees as the base instead (same lazy-base idiom as
-    //   m_panBaseValid/ScrollStateUsable in InstantPanBy below) — RequestScrollState() a few lines
+    //   ScrollStateUsable()) — RequestScrollState() a few lines
     //   down guarantees one arrives shortly. m_scrollLagScale records which scale this gesture is
     //   being measured at (fixed for the gesture's lifetime — pan and pinch cannot overlap).
     m_scrollLagActive = g_perfLogEnabled;
@@ -2811,10 +2772,9 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     // behind before the probe below can answer Drag for this one.
     ++m_dragGen;
     DragReset();
-    // Apotheosis (instant pan): a new gesture starts from the frame that is on screen — drop any
-    // remainder the previous one left behind, then ask the engine where it is so the very first
-    // delta can already be clamped to the document.
-    InstantPanReset();
+    // Apotheosis: a new gesture starts from the frame that is on screen — ask the engine where it
+    // is, so the pinch clamp and the tap mapping work against this gesture's own document bounds
+    // instead of whatever the previous one left in the cache.
     m_scrollStateValid = false;
     RequestScrollState();
     if (!m_sessionActive) { m_nestedScrollState = NestedScrollState::No; return; }
@@ -2832,10 +2792,9 @@ void MainPage::OnImageManipStarted(Platform::Object^, Windows::UI::Xaml::Input::
     // scrollable ancestor", because such widgets are routinely nested inside a scrollable container
     // and scrolling that container is exactly the wrong answer. WebCoreIsScrollableAt is then not
     // even asked, which keeps the added cost of this feature at zero for the Drag case.
-    bool probeDrag = m_dragPointer;
-    WebEngine::instance().post([disp, self, px, py, gen, probeDrag]() {
+    WebEngine::instance().post([disp, self, px, py, gen]() {
         int drag = 0;
-        if (probeDrag) { try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; } }
+        try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; }
         int r = 0;
         if (!drag) { try { r = WebCoreIsScrollableAt(px, py); } catch (...) { r = 0; } }
         try {
@@ -2868,7 +2827,6 @@ void MainPage::ReplayPendingPan()
         NestedScrollBy(m_pendingPanPx, m_pendingPanPy, dx, dy);
     } else {
         ApplyAxisLock(dx, dy);
-        InstantPanBy(dx, dy);
         FreeScrollBy(dx, dy);
     }
 }
@@ -2903,231 +2861,53 @@ void MainPage::ApplyAxisLock(int& dx, int& dy)
 }
 
 // ===========================================================================
-// Apotheosis: instant pan — "the last frame follows the finger".
+// Apotheosis: the scroll/bounds cache.
 //
-// The problem: a touch pan posts a coalesced WebCoreScrollBy to the engine thread and the screen
-// only moves once the engine has scrolled, composited and presented. While the engine is busy
-// (JS, layout, image decode) the finger runs ahead of the picture and the page reads as stuck.
+// A touch pan posts a coalesced WebCoreScrollBy to the engine thread (FreeScrollBy/PumpScroll); the
+// engine scrolls, composites and swaps, and the screen moves with that swap. The UI thread shows no
+// preview of its own — it only remembers what the engine reported:
 //
-// The fix: the pixels the engine already presented are exactly the pixels one pan delta away from
-// what the finger wants, so the UI thread moves them itself — a TranslateTransform on the same
-// presenting element the pinch preview scales (PresentLayer(): GpuPanel in direct-present mode,
-// RenderImage in software mode). The engine keeps getting the identical coalesced WebCoreScrollBy
-// it got before; nothing about the engine path changes.
-//
-// Bookkeeping, all on the UI thread:
-//   m_panRemX/Y  finger-requested engine px the engine has NOT applied yet. Grows on every delta
-//                (InstantPanBy), shrinks by the distance the engine really moved every time an
-//                engine frame lands (InstantPanApplied, from PumpScroll's completion). At 0 the
-//                transform is identity and the engine frame alone is on screen.
 //   m_scroll*/m_content*/m_view*  last scroll position and document bounds the engine reported
-//                (WebCoreGetScrollState). Two jobs: measure what the engine actually applied
-//                (which is NOT the delta we sent — the engine clamps at the document edges), and
-//                clamp the preview so a fling at the bottom of a page cannot slide the content off
-//                its own end.
-//
-// Uncovered area revealed by the translation shows the panel background; that is accepted, and the
-// translation is capped at one screen so it can never be more than a screen of it.
+//                (WebCoreGetScrollState, read in the same engine hop as the scroll itself and
+//                seeded at gesture start by RequestScrollState). Read by MapTapToEngine (tap
+//                mapping), ScrollStateUsable()/ApplyLiveZoom (the pinch clamp) and the touch-lag
+//                diagnostic below. The engine clamps at the document edges, so what it actually
+//                applied is generally NOT the delta we sent — only the position tells the truth.
 // ===========================================================================
-
-// The finger asked for dx/dy more engine px. Show them now.
-void MainPage::InstantPanBy(int dx, int dy)
-{
-    // Off by setting, no session, or a pinch owns the presenting layer right now: leave the
-    // transform alone entirely (a pinch preview must not be fought over — see SetPinchAnchor).
-    if (!m_instantPan || !m_sessionActive || m_pinching || m_zoomSpring != nullptr)
-        return;
-    if (dx == 0 && dy == 0)
-        return;
-    // Apotheosis (2026-09-04, device package 13): the XAML preview - a TranslateTransform on
-    // GpuPanel, the engine fed in coarse steps (PanFlushDue) and every composite held back until
-    // the harness acknowledges the frame it belongs to (ArmPanPresentAck / WebCorePresentFrame) -
-    // stopped scrolling the page altogether on device: nothing but a pinch moved the view. It is
-    // not deleted - it is the only way to keep the transform and the engine in step if we ever go
-    // back to it - but it is off unless settings.ini says instantpanxaml=1. Returning HERE, before
-    // PanGestureBegin(), is what makes the fallback the package-10 behaviour the user preferred:
-    // m_panGestureOn stays false, so FreeScrollBy() sends every coalesced delta to the engine at
-    // once and the engine swaps it immediately (no g_panGesture, no owed frame, no acknowledgement).
-    if (!m_instantPanXaml)
-        return;
-    // Apotheosis (pan present handshake): this is the first thing that happens on the main-frame
-    // pan route (and only on it - the nested-scroll and drag routes never come through here), so it
-    // is where the gesture is declared to the engine.
-    PanGestureBegin();
-    // Apotheosis (owed-frame remainder): the XAML path keeps an ABSOLUTE pair as well as the
-    // running remainder — everything this gesture's finger has asked for (m_panFinger*) measured
-    // against the scroll position the gesture started from (m_panBase*). A landing frame then
-    // rebuilds the remainder as "asked for minus what that frame really moved" instead of
-    // subtracting deltas from a total, which drifts as soon as anything scrolls that we did not
-    // dispatch. The base is per manipulation, so it is (re)taken whenever m_nestedScrollGen moves.
-    if (m_panGenSeen != m_nestedScrollGen) {
-        m_panGenSeen = m_nestedScrollGen;
-        m_panFingerX = 0;
-        m_panFingerY = 0;
-        m_panBaseValid = false;
-    }
-    if (!m_panBaseValid && ScrollStateUsable()) {
-        m_panBaseX = m_scrollX;
-        m_panBaseY = m_scrollY;
-        m_panBaseValid = true;
-    }
-    m_panFingerX += dx;
-    m_panFingerY += dy;
-    m_panRemX += dx;
-    m_panRemY += dy;
-    ClampPanRemainder();
-    ApplyPanTransform();
-    RestartPanSnapTimer();
-}
-
-// Apotheosis (owed-frame remainder): rebuild the remainder from the position a frame SHOWS.
-// m_panFinger* is what the finger has asked for since the gesture started, frameScroll* minus
-// m_panBase* is what that frame has actually moved in the same time, and the difference is what
-// the translation still has to carry. Absolute, so it cannot accumulate error, and it is exactly
-// the arithmetic a pan preview has to do per frame. False = no base yet (the gesture
-// started before any scroll state existed); the caller keeps its incremental estimate.
-// The caller clamps and applies — this only computes.
-bool MainPage::PanRemainderFromFrame(int frameScrollX, int frameScrollY)
-{
-    if (!m_panBaseValid)
-        return false;
-    m_panRemX = m_panFingerX - (frameScrollX - m_panBaseX);
-    m_panRemY = m_panFingerY - (frameScrollY - m_panBaseY);
-    return true;
-}
 
 // An engine frame landed. newScrollX/Y is where the engine now is (WebCoreGetScrollState, read on
 // the engine thread in the same hop as the WebCoreScrollBy). haveScrollState=false means the call
-// failed — then fall back to "the engine applied the delta we dispatched", which is right except
-// at a document edge, where the snap timer cleans up.
-// Apotheosis (owed-frame identity, driver b531043): swapScrollX/Y + swapId describe the composite
-// that is sitting in the back buffer waiting for its acknowledgement (WebCoreGetOwedSwapScroll,
-// read in the same engine hop). haveOwedSwap=false means the engine presented on its own and there
-// is nothing to acknowledge. Remembered here; the translation that belongs to that frame is built
-// and committed at release time (ReleasePanPresent), not now.
-void MainPage::InstantPanApplied(int newScrollX, int newScrollY, bool haveScrollState,
-                                 int fallbackDx, int fallbackDy,
-                                 int swapScrollX, int swapScrollY,
-                                 unsigned long long swapId, bool haveOwedSwap)
+// failed, and the cache is dropped rather than guessed at.
+// fallbackDx/fallbackDy is the coalesced delta that round trip was asked for (PumpScroll's dx/dy);
+// only the touch-lag diagnostic uses it, to tell a real lag apart from a document-edge clamp.
+void MainPage::EngineScrollFrameApplied(int newScrollX, int newScrollY, bool haveScrollState,
+                                        int fallbackDx, int fallbackDy)
 {
-    if (haveOwedSwap) {
-        m_panSwapX = swapScrollX;
-        m_panSwapY = swapScrollY;
-        m_panSwapId = swapId;
-        m_panSwapValid = true;
-    }
-    // Apotheosis (review 2026-09-04 item 0) — THE SCROLL REGRESSION, root cause. InstantPanBy()
-    //   returns at its top whenever the XAML preview is not the path in use - instantpanxaml off,
-    //   which is the shipping default since device package 13 - so the finger never puts anything
-    //   into m_panRem*/m_panFinger*/m_panBase*. This function is the
-    //   CORRECTION half of that same XAML preview and had NO such guard: every WebCoreScrollBy
-    //   completion ran the block below and did
-    //       m_panRemY -= (newScrollY - m_scrollY);
-    //   i.e. it subtracted the distance the engine had just scrolled from a remainder the finger
-    //   had never filled, and ApplyPanTransform() then put -m_panRemY = +that distance on GpuPanel
-    //   as a TranslateTransform. The engine scrolled the content up, XAML slid the whole panel down
-    //   by exactly as much: the page stood still, and anything position:fixed - which does NOT move
-    //   inside the composite - visibly moved the wrong way. That is the reported symptom on ntv.de,
-    //   and neither half of it was gated on anything.
-    //
-    //   Default path is package 10 again: OnImageManipDelta -> FreeScrollBy -> PumpScroll ->
-    //   WebCoreScrollBy, the engine composites and swaps, and nothing on the XAML side moves. Only
-    //   the scroll/bounds cache is kept, because MapTapToEngine()/ScrollStateUsable() read it.
-    if (!m_instantPan || !m_instantPanXaml) {
-        if (haveScrollState) {
-            // Apotheosis (2026-09-07, clamp fix): capture what the engine actually moved THIS round
-            //   trip (new minus the still-old m_scrollX/Y) before overwriting them, so the lag diagnostic
-            //   can tell a real lag apart from a document-edge clamp — see NoteScrollLagPresented().
-            const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
-            m_scrollX = newScrollX;
-            m_scrollY = newScrollY;
-            m_scrollStateValid = true;
-            m_scrollStateScale = m_pageScale;
-            NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic): the shipping default path
-        } else
-            m_scrollStateValid = false;
-        if (m_panRemX || m_panRemY) { m_panRemX = 0; m_panRemY = 0; ApplyPanTransform(); }
-        return;
-    }
     if (!haveScrollState) {
         m_scrollStateValid = false;
-        if (m_panRemX || m_panRemY) {
-            m_panRemX -= fallbackDx;
-            m_panRemY -= fallbackDy;
-            ClampPanRemainder();
-            ApplyPanTransform();
-        }
         return;
     }
-    // Apotheosis (owed-frame remainder, driver b531043): what the user is about to look at is the
-    // frame in the BACK BUFFER, not wherever the engine happens to be now — the two part company
-    // the moment anything scrolls between the composite and the acknowledgement (a click's
-    // scrollIntoView, the engine's own anchoring, a second job overtaking this completion). Build
-    // the translation from that frame's own position.
-    //
-    // Apotheosis (deferred transform commit): but not YET. That frame is still in the back buffer,
-    // and the acknowledgement that releases it is two CompositionTarget::Rendering events away
-    // (ArmPanPresentAck). Committing its translation here puts the OLD content under the NEW
-    // translation for those two frames — a backwards jump of one coarse engine step, twice per
-    // screen of panning, which is exactly the artefact on device. Leave the transform as the finger
-    // left it and let ReleasePanPresent() commit the corrected one in the same UI turn as the
-    // present: at most one frame of mismatch, in the forward direction, instead of two backwards.
-    const bool deferTransform = haveOwedSwap && m_panDefer && m_panBaseValid;
-    if (deferTransform) {
-        // Apotheosis (2026-09-07, clamp fix): see the appliedDx/Dy comment on the shipping-default
-        //   call site above — same capture, same reason.
-        const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
-        m_scrollX = newScrollX;
-        m_scrollY = newScrollY;
-        m_scrollStateValid = true;
-        m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2)
-        NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic)
-        return;
-    }
-    if (!(haveOwedSwap && PanRemainderFromFrame(swapScrollX, swapScrollY))) {
-        if (m_scrollStateValid) {
-            m_panRemX -= (newScrollX - m_scrollX);
-            m_panRemY -= (newScrollY - m_scrollY);
-        } else {
-            // First frame of this gesture and the seed from RequestScrollState() never arrived: the
-            // dispatched delta is the best estimate we have.
-            m_panRemX -= fallbackDx;
-            m_panRemY -= fallbackDy;
-        }
-    }
-    // Apotheosis (2026-09-07, clamp fix): same appliedDx/Dy capture as the two call sites above.
+    // Apotheosis (2026-09-07, clamp fix): capture what the engine actually moved THIS round trip
+    //   (new minus the still-old m_scrollX/Y) before overwriting them, so the lag diagnostic can
+    //   tell a real lag apart from a document-edge clamp — see NoteScrollLagPresented().
     const int appliedDx = newScrollX - m_scrollX, appliedDy = newScrollY - m_scrollY;
     m_scrollX = newScrollX;
     m_scrollY = newScrollY;
     m_scrollStateValid = true;
     m_scrollStateScale = m_pageScale;   // Apotheosis (2837ce0 review item 2): stamp the scale it is px in
     NoteScrollLagPresented(appliedDx, appliedDy, fallbackDx, fallbackDy);   // Apotheosis (touch-lag diagnostic)
-    // Apotheosis (owed-frame remainder): the gesture began before there was any scroll state to
-    // measure against, so no base was taken (InstantPanBy). This frame is the first thing that
-    // knows where the document is — adopt its position as the base and the incremental remainder
-    // above as what the finger is asking for on top of it. Every later frame is absolute.
-    if (!m_panBaseValid) {
-        m_panBaseX = haveOwedSwap ? swapScrollX : newScrollX;
-        m_panBaseY = haveOwedSwap ? swapScrollY : newScrollY;
-        m_panFingerX = m_panRemX;
-        m_panFingerY = m_panRemY;
-        m_panBaseValid = true;
-    }
-    ClampPanRemainder();
-    ApplyPanTransform();
 }
 
 // Apotheosis (touch-lag diagnostic): m_scrollX/m_scrollY were just refreshed from a real engine
-// present a few lines above, in whichever of InstantPanApplied's three branches got there — fold
-// the newly-applied delta into the gesture's running stats and close out the "finger moved, engine
-// hasn't caught up yet" timing window opened in OnImageManipDelta. A no-op outside an active,
-// perf-logging-gated free-scroll gesture (m_scrollLagActive), so the three call sites above cost
-// one branch when the diagnostic is off.
+// present a few lines above (EngineScrollFrameApplied) — fold the newly-applied delta into the
+// gesture's running stats and close out the "finger moved, engine hasn't caught up yet" timing
+// window opened in OnImageManipDelta. A no-op outside an active, perf-logging-gated free-scroll
+// gesture (m_scrollLagActive), so the call site above costs one branch when the diagnostic is off.
 // Apotheosis (2026-09-07, clamp fix): appliedDx/Dy is what m_scrollX/Y actually moved THIS round
 //   trip (the caller's new minus its still-old m_scrollX/Y, captured right before it overwrites
-//   them); requestedDx/Dy is the same round trip's coalesced ask (InstantPanApplied's own
-//   fallbackDx/fallbackDy parameter — PumpScroll's dx/dy, valid in every branch regardless of its
-//   "fallback" name). Both are 0/0-safe no-ops on the lazy-base-adopt path below.
+//   them); requestedDx/Dy is the same round trip's coalesced ask (EngineScrollFrameApplied's own
+//   fallbackDx/fallbackDy parameter — PumpScroll's dx/dy). Both are 0/0-safe no-ops on the
+//   lazy-base-adopt path below.
 void MainPage::NoteScrollLagPresented(int appliedDx, int appliedDy, int requestedDx, int requestedDy)
 {
     if (!m_scrollLagActive) return;
@@ -3179,32 +2959,14 @@ void MainPage::NoteScrollLagPresented(int appliedDx, int appliedDy, int requeste
     }
 }
 
-void MainPage::InstantPanReset()
-{
-    // Apotheosis (pan present handshake): the preview is gone, so the engine must be allowed to
-    // present again. Covers every way a pan can be abandoned: a new gesture, a pinch taking over,
-    // the 1 s snap timer, a superseded scroll frame, the developer toggle being switched off.
-    PanDeferOff();
-    m_panRemX = 0;
-    m_panRemY = 0;
-    // Apotheosis (owed-frame remainder): the absolute pair describes a gesture that is over. Leaving
-    // it behind would let the next frame of a NEW gesture rebuild the remainder against a base from
-    // the old one — a full-screen jump. InstantPanBy re-takes both at the next manipulation.
-    m_panFingerX = 0;
-    m_panFingerY = 0;
-    m_panBaseValid = false;
-    if (m_panSnapTimer) m_panSnapTimer->Stop();
-    m_panSnapDeadline = 0;   // Apotheosis (pan snap decay): nothing is outstanding any more
-    ApplyPanTransform();
-}
-
 // Apotheosis (2837ce0 review item 2): the last line of defence for the post-pinch jump. The cache
 //   (m_scrollX/Y, m_contentW/H, m_viewW/H) is engine px, and engine px per CSS px IS m_pageScale —
 //   so the instant a pinch commits, all six fields describe a document that no longer exists.
 //   PinchCommit invalidates them explicitly now, but every future path that forgets to would again
-//   feed pre-zoom bounds to the two clamps below, and a clamp is precisely a function that turns a
-//   zero offset into a non-zero one. Comparing the stamp against the committed scale makes that
-//   structurally impossible, and leaves one line in mem.txt whenever it catches something.
+//   feed pre-zoom bounds to the live-pinch clamp (ApplyLiveZoom/ClampZoomAxis), and a clamp is
+//   precisely a function that turns a zero offset into a non-zero one. Comparing the stamp against
+//   the committed scale makes that structurally impossible, and leaves one line in mem.txt whenever
+//   it catches something.
 bool MainPage::ScrollStateUsable()
 {
     if (!m_scrollStateValid) return false;
@@ -3216,81 +2978,15 @@ bool MainPage::ScrollStateUsable()
     return false;
 }
 
-// Keep the previewed position inside the document, and never show more than one screen of
-// background. m_scroll* + m_panRem* is the position the user is looking at.
-void MainPage::ClampPanRemainder()
-{
-    if (ScrollStateUsable()) {
-        int maxX = m_contentW - m_viewW; if (maxX < 0) maxX = 0;
-        int maxY = m_contentH - m_viewH; if (maxY < 0) maxY = 0;
-        const int loX = -m_scrollX, hiX = maxX - m_scrollX;
-        const int loY = -m_scrollY, hiY = maxY - m_scrollY;
-        if (m_panRemX < loX) m_panRemX = loX;
-        if (m_panRemX > hiX) m_panRemX = hiX;
-        if (m_panRemY < loY) m_panRemY = loY;
-        if (m_panRemY > hiY) m_panRemY = hiY;
-    }
-    if (m_panRemX >  kW) m_panRemX =  kW;
-    if (m_panRemX < -kW) m_panRemX = -kW;
-    if (m_panRemY >  kH) m_panRemY =  kH;
-    if (m_panRemY < -kH) m_panRemY = -kH;
-}
-
-// Engine px → presenting-layer DIPs. Same DIP↔px factor as MapTapToEngine/SetPinchAnchor
-// (c5731be): the kW×kH surface is stretched over the whole presenting layer, so the factor is that
-// layer's own size — GpuPanel spans the content row while ContentArea sits 6 DIP inside it.
-// A positive remainder means "the engine still owes us a scroll down", i.e. the content must move
-// UP on screen → negative translation.
-void MainPage::ApplyPanTransform()
-{
-    // Apotheosis (review 2026-09-03): during a pinch (and its spring-back) m_panTranslate belongs
-    //   to the zoom path — ApplyLiveZoom writes the clamp/recentre offset into the very same
-    //   transform (see the comment at m_panTranslate's reuse there). A late engine frame
-    //   (InstantPanApplied) or the async WebCoreGetScrollState answer (RequestScrollState) landing
-    //   mid-gesture would come in here with a zero remainder, write X/Y = 0 and detach the
-    //   translation — wiping the clamp and letting the preview jump past the document edge.
-    //   InstantPanBy already refuses to run while pinching; do the same for every other caller.
-    if (m_pinching || m_zoomSpring != nullptr)
-        return;
-    // Apotheosis (review 2026-09-04 item 0): belt and braces for the regression documented in
-    //   InstantPanApplied(). A XAML pan preview exists in exactly one configuration - instant pan
-    //   on and instantpanxaml on. In every other
-    //   one a translation on the presenting layer is a bug, not a preview: it moves the panel the
-    //   same way the engine just scrolled the content and the page appears frozen. Clear whatever
-    //   is there instead of writing a new one, whoever the caller was.
-    if (!m_instantPan || !m_instantPanXaml) {
-        if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
-        ApplyPresentTransform();
-        return;
-    }
-    if (m_panRemX == 0 && m_panRemY == 0) {
-        if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
-        ApplyPresentTransform();
-        return;
-    }
-    if (!GpuPanel || !RenderImage || !ContentArea)
-        return;
-    auto layer = PresentLayer();
-    double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
-    double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
-    if (!(lw > 1.0)) lw = ContentArea->ActualWidth;
-    if (!(lh > 1.0)) lh = ContentArea->ActualHeight;
-    const double fx = (lw > 1.0) ? lw / (double)kW : 1.0;
-    const double fy = (lh > 1.0) ? lh / (double)kH : 1.0;
-    if (m_panTranslate == nullptr) m_panTranslate = ref new Windows::UI::Xaml::Media::TranslateTransform();
-    m_panTranslate->X = -(double)m_panRemX * fx;
-    m_panTranslate->Y = -(double)m_panRemY * fy;
-    ApplyPresentTransform();
-}
-
-// Seed the scroll/bounds cache at gesture start so the very first delta can already be clamped.
+// Seed the scroll/bounds cache at gesture start, so the pinch clamp and the touch-lag diagnostic
+// have this gesture's own document bounds from its first delta on.
 // Fire-and-forget on the engine thread, exactly like the WebCoreIsScrollableAt hit test — the UI
 // thread never waits on the engine. A late answer for a gesture that has been superseded is
 // dropped via m_scrollStateGen, and an answer that arrives after a real engine frame must not
 // overwrite the position that frame reported, so only the bounds are refreshed in that case.
 void MainPage::RequestScrollState()
 {
-    if (!m_instantPan || !m_sessionActive) return;
+    if (!m_sessionActive) return;
     const unsigned long long gen = ++m_scrollStateGen;
     Platform::Agile<MainPage^> self(this);
     CoreDispatcher^ disp = this->Dispatcher;
@@ -3308,289 +3004,30 @@ void MainPage::RequestScrollState()
                     s->m_scrollStateValid = true;
                     s->m_scrollStateScale = s->m_pageScale;   // Apotheosis (2837ce0 review item 2)
                 }
-                s->ClampPanRemainder();
-                s->ApplyPanTransform();
             }));
         } catch (...) {}
     });
 }
 
-// The engine wins after ~1 s. Restarted on every finger delta, so the deadline is measured from
-// the last movement — during a gesture (and its inertia) it simply never fires, and after the
-// gesture it bounds how long a stale offset can sit on screen if the engine never catches up
-// (a load stole the engine thread, the scroll was clamped by something we cannot see, ...).
-void MainPage::RestartPanSnapTimer()
-{
-    if (m_panRemX == 0 && m_panRemY == 0) {
-        if (m_panSnapTimer) m_panSnapTimer->Stop();
-        m_panSnapDeadline = 0;
-        return;
-    }
-    if (!m_panSnapTimer) {
-        m_panSnapTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-        m_panSnapTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanSnapTick);
-    }
-    // Apotheosis (pan snap decay): the hard deadline the first tick may not cross. Measured from the
-    // last movement like the tick itself, so during a gesture it keeps moving out of reach.
-    m_panSnapDeadline = GetTickCount64() + 3000;
-    Windows::Foundation::TimeSpan ts; ts.Duration = 10000000LL;   // 1 s (100 ns units)
-    m_panSnapTimer->Stop();
-    m_panSnapTimer->Interval = ts;
-    m_panSnapTimer->Start();
-}
-
-// Apotheosis (pan snap decay): this used to be a bare InstantPanReset() — the translation was
-// zeroed a second after the last movement whether or not the engine had caught up. When it had not
-// (a load owns the engine thread, a swap is still owed, the last completion was superseded) the
-// content jumped back by the whole remainder in one frame and then forward again when the frame
-// finally landed: the "it settles, then twitches" on device.
-//
-// Decay the residual of a finished gesture instead. First RECOMPUTE
-// against the engine's actual position - a frame may well have landed since, and then there is
-// nothing left to snap at all. Whatever is still owed is given up gradually (halved every 100 ms,
-// finger total included so a later recompute does not put it back) rather than dropped in one
-// frame, and the hard reset only happens once the engine has caught up or 3 s after the last
-// movement, whichever comes first.
-void MainPage::OnPanSnapTick(Platform::Object^, Platform::Object^)
-{
-    if (ScrollStateUsable() && PanRemainderFromFrame(m_scrollX, m_scrollY)) {
-        ClampPanRemainder();
-        ApplyPanTransform();
-    }
-    const unsigned long long now = GetTickCount64();
-    if ((m_panRemX == 0 && m_panRemY == 0) || m_panSnapDeadline == 0 || now >= m_panSnapDeadline) {
-        InstantPanReset();
-        return;
-    }
-    const int giveUpX = m_panRemX - m_panRemX / 2;   // integer division truncates towards zero,
-    const int giveUpY = m_panRemY - m_panRemY / 2;   // so this reaches 0 from either sign
-    m_panRemX -= giveUpX;
-    m_panRemY -= giveUpY;
-    m_panFingerX -= giveUpX;   // the finger no longer asks for what we just gave up
-    m_panFingerY -= giveUpY;
-    ApplyPanTransform();
-    Windows::Foundation::TimeSpan ts; ts.Duration = 1000000LL;   // 100 ms (100 ns units)
-    m_panSnapTimer->Stop();
-    m_panSnapTimer->Interval = ts;
-    m_panSnapTimer->Start();
-}
-
-// ===========================================================================
-// Apotheosis (pan present handshake) - why a pan may not let the engine present.
-//
-// Two independent producers end up on the same screen: the engine composites and swaps the
-// SwapChainPanel on the ENGINE thread whenever it likes, and instant pan puts a TranslateTransform
-// on that very panel from the UI thread. DWM composes the two without knowing they belong
-// together. So the instant a scroll present lands, the screen shows content that has already moved
-// by D *plus* a translation that still contains D - one frame of double movement, corrected only
-// when the engine's completion reaches the UI thread. On device that is the "content briefly jumps
-// back" flicker, and event-driven present made it continuous, because rAF/timers/decodes now wake
-// the engine during the gesture too and every one of those presents races the transform as well.
-//
-// The rules while a main-frame pan gesture is running:
-//   1. The engine presents ONLY what we ask for. WebCoreSetPanGesture(1) defers every
-//      eglSwapBuffers and makes the live tick skip its composite (content updates still run).
-//   2. The engine is fed in coarse steps (FreeScrollBy / PanFlushDue): 1/6 of the viewport, so a
-//      whole screen of panning costs six presents instead of one per touch frame. The preview is
-//      capped at one screen anyway (ClampPanRemainder), so 1/6 keeps five sixths of margin - and
-//      the residual mismatch a released frame can carry is a fraction of one step, so a smaller
-//      step is a smaller artefact (see kPanStepX).
-//   3. Each present is released only after XAML has committed the matching translation
-//      (ArmPanPresentAck). This is the ordering that actually removes the artefact: a XAML property
-//      change is on screen at the next composition commit, an eglSwapBuffers is on screen at once,
-//      so "swap, then fix the transform" can never look right no matter how small the gap is.
-//
-// Why not the two-hop handshake with the engine waiting for an ack: the engine thread must not
-// block on the UI thread here (ANGLE marshals surface work back to the panel dispatcher - the
-// 线程铁律 in this repo's CLAUDE.md), and even a perfect ack would not help, because what has to
-// happen first is the XAML *commit*, not the UI-thread assignment. Counting Rendering events costs
-// the same two frames and blocks nobody: the engine returns from WebCoreScrollBy immediately and
-// simply receives a WebCorePresent() job a couple of frames later. Those frames of engine latency
-// are invisible during a pan - the translation, not the engine, is what the finger sees moving.
-// ===========================================================================
-
-// The engine catches up in steps of a sixth of the viewport. Engine px, same units as
-// m_scrollAccum/WebCoreScrollBy.
-//
-// Apotheosis (2026-09-04): it was a third. Whatever residual mismatch a released frame carries -
-// the one frame ReleasePanPresent() still cannot remove, a coarse step the engine clamped, a swap
-// that arrived out of order - is a fraction of ONE STEP, so the visible artefact scales directly
-// with the step size: halve the step, halve the jump. The cost is twice as many presents per screen
-// (six instead of three), each of which is a composite the engine was going to do anyway; the
-// preview is still capped at a full screen (ClampPanRemainder), so there is five sixths of margin
-// left instead of two thirds.
-static const int kPanStepX = kW / 6;
-static const int kPanStepY = kH / 6;
-
-bool MainPage::PanFlushDue() const
-{
-    const int ax = (m_scrollAccumX < 0) ? -m_scrollAccumX : m_scrollAccumX;
-    const int ay = (m_scrollAccum  < 0) ? -m_scrollAccum  : m_scrollAccum;
-    return ax >= kPanStepX || ay >= kPanStepY;
-}
-
-// First main-frame pan delta of a gesture: take the presents away from the engine. Posted, like
-// every other C ABI call - and because the engine queue is FIFO, it is guaranteed to be seen
-// before the WebCoreScrollBy this same delta is about to queue.
-void MainPage::PanGestureBegin()
-{
-    // Apotheosis (review 2026-09-04 item 3): only a live manipulation may own the presents. Every
-    //   caller reaches here from an engine completion that may land after ManipulationCompleted;
-    //   arming the mode then leaves nothing to disarm it but the 1 s snap timer, during which the
-    //   engine presents nothing at all.
-    if (!m_manipActive) return;
-    m_panGestureOn = true;
-    if (m_panDefer) return;
-    m_panDefer = true;
-    WebEngine::instance().post([]() { try { WebCoreSetPanGesture(1); } catch (...) {} });
-}
-
-// The finger has left the glass and inertia is over. Commit the offset the coarse gate held back in
-// one step; its completion corrects the transform and releases the last swap through the same
-// handshake, so the final frame and the snap to identity land in the same UI frame. If nothing is
-// owed, hand the presents back straight away.
-void MainPage::PanGestureEnd()
-{
-    if (!m_panGestureOn) return;
-    m_panGestureOn = false;
-    if (m_scrollBusy) return;                                   // its completion finishes this
-    if (m_scrollAccum != 0 || m_scrollAccumX != 0) { PumpScroll(); return; }
-    PanDeferOff();
-}
-
-// Give presents back to the engine now, flushing whatever swap it may still owe. Idempotent.
-void MainPage::PanDeferOff()
-{
-    // Apotheosis: m_panDefer is only armed on the XAML preview path, but m_panGestureOn is armed
-    // whenever a pan owns the coarse-step gate, and the live loop is held off for the length of a
-    // gesture either way - so the restart below has to happen for both.
-    const bool wasPanning = m_panGestureOn || m_panDefer;
-    m_panGestureOn = false;
-    if (m_panDefer) {
-        m_panDefer = false;
-        DisarmPanAck();
-        WebEngine::instance().post([]() { try { WebCorePresent(); WebCoreSetPanGesture(0); } catch (...) {} });
-    }
-    if (wasPanning && !m_loading) StartLiveMode();   // the live loop was held off during the gesture
-}
-
-// Stop waiting for a commit: either a newer scroll frame has superseded the composite we were
-// holding (its own ack will release both) or the presents have been handed back.
-void MainPage::DisarmPanAck()
-{
-    if (m_panAckArmed) { CompositionTarget::Rendering -= m_panAckToken; m_panAckArmed = false; }
-    if (m_panAckTimer) m_panAckTimer->Stop();
-    m_panAckFrames = 0;
-    // Apotheosis (owed-frame identity, driver b531043): forget which frame we were going to name.
-    // Every caller that reaches here has either superseded that composite (PumpScroll overwrites
-    // the back buffer) or handed the presents back (PanDeferOff); ReleasePanPresent takes its copy
-    // before it disarms.
-    m_panSwapValid = false;
-}
-
-// A composite is waiting in the back buffer and the translation that goes with it has just been
-// written. Wait two CompositionTarget::Rendering events - the first ends the frame our assignment
-// belongs to, the second guarantees it has been composed - then let the engine swap. Rearming while
-// already armed just restarts the count, which is what a second scroll frame wants. The timer is
-// the escape hatch for "Rendering stopped firing" (app going to the background mid-gesture).
-void MainPage::ArmPanPresentAck()
-{
-    m_panAckFrames = 2;
-    if (!m_panAckArmed) {
-        m_panAckArmed = true;
-        m_panAckToken = CompositionTarget::Rendering +=
-            ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanAckRendering);
-    }
-    if (!m_panAckTimer) {
-        m_panAckTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-        m_panAckTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnPanAckTimeout);
-    }
-    Windows::Foundation::TimeSpan ts; ts.Duration = 600000LL;   // 60 ms (100 ns units)
-    m_panAckTimer->Stop();
-    m_panAckTimer->Interval = ts;
-    m_panAckTimer->Start();
-}
-
-void MainPage::OnPanAckRendering(Platform::Object^, Platform::Object^)
-{
-    if (--m_panAckFrames > 0) return;
-    ReleasePanPresent();
-}
-
-void MainPage::OnPanAckTimeout(Platform::Object^, Platform::Object^)
-{
-    // Apotheosis (2026-09-04): this timer exists for one case only - CompositionTarget::Rendering
-    // stopped firing (the app went to the background mid-gesture) and the swap would otherwise stay
-    // owed for ever. It must not fire because the UI thread was merely busy: with a WebCoreScrollBy
-    // in flight the completion that lands next is about to arm a fresh acknowledgement for a NEWER
-    // frame, and releasing now puts the frame we are holding on screen under a translation that is
-    // one step out of date - the very artefact the handshake exists to prevent, produced by its own
-    // safety net. Wait another 60 ms instead; nothing is lost, the frame stays owed either way.
-    if (m_scrollBusy) {
-        if (m_panAckTimer) { m_panAckTimer->Stop(); m_panAckTimer->Start(); }
-        return;
-    }
-    ReleasePanPresent();
-}
-
-// The translation is on screen: let the engine show the frame that belongs to it. If the gesture is
-// over and nothing is queued behind this, the same engine hop also hands the presents back - one
-// post, so no other present can slip between the two.
-void MainPage::ReleasePanPresent()
-{
-    // Apotheosis (owed-frame identity, driver b531043): name the frame. WebCorePresent() releases
-    // "whatever is owed", so an acknowledgement that reaches the engine queue behind a newer
-    // WebCoreScrollBy - or behind any other export that paints during a gesture (click, wheel,
-    // drag, pinch, session paint) - puts a frame on screen under a translation committed for a
-    // different one. WebCorePresentFrame(id) releases the composite only while it is still that
-    // frame and otherwise leaves it owed, so a mismatch costs a frame of latency instead of a jump:
-    // the next scroll completion arms a fresh ack for it, PanDeferOff's WebCorePresent() flushes it
-    // when the gesture ends, and the driver arms a real present wake at WebCoreSetPanGesture(0).
-    // Take the record before DisarmPanAck() drops it; id 0 keeps the old "whatever is owed" meaning
-    // and is what the paths that never saw a composite (timeout on an idle gesture) want.
-    const bool haveSwap = m_panSwapValid;
-    const unsigned long long swapId = haveSwap ? m_panSwapId : 0ull;
-    const int swapX = m_panSwapX, swapY = m_panSwapY;
-    DisarmPanAck();
-    if (!m_panDefer) return;
-    // Apotheosis (deferred transform commit): the translation that belongs to this frame is written
-    // HERE, one UI turn before the swap, instead of when the completion landed two Rendering events
-    // ago — see InstantPanApplied(). Built from the finger's total as it is right now, so the deltas
-    // that arrived during those two frames are in it; the frame's own scroll position is what it is
-    // measured against.
-    if (haveSwap && PanRemainderFromFrame(swapX, swapY)) {
-        ClampPanRemainder();
-        ApplyPanTransform();
-    }
-    const bool finish = !m_panGestureOn && !m_scrollBusy && m_scrollAccum == 0 && m_scrollAccumX == 0;
-    if (finish) m_panDefer = false;
-    WebEngine::instance().post([finish, swapId]() {
-        try { WebCorePresentFrame(swapId); if (finish) WebCoreSetPanGesture(0); } catch (...) {}
-    });
-    if (finish && !m_loading) StartLiveMode();
-}
-
 // Apotheosis: one place that decides what sits on the presenting element. The pinch preview scale
-// and the instant-pan translation are composed in a TransformGroup with the scale FIRST, so the
-// translation stays in final screen DIPs instead of being scaled by the preview. In practice the
-// two never overlap (a pinch cancels the pan, see SetPinchAnchor), but a stray combination must
-// still compose rather than have one silently replace the other.
+// and the clamp translation ApplyLiveZoom writes with it are composed in a TransformGroup with the
+// scale FIRST, so the translation stays in final screen DIPs instead of being scaled by the preview.
 // Both elements are cleared and the group emptied before anything is (re)attached: a XAML Transform
 // may only have one parent, and re-appending one that still has its old parent throws.
 //
 // Apotheosis (review 2026-09-04 item 1): the view inset (m_gpuInset, set by ApplyViewInsets) is a
 // third, permanent member of the stack and belongs to GpuPanel ONLY — the software path is inset by
-// layout, on ContentBorder. It goes LAST: preview scale and pan translation are expressed in the
+// layout, on ContentBorder. It goes LAST: preview scale and translation are expressed in the
 // panel's own space and must be shifted by the inset, not the other way round. It also stays on the
 // panel while the software path presents, so the panel never jumps when the two swap over.
 void MainPage::ApplyPresentTransform()
 {
-    // ApplySettings() can reach this before the XAML tree exists (settings.ini with instantpan=0
-    // is read in the constructor), so both elements are checked like NavigateTo does.
+    // ApplySettings() can reach this before the XAML tree exists (settings.ini is read in the
+    // constructor), so both elements are checked like NavigateTo does.
     if (!GpuPanel || !RenderImage)
         return;
     const bool haveZoom = (m_zoomTransform != nullptr);
-    const bool havePan = (m_panTranslate != nullptr) && (m_panTranslate->X != 0.0 || m_panTranslate->Y != 0.0);
+    const bool haveTranslate = (m_panTranslate != nullptr) && (m_panTranslate->X != 0.0 || m_panTranslate->Y != 0.0);
     const bool haveInset = (m_gpuInset != nullptr) && (m_gpuInset->Y != 0.0);
     GpuPanel->RenderTransform = nullptr;
     RenderImage->RenderTransform = nullptr;
@@ -3599,7 +3036,7 @@ void MainPage::ApplyPresentTransform()
     Windows::UI::Xaml::Media::Transform^ parts[3];
     int n = 0;
     if (haveZoom) parts[n++] = m_zoomTransform;
-    if (havePan)  parts[n++] = m_panTranslate;
+    if (haveTranslate) parts[n++] = m_panTranslate;
     if (m_gpuPresent && haveInset) parts[n++] = m_gpuInset;
     // Software present: the preview goes on RenderImage, the panel keeps the bare inset.
     if (!m_gpuPresent && haveInset) GpuPanel->RenderTransform = m_gpuInset;
@@ -3615,26 +3052,6 @@ void MainPage::ApplyPresentTransform()
     }
     if (m_gpuPresent) GpuPanel->RenderTransform = t;
     else              RenderImage->RenderTransform = t;
-}
-
-// Apotheosis (OFFTHREAD-RASTER-LOG.md): DEVELOPER toggle "Threaded raster". Engine-thread call.
-void MainPage::ApplyThreadedRasterSetting()
-{
-    const int en = m_threadedRaster ? 1 : 0;
-    WebEngine::instance().post([en]() { try { WebCoreSetThreadedRaster(en); } catch (...) {} });
-}
-
-// Apotheosis (TILING-REWRITE-PLAN.md 5.2): DEVELOPER toggle "Tile grid v2 (next page load)",
-//   default ON since package 4. Same shape and the same two call sites as the one above
-//   (ApplySettings, i.e. once
-//   at startup and again whenever the Settings page closes). The engine reads the switch when a
-//   tiled backing store is CREATED, so flipping it leaves the page on screen alone and the next
-//   navigation is the one that runs on the new tile management — which is what the toggle's own
-//   label says, so nobody reads a flip that changes nothing as a broken switch.
-void MainPage::ApplyTileGridV2Setting()
-{
-    const int en = m_tileGridV2 ? 1 : 0;
-    WebEngine::instance().post([en]() { try { WebCoreSetTileGridV2(en); } catch (...) {} });
 }
 
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
@@ -3665,10 +3082,8 @@ static void PresentWakeThunk(void*)
     } catch (...) {}
 }
 
-// DEVELOPER toggle "Event-driven present" (default ON). On: the driver wakes us and the 200 ms
-//   live tick is replaced by wake + 1 s fallback. Off: the callback is unregistered (the engine
-//   then does not even arm its atomic) and StartLiveMode goes back to the fixed timer — the old
-//   code path is kept intact on purpose, it is the fallback if the event path misbehaves on device.
+// Register the driver's present wake-up: the engine tells us when something wants to be presented
+//   and the live loop runs on those wakes plus a fallback tick, instead of a fixed 200 ms timer.
 //   UI thread; the registration itself is posted to the engine thread as the ABI demands.
 void MainPage::ApplyEventPresentSetting()
 {
@@ -3683,12 +3098,10 @@ void MainPage::ApplyEventPresentSetting()
         g_wakePage = this;
         s_wakeBound = true;
     }
-    const bool on = m_eventPresent;
-    WebEngine::instance().post([on]() {
-        try { WebCoreSetPresentRequestCallback(on ? &PresentWakeThunk : nullptr, nullptr); } catch (...) {}
+    WebEngine::instance().post([]() {
+        try { WebCoreSetPresentRequestCallback(&PresentWakeThunk, nullptr); } catch (...) {}
     });
-    // Re-arm the loop in the new mode (StartLiveMode picks the timers apart); if no session is
-    // live it is a no-op and the next StartLiveMode does it.
+    // Re-arm the loop; if no session is live it is a no-op and the next StartLiveMode does it.
     if (m_sessionActive) { StopLiveMode(); StartLiveMode(); }
 }
 
@@ -3732,17 +3145,11 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
                 PumpDrag();
             }
             m_nestedScrollState = NestedScrollState::No;
-            // Apotheosis (instant pan): a pinch and a pan must not fight over the presenting
-            // element's transform — drop the pan preview before the anchor is taken (SetPinchAnchor
-            // needs an untransformed TransformToVisual).
-            // Order matters: ApplyPanTransform now refuses to touch the transform while m_pinching
-            // is set (it belongs to the zoom clamp then), so this reset must run before the flag.
-            InstantPanReset();
             // Apotheosis (2837ce0 review item 2): this gesture began as a pan, so
             //   OnImageManipStarted posted a RequestScrollState() for it. Its answer is engine px
             //   at the CURRENT scale and will land while (or after) we zoom — bump the generation
             //   so it is dropped instead of re-validating the cache with pre-zoom bounds, which is
-            //   what a later ClampPanRemainder() would then translate the view by.
+            //   what the live-pinch clamp would then translate the view by.
             ++m_scrollStateGen;
             m_scrollStateValid = false;
             // Apotheosis (axis lock / rail scrolling): a second contact turned this into a pinch —
@@ -3753,7 +3160,7 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
             // only when it started on a drag widget AND the page is at 1:1 - a page the user has
             // already zoomed must keep pinching as page zoom, or a pinch-out on a zoomed map would
             // silently change what the zoom gesture means halfway through a session.
-            if (m_pinchToPage && overDragWidget && m_pageScale <= 1.001f) {
+            if (overDragWidget && m_pageScale <= 1.001f) {
                 int cx, cy; MapTapToEngine(e->Position.X, e->Position.Y, cx, cy);
                 if (cx < 0) cx = 0; else if (cx >= kW) cx = kW - 1;
                 if (cy < 0) cy = 0; else if (cy >= kH) cy = kH - 1;
@@ -3828,7 +3235,7 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
     // Apotheosis (drag as pointer events): the gesture started over a map/canvas — hand the finger
     // to the page as a mouse drag. Absolute position, not a delta: the page moves its own content
     // from where the pointer is, so a coalesced move simply means "the finger is here now".
-    // Deliberately no InstantPanBy and no WebCoreScrollBy on this path: the document must not move.
+    // Deliberately no WebCoreScrollBy on this path: the document must not move.
     if (m_nestedScrollState == NestedScrollState::Drag) {
         int px, py; MapTapToEngine(e->Position.X, e->Position.Y, px, py);
         if (px < 0) px = 0; else if (px >= kW) px = kW - 1;
@@ -3844,16 +3251,14 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         NestedScrollBy(px, py, idx, idy);
         return;
     }
-    // No:现有主帧快路径不变。
-    // Apotheosis (instant pan): move the presented frame with the finger right now; the engine
-    // still gets the same coalesced WebCoreScrollBy it always did.
+    // No:现有主帧快路径不变(coalesced WebCoreScrollBy,引擎自己合成+交换)。
     ApplyAxisLock(idx, idy);   // Apotheosis (axis lock / rail scrolling)
-    // Apotheosis (touch-lag diagnostic): same idx/idy InstantPanBy/FreeScrollBy are about to see,
+    // Apotheosis (touch-lag diagnostic): the same idx/idy FreeScrollBy is about to see,
     //   summed raw (pre-axis-lock would double count the locked-out axis as "finger asked, engine
     //   never told" — using the post-lock values keeps this the same "what did we actually ask the
     //   engine for" question FreeScrollBy is answering). No allocation, two adds and a compare.
     // Apotheosis (2026-09-07, device bug fix — same "n=28 max=2045"/"n=187 max=2709" report): the
-    //   comment above InstantPanApplied already notes it — "OnImageManipDelta keeps firing translation
+    //   comment in OnImageManipCompleted already notes it — "OnImageManipDelta keeps firing translation
     //   deltas during TranslateInertia" — a synthetic deceleration curve the platform plays out after
     //   the finger has already left the glass, not the finger itself. Summing those into the finger
     //   total answered a different question than "does the page keep up with the finger": once inertia
@@ -3870,7 +3275,6 @@ void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::Ma
         ++m_scrollLagMoves;
         if (m_scrollLagPendingSinceMs == 0) m_scrollLagPendingSinceMs = GetTickCount64();
     }
-    InstantPanBy(idx, idy);
     FreeScrollBy(idx, idy);
 }
 
@@ -3958,10 +3362,9 @@ void MainPage::ApplyLiveZoom()
     m_zoomTransform->CenterX = m_focalX; m_zoomTransform->CenterY = m_focalY;
 
     // Apotheosis (package 7): clamp/centre the preview against the document edges (ClampZoomAxis).
-    //   Reuses m_panTranslate — InstantPanBy() never touches it while m_pinching is set, and
-    //   ApplyPresentTransform already composes it after the scale ("145b29f", scale first so the
-    //   translation stays screen-space) — so a pinch can borrow it for the whole gesture and
-    //   PinchCommit()/SpringBackZoom already know how to zero it back out on release.
+    //   m_panTranslate is the presenting layer's translation: ApplyPresentTransform composes it
+    //   after the scale ("145b29f", scale first so the translation stays screen-space), and
+    //   PinchCommit()/SpringBackZoom zero it back out on release.
     auto layer = PresentLayer();
     double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
     double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
@@ -4056,9 +3459,9 @@ void MainPage::SpringBackZoom(float targetLive, float commitScale)
 // Apotheosis (review 2026-09-04 item 3): THE ONE EXIT FROM A GESTURE.
 //   Five paths used to end a gesture and each cleared a different subset of the state. The one
 //   that mattered most - m_pinching - was cleared only by OnImageManipCompleted and NavigateTo, so
-//   a manipulation ended by a visibility change, a tab switch or a session teardown left it set;
-//   InstantPanBy() and ApplyPanTransform() both return early while it is, and nothing scrolled for
-//   the rest of the session. Everything that says "a finger owns the page" is reset here instead.
+//   a manipulation ended by a visibility change, a tab switch or a session teardown left it set,
+//   and ApplyLiveZoom kept owning the presenting layer's transform for the rest of the session.
+//   Everything that says "a finger owns the page" is reset here instead.
 //
 //   NOT hooked, deliberately: PointerCaptureLost / PointerCanceled. They fire when the finger
 //   leaves the glass, which is exactly where INERTIA begins - ending the gesture there would kill
@@ -4097,20 +3500,10 @@ void MainPage::EndGesture(GestureEnd reason)
         m_zoomSpring = nullptr;
         m_zoomTransform = nullptr;
     }
-    // --- main-frame pan. PanGestureEnd() is the ORDERLY end (it hands the presents back and lets
-    //     the residual decay as the engine catches up) and runs for every reason; the hard
-    //     reset below - drop the residual now, stop the snap timer - is right only for an abort.
-    //     On Completed the residual is supposed to decay against the frames the engine is still
-    //     catching up with, and the snap timer is what bounds that.
-    PanGestureEnd();
-    if (abort) {
-        InstantPanReset();
-        if (m_panSnapTimer) { try { m_panSnapTimer->Stop(); } catch (...) {} }
-        m_panSnapDeadline = 0;
-        m_pendingPanX = 0; m_pendingPanY = 0;
-    }
-    // --- nested scroll: bump the generation so a hit-test answer still in flight is dropped.
-    //     (Completed flushes the buffered deltas first, through ReplayPendingPan.)
+    // --- nested scroll: bump the generation so a hit-test answer still in flight is dropped, and
+    //     drop the deltas buffered while it was Unknown. On Completed the caller has already
+    //     flushed those through ReplayPendingPan; an abort has nothing left to send them to.
+    if (abort) { m_pendingPanX = 0; m_pendingPanY = 0; }
     ++m_nestedScrollGen;
     m_nestedScrollState = NestedScrollState::Unknown;
     // --- drag as pointer events. NOT on Completed: the mouseup for a drag that the page owns is
@@ -4122,8 +3515,7 @@ void MainPage::EndGesture(GestureEnd reason)
         ++m_dragGen;
         DragReset();
     }
-    // --- and the master flag: no finger owns the page any more. After this, PanGestureBegin()
-    //     refuses to re-arm pan-gesture mode from a late engine completion.
+    // --- and the master flag: no finger owns the page any more.
     m_manipActive = false;
     if (abort)
         ApplyPresentTransform();   // whatever preview transform is left goes with the gesture
@@ -4151,16 +3543,11 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
         m_dragReleasePending = true;
         PumpDrag();
     }
-    // Apotheosis (pan present handshake, step 4): the gesture (including its inertia - a
-    // ManipulationCompleted only arrives once inertia has run out) is over. Commit the offset the
-    // coarse gate held back in one step and let its frame release the last swap, so the final
-    // present and the snap of the translation to identity happen in the same UI frame.
-    PanGestureEnd();
     // Apotheosis (touch-lag diagnostic): one line per free-scroll gesture, "did the page keep up
     //   with the finger". n=0 means the gesture never took the free-scroll branch at all (drag/
-    //   nested-scroll/pinch, or moved less than half a device px) — expected, not a bug. The final
-    //   coarse-step flush PanGestureEnd() just posted lands asynchronously, after this line is
-    //   written, so it is not counted here (see the commit message).
+    //   nested-scroll/pinch, or moved less than half a device px) — expected, not a bug. A
+    //   WebCoreScrollBy still in flight completes asynchronously, after this line is written, so it
+    //   is not counted here (see the commit message).
     // Apotheosis (2026-09-07, clamp/fling fix): gated on m_scrollLagStarted, not m_scrollLagActive —
     //   the latter now freezes as soon as inertia begins (OnImageManipDelta), which is true of nearly
     //   every swipe, and gating the write on it too would have silently dropped the line for all of
@@ -4188,10 +3575,6 @@ void MainPage::OnImageManipCompleted(Platform::Object^, Windows::UI::Xaml::Input
                 + " fling=" + std::to_string(m_scrollLagFlingMoves)).c_str());
         }
     }
-    // Apotheosis (review 2026-09-04 item 3): after PanGestureEnd(), so the flushes above still count
-    //   as part of the gesture. From here on nothing may re-enter pan-gesture mode: a late engine
-    //   completion (PumpDrag's fallback) would arm m_panGestureOn/m_panDefer with no gesture left to
-    //   end them, and the engine would stay silent until the 1 s snap timer fired.
     // Apotheosis (review 2026-09-04 item 3): one exit, shared with every abort path. Capture what
     //   the pinch commit below needs BEFORE the reset - EndGesture() clears m_pinching/m_liveScale
     //   like every other caller, and leaves the zoom spring alone because this path owns it.
@@ -4235,28 +3618,24 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 //   commit whose frame was superseded left all of it standing. But the engine has
                 //   applied the new scale by the time we get here regardless of who owns the frame,
                 //   and from that moment every number expressed in pre-zoom engine px is a lie:
-                //     · the pan residual (m_panRem*) is subtracted against a scroll position
-                //       measured before the scale change, so it surfaces late;
                 //     · the scroll/bounds cache (m_scrollX/Y, m_contentW/H, m_viewW/H) is engine px
-                //       and content size scales with m_pageScale, so the next ClampPanRemainder()
-                //       clamps to a document that no longer exists and
+                //       and content size scales with m_pageScale, so the next live-pinch clamp
+                //       (ApplyLiveZoom/ClampZoomAxis) clamps to a document that no longer exists and
                 //       manufactures a translation out of a zero offset;
                 //     · a RequestScrollState() answer still in flight would re-validate that cache
                 //       (m_scrollStateGen was never bumped here — only RequestScrollState bumps it).
                 //   So the reset runs unconditionally now, and the generation is bumped with it.
-                const bool hadResidual = (s->m_panRemX || s->m_panRemY);
-                s->m_panRemX = 0; s->m_panRemY = 0;
+                const bool hadCache = s->m_scrollStateValid;
+                // The rubber-band offset ClampZoomAxis left on the presenting layer: the committed
+                //   frame lands with no translate at all.
                 if (s->m_panTranslate != nullptr) { s->m_panTranslate->X = 0.0; s->m_panTranslate->Y = 0.0; }
-                // The 1 s "the engine wins" timer would call InstantPanReset() long after the fact;
-                //   there is nothing left for it to reset and it must not fire into the new scale.
-                if (s->m_panSnapTimer) { try { s->m_panSnapTimer->Stop(); } catch (...) {} }
                 s->m_scrollStateValid = false;
                 ++s->m_scrollStateGen;
                 // Apotheosis (review 2026-09-04 item 6): record the committed scale HERE, with the
                 //   rest of the unconditional reset, not behind the m_opSeq guard below. The engine
                 //   has applied the new scale by the time we get here regardless of who owns the
-                //   frame - the same argument the block above makes for the pan residual and the
-                //   scroll cache. Behind the guard, a superseded commit left m_pageScale describing
+                //   frame - the same argument the block above makes for the scroll cache. Behind
+                //   the guard, a superseded commit left m_pageScale describing
                 //   the pre-pinch document, and every consumer of it worked in the wrong units:
                 //   ScrollStateUsable() compared the wrong stamp (and so trusted a stale cache),
                 //   MapTapToEngine mapped taps at the wrong scale, and the next pinch took its base
@@ -4268,11 +3647,11 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                 // The insets deferred while the gesture ran (ApplyViewInsets' pinch guard) — e.g.
                 //   the title row's auto-hide landing mid-pinch — are safe to apply now.
                 if (s->m_insetsPending) { s->m_insetsPending = false; s->ApplyViewInsets(); }
-                if (hadResidual)
+                if (hadCache)
                     WriteMemLog("pinch-commit scale=" + std::to_string(newScale)
                                 + " rc=" + std::to_string(rcCopy)
                                 + " current=" + std::to_string(s->m_opSeq == mySeq ? 1 : 0)
-                                + " dropped pan residual + pre-zoom scroll cache");
+                                + " dropped pre-zoom scroll cache");
                 if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
                 if (rcCopy == 0)
                     s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
@@ -4523,12 +3902,11 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
     });
 }
 
-// ---- 实时渲染循环:唤醒驱动(默认)/ 低帧率定时器(回退)推进动画/SPA 渐进挂载 ----
+// ---- 实时渲染循环:唤醒驱动推进动画/SPA 渐进挂载 ----
 // Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): the loop used to be a fixed 200 ms DispatcherTimer
-//   that composited whether or not anything had changed. It now runs on engine wake-ups
+//   that composited whether or not anything had changed. It runs on engine wake-ups
 //   (WebCoreSetPresentRequestCallback -> PresentWakeThunk -> OnPresentWake), rate-limited to one
-//   present per ~16 ms, with a 1 s fallback tick as the safety net for anything not signalled.
-//   The old timer path is kept and is used when the DEVELOPER toggle is off.
+//   present per ~16 ms, with a fallback tick as the safety net for anything not signalled.
 void MainPage::StartLiveMode()
 {
     if (!m_sessionActive || !m_appForeground) return;
@@ -4538,40 +3916,24 @@ void MainPage::StartLiveMode()
     if (TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
     m_liveBusy = false;        // 重置(若上次 RunAsync 抛/后台早退卡住,这里恢复)
     m_liveBusyAge = 0;
-    m_liveStaticTicks = 0;
     m_liveTotalTicks = 0;
-    if (m_eventPresent) {
-        // 事件驱动:没有固定帧率。兜底 tick 负责自愈 + 内存采样 + 补没被信号覆盖的变化,
-        // 刚有活动时按 200ms(=旧 tick,给 setTimeout 动画/在途图片留出 RunLoop::cycle),
-        // 画面静下来后 1s,再静下来 5s(见 OnFallbackTick)。
-        if (m_liveTimer) m_liveTimer->Stop();
-        m_fallbackStaticTicks = 0;
-        if (!m_fallbackTimer) {
-            m_fallbackTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-            m_fallbackTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnFallbackTick);
-        }
-        Windows::Foundation::TimeSpan fb; fb.Duration = 2000000LL;   // 200ms
-        m_fallbackTimer->Interval = fb;
-        m_fallbackTimer->Start();
-        // 交互/导航之后立刻出一帧(旧路径要等 200ms),限流仍然生效。
-        m_wakePending = true;
-        ScheduleWakeComposite();
-        return;
+    // 事件驱动:没有固定帧率。兜底 tick 负责自愈 + 内存采样 + 补没被信号覆盖的变化,
+    // 刚有活动时按 200ms(给 setTimeout 动画/在途图片留出 RunLoop::cycle),
+    // 画面静下来后 1s,再静下来 5s(见 OnFallbackTick)。
+    m_fallbackStaticTicks = 0;
+    if (!m_fallbackTimer) {
+        m_fallbackTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+        m_fallbackTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnFallbackTick);
     }
-    if (m_fallbackTimer) m_fallbackTimer->Stop();
-    if (m_wakeTimer) m_wakeTimer->Stop();
-    if (!m_liveTimer) {
-        m_liveTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-        m_liveTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(this, &MainPage::OnLiveTick);
-    }
-    // 每次启动都恢复快帧率(撤销之前永久动画的降速)。
-    Windows::Foundation::TimeSpan ts; ts.Duration = 2000000LL;   // 200ms(100ns 单位)≈ 5fps
-    m_liveTimer->Interval = ts;
-    m_liveTimer->Start();
+    Windows::Foundation::TimeSpan fb; fb.Duration = 2000000LL;   // 200ms
+    m_fallbackTimer->Interval = fb;
+    m_fallbackTimer->Start();
+    // 交互/导航之后立刻出一帧,限流仍然生效。
+    m_wakePending = true;
+    ScheduleWakeComposite();
 }
 void MainPage::StopLiveMode()
 {
-    if (m_liveTimer) m_liveTimer->Stop();
     if (m_fallbackTimer) m_fallbackTimer->Stop();
     if (m_wakeTimer) m_wakeTimer->Stop();
     m_wakePending = false;
@@ -4580,7 +3942,6 @@ void MainPage::StopLiveMode()
 // 引擎说"有东西要呈现"(UI 线程,PresentWakeThunk 转投而来)。只做限流 + 排帧,绝不碰引擎。
 void MainPage::OnPresentWake()
 {
-    if (!m_eventPresent) return;
     m_fallbackStaticTicks = 0;   // 有活动 → 兜底 tick 回到快节奏(OnFallbackTick 里定档)
     m_wakePending = true;
     ScheduleWakeComposite();
@@ -4589,13 +3950,7 @@ void MainPage::OnPresentWake()
 // 排一帧:满足最小间隔就立刻投引擎,否则用一次性定时器补齐剩下的时间。UI 线程。
 void MainPage::ScheduleWakeComposite()
 {
-    if (!m_eventPresent || !m_wakePending) return;
-    // Apotheosis (pan present handshake): the engine presents only from our scroll jobs while a pan
-    // owns the screen. m_wakePending stays set, so the wake is served as soon as the gesture ends
-    // (PanDeferOff/ReleasePanPresent call StartLiveMode). Not queueing the tick at all - rather
-    // than only suppressing its swap in the driver - is also what keeps the engine thread free for
-    // the scroll jobs the finger is waiting on.
-    if (m_panDefer) return;
+    if (!m_wakePending) return;
     if (m_liveBusy) return;                 // 上一帧还没回;它回来时会重新排
     if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
@@ -4634,9 +3989,7 @@ void MainPage::OnWakeTimer(Platform::Object^, Platform::Object^)
 // 1s 兜底:没被信号覆盖的变化、丢掉的 RunAsync(自愈)、内存采样都靠它。静止久了降到 5s。
 void MainPage::OnFallbackTick(Platform::Object^, Platform::Object^)
 {
-    if (!m_eventPresent) { if (m_fallbackTimer) m_fallbackTimer->Stop(); return; }
     if (!m_sessionActive || !m_appForeground) return;
-    if (m_panDefer) return;   // Apotheosis (pan present handshake): the gesture owns the presents
     if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
         || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
         || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
@@ -4661,28 +4014,7 @@ void MainPage::OnFallbackTick(Platform::Object^, Platform::Object^)
     ScheduleWakeComposite();
 }
 
-void MainPage::OnLiveTick(Platform::Object^, Platform::Object^)
-{
-    if (!m_sessionActive || !m_appForeground || m_loading || m_interacting) return;
-    if (m_panDefer) return;   // Apotheosis (pan present handshake): the gesture owns the presents
-    if (Drawer->Visibility == Windows::UI::Xaml::Visibility::Visible
-        || ActionMenu->Visibility == Windows::UI::Xaml::Visibility::Visible
-        || SettingsPage->Visibility == Windows::UI::Xaml::Visibility::Visible
-        || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) { StopLiveMode(); return; }
-    if (m_liveBusy) {                      // 上一帧引擎任务还没回
-        // Apotheosis (M4): perf.csv showed a live tick costing 1-4 s on github.com. With the
-        // old 5-tick (~1 s) self-heal a new tick was queued on the engine thread every second
-        // while the previous one was still running, so the FIFO grew without bound and every
-        // navigation/scroll queued behind minutes of ticks ("load timeout", eventually OOM).
-        // Only self-heal after 30 s - that is a genuinely lost RunAsync, not a slow frame.
-        if (++m_liveBusyAge < 150) return;
-        m_liveBusy = false;                // 卡过久 → RunAsync 很可能丢了,自愈不死循环
-    }
-    m_liveBusyAge = 0;
-    DispatchLiveFrame();
-}
-
-// 一帧:引擎线程 WebCoreLiveTick + UI 线程呈现。两条路(固定 tick / 唤醒)共用,调用方负责守卫与限流。
+// 一帧:引擎线程 WebCoreLiveTick + UI 线程呈现。调用方负责守卫与限流。
 void MainPage::DispatchLiveFrame()
 {
     m_liveBusy = true;
@@ -4724,38 +4056,22 @@ void MainPage::DispatchLiveFrame()
                     }
                     // Apotheosis (M4): the mem-tick line moved to the engine-thread part of this
                     // tick, where the engine-side numbers can be read (EngineMemStats()).
-                    if (hashCopy == s->m_lastFrameHash) {        // 画面没变:连续静止则停帧省电
-                        if (s->m_eventPresent) {
-                            // 事件驱动:静止不停循环——唤醒随时会来,只让兜底 tick 逐步降速。
-                            // 还有图片/子资源在途 → 保持快节奏,它们的完成回调要 RunLoop::cycle 取。
-                            if (pendingCopy > 0) s->m_fallbackStaticTicks = 0;
-                            else ++s->m_fallbackStaticTicks;
-                        } else if (pendingCopy > 0) {
-                            s->m_liveStaticTicks = 0;            // 仍有图片/子资源在途:继续 tick,等待完成回调和解码
-                            int ticks = ++s->m_liveTotalTicks;
-                            if (ticks == 150 && s->m_liveTimer) {
-                                Windows::Foundation::TimeSpan slow; slow.Duration = 10000000LL;   // 1s ≈ 1fps
-                                s->m_liveTimer->Interval = slow;
-                            }
-                            if (ticks >= 300)
-                                s->StopLiveMode();
-                        } else if (++s->m_liveStaticTicks >= 40)
-                            s->StopLiveMode();                   // ~8s 静止 → 停,给慢图片/解码留余量
+                    if (hashCopy == s->m_lastFrameHash) {        // 画面没变:静止不停循环——唤醒随时会来,
+                        // 只让兜底 tick 逐步降速。还有图片/子资源在途 → 保持快节奏,它们的完成回调
+                        // 要 RunLoop::cycle 取。
+                        if (pendingCopy > 0) s->m_fallbackStaticTicks = 0;
+                        else ++s->m_fallbackStaticTicks;
                     } else {
-                        s->m_liveStaticTicks = 0;
                         s->m_fallbackStaticTicks = 0;
                         s->m_lastFrameHash = hashCopy;
                         s->PresentSoftwareFrame(rgba);
-                        // 永久动画防失控:连续动画超 ~150 帧(旧路径 30s)无交互 → 降到 ~1fps(不硬停,免得
-                        // 动画卡死;事件驱动路径由 ScheduleWakeComposite 的 minGap 实现同一条规则);
+                        // 永久动画防失控:连续动画超 ~150 帧无交互 → 降到 ~1fps(不硬停,免得动画卡死):
+                        // ScheduleWakeComposite 的 minGap 读 m_liveTotalTicks 实现这条规则。
                         // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复快帧率。
-                        if (++s->m_liveTotalTicks == 150 && !s->m_eventPresent && s->m_liveTimer) {
-                            Windows::Foundation::TimeSpan slow; slow.Duration = 10000000LL;   // 1s ≈ 1fps
-                            s->m_liveTimer->Interval = slow;
-                        }
+                        ++s->m_liveTotalTicks;
                     }
-                    // 事件驱动:这一帧跑的时候又来了唤醒(动画页每帧都会) → 按限流排下一帧。
-                    if (s->m_eventPresent && s->m_wakePending) s->ScheduleWakeComposite();
+                    // 这一帧跑的时候又来了唤醒(动画页每帧都会) → 按限流排下一帧。
+                    if (s->m_wakePending) s->ScheduleWakeComposite();
                 }));
         } catch (...) {}
     });
@@ -5080,12 +4396,6 @@ void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
         ++m_opSeq;
         m_interacting = false;
         if (m_loadWatchdog) m_loadWatchdog->Stop();
-        // Apotheosis (review 2026-09-04 item 6): the session is about to go away, so hand the
-        //   presents back first. Stop can be hit while a pan is still deferring them (m_panDefer),
-        //   and after the teardown nothing would ever call PanGestureEnd/PanDeferOff — the engine
-        //   would stay in "present only when we ask" mode into the next page. Same reason
-        //   NavigateTo calls it.
-        PanDeferOff();
         WebEngine::instance().post([]() { try { WebCoreCloseSession(); } catch (...) {} });
         m_sessionActive = false;
         ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
@@ -5435,12 +4745,9 @@ void MainPage::ApplySettings()
     });
     UpdateScrollFab();
     ApplyPrefetchSetting();
-    ApplyThreadedRasterSetting();            // Apotheosis: DEVELOPER toggle, engine-thread call
-    ApplyTileGridV2Setting();                // Apotheosis: DEVELOPER toggle, engine-thread call
-    ApplyEventPresentSetting();              // Apotheosis: DEVELOPER toggle, (un)registers the engine wake
+    ApplyEventPresentSetting();              // Apotheosis: registers the engine present wake-up
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     ApplyHideStatusBarSetting();             // Apotheosis: DISPLAY toggle, UI thread only
-    if (!m_instantPan) InstantPanReset();    // Apotheosis: switching it off must clear a live preview
     if (UaBtn) {
         bool en = (g_lang == L"en");
         UaBtn->Content = ref new String(m_uaMobile ? (en ? L"\U0001F4F1 Mobile UA" : L"\U0001F4F1 手机UA")
@@ -5464,22 +4771,14 @@ void MainPage::LoadSettings()
             else if (k == "home") g_homeUrl = v.empty() ? L"about:home" : Utf8ToWide(v);
             else if (k == "ua") m_setUaDesktop = (atoi(v.c_str()) != 0);
             else if (k == "zoom") m_defaultZoom = atoi(v.c_str());
-            else if (k == "tabmode") m_tabMode = atoi(v.c_str());
             else if (k == "gpudefault") m_gpuDefault = (atoi(v.c_str()) != 0);
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
             else if (k == "updatecheck") m_updateAuto = (atoi(v.c_str()) != 0);
             else if (k == "prefetch") m_prefetch = atoi(v.c_str());
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
-            else if (k == "instantpan") m_instantPan = (atoi(v.c_str()) != 0);
-            else if (k == "instantpanxaml") m_instantPanXaml = (atoi(v.c_str()) != 0);
-            else if (k == "threadraster") m_threadedRaster = (atoi(v.c_str()) != 0);
-            else if (k == "tilegridv2") m_tileGridV2 = (atoi(v.c_str()) != 0);
-            else if (k == "eventpresent") m_eventPresent = (atoi(v.c_str()) != 0);
-            else if (k == "dragpointer") m_dragPointer = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
             else if (k == "axislock") m_axisLockEnabled = (atoi(v.c_str()) != 0);
-            else if (k == "pinchpage") m_pinchToPage = (atoi(v.c_str()) != 0);
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
@@ -5497,22 +4796,14 @@ void MainPage::SaveSettings()
     s += "home=" + (g_homeUrl == L"about:home" ? std::string() : WideToUtf8(g_homeUrl)) + "\n";
     s += "ua=" + std::to_string(m_setUaDesktop ? 1 : 0) + "\n";
     s += "zoom=" + std::to_string(m_defaultZoom) + "\n";
-    s += "tabmode=" + std::to_string(m_tabMode) + "\n";
     s += "gpudefault=" + std::to_string(m_gpuDefault ? 1 : 0) + "\n";
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
     s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "\n";
     s += "prefetch=" + std::to_string(m_prefetch) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
-    s += "instantpan=" + std::to_string(m_instantPan ? 1 : 0) + "\n";
-    s += "instantpanxaml=" + std::to_string(m_instantPanXaml ? 1 : 0) + "\n";
-    s += "threadraster=" + std::to_string(m_threadedRaster ? 1 : 0) + "\n";
-    s += "tilegridv2=" + std::to_string(m_tileGridV2 ? 1 : 0) + "\n";
-    s += "eventpresent=" + std::to_string(m_eventPresent ? 1 : 0) + "\n";
-    s += "dragpointer=" + std::to_string(m_dragPointer ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
     s += "axislock=" + std::to_string(m_axisLockEnabled ? 1 : 0) + "\n";
-    s += "pinchpage=" + std::to_string(m_pinchToPage ? 1 : 0) + "\n";
     s += "lang=" + WideToUtf8(g_lang) + "\n";
     std::ofstream f(WideToUtf8(d) + "\\settings.ini", std::ios::binary | std::ios::trunc);
     if (f) f.write(s.data(), s.size());
@@ -5526,22 +4817,15 @@ void MainPage::ShowSettings()
     if (SetSearchCombo) SetSearchCombo->SelectedIndex = m_setSearch;
     if (SetHomeBox) SetHomeBox->Text = ref new String(g_homeUrl == L"about:home" ? L"" : g_homeUrl.c_str());
     if (SetUaSwitch) SetUaSwitch->IsOn = m_setUaDesktop;
-    if (SetTabModeSwitch) SetTabModeSwitch->IsOn = (m_tabMode == 1);
     if (SetZoomSlider) SetZoomSlider->Value = m_defaultZoom;
     if (SetZoomLabel) SetZoomLabel->Text = ref new String((std::to_wstring(m_defaultZoom) + L"%").c_str());
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
     if (SetUpdateSwitch) SetUpdateSwitch->IsOn = m_updateAuto;
     if (SetPrefetchCombo) SetPrefetchCombo->SelectedIndex = m_prefetch;
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
-    if (SetInstantPanSwitch) SetInstantPanSwitch->IsOn = m_instantPan;
-    if (SetThreadedRasterSwitch) SetThreadedRasterSwitch->IsOn = m_threadedRaster;
-    if (SetTileGridV2Switch) SetTileGridV2Switch->IsOn = m_tileGridV2;
-    if (SetEventPresentSwitch) SetEventPresentSwitch->IsOn = m_eventPresent;
-    if (SetDragPointerSwitch) SetDragPointerSwitch->IsOn = m_dragPointer;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
     if (SetAxisLockSwitch) SetAxisLockSwitch->IsOn = m_axisLockEnabled;
-    if (SetPinchPageSwitch) SetPinchPageSwitch->IsOn = m_pinchToPage;
     if (SetUaCustomBox) SetUaCustomBox->Text = ref new String(m_uaCustom.c_str());
     // Apotheosis: app version comes from the package manifest, so it can never drift from what
     //   was actually deployed. The engine has no version export (WebCoreDriver.h) — the WebCore
@@ -5571,21 +4855,14 @@ void MainPage::HideSettings()
         else { if (h.rfind(L"http", 0) != 0 && h.rfind(L"about:", 0) != 0) h = L"https://" + h; g_homeUrl = h; }
     }
     if (SetUaSwitch) m_setUaDesktop = SetUaSwitch->IsOn;
-    if (SetTabModeSwitch) m_tabMode = SetTabModeSwitch->IsOn ? 1 : 0;
     if (SetZoomSlider) m_defaultZoom = (int)(SetZoomSlider->Value + 0.5);
     if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
     if (SetUpdateSwitch) m_updateAuto = SetUpdateSwitch->IsOn;
     if (SetPrefetchCombo && SetPrefetchCombo->SelectedIndex >= 0) m_prefetch = SetPrefetchCombo->SelectedIndex;
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
-    if (SetInstantPanSwitch) m_instantPan = SetInstantPanSwitch->IsOn;
-    if (SetThreadedRasterSwitch) m_threadedRaster = SetThreadedRasterSwitch->IsOn;
-    if (SetTileGridV2Switch) m_tileGridV2 = SetTileGridV2Switch->IsOn;
-    if (SetEventPresentSwitch) m_eventPresent = SetEventPresentSwitch->IsOn;
-    if (SetDragPointerSwitch) m_dragPointer = SetDragPointerSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
     if (SetAxisLockSwitch) m_axisLockEnabled = SetAxisLockSwitch->IsOn;
-    if (SetPinchPageSwitch) m_pinchToPage = SetPinchPageSwitch->IsOn;
     if (SetUaCustomBox) {
         std::wstring u = SetUaCustomBox->Text ? std::wstring(SetUaCustomBox->Text->Data()) : L"";
         while (!u.empty() && (u.front() == L' ' || u.front() == L'\t')) u.erase(u.begin());
@@ -5619,7 +4896,6 @@ static const wchar_t* const kI18n[][2] = {
     { L"自定义 User-Agent(留空=用上面的开关;改后刷新网页生效)", L"Custom User-Agent (blank = use the switch above; reload to apply)" },
     { L"默认缩放", L"Default zoom" },
     { L"启动请求桌面版网站", L"Request desktop site on launch" },
-    { L"并发多引擎标签(暂搁置,后续实现)", L"Concurrent multi-engine tabs (planned)" },
     { L"默认启用 GPU 渲染(加载首个网页后自动开)", L"Enable GPU rendering by default (auto after first page)" },
     { L"立即开启 GPU 合成(重启回软件)", L"Enable GPU compositing now (restart reverts)" },
     { L"清除数据", L"Clear data" }, { L"清除历史记录", L"Clear history" },
@@ -5627,14 +4903,8 @@ static const wchar_t* const kI18n[][2] = {
     { L"清除 Cookie(退出全部登录)", L"Clear cookies (sign out everywhere)" },
     { L"诊断", L"Diagnostics" }, { L"导出调试日志 / 崩溃 dump", L"Export debug log / crash dump" },
     { L"开发者选项", L"Developer settings" }, { L"显示翻页按钮", L"Show scroll buttons" },
-    { L"即时跟手滚动(实验)", L"Instant pan (experimental)" },
-    { L"多线程栅格化(实验)", L"Threaded raster (experimental)" },
-    { L"瓦片网格 v2(下次加载页面生效)", L"Tile grid v2 (next page load)" },
-    { L"事件驱动呈现", L"Event-driven present" },
-    { L"拖拽作为指针事件（地图/画布）", L"Drag as pointer events (maps/canvas)" },
-    { L"陈旧瓦片占位符", L"Stale tile placeholders" },
+    { L"滚动", L"Scrolling" },
     { L"轴锁定(单指滚动吸附方向)", L"Axis lock" },
-    { L"捏合作用于页面元素(地图)", L"Pinch to page elements (maps)" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
@@ -6262,17 +5532,12 @@ void MainPage::EnableGpu()
         std::wstring fd = LocalStateDir();
         if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
     }
-    // Apotheosis (TILING-REWRITE-PLAN.md 5.2): which tile management this session runs on, read here
-    //   on the UI thread while the setting is being applied, so gpuinit.txt says what the session
-    //   STARTED with — the engine only picks the implementation up when it creates a store, so a
-    //   later flip in Settings does not belong on this line.
-    const bool tileGridV2 = m_tileGridV2;
-    WebEngine::instance().post([disp, self, win, tileGridV2]() {
+    WebEngine::instance().post([disp, self, win]() {
         int rc = -999;
         try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
         try {
             std::wstring d = LocalStateDir();
-            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + " tilegrid=" + (tileGridV2 ? "v2" : "v1") + "\n"; f.write(s.data(), s.size()); } }
+            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
         } catch (...) {}
         int rcCopy = rc;
         try {
