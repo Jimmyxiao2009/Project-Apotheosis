@@ -766,6 +766,12 @@ namespace Harness {
         // Apotheosis (review 2026-09-04 item 2): last insets ApplyViewInsets() actually applied.
         //   It is called from every source that could move an edge, so most calls are no-ops.
         double m_lastInsetTop { 0.0 }, m_lastInsetBottom { 0.0 };
+        // Apotheosis (landscape, 0.1.9.44): the same on the horizontal edges. In landscape the
+        //   software navigation bar sits on the RIGHT, so a window that extends under it (which
+        //   ours does, UseCoreWindow) owes an inset there exactly as it owes one at the bottom in
+        //   portrait. Nothing looked at those two numbers until now, which is why the settings
+        //   panel and the suggestion dropdown ran under the buttons.
+        double m_lastInsetLeft { 0.0 }, m_lastInsetRight { 0.0 };
         // Apotheosis (2026-09-04 review, title row reverted to the bottom): Progress's height while
         //   the loading strip is visible, as XAML reports it — part of the cache key, both because it
         //   goes 0 -> its real value at the first arrange and because it now flips between 0 and that

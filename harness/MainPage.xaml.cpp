@@ -1724,12 +1724,13 @@ void MainPage::ApplyViewInsets()
     //   no longer theoretical: a pinch shortly after a load would land right on top of it.
     //   PinchCommit's continuation flushes the deferred call.
     if (m_pinching || m_zoomSpring != nullptr) { m_insetsPending = true; return; }
-    double top = 0.0, bottom = 0.0;
+    double top = 0.0, bottom = 0.0, left = 0.0, right = 0.0;
     // Apotheosis (bug fix 2026-09-06 evening): kept for the stage.txt line at the bottom of this
     //   function — the numbers that say, once and for all, whether this shell moves VisibleBounds for
     //   the on-screen keyboard (the "insets" line's bottom value jumping by the keyboard height when
     //   keyboard-show is logged) or only for the software navigation bar.
     double vbY = 0.0, vbH = 0.0, wbY = 0.0, wbH = 0.0;
+    double vbX = 0.0, vbW = 0.0, wbX = 0.0, wbW = 0.0;
     try {
         auto view = Windows::UI::ViewManagement::ApplicationView::GetForCurrentView();
         auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
@@ -1739,11 +1740,25 @@ void MainPage::ApplyViewInsets()
         if (!(vb.Height > 0.0f) || !(wb.Height > 0.0f)) return;
         vbY = (double)vb.Y; vbH = (double)vb.Height;
         wbY = (double)wb.Y; wbH = (double)wb.Height;
+        vbX = (double)vb.X; vbW = (double)vb.Width;
+        wbX = (double)wb.X; wbW = (double)wb.Width;
         top = vbY - wbY;
         bottom = (wbY + wbH) - (vbY + vbH);
+        // Apotheosis (landscape, 0.1.9.44): the horizontal pair, computed identically. On this
+        //   shell the software navigation bar moves to whichever edge the rotation puts it on -
+        //   the bottom in portrait, the RIGHT in landscape - and VisibleBounds shrinks on that
+        //   edge either way. Only the vertical pair was ever read, so in landscape every panel in
+        //   this file ran the full window width and its right-hand end was covered by the buttons
+        //   (device screenshot: the settings menu under the back/home/search column). There is
+        //   nothing landscape-specific below: the left inset is applied for the same reason, for
+        //   the shells and orientations that put the bar there.
+        left = vbX - wbX;
+        right = (wbX + wbW) - (vbX + vbW);
     } catch (...) { return; }
     if (!(top > 0.0)) top = 0.0;
     if (!(bottom > 0.0)) bottom = 0.0;
+    if (!(left > 0.0)) left = 0.0;
+    if (!(right > 0.0)) right = 0.0;
     // Apotheosis (review 2026-09-04 item 2): at least five sources call this (page Loaded, window
     //   SizeChanged, VisibleBoundsChanged, the Hide-status-bar setting, the OOBE/settings overlays),
     //   several of them repeatedly for one user action. Everything below writes layout properties
@@ -1779,11 +1794,13 @@ void MainPage::ApplyViewInsets()
         if (!(titleH > 0.0)) titleH = 24.0;
     }
     if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH
-        && titleH == m_lastTitleH)
+        && titleH == m_lastTitleH && left == m_lastInsetLeft && right == m_lastInsetRight)
         return;
     m_insetsValid = true;
     m_lastInsetTop = top;
     m_lastInsetBottom = bottom;
+    m_lastInsetLeft = left;
+    m_lastInsetRight = right;
     m_lastStripH = stripH;
     m_lastTitleH = titleH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
@@ -1831,14 +1848,26 @@ void MainPage::ApplyViewInsets()
         m_gpuInset->Y = top + stripH;
         ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
     }
-    if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(0, 0, 0, bottom);
+    // Apotheosis (landscape, 0.1.9.44): the horizontal insets go on RootGrid together with the
+    //   bottom one, because that is the single box every panel in this file lives in - the bottom
+    //   chrome row, the content row and all five full-window overlays (Drawer, SettingsPage,
+    //   TabSwitcher, LinkMenu, OobePanel) are its children. One padding therefore makes every one
+    //   of them span exactly the visible area, and there is no second place that could drift.
+    //   The top edge deliberately stays out of it: the page is supposed to run under the status
+    //   bar (the elements that must not are given the top inset individually, above).
+    //   Consequence to know: the content row shrinks with it, so the presenting panel does too and
+    //   the page is laid out for the visible width - which is the point, the right-hand strip of
+    //   the page was behind the buttons before. GpuPanel's size change goes through
+    //   UpdateEngineViewport like any rotation.
+    if (RootGrid) RootGrid->Padding = Windows::UI::Xaml::Thickness(left, 0, right, bottom);
     // Apotheosis (bug fix 2026-09-06 evening): one line per ACTUAL inset change (the early-out above
     //   swallows the many no-op calls), so a device log shows both keyboard-avoidance mechanisms side
     //   by side and the next session can be diagnosed from stage.txt alone.
-    WriteStage(("insets top=" + Dip(top) + " bottom=" + Dip(bottom)
+    WriteStage(("insets l=" + Dip(left) + " t=" + Dip(top)
+                + " r=" + Dip(right) + " b=" + Dip(bottom)
                 + " strip=" + Dip(stripH) + " title=" + Dip(titleH)
-                + " vb=" + Dip(vbY) + "+" + Dip(vbH)
-                + " wb=" + Dip(wbY) + "+" + Dip(wbH)
+                + " vb=" + Dip(vbX) + "," + Dip(vbY) + " " + Dip(vbW) + "x" + Dip(vbH)
+                + " wb=" + Dip(wbX) + "," + Dip(wbY) + " " + Dip(wbW) + "x" + Dip(wbH)
                 + " kb=" + (m_kbVisible ? "1" : "0")).c_str());
     // The bottom padding just moved the nav bar's resting position, so whatever the keyboard shift
     //   still owes on top of it has changed with it — recompute from the same single formula rather
@@ -5397,10 +5426,16 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
     // that is 268x88), the flip-if-it-does-not-fit test then fired on a height of 483 in a 640
     // DIP window whatever the finger did, and the card landed on the clamp at the top of the
     // screen. Reset the margin first and the measurement is the card again.
-    double availW = RootGrid ? RootGrid->ActualWidth : 0.0;
-    double availH = RootGrid ? RootGrid->ActualHeight : 0.0;
+    // Apotheosis (landscape, 0.1.9.44): RootGrid's ActualWidth/Height are the whole window; the
+    //   card lives INSIDE RootGrid's padding, which is where the navigation bar's strip has been
+    //   subtracted since this version. So the placement box is the padded box, and the finger
+    //   position - taken in RootGrid coordinates when the hold started - has to move into it.
+    double availW = RootGrid ? RootGrid->ActualWidth - m_lastInsetLeft - m_lastInsetRight : 0.0;
+    double availH = RootGrid ? RootGrid->ActualHeight - m_lastInsetBottom : 0.0;
     if (!(availW > 0.0)) availW = 400.0;
     if (!(availH > 0.0)) availH = 640.0;
+    const double fingerX = m_ctxDipX - m_lastInsetLeft;
+    const double fingerY = m_ctxDipY;   // RootGrid's top padding is always 0 - see ApplyViewInsets
     double cw = 0.0, ch = 0.0;
     try {
         LinkMenuCard->Margin = Windows::UI::Xaml::Thickness(0, 0, 0, 0);
@@ -5415,12 +5450,12 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
     if (!(ch > 0.0)) ch = 96.0;
     const double kGap = 14.0;    // clearance from the fingertip, so the card is not under it
     const double kEdge = 8.0;
-    double left = m_ctxDipX - cw / 2.0;
+    double left = fingerX - cw / 2.0;
     const char* place = "above";
-    double top = m_ctxDipY - kGap - ch;
+    double top = fingerY - kGap - ch;
     if (top < kEdge) {                        // no room above the finger - go below it
         place = "below";
-        top = m_ctxDipY + kGap;
+        top = fingerY + kGap;
     }
     if (left > availW - cw - kEdge) left = availW - cw - kEdge;
     if (left < kEdge) left = kEdge;
@@ -5434,7 +5469,8 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
         + " at=" + std::to_string((int)left) + "," + std::to_string((int)top)
         + " card=" + std::to_string((int)cw) + "x" + std::to_string((int)ch)
         + " place=" + place
-        + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)).c_str());
+        + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)
+        + " inset=" + std::to_string((int)m_lastInsetLeft) + "," + std::to_string((int)m_lastInsetRight)).c_str());
 }
 
 void MainPage::HideLinkMenu(const char* why)
