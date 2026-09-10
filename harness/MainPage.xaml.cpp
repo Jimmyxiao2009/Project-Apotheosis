@@ -433,7 +433,10 @@ static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, c
     h += ".hero{background:linear-gradient(135deg,#00aa77,#0088cc);color:#fff;padding:46px 26px 38px}";
     h += ".hero h1{margin:0;font-size:46px;letter-spacing:-1px}.hero p{margin:10px 0 0;font-size:20px;opacity:.92}";
     h += ".wrap{padding:24px}.sec{font-size:17px;color:#5f6368;margin:0 0 14px}";
-    h += ".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}";
+    // Apotheosis (landscape, 0.1.9.43): auto-fill instead of a hard 2 columns, so the tiles use
+    //   the width they are given - two across in portrait (360 CSS px), more in landscape - and
+    //   the start page reflows on a rotation like any other page. Nothing here is fixed-width.
+    h += ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}";
     h += "a.tile{display:block;text-decoration:none;background:#fff;border-radius:16px;padding:18px 18px 20px;box-shadow:0 2px 10px rgba(0,0,0,.08);color:#202124}";
     h += ".tile .t{font-size:20px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".tile .u{font-size:15px;color:#80868b;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
@@ -1970,8 +1973,14 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     unsigned long long mySeq = ++m_opSeq;
     // 主页:用当前书签/历史动态生成新标签页(速拨磁贴=<a>,渲染时提取进链接表→点击导航)。
     std::string homeHtml = isHome ? BuildHomeHtml(m_bookmarks, m_historyList) : std::string();
+    // Apotheosis (landscape, 0.1.9.43): the source of whatever STATIC page ends up on screen -
+    //   the start page here, the error page from the engine thread below - kept so a later
+    //   viewport change can re-render it. A static page has no session (NavigateTo closes it),
+    //   so WebCoreResize has no LocalFrameView to lay out and re-rendering the same HTML at the
+    //   new size IS the relayout. Empty for a successful network load, i.e. a live session.
+    auto staticHtml = std::make_shared<std::string>(homeHtml);
 
-    WebEngine::instance().post([disp, self, surl, isHome, homeHtml, mySeq]() {
+    WebEngine::instance().post([disp, self, surl, isHome, homeHtml, staticHtml, mySeq]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         bool loadOk = false;   // 网络加载是否真成功(区别于错误页渲染成功),决定是否进历史
@@ -2010,6 +2019,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     if (title.empty()) title = Utf8ToWide(surl);
                 } else {
                     std::string eh = MakeErrorHtml(surl, err);
+                    *staticHtml = eh;   // Apotheosis: re-renderable on a rotation, like the start page
                     rc = WebCoreRenderHtml(eh.c_str(), kW, kH, rgba->data());   // 渲染错误页(会话已被引擎清理)
                     loadOk = false;
                     title = W8(L"加载失败", L"Load failed");
@@ -2034,10 +2044,13 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         bool ok = (rc == 0);   // 渲染是否成功(决定是否贴图)
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, titleCopy, ok, loadOk, sessionActive, comp, links, mySeq]() {
+                ref new DispatchedHandler([self, rgba, titleCopy, ok, loadOk, sessionActive, comp, links, staticHtml, mySeq]() {
                     MainPage^ s = self.Get();
                     if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被更新操作/看门狗取代,丢弃此迟到回调
+                    // Apotheosis (landscape, 0.1.9.43): what a viewport change has to re-render for
+                    //   this page, if anything. Empty = a live session, which WebCoreResize handles.
+                    s->m_staticHtml = *staticHtml;
                     if (ok) {
                         // Apotheosis (M4): 主页/错误页是纯软件渲染(无会话 → 无合成图层树,paintToRGBA
                         //   落回 cairo 并填满 rgba)。直呈现模式下 PresentSoftwareFrame 自跳过贴图,画面
@@ -6355,20 +6368,31 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
                 + " scale=" + Dip(m_engineScale)
                 + " gpu=" + (m_gpuPresent ? "1" : "0")).c_str());
 
-    if (!m_sessionActive && !m_gpuOn)
-        return;   // nothing live to resize; the next WebCoreSessionLoad carries kW/kH itself
+    // Apotheosis (landscape, 0.1.9.43): a static page (start page / error page) is a ONE-SHOT
+    //   WebCoreRenderHtml with no session behind it, so WebCoreResize finds no LocalFrameView and
+    //   the picture stayed at the width it was first laid out for - the start page did not reflow
+    //   on a rotation while an ordinary site did. Re-rendering the same HTML at the new viewport
+    //   is the relayout. Not while a load is running: that load is about to replace the page.
+    const bool staticPage = (!m_staticHtml.empty() && !m_loading);
+
+    if (!m_sessionActive && !m_gpuOn) {
+        // Nothing live to resize; the next WebCoreSessionLoad carries kW/kH itself - but a static
+        // page is on screen right now and nothing else will ever repaint it.
+        if (staticPage) RenderStaticPage("resize");
+        return;
+    }
 
     bool present = m_gpuPresent;
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // as PumpScroll: not a token of its own, but superseded by one
-    WebEngine::instance().post([disp, self, ew, eh, present, mySeq]() {
+    WebEngine::instance().post([disp, self, ew, eh, present, staticPage, mySeq]() {
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999, surfW = 0, surfH = 0;
         try { rc = WebCoreResize(ew, eh, &surfW, &surfH, rgba->data()); } catch (...) { rc = -1000; }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, ew, eh, surfW, surfH]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, staticPage, ew, eh, surfW, surfH]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 // What ANGLE really made of it (traced on the UI thread - WriteStage has one
                 //   truncate-once static and is not written for two writers). If this ever stops
@@ -6413,10 +6437,67 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
                     return;
                 }
                 if (s->m_opSeq != mySeq) return;     // a navigation/click has taken over since
-                if (rcCopy == 0 && !present) s->PresentSoftwareFrame(rgba);
+                // A static page's buffer was never filled here (WebCoreResize returns early with
+                //   no session), and RenderStaticPage's own frame is on its way - presenting this
+                //   one would be a black flash between the two.
+                if (rcCopy == 0 && !present && !staticPage) s->PresentSoftwareFrame(rgba);
                 s->m_lastFrameHash = 0;              // force the next live frame to be re-shown
-                s->SyncLinksAfterScroll();           // the hit table was built for the old layout
-                s->StartLiveMode();
+                if (!staticPage) {
+                    s->SyncLinksAfterScroll();       // the hit table was built for the old layout
+                    s->StartLiveMode();
+                }
+            }));
+        } catch (...) {}
+    });
+
+    // Queued AFTER the resize job on the same engine queue, so the GL viewport is already the new
+    //   one when the page is re-rendered into it.
+    if (staticPage) RenderStaticPage("resize");
+}
+
+// Apotheosis (landscape, 0.1.9.43): re-render the static page that is on screen (start page or
+// error page) at the current engine viewport. Both are plain engine HTML rendered ONCE by
+// WebCoreRenderHtml with no session behind them, so there is no LocalFrameView for WebCoreResize
+// to lay out and nothing that would ever repaint them - which is why the start page kept its
+// portrait layout after a rotation while an ordinary site reflowed. Rendering the same source at
+// the new size is the relayout; the tiles' <a> hit table is re-read with it, because the tile
+// rectangles have moved. UI THREAD ONLY.
+void MainPage::RenderStaticPage(const char* why)
+{
+    if (m_staticHtml.empty()) return;
+    const std::string html = m_staticHtml;
+    const int w = kW, h = kH;
+    WriteStage((std::string("static-render why=") + (why ? why : "?")
+                + " eng=" + std::to_string(w) + "x" + std::to_string(h)
+                + " len=" + std::to_string(html.size())).c_str());
+
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;   // superseded by any navigation/click that starts meanwhile
+    WebEngine::instance().post([disp, self, html, w, h, mySeq]() {
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
+        int rc = -999;
+        try { rc = WebCoreRenderHtml(html.c_str(), w, h, rgba->data()); } catch (...) { rc = -1000; }
+        auto links = std::make_shared<std::vector<Harness::PageLink>>();
+        try {
+            int lc = WebCoreGetLinkCount();
+            for (int i = 0; i < lc; ++i) {
+                int lx = 0, ly = 0, lw = 0, lh = 0; char lu[1200] = "";
+                if (WebCoreGetLink(i, &lx, &ly, &lw, &lh, lu, sizeof lu)) {
+                    Harness::PageLink pl; pl.x = lx; pl.y = ly; pl.w = lw; pl.h = lh; pl.url = Utf8ToWide(lu);
+                    links->push_back(std::move(pl));
+                }
+            }
+        } catch (...) {}
+        const int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, links, rcCopy, mySeq]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                if (s->m_opSeq != mySeq) return;
+                if (rcCopy != 0) return;
+                s->PresentSoftwareFrame(rgba);
+                s->m_pageLinks = *links;
+                s->m_lastFrameHash = 0;
             }));
         } catch (...) {}
     });

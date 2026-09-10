@@ -426,6 +426,9 @@ namespace Harness {
         void UpdateEngineViewport(const char* why, bool force);
         void WirePresentPanelSizeChanged();
         void OnPresentPanelSizeChanged(Platform::Object^ sender, Windows::UI::Xaml::SizeChangedEventArgs^ e);
+        // Apotheosis (landscape, 0.1.9.43): re-render the session-less page on screen (start page /
+        //   error page) at the current viewport - see RenderStaticPage in MainPage.xaml.cpp.
+        void RenderStaticPage(const char* why);
         // 把一帧引擎渲染结果(rgba)贴到位图 + 同步标题/地址/链接表;navUrl 非空表示会话内发生了导航。
         void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                               Platform::String^ title, Platform::String^ navUrl,
@@ -460,6 +463,10 @@ namespace Harness {
         std::wstring m_currentUrl;
         std::wstring m_currentTitle;
         std::vector<PageLink> m_pageLinks;   // 当前页链接命中表(点击交互)
+        // Apotheosis (landscape, 0.1.9.43): the HTML of the static page on screen (start page or
+        //   error page), so a viewport change can re-render it. Empty whenever a live session owns
+        //   the picture - then WebCoreResize does the relayout.
+        std::string m_staticHtml;
         bool m_sessionActive { false };      // 当前是否有引擎常驻会话(网络页=有,主页/错误页=无)
         bool m_interacting { false };        // 正在转发点击/滚动到引擎(防重入,UI 侧)
         // 操作序号:每次导航/点击/滚动 ++。回调在 UI 线程检查捕获的序号是否仍等于最新,过期(被看门狗
