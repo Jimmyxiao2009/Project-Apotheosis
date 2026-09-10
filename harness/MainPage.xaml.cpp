@@ -651,6 +651,11 @@ static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int 
 static int kW = 720, kH = 1080;
 // The reference short side. Portrait width stays exactly what it has always been.
 static const int kEngineShortSidePx = 720;
+// Ceiling on the engine viewport, in pixels. The sizes this device actually asks for are around
+// 0.9 MPixel in either orientation; this is roughly twice that, and exists only as a stop on the
+// surface-mismatch path in UpdateEngineViewport - rastering several times the intended number of
+// pixels on an ARM32 phone is worse than the stretch it would be fixing.
+static const int kMaxEngineViewportPixels = 1800000;
 
 // Apotheosis (landscape/rotation): the size every engine output buffer is allocated at - the
 // largest w*h this session has ever asked the engine for, times 4. The driver writes exactly
@@ -6169,6 +6174,36 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
                 WriteStage((std::string("resized rc=") + std::to_string(rcCopy)
                             + " eng=" + std::to_string(ew) + "x" + std::to_string(eh)
                             + " surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)).c_str());
+                // SAFETY NET. ANGLE derives the surface from the panel and the resolution scale
+                //   it was given; the harness derives the viewport from the same panel and the
+                //   same scale, so the two should be the same number. If they are not, the
+                //   assumption behind the scale is wrong somewhere and the engine would be
+                //   rendering at a size the surface does not have - a garbage frame. Adopt what
+                //   the surface actually is instead, once (WebCoreResize cannot change the
+                //   surface, so the next answer agrees and this settles immediately), unless
+                //   doing so would cost more pixels than this device can raster - in that case
+                //   keep the requested size and take the stretch, which is what 0.1.9.40 did
+                //   everywhere. Either way the `resized` line above has already recorded it.
+                const bool surfaceKnown = (surfW > 0 && surfH > 0);
+                const bool surfaceDiffers = surfaceKnown && (abs(surfW - ew) > 2 || abs(surfH - eh) > 2);
+                if (surfaceDiffers && s->m_engineFollowsGpuPanel) {
+                    const long long px = (long long)surfW * (long long)surfH;
+                    if (px <= (long long)kMaxEngineViewportPixels) {
+                        NoteEngineViewport(surfW, surfH);
+                        kW = surfW;
+                        kH = surfH;
+                        s->m_frameBmpA = nullptr;
+                        s->m_frameBmpB = nullptr;
+                        s->m_snapBmp = nullptr;
+                        s->m_scrollStateValid = false;
+                        s->UpdateEngineViewport("surface-mismatch", /*force*/ true);
+                    } else {
+                        s->m_engineFollowsGpuPanel = false;   // stop chasing it; stretch as before
+                        WriteStage(("resize-giveup surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)
+                                    + " too-large-for=" + std::to_string(kMaxEngineViewportPixels)).c_str());
+                    }
+                    return;
+                }
                 if (s->m_opSeq != mySeq) return;     // a navigation/click has taken over since
                 if (rcCopy == 0 && !present) s->PresentSoftwareFrame(rgba);
                 s->m_lastFrameHash = 0;              // force the next live frame to be re-shown
@@ -6210,6 +6245,29 @@ void MainPage::OnPresentPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::S
 void MainPage::EnableGpu()
 {
     if (m_gpuOn) return;
+
+    // Apotheosis (landscape/rotation, 0.1.9.41): the resolution scale below has to be measured off
+    //   an ARRANGED panel, and GpuPanel is Collapsed - therefore 0x0 - until this call makes it
+    //   visible. The startup path goes through HookGpuPanelForStartup and arrives with a real
+    //   size; the other two callers (the GPU toggle, OnNavDone's default-GPU branch) do not, and
+    //   without this they would silently fall back to a fixed surface and rotate by stretching.
+    //   So: show the panel, let XAML arrange it, come back once. One retry only - if the size is
+    //   still not there the fixed-surface fallback below takes over, exactly as before. This also
+    //   keeps the older size gate's promise on those paths: ANGLE is never bound to a panel that
+    //   has never been arranged (the 2026-09-03 libGLESv2 AV, see HookGpuPanelForStartup).
+    if (!m_gpuEnableRetried && GpuPanel && !(GpuPanel->ActualWidth > 1.0 && GpuPanel->ActualHeight > 1.0)) {
+        m_gpuEnableRetried = true;
+        GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+        Platform::Agile<MainPage^> retrySelf(this);
+        try {
+            this->Dispatcher->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([retrySelf]() {
+                MainPage^ s = retrySelf.Get(); if (!s) return;
+                s->EnableGpu();
+            }));
+            return;
+        } catch (...) { /* could not defer: fall through and take the old behaviour */ }
+    }
+
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;

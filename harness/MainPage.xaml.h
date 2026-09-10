@@ -533,6 +533,10 @@ namespace Harness {
         //   surface really does follow the panel. false = the fixed-surface fallback, where the
         //   engine viewport must stay put whatever the panel does.
         bool m_engineFollowsGpuPanel { false };
+        // EnableGpu() defers itself once when GpuPanel has not been arranged yet, so the ANGLE
+        //   resolution scale can be measured off a real panel rectangle. One retry, then the
+        //   fixed-surface fallback.
+        bool m_gpuEnableRetried { false };
         bool m_presentSizeHandlerWired { false };   // GpuPanel->SizeChanged (rotation), subscribed once
         bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
