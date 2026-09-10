@@ -213,6 +213,9 @@ unsigned wkWinUWPTexmapVisibleHoles();
 #include <WebCore/HTMLTextAreaElement.h>     // 同上,textarea
 #include <WebCore/HTMLElement.h>             // isContentEditable()(contenteditable 检测)
 #include <WebCore/Document.h>                // elementFromPoint / focusedElement(命中点显式聚焦可编辑元素)
+#include <WebCore/DocumentPage.h>            // Apotheosis (0.1.9.40): Document::page()/Frame::page() are declared
+                                              // inline in Document.h/LocalFrame.h but DEFINED here only -
+                                              // clientPointForEnginePoint()'s callers need doc->page().
 #include <WebCore/PlatformKeyboardEvent.h>   // Enter/退格 真键盘事件
 #include <WebCore/ScriptController.h>        // frame->script().canExecuteScripts / executeScript(诊断 SPA)
 #include <WebCore/DOMWrapperWorld.h>         // mainThreadNormalWorldSingleton()(WebCoreEvalJS)
@@ -4347,6 +4350,29 @@ static void inputNote(const char* text)
     std::fclose(fp);
 }
 
+// Apotheosis (0.1.9.40, double-tap-at-zoom fix): every (x,y) this driver passes around is
+// viewport/BITMAP px (WebCoreClickAt's convention — see WebCoreDriver.h). WebCore::Document::
+// elementFromPoint() (TreeScope::nodeFromPoint -> absolutePointIfNotClipped(), dom/TreeScope.cpp)
+// wants something different: a CSS CLIENT point in the unscaled layout viewport, which it then
+// multiplies by frame->pageZoomFactor()*frame->frameScaleFactor() itself before comparing against
+// visibleContentRect(). The two coincide only at pageScaleFactor()==1 — at any other scale, passing
+// bitmap px straight through overshoots the real "absolute" point by a factor of the scale and the
+// hit test misses everything but points very close to the origin (at scale 2.9 the layout viewport
+// is only screenWidth/2.9 CSS px wide). That is why WebCoreTapPolicyAt's hit test failed at scale
+// 2.9 on the device and returned "not zoomable" before the already-zoomed rule even got a chance to
+// run. Actual mouse EVENT dispatch (clickAtImpl's move/down/up) is NOT affected: EventHandler
+// converts its "window" point via ScrollView::windowToContents(), which only adds the scroll
+// position (itself already in the same scaled/absolute space — see WebCoreSetPageScale's own
+// derivation above) with no separate multiply, landing directly in the space the layout tree's
+// RenderView scale transform produces. Apply this ONLY to elementFromPoint()-style client-coordinate
+// calls, never to PlatformMouseEvent positions.
+static WebCore::DoublePoint clientPointForEnginePoint(WebCore::Page* page, int x, int y)
+{
+    float scale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(scale > 0.0f)) scale = 1.0f;
+    return WebCore::DoublePoint(static_cast<double>(x) / scale, static_cast<double>(y) / scale);
+}
+
 // Apotheosis: the drag-widget walk (canvas / touch-action:none), defined with WebCoreWantsDragAt
 // further down — the tap and long-press paths want the same answer about the same point.
 static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y);
@@ -4498,7 +4524,12 @@ static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
     //   时弹时不弹)。这里命中测试点击点,若落在 text input / textarea / contenteditable 上就直接 focus(),
     //   让 WebCoreFocusedEditable 稳定返回 1(弹键盘)、后续 WebCoreTypeText 有确定的插入目标。
     if (RefPtr<Document> hdoc = lf->document()) {
-        if (RefPtr<Element> hit = hdoc->elementFromPoint(static_cast<double>(x), static_cast<double>(y))) {
+        // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+        // clientPointForEnginePoint's comment. Without this, focusing an input on tap while the page
+        // is zoomed silently failed (hit test missed, keyboard never popped) the same way
+        // WebCoreTapPolicyAt's hit test did.
+        WebCore::DoublePoint hcp = clientPointForEnginePoint(g_session->page.get(), x, y);
+        if (RefPtr<Element> hit = hdoc->elementFromPoint(hcp.x(), hcp.y())) {
             RefPtr<Element> target;
             for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
                 if ((is<HTMLInputElement>(*e) && downcast<HTMLInputElement>(*e).isTextField())
@@ -4704,7 +4735,11 @@ int WebCoreIsScrollableAt(int x, int y)
         return 0;
     doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
 
-    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment. Without this, a nested-scroll probe on a zoomed page
+    // always missed and the harness fell back to the (wrong) main-frame scroll route.
+    WebCore::DoublePoint cp = clientPointForEnginePoint(doc->page(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
     if (!hit)
         return 0;
 
@@ -4723,7 +4758,7 @@ int WebCoreIsScrollableAt(int x, int y)
         RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
         if (!shadow || shadow->mode() != ShadowRootMode::Open)
             break;
-        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
         if (!inner || inner == hit)
             break;
         hit = WTF::move(inner);
@@ -4961,7 +4996,12 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
 {
     using namespace WebCore;
-    RefPtr<Element> hit = doc.elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment. Without this, a pinch-zoomed map/canvas widget stopped
+    // being recognised as a drag widget (the hit test missed) and its gesture was misrouted to the
+    // page scroll fast path — the zoomed-Maps-drag case this bug family covers.
+    WebCore::DoublePoint cp = clientPointForEnginePoint(doc.page(), x, y);
+    RefPtr<Element> hit = doc.elementFromPoint(cp.x(), cp.y());
     if (!hit)
         return false;
 
@@ -4973,7 +5013,7 @@ static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
         RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
         if (!shadow || shadow->mode() != ShadowRootMode::Open)
             break;
-        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
         if (!inner || inner == hit)
             break;
         hit = WTF::move(inner);
@@ -5583,13 +5623,21 @@ int WebCoreGetPageScale()
 // zoom the page (mobile-Safari/Chrome semantics) rather than being forwarded as an ordinary second
 // click, and if so, to what scale. No event dispatched, no session/document state changed — safe to
 // call from the harness' tap-hold path before it has decided whether to click at all.
-int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY)
+// Apotheosis (0.1.9.40): outReason says which rule decided the answer, so a device trace can tell
+// "opted out" apart from "hit test missed" apart from "already zoomed" instead of everything
+// collapsing into zoomable=0. Values: 0 = zoomable (target computed), 1 = already zoomed
+// (curScale>1.05), 2 = no element under the point, 3 = viewport meta disables zoom, 4 = mobile-
+// optimised viewport, 5 = touch-action opt-out, 6 = target within 5% of curScale (not worth
+// animating). Left at -1 on every early/error return above (no session, busy, no document) — those
+// are not a rule decision, and the caller already has rc for that.
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason)
 {
     using namespace WebCore;
     if (outZoomable) *outZoomable = 0;
     if (outTargetScale) *outTargetScale = 1.0f;
     if (outAnchorX) *outAnchorX = x;
     if (outAnchorY) *outAnchorY = y;
+    if (outReason) *outReason = -1;
     if (!g_session || !g_session->mainFrame)
         return kErrNoSession;
     if (g_inPump)
@@ -5603,23 +5651,37 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
         return kErrNoDocument;
     doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
 
-    RefPtr<Element> hit = doc->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
-    if (!hit)
-        return kOK;   // nothing under the point: leave *outZoomable at 0, not an error
-
-    // Apotheosis (0.1.9.38): "already zoomed" is decided BEFORE any opt-out. The page scale above
-    // 1:1 is the harness' own pinch zoom, not something the page asked for, so a double tap must
-    // always be able to undo it — otherwise a page that opts out of double-tap-to-zoom (a map, a
-    // site with touch-action or user-scalable=no) traps the user at whatever scale the pinch left
-    // behind, which is exactly what the 0.1.9.38 log shows: two double taps at scale 3.3 answered
-    // zoomable=0 and dispatched a dblclick the page did nothing with.
+    // Apotheosis (0.1.9.40): "already zoomed" moved BEFORE the hit test (0.1.9.38 put it after
+    // elementFromPoint(), which is why it never actually ran at scale — see below). The rule needs
+    // no element at all: the page scale above 1:1 is the harness' own pinch zoom, not something the
+    // page asked for, so a double tap must always be able to undo it — otherwise a page that opts
+    // out of double-tap-to-zoom (a map, a site with touch-action or user-scalable=no) traps the user
+    // at whatever scale the pinch left behind.
     RefPtr<Page> page = g_session->page;
     float curScale = page ? page->pageScaleFactor() : 1.0f;
     if (!(curScale > 0.0f)) curScale = 1.0f;
     if (curScale > 1.05f) {
         if (outZoomable) *outZoomable = 1;
         if (outTargetScale) *outTargetScale = 1.0f;
+        if (outReason) *outReason = 1;   // already zoomed
         return kOK;
+    }
+
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment above (near dragWidgetAtPoint). This is the actual bug the
+    // 0.1.9.39 device log showed: at scale 2.9 the layout viewport is only ~screenWidth/2.9 CSS px
+    // wide, so a raw bitmap-px point like x=566 named a client coordinate far outside
+    // visibleContentRect() and TreeScope::nodeFromPoint() returned null every time — which meant the
+    // "already zoomed" rule above, that 0.1.9.38 had placed AFTER this call, never got a chance to
+    // run at any scale worth mentioning. curScale is <=1.05 here (the branch above already returned
+    // otherwise), so this conversion is a no-op in practice at this point in the function, but it
+    // keeps this call consistent with the other three hit-test sites that had the identical bug at
+    // higher scales (WebCoreClickAt's focus-on-editable, WebCoreIsScrollableAt, dragWidgetAtPoint).
+    DoublePoint cp = clientPointForEnginePoint(page.get(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
+    if (!hit) {
+        if (outReason) *outReason = 2;   // no element
+        return kOK;   // nothing under the point: leave *outZoomable at 0, not an error
     }
 
     // Apotheosis: document-level opt-out (cheap, one struct already on Document) — a page
@@ -5631,8 +5693,10 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     const bool viewportDisablesZoom = (va.userZoom == 0.0f)
         || (va.minZoom != ViewportArguments::ValueAuto && va.maxZoom != ViewportArguments::ValueAuto
             && va.minZoom == va.maxZoom);
-    if (viewportDisablesZoom)
+    if (viewportDisablesZoom) {
+        if (outReason) *outReason = 3;   // viewport disables zoom
         return kOK;
+    }
 
     // Apotheosis (0.1.9.38): a mobile-optimised page is not double-tap-zoomable at all, which is
     // what Chrome does and the single biggest reason double-tap-to-zoom feels right there. Blink
@@ -5648,8 +5712,10 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     const bool mobileOptimizedViewport = va.type != ViewportArguments::Type::Implicit
         && (va.width == ViewportArguments::ValueDeviceWidth
             || (va.width == ViewportArguments::ValueAuto && va.zoom == 1.0f));
-    if (mobileOptimizedViewport)
+    if (mobileOptimizedViewport) {
+        if (outReason) *outReason = 4;   // mobile-optimised viewport
         return kOK;
+    }
 
     // Apotheosis: same open-shadow descent as dragWidgetAtPoint()/WebCoreIsScrollableAt — a point
     // inside a web component's shadow tree would otherwise only ever see the host element.
@@ -5657,7 +5723,7 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
         RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
         if (!shadow || shadow->mode() != ShadowRootMode::Open)
             break;
-        RefPtr<Element> inner = shadow->elementFromPoint(static_cast<double>(x), static_cast<double>(y));
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
         if (!inner || inner == hit)
             break;
         hit = WTF::move(inner);
@@ -5672,8 +5738,10 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     Element* root = doc->documentElement();
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (RenderObject* r = e->renderer()) {
-            if (!r->style().touchAction().isAuto())
+            if (!r->style().touchAction().isAuto()) {
+                if (outReason) *outReason = 5;   // touch-action opt-out
                 return kOK;   // opted out; *outZoomable stays 0
+            }
         }
         if (e.get() == root)
             break;
@@ -5724,11 +5792,13 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     const float delta = (targetScale > curScale) ? (targetScale - curScale) : (curScale - targetScale);
     if (delta <= 0.05f * curScale) {
         if (outZoomable) *outZoomable = 0;
+        if (outReason) *outReason = 6;   // target within 5% of curScale
         return kOK;
     }
 
     if (outZoomable) *outZoomable = 1;
     if (outTargetScale) *outTargetScale = targetScale;
+    if (outReason) *outReason = 0;   // zoomable, target computed
     return kOK;
 }
 

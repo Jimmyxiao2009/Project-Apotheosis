@@ -295,9 +295,14 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 //   *outAnchorX/*outAnchorY: the anchor for that zoom, in the same viewport/bitmap px
 //     WebCoreSetPageScale takes as focalX/focalY — always just (x,y) echoed back, so the caller
 //     does not have to remember the tap point across the hold interval.
+//   *outReason (0.1.9.40): which rule above decided the answer — 0 = zoomable (target computed),
+//     1 = already zoomed (rule 1), 2 = no element under the point, 3 = viewport disables zoom
+//     (rule 2), 4 = mobile-optimised viewport (rule 3), 5 = touch-action opt-out (rule 4),
+//     6 = target within 5% of the current scale (not worth animating). Left at -1 on a negative
+//     (error) return — no session/busy/no document, not a rule decision.
 // Any output pointer may be null. Returns kOK, or a negative error (no session prints
 // outZoomable=0 as well, so a caller that only checks *outZoomable still degrades safely).
-int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY);
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
 
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
