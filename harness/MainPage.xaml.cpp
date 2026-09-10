@@ -1631,7 +1631,8 @@ void MainPage::RevealTitleRow()
     //   calls back in here and only then does the grace period start.
     // Apotheosis (2026-09-04): so does the keyboard/URL-editing pin - see m_titleRowPinned. The
     //   handlers that clear it call back in here, which is where the grace period then starts.
-    if (!m_loading && !m_titleRowPinned) { try { m_titleHideTimer->Start(); } catch (...) {} }
+    // Apotheosis (0.1.9.45): and so does an open link context card - see m_titleRowCtxPinned.
+    if (!m_loading && !m_titleRowPinned && !m_titleRowCtxPinned) { try { m_titleHideTimer->Start(); } catch (...) {} }
 }
 
 void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
@@ -1639,6 +1640,7 @@ void MainPage::OnTitleRowHideTick(Platform::Object^, Platform::Object^)
     if (m_titleHideTimer) { try { m_titleHideTimer->Stop(); } catch (...) {} }   // one-shot
     if (m_loading) return;             // a load started while the grace period ran — keep it up
     if (m_titleRowPinned) return;      // Apotheosis: the keyboard came up while the grace period ran
+    if (m_titleRowCtxPinned) return;   // Apotheosis (0.1.9.45): the link card is open - it owns the row
     // Apotheosis (2837ce0 review item 2): collapsing changes the content area's bottom inset, i.e.
     //   ContentArea's size — the one thing a frozen pinch anchor must not have move under it. Wait
     //   the gesture out instead of dropping the collapse, or the row would stay up for good.
@@ -5420,6 +5422,16 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
     if (LinkMenuOpenLabel) LinkMenuOpenLabel->Text = L8(L"在新标签页中打开", L"Open in new tab");
     LinkMenu->Visibility = Windows::UI::Xaml::Visibility::Visible;
 
+    // Apotheosis (0.1.9.45): the title row belongs to the card while the card is open. Until now the
+    //   hold wrote the page title into TitleText (the caller, one step before this), which revealed
+    //   the row through the property-changed callback and armed the ordinary ~2 s auto-hide - so the
+    //   row slid away under a card that was still up, which reads as a glitch rather than a label.
+    //   Pin it here, drop the pin in HideLinkMenu(), and reveal explicitly: the caller's write only
+    //   raises the row when the text actually CHANGED, and re-opening the card on the same page
+    //   writes the same title.
+    m_titleRowCtxPinned = true;
+    RevealTitleRow();
+
     // Placement: ABOVE the finger by default (that is where the hand is not), flipped below only
     // when the card would not fit up there, then clamped into the window.
     //
@@ -5493,6 +5505,17 @@ void MainPage::HideLinkMenu(const char* why)
     const bool wasOpen = (LinkMenu->Visibility == Windows::UI::Xaml::Visibility::Visible);
     LinkMenu->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
     m_ctxUrl.clear();
+    // Apotheosis (0.1.9.45): the row came up with the card, so it goes down with it - on a tap
+    //   outside, on Back and on the action alike. Unless something else is holding it up: a load in
+    //   flight uses it as the progress readout and address-bar editing pins it, and in both cases
+    //   RevealTitleRow() simply hands it back to the ordinary rules (which re-arm the timer only
+    //   when neither pin is set). An action that writes a toast into TitleText right after this
+    //   raises the row again on its own - Reveal takes the collapse's animation token with it.
+    if (m_titleRowCtxPinned) {
+        m_titleRowCtxPinned = false;
+        if (!m_loading && !m_titleRowPinned) CollapseTitleRow();
+        else RevealTitleRow();
+    }
     if (wasOpen) WriteStage((std::string("ctx dismiss why=") + (why ? why : "?")).c_str());
 }
 

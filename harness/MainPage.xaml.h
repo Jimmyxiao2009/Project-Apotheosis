@@ -830,6 +830,10 @@ namespace Harness {
         //   while UrlBox has focus and while the on-screen keyboard is up, cleared on blur/hide,
         //   which re-arms the usual grace period.
         bool m_titleRowPinned { false };
+        // Apotheosis (0.1.9.45): the link context card holds the title row up for as long as it is
+        //   open, and takes it down with itself. Its own flag rather than m_titleRowPinned, which
+        //   belongs to address-bar editing - the two can overlap and neither may clear the other.
+        bool m_titleRowCtxPinned { false };
         // Last scroll position/bounds the engine reported (WebCoreGetScrollState). Used to clamp the
         //   pinch preview to the document, to map taps into engine space and to measure how far the
         //   engine really got (the touch-lag diagnostic).
