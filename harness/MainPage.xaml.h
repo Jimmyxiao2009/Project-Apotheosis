@@ -200,7 +200,7 @@ namespace Harness {
         // 把位图像素 (px,py) 的点击转发到引擎活会话(WebCoreClickAt),完成后同步地址栏/历史/链接表。
         // longPress = hold the button down first (WebCoreLongPressAt) instead of clicking.
         // Apotheosis (double-tap zoom, 2026-09-09): clickCount is forwarded to WebCoreClickAtCount
-        //   (2 = a real DOM 'dblclick', see OnPageTapped's m_dtapLastClickMs follow-up); default 1
+        //   (2 = a real DOM 'dblclick', see DtapCompleteSecond); default 1
         //   keeps every existing call site (ordinary tap, long press) unchanged.
         void ForwardClickToEngine(int px, int py, bool longPress = false, int clickCount = 1);
         // 引擎滚动 dy 像素(触发懒加载图片)后重绘。dy>0 向下。
@@ -333,6 +333,15 @@ namespace Harness {
         // Apotheosis (double-tap zoom, 2026-09-09): m_dtapHoldTimer's one-shot Tick — no second tap
         //   arrived within the hold interval, so the tap OnPageTapped held is just an ordinary click.
         void OnDtapHoldTimer(Platform::Object^ sender, Platform::Object^ e);
+        // Apotheosis (double-tap route, 2026-09-10): the second tap of a pair has been recognised and
+        //   the engine's policy answer for the first one is in — zoom, or forward one clickCount=2
+        //   click. Clears the whole tap-hold state and bumps m_dtapGen, so a late answer cannot act.
+        void DtapCompleteSecond();
+        // Apotheosis (double-tap route, 2026-09-10): forget the held tap (timer, flags, generation).
+        void DtapReset();
+        // Apotheosis (double-tap route, 2026-09-10): ONE stage.txt line per tap decision, including
+        //   every early return, so a device log shows what the route did even when it did nothing.
+        void DtapTrace(const char* what, const std::string& detail);
         // 实时渲染循环:低帧率驱动引擎 WebCoreLiveTick,让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
@@ -607,25 +616,39 @@ namespace Harness {
         //   scale by ApplyPresentTransform, so it stays in screen DIPs.
         Windows::UI::Xaml::Media::TranslateTransform^ m_panTranslate;
         Windows::UI::Xaml::Media::TransformGroup^ m_presentGroup;
-        // Apotheosis (double-tap zoom, 2026-09-09): OnPageTapped's tap-hold state machine, active
-        //   only while m_dtapZoomEnabled is on. A tap WebCoreTapPolicyAt said is zoomable is held
-        //   (m_dtapPending) instead of dispatched: m_dtapHoldTimer fires the plain click if no second
-        //   tap follows (OnDtapHoldTimer); a second tap near (m_dtapPx,m_dtapPy) while pending cancels
-        //   the timer and zooms via RunDoubleTapZoom (SetPinchAnchor/ApplyLiveZoom/SpringBackZoom —
-        //   the same commit path a pinch release uses, see PinchCommit). A tap the policy call said is
-        //   NOT zoomable is dispatched right away (as before this feature existed) and remembered in
-        //   m_dtapLastClickMs/Px/Py so a following rapid tap dispatches with clickCount=2 (a real
-        //   'dblclick' for pages that want one) instead of being silently forgotten.
-        bool   m_dtapZoomEnabled { true };   // SCROLLING toggle, default ON; settings.ini dtapzoom
-        bool   m_dtapPending { false };
+        // Apotheosis (double-tap zoom 2026-09-09, route fixed 2026-09-10): OnPageTapped's tap-hold
+        //   state machine, active only while m_dtapZoomEnabled is on.
+        //
+        //   EVERY tap on a live session is held for kDoubleTapHoldMs (m_dtapPending, m_dtapHoldTimer)
+        //   instead of being dispatched, and the engine is asked in parallel whether this point is
+        //   zoomable (WebCoreTapPolicyAt, answer in m_dtapPolicyReady/m_dtapZoomable/m_dtapTargetScale).
+        //   The first version of this state machine only entered the held state once that ANSWER came
+        //   back, and dispatched the click immediately otherwise — which cannot work: the answer
+        //   travels the engine thread's FIFO queue behind live ticks and composites, so it lands
+        //   later than the second tap of a real double tap, and the dispatched first click sets
+        //   m_interacting/m_loading, which makes OnPageTapped drop the second tap at its first gate.
+        //   The pair was therefore never recognised on the device (0.1.9.36, zero "dtap" lines).
+        //   Holding first and asking in parallel decouples the two: recognising the pair is a pure
+        //   UI-thread decision on time and distance, and the engine answer only decides zoom vs click.
+        //
+        //   Second tap near (m_dtapPx,m_dtapPy) within the interval -> DtapCompleteSecond(): zoom via
+        //   RunDoubleTapZoom (SetPinchAnchor/ApplyLiveZoom/SpringBackZoom — the same commit path a
+        //   pinch release uses, see PinchCommit) when the policy said zoomable, else one click with
+        //   clickCount=2 (a real DOM 'dblclick' for pages that want one, e.g. a map that zooms
+        //   itself). Answer not in yet: m_dtapSecondSeen parks the decision and the answer (or the
+        //   restarted timer, so a wedged engine cannot swallow the tap) completes it.
+        //   No second tap: OnDtapHoldTimer forwards the ordinary click it held.
+        bool   m_dtapZoomEnabled { true };   // INTERACTION toggle, default ON; settings.ini dtapzoom
+        bool   m_dtapPending { false };      // a tap is held, waiting for a possible second one
+        bool   m_dtapPolicyReady { false };  // WebCoreTapPolicyAt has answered for the held tap
         bool   m_dtapZoomable { false };
+        bool   m_dtapSecondSeen { false };   // second tap arrived before the answer did
         int    m_dtapPx { -1 }, m_dtapPy { -1 };         // held tap, engine px (proximity + click target)
         double m_dtapDipX { 0.0 }, m_dtapDipY { 0.0 };   // held tap, ContentArea DIPs (SetPinchAnchor input)
         float  m_dtapTargetScale { 1.0f };
-        unsigned long long m_dtapGen { 0 };   // bumped per fresh tap; drops a stale WebCoreTapPolicyAt answer
+        unsigned long long m_dtapGen { 0 };     // bumped per fresh tap; drops a stale WebCoreTapPolicyAt answer
+        unsigned long long m_dtapAtMs { 0 };    // when the held tap happened (double-tap interval)
         Windows::UI::Xaml::DispatcherTimer^ m_dtapHoldTimer;
-        unsigned long long m_dtapLastClickMs { 0 };
-        int    m_dtapLastClickPx { -1 }, m_dtapLastClickPy { -1 };
         // Apotheosis (review 2026-09-04 item 1): the status-bar/title-row inset of the direct
         //   present surface. GpuPanel's SIZE must never change once ANGLE has a swap chain on it
         //   (a resize rebuilds the swap chain on the engine thread's next swap, which is the

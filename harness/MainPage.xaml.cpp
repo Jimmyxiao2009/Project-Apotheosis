@@ -668,9 +668,12 @@ static const int kTitleRowSlideMs = 200;   // Apotheosis (title row slide): was 
 //   clearly wants a different scale, so the real value is committed. The 180 ms spring animates the
 //   preview across the snap gap so it reads as a release rather than a jump (SpringBackZoom).
 static const float kPageScaleSnapTol = 0.33f;
-// Apotheosis (double-tap zoom, 2026-09-09): how long OnPageTapped holds a click on zoomable content
-// waiting for a second tap, and the window a following tap on NON-zoomable content still counts as
-// completing a double tap (clickCount=2). Windows has no UWP-surface equivalent of the classic
+// Apotheosis (double-tap zoom 2026-09-09, route fixed 2026-09-10): how long OnPageTapped holds a
+// click waiting for a possible second tap — every tap on a live session, not just one the engine
+// calls zoomable, because whether it is zoomable is not known until the engine answers and the
+// second tap does not wait for that. It is therefore the latency this feature adds to an ordinary
+// tap, and the INTERACTION toggle is what buys it back. Windows has no UWP-surface equivalent of the
+// classic
 // GetDoubleClickTime() (Windows::UI::ViewManagement::UISettings carries cursor/caret timings, not
 // this one) — 300 ms matches the interval mobile Safari/Chrome use for double-tap-to-zoom.
 static const int kDoubleTapHoldMs = 300;
@@ -2058,21 +2061,89 @@ void MainPage::MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy)
     }
 }
 
+// Apotheosis (double-tap route, 2026-09-10): every tap writes exactly one "dtap" line before it
+// does anything, so a device log tells the whole story even when the route decides to do nothing.
+// The 0.1.9.36 log had ZERO dtap lines for a session full of double taps, and that could not be
+// told apart from "Tapped never fired", "the toggle was off", "the engine never answered" or "the
+// pair was never recognised" — the only two WriteStage calls sat behind the two branches that
+// never ran. Volume is one line per tap plus one per policy answer/timer, i.e. nothing next to the
+// tile-grid lines in the same file.
+void MainPage::DtapTrace(const char* what, const std::string& detail)
+{
+    WriteStage((std::string("dtap ") + what + " " + detail).c_str());
+}
+
+void MainPage::DtapReset()
+{
+    if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
+    m_dtapPending = false;
+    m_dtapPolicyReady = false;
+    m_dtapZoomable = false;
+    m_dtapSecondSeen = false;
+    m_dtapAtMs = 0;
+    ++m_dtapGen;   // a WebCoreTapPolicyAt answer still in flight belongs to nobody now
+}
+
+void MainPage::DtapCompleteSecond()
+{
+    const bool zoomable = m_dtapPolicyReady && m_dtapZoomable;
+    const float target = m_dtapTargetScale;
+    const double dipX = m_dtapDipX, dipY = m_dtapDipY;
+    const int px = m_dtapPx, py = m_dtapPy;
+    const bool blocked = (!m_sessionActive || m_loading || m_interacting);
+    DtapTrace("second", std::string("at=") + std::to_string(px) + "," + std::to_string(py)
+        + " zoomable=" + (zoomable ? "1" : "0")
+        + " ready=" + (m_dtapPolicyReady ? "1" : "0")
+        + " scale=" + Dip(m_pageScale) + "->" + Dip(zoomable ? target : m_pageScale)
+        + " act=" + (blocked ? "drop:busy" : (zoomable ? "zoom" : "dblclick")));
+    DtapReset();
+    if (blocked)
+        return;
+    if (zoomable)
+        RunDoubleTapZoom(dipX, dipY, target);
+    else
+        ForwardClickToEngine(px, py, /*longPress*/ false, /*clickCount*/ 2);
+}
+
 void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
 {
     HideSuggestions();   // 点页面即收起地址栏建议下拉(否则只能靠导航/清空关 → "关不掉")
-    if (m_loading || m_interacting) return;
+    // 取相对 ContentArea(承接手势/点击的层,始终参与布局)的坐标。★ 不能用 RenderImage:直呈现模式下它被
+    //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
+    //   ContentArea 左上角 = 渲染视口原点,故二者在软件模式下等价,直呈现模式下正确。
+    const unsigned long long nowMs = GetTickCount64();
+    auto pt = e->GetPosition(ContentArea);
+    int px = -1, py = -1; MapTapToEngine(pt.X, pt.Y, px, py);
+    const bool inBounds = (px >= 0 && py >= 0 && px < kW && py < kH);
     // Apotheosis (Google Maps pin, 2026-09-06): the tail of a long press is not a tap. XAML normally
     // raises RightTapped rather than Tapped once a hold has been recognised, but the engine has been
     // given the whole press/hold/release either way - a click on top of it would toggle the map view
     // the long press was meant to avoid.
-    if (m_holdAtMs && GetTickCount64() - m_holdAtMs < 1000) return;
-    // 取相对 ContentArea(承接手势/点击的层,始终参与布局)的坐标。★ 不能用 RenderImage:直呈现模式下它被
-    //   Collapsed(让位给 GpuPanel),对已塌缩元素 GetPosition 坐标无效 → 点击错位(滚动后点底部却命中顶部)。
-    //   ContentArea 左上角 = 渲染视口原点,故二者在软件模式下等价,直呈现模式下正确。
-    auto pt = e->GetPosition(ContentArea);
-    int px, py; MapTapToEngine(pt.X, pt.Y, px, py);
-    if (px < 0 || py < 0 || px >= kW || py >= kH) return;
+    const bool holdTail = (m_holdAtMs && nowMs - m_holdAtMs < 1000);
+    const char* drop = nullptr;
+    if (m_loading) drop = "loading";
+    else if (m_interacting) drop = "interacting";
+    else if (holdTail) drop = "holdtail";
+    else if (!inBounds) drop = "oob";
+    // Apotheosis (double-tap route, 2026-09-10): the pair is recognised HERE, on the UI thread, from
+    // time and distance alone — never from an engine answer that may still be in flight.
+    const bool pairing = !drop && m_sessionActive && m_dtapZoomEnabled && m_dtapPending
+        && nowMs - m_dtapAtMs <= (unsigned long long)kDoubleTapHoldMs
+        && std::abs(px - m_dtapPx) <= kDoubleTapSlopPx
+        && std::abs(py - m_dtapPy) <= kDoubleTapSlopPx;
+    std::string act = drop ? (std::string("drop:") + drop)
+        : (!m_sessionActive ? std::string("nosession")
+        : (!m_dtapZoomEnabled ? std::string("click-off")
+        : (pairing ? std::string("second") : std::string("hold"))));
+    DtapTrace("tap", std::string("at=") + std::to_string(px) + "," + std::to_string(py)
+        + " act=" + act
+        + " on=" + (m_dtapZoomEnabled ? "1" : "0")
+        + " session=" + (m_sessionActive ? "1" : "0")
+        + " pending=" + (m_dtapPending ? "1" : "0")
+        + " ready=" + (m_dtapPolicyReady ? "1" : "0")
+        + " since=" + std::to_string(m_dtapAtMs ? nowMs - m_dtapAtMs : 0ULL));
+    if (drop)
+        return;
 
     // 有会话:一律转发引擎真实点击。引擎命中测试是权威的——正确处理弹窗/遮罩层(z-order)、按钮、表单、
     // 以及链接(锚点默认动作=导航)。链接表感知不到模态层覆盖,故不再"链接表优先"(否则点模态关闭按钮
@@ -2082,84 +2153,77 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
             ForwardClickToEngine(px, py);   // 双击缩放关:一切照旧
             return;
         }
-        // Apotheosis (double-tap zoom, 2026-09-09): a second tap landing close to a still-pending
-        // one completes the double tap — cancel the hold and either zoom (WebCoreTapPolicyAt said
-        // the point is zoomable) or forward a real clickCount=2 click otherwise. See the state
-        // machine comment on m_dtapPending in MainPage.xaml.h.
-        if (m_dtapPending
-            && std::abs(px - m_dtapPx) <= kDoubleTapSlopPx && std::abs(py - m_dtapPy) <= kDoubleTapSlopPx) {
-            if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
-            m_dtapPending = false;
-            const bool zoomable = m_dtapZoomable;
-            const float target = m_dtapTargetScale;
-            const double anchorDipX = m_dtapDipX, anchorDipY = m_dtapDipY;
-            const int firstPx = m_dtapPx, firstPy = m_dtapPy;
-            WriteStage(("dtap zoomable=" + std::to_string(zoomable ? 1 : 0)
-                + " scale=" + Dip(m_pageScale) + "->" + Dip(zoomable ? target : m_pageScale)).c_str());
-            if (zoomable) {
-                m_dtapLastClickMs = 0;   // this pair ended in a zoom, not a click — nothing to follow up
-                RunDoubleTapZoom(anchorDipX, anchorDipY, target);
-            } else {
-                m_dtapLastClickMs = 0;
-                ForwardClickToEngine(firstPx, firstPy, /*longPress*/ false, /*clickCount*/ 2);
+        if (pairing) {
+            if (m_dtapPolicyReady) {
+                DtapCompleteSecond();
+                return;
             }
+            // The engine has not answered for the first tap yet (its queue is behind live ticks and
+            // composites). Park the decision and restart the timer as the deadline: whichever comes
+            // first — the answer or the tick — completes the pair, so a slow or wedged engine costs
+            // the zoom, never the tap itself.
+            m_dtapSecondSeen = true;
+            if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); m_dtapHoldTimer->Start(); } catch (...) {} }
             return;
         }
-        // Apotheosis: a tap the harness already dispatched as an ordinary click landed here recently
-        // — this one completes that pair as a real dblclick. No policy re-check needed: the decision
-        // here is only the clickCount WebCoreClickAtCount forwards, not whether to zoom (a tap that
-        // was dispatched immediately was already found not-zoomable).
-        if (m_dtapLastClickMs && GetTickCount64() - m_dtapLastClickMs <= (unsigned long long)kDoubleTapHoldMs
-            && std::abs(px - m_dtapLastClickPx) <= kDoubleTapSlopPx
-            && std::abs(py - m_dtapLastClickPy) <= kDoubleTapSlopPx) {
-            m_dtapLastClickMs = 0;
-            WriteStage(("dtap zoomable=0 scale=" + Dip(m_pageScale) + "->" + Dip(m_pageScale)).c_str());
-            ForwardClickToEngine(px, py, /*longPress*/ false, /*clickCount*/ 2);
-            return;
-        }
-        // Apotheosis: a fresh, independent tap — ask the engine whether it wants to zoom before
-        // deciding to hold it. WebCoreWantsDragAt is the SAME drag-widget probe the pinch/drag
-        // routing already uses (dragWidgetAtPoint): a map/canvas keeps taking plain clicks, never
-        // harness-level zoom, exactly like a real touch browser leaves map pinch-to-zoom to the map.
-        if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
-        m_dtapPending = false;
+        // A fresh, independent tap: hold it for the double-tap interval and ask the engine in
+        // parallel whether this point is zoomable. Holding is what makes the pair recognisable at
+        // all (see the state-machine comment in MainPage.xaml.h) and costs a tap kDoubleTapHoldMs of
+        // latency; the INTERACTION toggle turns the whole route, and that cost, off.
+        // WebCoreWantsDragAt is the SAME drag-widget probe the pinch/drag routing already uses
+        // (dragWidgetAtPoint): a map/canvas is never zoomed by the harness, it gets the dblclick and
+        // zooms itself, exactly like a real touch browser leaves map gestures to the map.
+        DtapReset();
+        m_dtapPending = true;
+        m_dtapAtMs = nowMs;
+        m_dtapPx = px; m_dtapPy = py;
         m_dtapDipX = pt.X; m_dtapDipY = pt.Y;
-        const unsigned long long gen = ++m_dtapGen;
+        if (m_dtapHoldTimer == nullptr) {
+            m_dtapHoldTimer = ref new Windows::UI::Xaml::DispatcherTimer();
+            m_dtapHoldTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
+                this, &MainPage::OnDtapHoldTimer);
+        }
+        Windows::Foundation::TimeSpan iv; iv.Duration = (long long)kDoubleTapHoldMs * 10000;
+        m_dtapHoldTimer->Interval = iv;
+        try { m_dtapHoldTimer->Start(); } catch (...) {}
+
+        const unsigned long long gen = m_dtapGen;
+        const unsigned long long askedAt = nowMs;
         CoreDispatcher^ disp = this->Dispatcher;
         Platform::Agile<MainPage^> self(this);
-        WebEngine::instance().post([disp, self, px, py, gen]() {
+        WebEngine::instance().post([disp, self, px, py, gen, askedAt]() {
             int drag = 0;
             try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; }
-            int zoomable = 0; float target = 1.0f;
+            int zoomable = 0; float target = 1.0f; int rc = 0;
             // outAnchorX/Y not needed here — the harness already has this tap's own anchor in
             // ContentArea DIPs (m_dtapDipX/Y, stashed before this post()) for RunDoubleTapZoom, and
             // the driver only ever echoes back the (px,py) we already passed in.
+            // rc is carried into the trace: the driver answers kErrBusy/kErrNoSession with
+            // zoomable=0, which looks exactly like "the page opted out" and must be tellable apart.
             if (!drag) {
-                try { WebCoreTapPolicyAt(px, py, &zoomable, &target, nullptr, nullptr); } catch (...) { zoomable = 0; }
+                try { rc = WebCoreTapPolicyAt(px, py, &zoomable, &target, nullptr, nullptr); }
+                catch (...) { zoomable = 0; rc = -1000; }
             }
             try {
                 disp->RunAsync(CoreDispatcherPriority::Normal,
-                    ref new DispatchedHandler([self, px, py, zoomable, target, gen]() {
+                    ref new DispatchedHandler([self, zoomable, target, drag, rc, gen, askedAt]() {
                         MainPage^ s = self.Get(); if (!s) return;
-                        if (s->m_dtapGen != gen) return;   // superseded by a later tap: drop
-                        if (!zoomable) {
-                            s->m_dtapLastClickMs = GetTickCount64();
-                            s->m_dtapLastClickPx = px; s->m_dtapLastClickPy = py;
-                            s->ForwardClickToEngine(px, py);   // not zoomable: dispatch immediately, as today
+                        const unsigned long long late = GetTickCount64() - askedAt;
+                        if (s->m_dtapGen != gen) {   // superseded by a later tap, or the tap is over
+                            s->DtapTrace("policy", std::string("zoomable=") + std::to_string(zoomable)
+                                + " drag=" + std::to_string(drag) + " rc=" + std::to_string(rc)
+                                + " late=" + std::to_string(late) + " act=drop:stale");
                             return;
                         }
-                        s->m_dtapPending = true;
-                        s->m_dtapZoomable = true;
-                        s->m_dtapPx = px; s->m_dtapPy = py;
+                        s->m_dtapPolicyReady = true;
+                        s->m_dtapZoomable = (zoomable != 0);
                         s->m_dtapTargetScale = target;
-                        if (s->m_dtapHoldTimer == nullptr) {
-                            s->m_dtapHoldTimer = ref new Windows::UI::Xaml::DispatcherTimer();
-                            s->m_dtapHoldTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
-                                s, &MainPage::OnDtapHoldTimer);
-                        }
-                        Windows::Foundation::TimeSpan iv; iv.Duration = (long long)kDoubleTapHoldMs * 10000;
-                        s->m_dtapHoldTimer->Interval = iv;
-                        try { s->m_dtapHoldTimer->Start(); } catch (...) {}
+                        s->DtapTrace("policy", std::string("zoomable=") + std::to_string(zoomable)
+                            + " drag=" + std::to_string(drag) + " rc=" + std::to_string(rc)
+                            + " target=" + Dip(target) + " late=" + std::to_string(late)
+                            + " act=" + (s->m_dtapSecondSeen ? "second" : "wait"));
+                        if (s->m_dtapSecondSeen)
+                            s->DtapCompleteSecond();   // the pair was waiting on exactly this answer
                     }));
             } catch (...) {}
         });
@@ -3577,6 +3641,12 @@ void MainPage::SpringBackZoom(float targetLive, float commitScale)
 void MainPage::EndGesture(GestureEnd reason)
 {
     const bool abort = (reason != GestureEnd::Completed);
+    // Apotheosis (double-tap route, 2026-09-10): "did a finger actually manipulate the page", read
+    //   BEFORE anything below clears it — the double-tap hold is cancelled on Completed only for a
+    //   real gesture, see the block further down. m_manipActive is set in OnImageManipStarted, which
+    //   a stationary tap never reaches (a gesture that never moves never starts a manipulation).
+    const bool hadRealGesture = m_manipActive || m_pinching || m_pinchPage
+        || m_dragActive || m_dragPressPending || m_dragBusy;
     // --- pinch. Cleared for every reason; this is the flag whose absence froze scrolling.
     m_pinching = false;
     m_liveScale = 1.0f;
@@ -3620,13 +3690,20 @@ void MainPage::EndGesture(GestureEnd reason)
     // --- double-tap zoom (Apotheosis, 2026-09-09): a click OnPageTapped is holding, waiting for a
     //     possible second tap, must not fire into whatever this reason is turning the page into
     //     (navigation, session teardown, tab switch, background) — cancel the hold and bump the
-    //     generation so a WebCoreTapPolicyAt answer still in flight is dropped too. Unconditional,
-    //     for every reason including Completed: a tap-hold has nothing to do with the pinch this
-    //     Completed belongs to, and the whole point is that it must not survive them either.
-    if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
-    m_dtapPending = false;
-    m_dtapLastClickMs = 0;
-    ++m_dtapGen;
+    //     generation so a WebCoreTapPolicyAt answer still in flight is dropped too.
+    //     Apotheosis (double-tap route, 2026-09-10): NOT unconditional any more. A tap on an element
+    //     with ManipulationMode set raises ManipulationCompleted as well (a zero-delta manipulation),
+    //     and if XAML delivers that before Tapped — the order is not contractual, and this route must
+    //     not depend on it — then an unconditional cancel here would wipe the tap the FIRST tap is
+    //     holding right as the SECOND one arrives, and no pair could ever be recognised. Cancel for
+    //     every abort reason, and on Completed only when a real gesture (pan/pinch/drag) is ending:
+    //     that is the case the original reasoning was about, and a bare tap is not it.
+    if (abort || hadRealGesture) {
+        if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }
+        if (m_dtapPending || m_dtapSecondSeen)
+            DtapTrace("cancel", std::string("reason=") + std::to_string(static_cast<int>(reason)));
+        DtapReset();
+    }
     // --- and the master flag: no finger owns the page any more.
     m_manipActive = false;
     if (abort)
@@ -3802,13 +3879,26 @@ void MainPage::RunDoubleTapZoom(double dipX, double dipY, float targetScale)
 // having said this point is zoomable does not mean a SINGLE tap here should zoom or be suppressed —
 // a real mobile browser dispatches the click either way and only decides late whether a second tap
 // also arrived to zoom.
+// Apotheosis (double-tap route, 2026-09-10): the tick is also the deadline for a pair whose policy
+// answer never arrived (m_dtapSecondSeen) — that tap gets its click too, just without the zoom.
 void MainPage::OnDtapHoldTimer(Platform::Object^, Platform::Object^)
 {
     if (m_dtapHoldTimer) { try { m_dtapHoldTimer->Stop(); } catch (...) {} }   // one-shot
-    if (!m_dtapPending) return;
-    m_dtapPending = false;
-    if (!m_sessionActive || m_loading || m_interacting) return;   // session torn down/busy while held
-    ForwardClickToEngine(m_dtapPx, m_dtapPy);
+    const bool second = m_dtapSecondSeen;
+    if (!m_dtapPending && !second) {
+        DtapTrace("timer", "act=drop:idle");
+        return;
+    }
+    const int px = m_dtapPx, py = m_dtapPy;
+    const bool blocked = (!m_sessionActive || m_loading || m_interacting);   // torn down/busy while held
+    DtapTrace("timer", std::string("at=") + std::to_string(px) + "," + std::to_string(py)
+        + " second=" + (second ? "1" : "0")
+        + " ready=" + (m_dtapPolicyReady ? "1" : "0")
+        + " act=" + (blocked ? "drop:busy" : (second ? "dblclick" : "click")));
+    DtapReset();
+    if (blocked)
+        return;
+    ForwardClickToEngine(px, py, /*longPress*/ false, /*clickCount*/ second ? 2 : 1);
 }
 
 // ---- GPU 路径1 探针 ----
