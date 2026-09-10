@@ -337,8 +337,16 @@ int WebCoreSessionPaint(uint8_t* outBuf);
 //   when there is no window surface. The caller asks for w*h; ANGLE derives its own size from the
 //   panel and the resolution scale the caller set at WebCoreGpuInit time, and these two numbers
 //   are how a device log shows whether the two agree. Nothing in the engine acts on them.
-// Returns kOK, or the usual negative driver errors (kErrBadArgs for a size the surface limits
-//   reject, kErrBusy when a pump is already running - retry after it, nothing was changed).
+// Returns kOK, or one of five negative errors. With a live session the call is ALL-OR-NOTHING: on
+//   every one of them the GL viewport and the LocalFrameView are still the pair the previous call
+//   left, so the caller must keep the size it had rather than the size it asked for.
+//     kErrBadArgs     w/h outside the surface limits, or outRGBA null while a session is live.
+//     kErrBusy        a pump is already running (re-entrancy guard) - retry after it.
+//     kErrNoView      the main frame has no LocalFrameView.
+//     kErrNoDocument  the main frame has no Document.
+//     kErrFrameGone   the main frame is gone. THE ONE EXCEPTION to the sentence above: the session
+//                     has been torn down before returning, so treat it as a lost session exactly as
+//                     for the interaction entry points, not as a resize to retry.
 int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA);
 
 // 视口底部被"引擎看不见的东西"遮住多少引擎像素——实为屏幕键盘:它是覆盖在窗口之上的系统浮层,

@@ -6477,35 +6477,46 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
     if (g_inPump)
         return kErrBusy;
 
-    // The GL viewport first: it is read by gpuPresent() on every composite, including composites
-    // that happen while there is no session at all, and by WebCoreCompositeReadback.
-    g_gpuW = w;
-    g_gpuH = h;
-
-    // No live page: nothing to lay out. The next WebCoreSessionLoad carries the new size itself,
-    // so this is a complete answer rather than an error.
+    // No live page: nothing to lay out, so the GL viewport - read by gpuPresent() on every
+    // composite, including composites that happen while there is no session at all, and by
+    // WebCoreCompositeReadback - is the whole job. The next WebCoreSessionLoad carries the new size
+    // itself, so this is a complete answer rather than an error, and there is nothing this size
+    // could fall out of step with.
     if (!g_session || !g_session->page) {
+        g_gpuW = w;
+        g_gpuH = h;
         querySurfaceSize(outSurfaceW, outSurfaceH);
         return kOK;
     }
+
+    // Apotheosis (review fix, 0.1.9.48): with a session live this call is ALL-OR-NOTHING, so every
+    // remaining failure exit is resolved BEFORE the first write. The GL viewport and the
+    // LocalFrameView are the two things everything the driver renders is sized from, and moving one
+    // of them and then returning an error split them for the rest of the session: the caller keeps
+    // the size it asked for (it has no way of knowing which half took), the composite paints into a
+    // viewport the layout does not have, and nothing ever brings the two back together because the
+    // next resize to the same size is a no-op. The header documents the whole error set.
     if (!outRGBA)
         return kErrBadArgs;
-
-    g_session->w = w;
-    g_session->h = h;
 
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     if (!lf) {
         teardownSession();
         return kErrFrameGone;
     }
-    g_session->mainFrame = lf;
     RefPtr<LocalFrameView> view = lf->view();
     if (!view)
         return kErrNoView;
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
+
+    // Past the last exit: commit both sizes together.
+    g_gpuW = w;
+    g_gpuH = h;
+    g_session->mainFrame = lf;
+    g_session->w = w;
+    g_session->h = h;
 
     g_inPump = true;
     PumpGuard guard;
