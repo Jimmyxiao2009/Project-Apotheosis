@@ -991,7 +991,7 @@
                     Tapped="OnLinkMenuCardTap" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
                 <StackPanel Margin="0,10,0,4">
                     <!-- 目标链接:仅供辨认,不可点。0.1.9.44:长链接改为可横向拖动查看,不再省略号截断
-                         (Andreas:"die ganze URL sehen"),卡片宽度不变。ScrollViewer 不取 x:Name —
+                         (一个被长按的目标必须能被完整读出),卡片宽度不变。ScrollViewer 不取 x:Name —
                          代码侧无需访问,也就不必让 gen-xaml-codebehind.ps1 认识一个新类型。
                          纵向滚动关闭:内容只有一行,SV 因此按内容高度参与 StackPanel 布局。 -->
                     <ScrollViewer Margin="14,0,14,9"

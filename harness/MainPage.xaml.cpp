@@ -5545,8 +5545,8 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
 // against the window it was opened in. A rotation replaces that box (360x640 becomes 640x360 here)
 // and a software navigation bar appearing or going away moves its edges, so the card - and with it
 // the "open in new tab" row the finger is aiming at - can end up half off the screen or under the
-// buttons. Andreas' decision for this round: do not re-place it, DISMISS it. A context menu is a
-// momentary thing; the link is still under the finger.
+// buttons. Decision for this round: do not re-place it, DISMISS it. A context menu is a momentary
+// thing; the link is still under the finger.
 //
 // What must NOT dismiss it: the title row coming and going. That is a size change of the content
 // area (and an ApplyViewInsets pass) like any other, and ShowLinkMenu itself raises the row - so

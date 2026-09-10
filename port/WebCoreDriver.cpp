@@ -829,7 +829,7 @@ static const int kMaxCrashLogEntries = 16;
 // was invisible. Everything that can abort *behind* WTF's back now gets its own
 // leg, each writing a distinct `reason:` line before falling through:
 //   (d) std::terminate      — uncaught exception, or ANGLE's RunOnUIThread timeout
-//                             (the thread rule in CLAUDE.md) reaching our CRT;
+//                             (the port's single-engine-thread rule) reaching our CRT;
 //   (e) _set_new_handler    — operator new failed: address-space/commit exhaustion,
 //                             which with _HAS_EXCEPTIONS=0 aborts with no message;
 //   (f) invalid parameter   — CRT contract violation (bad handle, bad printf, ...);
@@ -1118,8 +1118,8 @@ static void __cdecl crashLogSignalHandler(int sig)
 }
 
 // (d) std::terminate. Reached by an uncaught exception, a noexcept violation, or a
-// terminate() call — on this port most plausibly ANGLE's RunOnUIThread timeout (see
-// the thread rule in CLAUDE.md) unwinding into our CRT. The driver is built with
+// terminate() call — on this port most plausibly ANGLE's RunOnUIThread timeout (the
+// port's single-engine-thread rule) unwinding into our CRT. The driver is built with
 // _HAS_EXCEPTIONS=0, so there is no exception object to describe: say so explicitly
 // rather than leaving the reader guessing. Must not return — the CRT would abort
 // anyway; we abort ourselves so leg (c) also runs and the RVAs land in the file.

@@ -19,7 +19,7 @@ using namespace Windows::UI::Xaml::Controls;
 // installs terminate/new/invalid-parameter/purecall handlers for the clang-cl DLL; those
 // never fire for a C++/CX exception escaping the UI thread, nor for the std::terminate
 // that ANGLE's RunOnUIThread raises when it times out marshalling a swapchain
-// create/resize back to the panel dispatcher (the thread rule in CLAUDE.md). Both of
+// create/resize back to the panel dispatcher (the port's single-engine-thread rule). Both of
 // those are exactly what a pinch-zoom-at-770 MB abort looks like from outside, so name
 // them in crash.txt before falling through to the abort the CRT was going to do anyway.
 static void __cdecl HarnessTerminateHandler()
