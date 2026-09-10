@@ -293,8 +293,13 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 //     zoomable=0 instead, so the caller forwards a clickCount=2 click rather than animating
 //     to where it already is.
 //   *outAnchorX/*outAnchorY: the anchor for that zoom, in the same viewport/bitmap px
-//     WebCoreSetPageScale takes as focalX/focalY — always just (x,y) echoed back, so the caller
-//     does not have to remember the tap point across the hold interval.
+//     WebCoreSetPageScale takes as focalX/focalY. *outAnchorY is always y (the tap y): vertically
+//     the tapped point stays under the finger. *outAnchorX is x (the tap x) UNLESS the target
+//     scale came from the "zoom to column" case above, in which case it is the column's own
+//     horizontal centre (0.1.9.40) — Safari centres a narrower column instead of anchoring on
+//     wherever inside it was tapped, so a tap near a column's edge does not zoom in with most of
+//     the column off-screen. The caller does not have to remember the tap point across the hold
+//     interval either way.
 //   *outReason (0.1.9.40): which rule above decided the answer — 0 = zoomable (target computed),
 //     1 = already zoomed (rule 1), 2 = no element under the point, 3 = viewport disables zoom
 //     (rule 2), 4 = mobile-optimised viewport (rule 3), 5 = touch-action opt-out (rule 4),

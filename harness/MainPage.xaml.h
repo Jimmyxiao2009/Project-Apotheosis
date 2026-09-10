@@ -339,13 +339,18 @@ namespace Harness {
         // Apotheosis: fix the pinch anchor (once per gesture) from a ContentArea DIP position;
         //   fills m_focalX/Y (transform centre) and m_focalPx/Py (engine pixels for the commit).
         void SetPinchAnchor(double dipX, double dipY);
+        // Apotheosis (0.1.9.40): same, from an anchor already in ENGINE VIEWPORT PX (WebCoreTapPolicyAt's
+        //   outAnchorX/Y) — see the definition's comment. Used by RunDoubleTapZoom only.
+        void SetPinchAnchorEnginePx(int anchorPx, int anchorPy);
         // Apotheosis: ease the preview from where the fingers left it to the scale we commit
         //   (overview below 1:1, ±6 % snap), then call PinchCommit. Composition-thread animation.
         void SpringBackZoom(float targetLive, float commitScale);
         // Apotheosis (double-tap zoom, 2026-09-09): commit a double-tap zoom through the same
-        //   anchor/animate/commit path a pinch release uses — SetPinchAnchor(dipX,dipY) then
-        //   SpringBackZoom to targetScale (clamped/snapped), which calls PinchCommit when done.
-        void RunDoubleTapZoom(double dipX, double dipY, float targetScale);
+        //   anchor/animate/commit path a pinch release uses — SetPinchAnchorEnginePx(anchorPx,anchorPy)
+        //   then SpringBackZoom to targetScale (clamped/snapped), which calls PinchCommit when done.
+        //   Apotheosis (0.1.9.40): anchorPx/anchorPy are engine viewport px (WebCoreTapPolicyAt's
+        //   outAnchorX/Y — the tap point, or a column's centre x), not a ContentArea DIP position.
+        void RunDoubleTapZoom(int anchorPx, int anchorPy, float targetScale);
         // Apotheosis (double-tap zoom, 2026-09-09): m_dtapHoldTimer's one-shot Tick — no second tap
         //   arrived within the hold interval, so the tap OnPageTapped held is just an ordinary click.
         void OnDtapHoldTimer(Platform::Object^ sender, Platform::Object^ e);
@@ -656,8 +661,8 @@ namespace Harness {
         //   UI-thread decision on time and distance, and the engine answer only decides zoom vs click.
         //
         //   Second tap near (m_dtapPx,m_dtapPy) within the interval -> DtapCompleteSecond(): zoom via
-        //   RunDoubleTapZoom (SetPinchAnchor/ApplyLiveZoom/SpringBackZoom — the same commit path a
-        //   pinch release uses, see PinchCommit) when the policy said zoomable, else one click with
+        //   RunDoubleTapZoom (SetPinchAnchorEnginePx/ApplyLiveZoom/SpringBackZoom — the same commit
+        //   path a pinch release uses, see PinchCommit) when the policy said zoomable, else one click with
         //   clickCount=2 (a real DOM 'dblclick' for pages that want one, e.g. a map that zooms
         //   itself). Answer not in yet: m_dtapSecondSeen parks the decision and the answer (or the
         //   restarted timer, so a wedged engine cannot swallow the tap) completes it.
@@ -668,8 +673,11 @@ namespace Harness {
         bool   m_dtapZoomable { false };
         bool   m_dtapSecondSeen { false };   // second tap arrived before the answer did
         int    m_dtapPx { -1 }, m_dtapPy { -1 };         // held tap, engine px (proximity + click target)
-        double m_dtapDipX { 0.0 }, m_dtapDipY { 0.0 };   // held tap, ContentArea DIPs (SetPinchAnchor input)
         float  m_dtapTargetScale { 1.0f };
+        // Apotheosis (0.1.9.40): the zoom anchor WebCoreTapPolicyAt answered with, engine viewport
+        //   px — the tap point, or a column's centre x when the driver zoomed to a column. Read by
+        //   DtapCompleteSecond, fed to RunDoubleTapZoom/SetPinchAnchorEnginePx.
+        int    m_dtapAnchorPx { -1 }, m_dtapAnchorPy { -1 };
         unsigned long long m_dtapGen { 0 };     // bumped per fresh tap; drops a stale WebCoreTapPolicyAt answer
         unsigned long long m_dtapAtMs { 0 };    // when the held tap happened (double-tap interval)
         Windows::UI::Xaml::DispatcherTimer^ m_dtapHoldTimer;

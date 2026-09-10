@@ -2153,7 +2153,10 @@ void MainPage::DtapCompleteSecond()
     const float target = ClampPageScale(m_dtapTargetScale);
     const bool moves = std::fabs(target - cur) > 0.05f * cur;
     const bool zoomable = m_dtapPolicyReady && m_dtapZoomable && moves;
-    const double dipX = m_dtapDipX, dipY = m_dtapDipY;
+    // Apotheosis (0.1.9.40): the zoom anchor is the driver's outAnchorX/Y (WebCoreTapPolicyAt),
+    // already in engine viewport px — the tap point itself, unless the driver picked the centre of
+    // a narrower column instead (Safari zoom-to-column). See RunDoubleTapZoom's comment.
+    const int anchorPx = m_dtapAnchorPx, anchorPy = m_dtapAnchorPy;
     const int px = m_dtapPx, py = m_dtapPy;
     const bool blocked = (!m_sessionActive || m_loading || m_interacting);
     DtapTrace("second", std::string("at=") + std::to_string(px) + "," + std::to_string(py)
@@ -2162,12 +2165,13 @@ void MainPage::DtapCompleteSecond()
         + " moves=" + (moves ? "1" : "0")
         + " ready=" + (m_dtapPolicyReady ? "1" : "0")
         + " scale=" + Dip(cur) + "->" + Dip(zoomable ? target : cur)
+        + " anchor=" + std::to_string(anchorPx) + "," + std::to_string(anchorPy)
         + " act=" + (blocked ? "drop:busy" : (zoomable ? "zoom" : "dblclick")));
     DtapReset();
     if (blocked)
         return;
     if (zoomable)
-        RunDoubleTapZoom(dipX, dipY, target);
+        RunDoubleTapZoom(anchorPx, anchorPy, target);
     else
         ForwardClickToEngine(px, py, /*longPress*/ false, /*clickCount*/ 2);
 }
@@ -2244,7 +2248,6 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
         m_dtapPending = true;
         m_dtapAtMs = nowMs;
         m_dtapPx = px; m_dtapPy = py;
-        m_dtapDipX = pt.X; m_dtapDipY = pt.Y;
         if (m_dtapHoldTimer == nullptr) {
             m_dtapHoldTimer = ref new Windows::UI::Xaml::DispatcherTimer();
             m_dtapHoldTimer->Tick += ref new Windows::Foundation::EventHandler<Platform::Object^>(
@@ -2262,21 +2265,25 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
             int drag = 0;
             try { drag = WebCoreWantsDragAt(px, py); } catch (...) { drag = 0; }
             int zoomable = 0; float target = 1.0f; int rc = 0; int reason = -1;
-            // outAnchorX/Y not needed here — the harness already has this tap's own anchor in
-            // ContentArea DIPs (m_dtapDipX/Y, stashed before this post()) for RunDoubleTapZoom, and
-            // the driver only ever echoes back the (px,py) we already passed in.
+            int anchorX = px, anchorY = py;
+            // Apotheosis (0.1.9.40): outAnchorX/Y ARE needed now — the driver may answer with the
+            // centre of a narrower column (Safari's zoom-to-column behaviour) instead of the raw tap
+            // point, and RunDoubleTapZoom must anchor on THAT. Before this, the harness ignored the
+            // driver's anchor and always zoomed on the raw tap point instead, which on a column not
+            // centred under the finger put most of the column off-screen — read on the device as
+            // "jumps to the middle of the page".
             // rc is carried into the trace: the driver answers kErrBusy/kErrNoSession with
             // zoomable=0, which looks exactly like "the page opted out" and must be tellable apart.
             // reason (0.1.9.40, WebCoreDriver.h WebCoreTapPolicyAt): which rule decided — see the
             // header comment for the 0-6 table (1=already zoomed, 2=no element, 3=viewport disables
             // zoom, 4=mobile-optimised viewport, 5=touch-action opt-out, 6=target within 5%).
             if (!drag) {
-                try { rc = WebCoreTapPolicyAt(px, py, &zoomable, &target, nullptr, nullptr, &reason); }
-                catch (...) { zoomable = 0; rc = -1000; }
+                try { rc = WebCoreTapPolicyAt(px, py, &zoomable, &target, &anchorX, &anchorY, &reason); }
+                catch (...) { zoomable = 0; rc = -1000; anchorX = px; anchorY = py; }
             }
             try {
                 disp->RunAsync(CoreDispatcherPriority::Normal,
-                    ref new DispatchedHandler([self, zoomable, target, drag, rc, reason, gen, askedAt]() {
+                    ref new DispatchedHandler([self, zoomable, target, drag, rc, reason, anchorX, anchorY, gen, askedAt]() {
                         MainPage^ s = self.Get(); if (!s) return;
                         const unsigned long long late = GetTickCount64() - askedAt;
                         if (s->m_dtapGen != gen) {   // superseded by a later tap, or the tap is over
@@ -2289,6 +2296,7 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
                         s->m_dtapPolicyReady = true;
                         s->m_dtapZoomable = (zoomable != 0);
                         s->m_dtapTargetScale = target;
+                        s->m_dtapAnchorPx = anchorX; s->m_dtapAnchorPy = anchorY;
                         s->DtapTrace("policy", std::string("zoomable=") + std::to_string(zoomable)
                             + " drag=" + std::to_string(drag) + " rc=" + std::to_string(rc)
                             + " why=" + std::to_string(reason)
@@ -3590,6 +3598,40 @@ void MainPage::SetPinchAnchor(double dipX, double dipY)
     m_focalPy = (int)(py + 0.5);
 }
 
+// Apotheosis (0.1.9.40): same job as SetPinchAnchor above (stop any running spring, drop the
+// preview transform, fill m_focalX/Y + m_focalPx/Py), but starting from an anchor already known in
+// ENGINE VIEWPORT PX — WebCoreTapPolicyAt's outAnchorX/Y — instead of a ContentArea DIP position.
+// Only RunDoubleTapZoom uses this: SetPinchAnchor's ContentArea->layer TransformToVisual step is
+// for turning a DIP gesture position (from XAML's e->Position) into layer space; an engine-px
+// anchor is already IN that derived space (see SetPinchAnchor's own derivation comment above), one
+// division away — going back out to a DIP and letting SetPinchAnchor convert it a second time would
+// add nothing but a rounding mismatch between the two paths.
+void MainPage::SetPinchAnchorEnginePx(int anchorPx, int anchorPy)
+{
+    auto layer = PresentLayer();
+    if (m_zoomSpring != nullptr) {
+        try { m_zoomSpring->Stop(); } catch (...) {}   // Stop() does not raise Completed
+        m_zoomSpring = nullptr;
+        m_liveScale = m_springTargetLive;
+    }
+    m_zoomTransform = nullptr;
+    if (m_panTranslate != nullptr) { m_panTranslate->X = 0.0; m_panTranslate->Y = 0.0; }
+    ApplyPresentTransform();
+    double lw = (layer != nullptr) ? layer->ActualWidth : 0.0;
+    double lh = (layer != nullptr) ? layer->ActualHeight : 0.0;
+    if (!(lw > 1.0)) lw = ContentArea->ActualWidth;
+    if (!(lh > 1.0)) lh = ContentArea->ActualHeight;
+    // Inverse of SetPinchAnchor's px = lx*kW/lw: lx = px*lw/kW — the same presenting-layer DIP
+    // space the ScaleTransform centre (m_focalX/Y) lives in.
+    m_focalX = (kW > 0) ? (double)anchorPx * lw / (double)kW : (double)anchorPx;
+    m_focalY = (kH > 0) ? (double)anchorPy * lh / (double)kH : (double)anchorPy;
+    int px = anchorPx, py = anchorPy;
+    if (px < 0) px = 0; else if (px > kW) px = kW;
+    if (py < 0) py = 0; else if (py > kH) py = kH;
+    m_focalPx = px;
+    m_focalPy = py;
+}
+
 // 实时缩放变换:把 ScaleTransform(以焦点为中心)挂到当前显示层(present=GpuPanel,readback=RenderImage)。
 //   只变换已渲染像素 → 捏合期间 60fps 丝滑,不调引擎。
 void MainPage::ApplyLiveZoom()
@@ -3929,15 +3971,22 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
 
 // Apotheosis (double-tap zoom, 2026-09-09): commit a double-tap zoom through the SAME anchor/
 // animate/commit path a pinch release uses — there is only one zoom path in this harness, pinch and
-// double-tap both end up on SetPinchAnchor -> ApplyLiveZoom (seeds the animation's start frame) ->
-// SpringBackZoom (eases to the target, then calls PinchCommit). dipX/dipY are ContentArea DIPs —
-// SetPinchAnchor does its own conversion into the presenting layer's space, exactly as it does for
-// e->Position in OnImageManipDelta; targetScale is the absolute page scale WebCoreTapPolicyAt asked
-// for (already clamped to [1.0, 3.0], a subrange of SnapAndClampPageScale's own [0.5, 6.0]).
-void MainPage::RunDoubleTapZoom(double dipX, double dipY, float targetScale)
+// double-tap both end up on SetPinchAnchor(Px) -> ApplyLiveZoom (seeds the animation's start frame)
+// -> SpringBackZoom (eases to the target, then calls PinchCommit). targetScale is the absolute page
+// scale WebCoreTapPolicyAt asked for (already clamped to [1.0, 3.0], a subrange of
+// SnapAndClampPageScale's own [0.5, 6.0]).
+// Apotheosis (0.1.9.40): anchorPx/anchorPy are ENGINE VIEWPORT PX — WebCoreTapPolicyAt's own
+// outAnchorX/Y, the same convention WebCoreSetPageScale's focalX/focalY use — not a ContentArea DIP
+// position any more. A double tap on a narrow column previously always anchored on the raw tap
+// point (a ContentArea DIP converted through SetPinchAnchor), which on a column not centred under
+// the finger put most of the column off-screen after the zoom — read on the device as "jumps to
+// the middle of the page". The driver now centres the anchor on the column when it zoomed to one
+// (see WebCoreTapPolicyAt's column loop); SetPinchAnchorEnginePx consumes that directly instead of
+// re-deriving a DIP position from it only to have SetPinchAnchor convert it straight back.
+void MainPage::RunDoubleTapZoom(int anchorPx, int anchorPy, float targetScale)
 {
     if (!m_sessionActive || m_loading || m_interacting) return;
-    SetPinchAnchor(dipX, dipY);
+    SetPinchAnchorEnginePx(anchorPx, anchorPy);
     m_liveScale = 1.0f;
     ApplyLiveZoom();   // seeds the preview at scale 1 around this anchor before the spring animates it
     float target = ClampPageScale(targetScale);   // no ±33 % 1:1 snap here, see ClampPageScale

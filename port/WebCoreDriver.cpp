@@ -5769,12 +5769,24 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     const float kMinZoomTarget = 1.25f;// below this the zoom is not worth the animation
     const float kMaxZoomTarget = 3.0f;
     float targetScale = kFallbackScale;
+    // Apotheosis (0.1.9.40): the column's horizontal centre, in the same viewport/bitmap px space
+    // as (x,y) — see the comment above. Defaults to the tap x itself: the fallback 2x zoom (no
+    // narrower block ancestor found) has no column to centre on, and Safari leaves the tap x alone
+    // in that case too, only the vertical stays under the finger either way.
+    float anchorXf = static_cast<float>(x);
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (RenderObject* r = e->renderer()) {
             if (r->isRenderBlock()) {
-                float w = e->boundingClientRect().width();
+                FloatRect rect = e->boundingClientRect();
+                float w = rect.width();
                 if (w > 0.0f && w < kColumnMaxWidth) {
                     targetScale = viewportW / (w + kZoomPadding);
+                    // Apotheosis (0.1.9.40): centre the column horizontally (Safari's own double-
+                    // tap-zoom behaviour) instead of anchoring on the tap x — a tap near a column's
+                    // edge previously zoomed in with most of the column off-screen, which is what
+                    // "jumps to the middle of the page" was: the anchor was always the tap point,
+                    // never the block the zoom was actually computed for.
+                    anchorXf = rect.x() + rect.width() / 2.0f;
                     break;
                 }
             }
@@ -5784,6 +5796,8 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     }
     if (targetScale < kMinZoomTarget) targetScale = kMinZoomTarget;
     if (targetScale > kMaxZoomTarget) targetScale = kMaxZoomTarget;
+    if (anchorXf < 0.0f) anchorXf = 0.0f;
+    if (anchorXf > viewportW) anchorXf = viewportW;
 
     // Apotheosis (0.1.9.38): a target within ±5 % of where we already are is not a zoom. Report it
     // as "not zoomable" so the harness forwards the second tap as a clickCount=2 click instead of
@@ -5798,6 +5812,10 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
 
     if (outZoomable) *outZoomable = 1;
     if (outTargetScale) *outTargetScale = targetScale;
+    // Apotheosis (0.1.9.40): outAnchorX becomes the column centre when the zoom is to a column;
+    // outAnchorY stays the tap y (set at function entry, never touched again) — vertically the
+    // tapped point must stay under the finger regardless of the horizontal case.
+    if (outAnchorX) *outAnchorX = static_cast<int>(anchorXf + 0.5f);
     if (outReason) *outReason = 0;   // zoomable, target computed
     return kOK;
 }

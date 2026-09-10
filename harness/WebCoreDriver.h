@@ -271,7 +271,10 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 //     等于什么都不做。与当前尺度相差不到 ±5% 的目标永远不会被返回——那种情况改答 zoomable=0,
 //     调用方转发 clickCount=2 的点击,而不是动画到原地。
 //   *outAnchorX/*outAnchorY:这次缩放的锚点,同 WebCoreSetPageScale 的 focalX/focalY 一样的
-//     视口/位图像素——总是原样回传 (x,y),调用方不必在按住间隔内自己记着点击点。
+//     视口/位图像素。*outAnchorY 总是 y(点击 y)——竖直方向点击点始终留在手指下。*outAnchorX
+//     是 x(点击 x),除非目标尺度来自上面的"缩放到栏"分支——此时是那一栏自己的水平中心
+//     (0.1.9.40):Safari 把窄栏居中显示,而不是锚定在点击点在栏内的任意位置,否则点在栏边缘
+//     会缩放到栏的大半截跑出屏幕外。两种情况下调用方都不必在按住间隔内自己记着点击点。
 //   *outReason (0.1.9.40):上面哪条规则决定了答案——0=可缩放(已算出 target),1=已处于缩放
 //     (规则 1),2=命中点下无元素,3=viewport 关闭缩放(规则 2),4=移动端优化 viewport(规则 3),
 //     5=touch-action opt-out(规则 4),6=目标与当前尺度相差不到 5%(不值得动画)。负数(错误)
