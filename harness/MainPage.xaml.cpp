@@ -6184,23 +6184,27 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
                 //   doing so would cost more pixels than this device can raster - in that case
                 //   keep the requested size and take the stretch, which is what 0.1.9.40 did
                 //   everywhere. Either way the `resized` line above has already recorded it.
-                const bool surfaceKnown = (surfW > 0 && surfH > 0);
-                const bool surfaceDiffers = surfaceKnown && (abs(surfW - ew) > 2 || abs(surfH - eh) > 2);
-                if (surfaceDiffers && s->m_engineFollowsGpuPanel) {
+                const bool surfaceKnown = (surfW > 0 && surfH > 0 && ew > 0 && eh > 0);
+                const bool surfaceDiffers = surfaceKnown
+                    && (std::abs(surfW - ew) > 2 || std::abs(surfH - eh) > 2);
+                if (surfaceDiffers && s->m_engineFollowsGpuPanel && s->m_engineCalibrations < 2) {
+                    ++s->m_engineCalibrations;
                     const long long px = (long long)surfW * (long long)surfH;
                     if (px <= (long long)kMaxEngineViewportPixels) {
-                        NoteEngineViewport(surfW, surfH);
-                        kW = surfW;
-                        kH = surfH;
-                        s->m_frameBmpA = nullptr;
-                        s->m_frameBmpB = nullptr;
-                        s->m_snapBmp = nullptr;
-                        s->m_scrollStateValid = false;
+                        // Correct OUR factor by exactly the ratio ANGLE applied, so that
+                        //   ComputeEngineViewport() produces the surface from now on - in this
+                        //   orientation and in the other one, since the same ratio applies to
+                        //   both. Yes, this moves m_engineScale after the surface was created:
+                        //   ANGLE keeps the value it was given, and the whole point is that our
+                        //   formula has to end up somewhere else to agree with it.
+                        s->m_engineScale *= (double)surfW / (double)ew;
+                        if (s->m_engineScale < 0.05) s->m_engineScale = 0.05;
+                        if (s->m_engineScale > 16.0) s->m_engineScale = 16.0;
                         s->UpdateEngineViewport("surface-mismatch", /*force*/ true);
                     } else {
                         s->m_engineFollowsGpuPanel = false;   // stop chasing it; stretch as before
                         WriteStage(("resize-giveup surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)
-                                    + " too-large-for=" + std::to_string(kMaxEngineViewportPixels)).c_str());
+                                    + " max=" + std::to_string(kMaxEngineViewportPixels)).c_str());
                     }
                     return;
                 }
@@ -6358,6 +6362,10 @@ void MainPage::EnableGpu()
                     // 那时 ANGLE 已绑在面板上,折叠 → 0×0 重建交换链 = 崩。
                     s->GpuPanel->Opacity = 0.0;
                     s->GpuPanel->IsHitTestVisible = false;
+                    // There is no surface to follow: the viewport must be measured off
+                    //   ContentArea (the software frame) from here on, not off the hidden panel.
+                    s->m_engineFollowsGpuPanel = false;
+                    s->UpdateEngineViewport("gpu-failed", /*force*/ false);
                     s->GpuBtn->Content = ref new String(L"\U0001F5A5 GPU\x2717");
                     s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::OrangeRed);
                     // Apotheosis (M4): GPU 起不来 → 待发的首次导航照常走软件路径(g_gpuActive 仍 false)。

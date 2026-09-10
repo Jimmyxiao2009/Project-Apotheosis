@@ -537,6 +537,9 @@ namespace Harness {
         //   resolution scale can be measured off a real panel rectangle. One retry, then the
         //   fixed-surface fallback.
         bool m_gpuEnableRetried { false };
+        // How many times the requested viewport has been corrected to the surface ANGLE reported.
+        //   Bounded so a surface that never matches cannot turn into a resize loop.
+        int m_engineCalibrations { 0 };
         bool m_presentSizeHandlerWired { false };   // GpuPanel->SizeChanged (rotation), subscribed once
         bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
