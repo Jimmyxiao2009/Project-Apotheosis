@@ -43,7 +43,7 @@ namespace Harness {
         std::wstring currentTitle;
         float pageScale { 1.0f };
         // Apotheosis: 切走前抓下的最后一帧(RGBA8888,kW×kH,~3 MB)。只有**非活动**标签持有;
-        // 切回来时先贴出它、再让真实重载在下面跑(TABS-PLAN.md 方案 a)。snapSeq 用于超出
+        // 切回来时先贴出它、再让真实重载在下面跑。snapSeq 用于超出
         // 上限时丢最老的一张。
         std::shared_ptr<std::vector<uint8_t>> snapshot;
         unsigned long long snapSeq { 0 };
@@ -166,7 +166,7 @@ namespace Harness {
         void CloseTab(int i);
         void SwitchTab(int i);
         void UpdateTabCount();
-        // Apotheosis: 标签切换快照(TABS-PLAN.md 方案 a)。
+        // Apotheosis: 标签切换快照。
         void CaptureActiveTabSnapshot();  // 把当前会话最后一帧读回,存进**离开**的那个标签(引擎线程,异步)
         void ShowTabSnapshot(int i);      // 切到 i:立刻贴出它的快照(有的话)并释放之
         void HideTabSnapshot();           // 新会话第一帧到位/加载超时:恢复正常显示面
@@ -362,7 +362,7 @@ namespace Harness {
         // 画面连续静止则自动停帧省电,交互/滚动/导航再启动。
         void StartLiveMode();
         void StopLiveMode();
-        // Apotheosis (event-driven present, THREADED-COMPOSITOR-PLAN.md C5): the tick body — one
+        // Apotheosis (event-driven present): the tick body — one
         //   WebCoreLiveTick on the engine thread plus the UI-thread continuation that presents it.
         //   Sets m_liveBusy; UI thread only.
         void DispatchLiveFrame();

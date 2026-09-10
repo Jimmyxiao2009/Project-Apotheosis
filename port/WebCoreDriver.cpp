@@ -102,13 +102,13 @@
 namespace WebCore {
 void wkWinUWPTexmapTextureStats(uint64_t& bytes, unsigned& count);   // BitmapTexture.h
 void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTexturePool.h
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §4): the in-flight counter of the off-thread tile
+// Apotheosis (threaded raster): the in-flight counter of the off-thread tile
 // rasterisation (TextureMapperTiledStore.h). Declared here for the same reason as the two above —
 // including the texmap header would drag in TextureMapperGLHeaders.h. The runtime switch that used
 // to sit beside it is gone with package 5: a layer pass is always rastered on the worker pool.
 unsigned wkWinUWPTexmapPendingRasterTiles();
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §10, WebKit winuwp 099064a24d..c0608a6353): step 4 made
-// first paints asynchronous too, so a tile whose replay has not landed draws NOTHING. Missing the
+// Apotheosis (threaded raster, WebKit winuwp 099064a24d..c0608a6353): first paints became
+// asynchronous too, so a tile whose replay has not landed draws NOTHING. Missing the
 // follow-up composite is now an empty tile, not a stale one — hence the edge-triggered counter and
 // the worker-side wake-up below, which cover the two cases polling alone cannot.
 unsigned wkWinUWPTexmapTakeFinishedRasterTiles();          // engine thread; reading resets
@@ -315,7 +315,7 @@ static bool isValidSurfaceSize(int w, int h)
 }
 
 // ---------------------------------------------------------------------------
-// Apotheosis (MEMORY-PLAN.md §3 changes 3/4/6): memory-pressure state.
+// Apotheosis: memory-pressure state.
 // The App Container cap is 1536 MB and the OS kills us at it with no exception and no dump,
 // so the only defence is to shrink before we get there. The numbers come from the harness
 // (MemoryManager.AppMemoryUsage / AppMemoryUsageLimit) and arrive through
@@ -413,7 +413,7 @@ bool ensureWebCoreInitialized()
         // short-circuits Heap::collectIfNecessaryOrDefer's shouldRequestGC (Heap.cpp:2901-2906)
         // to "collect only once more than N bytes were allocated *this cycle*", bypassing the
         // proportional heuristic entirely. The 384 MB we used to set therefore made GC happen
-        // *later*, not earlier — the opposite of what it was added for (see MEMORY-PLAN.md §3).
+        // *later*, not earlier — the opposite of what it was added for.
         JSC::initialize();                       // JSC heap/threading/options
         WTF::initializeMainThread();             // pins this thread as the WebKit main thread + RunLoop::main
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
@@ -428,9 +428,9 @@ bool ensureWebCoreInitialized()
         // 是 32 位地址空间最大的隐性占用),资源缓存收紧上限。系统内存压力来时由 harness 经
         // WebCoreReleaseMemory() 主动放(WebCore::releaseMemory 一把清缓存 + JSC GC + 字体缓存)。
         WebCore::BackForwardCache::singleton().setMaxSize(0);
-        // Apotheosis (MEMORY-PLAN.md §3 change 4): sized for the 1536 MB App Container cap.
+        // Apotheosis: sized for the 1536 MB App Container cap.
         // 8/16 MB was too tight for repeat visits and bought nothing - encoded resources are a
-        // rounding error next to the decoded bitmaps (§1). What actually bounds us is the
+        // rounding error next to the decoded bitmaps. What actually bounds us is the
         // *decoded* data, and that needs the deletion interval below - and enough headroom that
         // the pruner does not eat the frames the decode queue has just produced (see the constants).
         wkSetMemoryCacheCapacities(kMemCacheMinDeadNormal, kMemCacheDeadNormal, kMemCacheTotalNormal);
@@ -439,7 +439,7 @@ bool ensureWebCoreInitialized()
         // *insert* happens to trigger a prune - i.e. never, on a page that just sits there.
         // 5 s after the last client goes away is safe: nothing on screen references it.
         WebCore::MemoryCache::singleton().setDeadDecodedDataDeletionInterval(WTF::Seconds(5));
-        // Apotheosis (MEMORY-PLAN.md §3 change 3): MemoryPressureHandler is never install()ed on
+        // Apotheosis: MemoryPressureHandler is never install()ed on
         // this port on purpose - its Windows poll (windowsMeasurementTimerFired) would reset the
         // status to Normal every 60 s, and the App Container has no CreateMemoryResourceNotification
         // anyway. We only push the status in from the harness (WebCoreSetMemoryPressure). Giving it
@@ -473,7 +473,7 @@ extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobi
 // g_perfOn in WebCoreSetPerfLogPath; off in the shipping default, so the per-response URL copy
 // and main-thread hop that feed the waterfall cost nothing on a normal run.
 extern "C" bool g_apoNetTimingOn = false;
-// Apotheosis (PRIVACY-AUDIT.md recommended action 4): speculation-rules prefetch.
+// Apotheosis (privacy review): speculation-rules prefetch.
 //   WebCore defaults speculationRulesPrefetchEnabled to true, so a page's
 //   <script type="speculationrules"> may issue full requests for URLs the user never clicked.
 //   Off unless the harness turns it on (Settings -> PRIVACY: Off / Wi-Fi only / Always).
@@ -549,7 +549,7 @@ static bool g_gpuForceFullNext = false;       // next composite must force-dirty
 static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
 
 // ---------------------------------------------------------------------------
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
+// Apotheosis: event-driven present.
 //
 // The harness used to poll us with a fixed 200 ms DispatcherTimer because the C ABI had no way
 // of saying "something changed". It now registers a wake callback here; every invalidation
@@ -1289,10 +1289,10 @@ static const char* const kPerfHeader =
     //      (g_gpuLastCompositeFull), else 0 - the only field NOT counted inside WebCore, so a
     //      row with e > 0 and f = 0 means WebCore itself asked for the repaint, not the driver
     "dirty_src,"
-    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.5/3): TileGrid v2's only output
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.5/3): the TileGrid's only output
     // the driver reacts to - the sum over this operation's composites of visible cells that drew
     // NOTHING and had no backdrop behind them (wkWinUWPTexmapVisibleHoles, read once per composite
-    // in gpuPresent). Empty while the v2 switch is off. 0 = every visible cell had pixels; a small
+    // in gpuPresent). Empty when the operation never composited. 0 = every visible cell had pixels; a small
     // number for a frame or two after a pinch or a fast pan is the model working (each of those
     // composites also asks for one more present); a row that stays non-zero with the finger off the
     // glass is the thing to chase. Appended at the very END for the same reason as dirty_src.
@@ -1321,7 +1321,7 @@ struct PerfRow {
         dirtySrcScaleChange = -1, dirtySrcSetNeedsDisplay = -1, dirtySrcForceDirty = -1;
     // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes - the sum of
     // wkWinUWPTexmapVisibleHoles() over this operation's composites (see the column in
-    // kPerfHeader). -1 = the TileGrid v2 switch was off, i.e. nobody could have reported a hole,
+    // kPerfHeader). -1 = this operation never composited, i.e. nobody could have reported a hole,
     // which is a different statement from "no hole was reported" and therefore a different cell.
     int tgHoles = -1;
     // Apotheosis (M4): curl's breakdown of the main resource of this navigation
@@ -1331,11 +1331,11 @@ struct PerfRow {
     // Chasing the sporadic 14-22 s "first contact" stalls seen on the Lumia over Wi-Fi.
     double netDns = -1, netConnect = -1, netTls = -1, netTtfb = -1;
     int httpVer = -1;         // 10 / 11 / 20 / 30; 0 = curl could not tell
-    // Apotheosis (OFFTHREAD-RASTER-LOG.md §4.3): tile replays still running on the worker pool when
+    // Apotheosis (threaded raster): tile replays still running on the worker pool when
     // this operation's last composite finished. 0 with threaded raster on = the pool kept up;
     // -1 = no composite happened (or the feature is off), i.e. an empty CSV cell.
     int rasterPending = -1;
-    // Apotheosis (OFFTHREAD-RASTER-LOG.md §10): raster_done = replays that finished since the last
+    // Apotheosis (threaded raster): raster_done = replays that finished since the last
     // composite and are therefore owed a present (edge-triggered, wkWinUWPTexmapTakeFinishedRasterTiles).
     // The other three are running totals since process start: replays posted, replays cancelled
     // before a worker picked them up, and times the engine thread had to BLOCK on a replay. The
@@ -1569,8 +1569,8 @@ static void perfFlushLocked()
                 r.dirtySrcScaleChange, r.dirtySrcSetNeedsDisplay,
                 r.dirtySrcForceDirty > 0 ? 1 : 0);
         // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes, after it. Same
-        // convention: -1 (the v2 switch was off for every composite of this operation) -> empty
-        // cell, so a 0 always means "v2 ran and saw no hole".
+        // convention: -1 (this operation never composited) -> empty
+        // cell, so a 0 always means "the grid ran and saw no hole".
         char tgh[12];
         perfFmtI(tgh, sizeof tgh, r.tgHoles);
         std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
@@ -2853,7 +2853,7 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     return kOK;
 }
 
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2/§4.3): call right after a composite. A replay that
+// Apotheosis (threaded raster): call right after a composite. A replay that
 // finishes after this composite has no one to upload it — the tile would keep its old pixels until
 // the page happens to be dirtied again. Arming m_needsPresent makes the harness' next live tick
 // composite (and the tick's own peekNeedsPresent() fast-path check take the heavy branch), where
@@ -2874,7 +2874,7 @@ static void notePendingRasterTiles()
     // Both are needed. `pending` covers "a replay is still running" — one more composite will be
     // owed. `finished` (edge-triggered, reading resets) covers the replay that started AND ended
     // between two composites, which leaves `pending` at zero although nothing has uploaded the new
-    // pixels yet. With step 4's asynchronous first paints (OFFTHREAD-RASTER-LOG.md §10) that case
+    // pixels yet. With threaded raster's asynchronous first paints that case
     // is an *empty* tile on screen, not a stale one, so it is the more important of the two.
     // Apotheosis (2026-09-06): and `deferred` covers the third case, which the tile-upload budget
     // introduced — a replay that finished long ago and whose pixels the last pass chose not to
@@ -2903,7 +2903,7 @@ static void notePendingRasterTiles()
     ++g_lastFrameHash;
 }
 
-// Apotheosis (OFFTHREAD-RASTER-LOG.md §10): the case polling cannot cover — a replay lands while
+// Apotheosis (threaded raster): the case polling cannot cover — a replay lands while
 // the harness' tick loop has already gone idle, so no composite is coming and the tile stays empty.
 // wkWinUWPSetRasterCompletionHandler() calls this ON A WORKER THREAD, so the contract is strict:
 // non-blocking, thread-safe, must not touch WebCore. All it does is hop to the engine thread
@@ -3179,7 +3179,7 @@ static void teardownSession()
     g_session.reset();                                          // (f) 此时 Session.page 已空,~Session 不再触发回调
     for (int i = 0; i < 4; ++i)                                  // (g) 排空延迟清理 / curl 取消
         RunLoop::cycle();
-    // Apotheosis (MEMORY-PLAN.md §3 change 6): (h) ~Page freed the layer tree and its textures,
+    // Apotheosis (memory pressure): (h) ~Page freed the layer tree and its textures,
     // but the JSC heap and the MemoryCache survive a tab switch untouched — that is why the
     // second tab measured 951 MB while the same page alone costs 620 MB. Give it back here,
     // after the Page is gone (nothing can re-populate the caches at this point) and after the
@@ -3481,7 +3481,7 @@ extern "C" void WebCoreReleaseMemory(int critical)
     wkReleaseMemoryLevel(critical ? 2 : 1, /*keepResourceCache*/ false);
 }
 
-// Apotheosis (MEMORY-PLAN.md §3 change 3): push the harness' MemoryManager numbers into WebCore.
+// Apotheosis: push the harness' MemoryManager numbers into WebCore.
 // Two effects, both of which the port was missing entirely:
 //  (1) MemoryPressureHandler's status. It is never install()ed here (the Windows 60 s poll would
 //      just reset it to Normal — MemoryPressureHandlerWin.cpp is a stub in an App Container), so
@@ -3527,9 +3527,9 @@ extern "C" void WebCoreSetMemoryPressure(int level)
     }
 }
 
-// Apotheosis (MEMORY-PLAN.md §3 change 2): engine-side memory numbers for the harness' mem.txt.
+// Apotheosis: engine-side memory numbers for the harness' mem.txt.
 // Without these, mem.txt only carries the OS view (AppMemoryUsage) and every one of the eight
-// buckets in §1 is a guess. Engine thread only: getStatistics() walks the whole resource map
+// buckets below is a guess. Engine thread only: getStatistics() walks the whole resource map
 // and the JSC accessors touch the heap.
 extern "C" int WebCoreGetMemoryStats(WebCoreMemoryStats* out)
 {
@@ -4268,7 +4268,7 @@ void WebCoreCloseSession()
         return;
     const bool hadSession = g_session.has_value();
     teardownSession();
-    // Apotheosis (MEMORY-PLAN.md §3 change 6): the user left the page for good (home screen,
+    // Apotheosis (memory pressure): the user left the page for good (home screen,
     // suspend, tab closed) — unlike the navigation path there is no next page that would reuse
     // the encoded resources or the compiled code, so take the critical route as well.
     if (hadSession)
@@ -4659,7 +4659,7 @@ int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* vie
     return kOK;
 }
 
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): register the harness' present wake-up. Pass
+// Apotheosis: register the harness' present wake-up. Pass
 // nullptr to go back to pure polling (the fixed-interval live tick). See the "event-driven
 // present" block near the top of this file for the threading contract: the callback can be
 // invoked on the engine thread OR on a raster worker, must not block and must not re-enter the
@@ -5706,7 +5706,7 @@ void WebCoreSetUserAgentString(const char* ua)
 
 // M1 验证:GPU 合成是否在跑。PortChromeClient 的 attachRootGraphicsLayer 被调=合成激活+图层树已建;
 // 根图层非空即证。加载后查(图层树在布局/合成更新时建)。返回 1=合成在跑,0=未。
-// Apotheosis (PRIVACY-AUDIT.md recommended action 4): switch speculation-rules prefetch on/off.
+// Apotheosis (privacy review): switch speculation-rules prefetch on/off.
 // enabled!=0 -> a page's <script type="speculationrules"> may prefetch URLs the user has not clicked.
 // Engine thread only (touches the live Page). Sticky: applies to the current session and to every
 // session created afterwards, so the harness sets it at startup and on every network-cost change.

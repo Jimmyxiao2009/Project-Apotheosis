@@ -121,7 +121,7 @@ int WebCoreGetLink(int i, int* x, int* y, int* w, int* h, char* url, int len);
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
 
-// Apotheosis (MEMORY-PLAN.md §3 change 2): engine-side memory accounting, so the harness'
+// Apotheosis: engine-side memory accounting, so the harness'
 // mem.txt carries more than the OS view of our working set. All sizes are bytes.
 // Usage: zero the struct, set structSize = sizeof(WebCoreMemoryStats), call. The driver
 // writes at most structSize bytes, so the two copies of this header may drift by a trailing
@@ -309,7 +309,7 @@ int WebCoreCompositeReadback(uint8_t* outRGBA);       // M2: offscreen composite
 void WebCoreGpuSetFlip(int flipH, int flipV);         // M2 debug: set readback flip (find correct orientation); repaint to apply
 int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scroll/contents + layerTreeAsText dump
 
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present. Register a wake-up the
+// Apotheosis: event-driven present. Register a wake-up the
 // engine calls whenever something wants to be presented (rendering update scheduled, image
 // loaded, off-thread raster tile finished, a tick that ended still dirty) instead of having the
 // harness poll on a fixed timer. Fired at most once per composite; disarmed at the top of every

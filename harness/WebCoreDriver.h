@@ -22,7 +22,7 @@ void WebCoreSetCACertPath(const char* path);
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
 
-// Apotheosis (MEMORY-PLAN.md §3 change 2): engine-side memory accounting, so the harness'
+// Apotheosis: engine-side memory accounting, so the harness'
 // mem.txt carries more than the OS view of our working set. All sizes are bytes.
 // Usage: zero the struct, set structSize = sizeof(WebCoreMemoryStats), call. The driver
 // writes at most structSize bytes, so the two copies of this header may drift by a trailing
@@ -291,7 +291,7 @@ void WebCoreSetUserAgentMobile(int mobile);
 // 自定义 UA:非空覆盖 mobile/desktop(绕开按 UA 拦截的站点如 microsoft);空串=清除回退开关。切后重载生效。
 void WebCoreSetUserAgentString(const char* ua);
 
-// Apotheosis (PRIVACY-AUDIT.md): 推测预取（<script type="speculationrules">）开关，默认关。
+// Apotheosis（隐私审查）：推测预取（<script type="speculationrules">）开关，默认关。
 // enabled!=0 时网页可预取用户未点击的 URL。仅引擎线程调；对当前会话和新建会话都生效。
 void WebCoreSetSpeculativePrefetch(int enabled);
 
@@ -317,7 +317,7 @@ void WebCoreGpuSetFlip(int flipH, int flipV);
 // 调试:把 FrameView 滚动/内容尺寸 + 合成图层树文本写入 outBuf(定位背景丢失/滚动失效)。返回 0 成功。
 int WebCoreGpuLayerInfo(char* outBuf, int len);
 
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): 事件驱动呈现。引擎在“有东西需要重新呈现”时
+// Apotheosis：事件驱动呈现。引擎在“有东西需要重新呈现”时
 // （调度渲染更新 / 图片加载完 / 异步栅格化瓦片落地 / 一次 tick 结束时仍脏）回调它，代替
 // harness 固定 200ms 轮询。每次合成最多回调一次（WebCoreLiveTick 开头重新武装）。
 // ★ 回调可能在引擎线程或栅格化工作线程上跑：不得阻塞、不得反过来调引擎，只能投队列。

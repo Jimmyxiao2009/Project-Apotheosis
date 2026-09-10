@@ -230,7 +230,7 @@ static void WriteMemLog(const std::string& line)
     } catch (...) {}
 }
 
-// Apotheosis (MEMORY-PLAN.md §3 change 2): the engine's own view, appended to the OS view above.
+// Apotheosis: the engine's own view, appended to the OS view above.
 // MemSnapshot() only says *that* we are at 620 MB, never which of the eight buckets moved.
 // ENGINE THREAD ONLY — WebCoreGetMemoryStats() walks the MemoryCache and locks the JSC VM.
 static std::string EngineMemStats()
@@ -254,7 +254,7 @@ static std::string EngineMemStats()
          + " plvl=" + std::to_string(st.pressureLevel);
 }
 
-// Apotheosis (MEMORY-PLAN.md §3 change 3 / §4): the memory-pressure level we last pushed into
+// Apotheosis: the memory-pressure level we last pushed into
 // WebCore. Only ever read/written on the engine thread — the UI-thread MemoryManager handlers
 // post into the engine instead of touching it. The OS raises AppMemoryUsageIncreased only on a
 // level boundary and never before the silent kill, so our own sampling is the primary source.
@@ -370,7 +370,7 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
 // 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
 static std::wstring g_searchPrefix = L"https://www.qwant.com/?q=";
 static std::wstring g_homeUrl = L"about:home";
-// Apotheosis (PRIVACY-AUDIT.md recommended action 3): index 4 = Qwant, the default for a fresh
+// Apotheosis (privacy review): index 4 = Qwant, the default for a fresh
 //   install - it is the only one of these that states it does not track or profile its users, and
 //   the previous default (cn.bing.com, Bing China) was a poor fit outside China. Bing now goes to
 //   www.bing.com. Existing users keep whatever settings.ini already stores, so the indices below
@@ -975,7 +975,7 @@ MainPage::MainPage()
                 WebEngine::instance().post([]() { try { WebCoreFlushCookiesToDisk(); } catch (...) {} });
             }
         });
-    // Apotheosis (PRIVACY-AUDIT.md): "Wi-Fi only" prefetch has to follow the connection. The event
+    // Apotheosis (privacy review): "Wi-Fi only" prefetch has to follow the connection. The event
     //   arrives on a worker thread, so hop to the UI thread first (m_prefetch lives there) and let
     //   ApplyPrefetchSetting post the engine call - never call the engine from here.
     try {
@@ -1003,7 +1003,7 @@ MainPage::MainPage()
                     // Apotheosis (M4): the OS only raises this when we cross a level boundary (rare),
                     // so logging it is free and it is the last breadcrumb before a silent kill.
                     WriteMemLog("mem-event increased " + MemSnapshot());
-                    // Apotheosis (MEMORY-PLAN.md §3 change 3): Medium is the level we actually
+                    // Apotheosis: Medium is the level we actually
                     // spend our time in and it used to do nothing at all. Push every level into
                     // WebCore — on the engine thread, never from here.
                     int want = 0;
@@ -2557,7 +2557,7 @@ void MainPage::EngineScroll(int dy)
         } catch (...) {}
     });
 }
-// Apotheosis (PRIVACY-AUDIT.md recommended action 4): is the connection we are on unmetered?
+// Apotheosis (privacy review): is the connection we are on unmetered?
 //   Anything that is not explicitly Unrestricted (Fixed / Variable / Unknown, or no profile at all)
 //   counts as metered, so "Wi-Fi only" errs towards not spending the user's data plan.
 static bool ConnectionIsUnmetered()
@@ -3263,7 +3263,7 @@ void MainPage::ApplyPresentTransform()
     else              RenderImage->RenderTransform = t;
 }
 
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): event-driven present.
+// Apotheosis: event-driven present.
 //   The engine calls PresentWakeThunk whenever something wants to be presented. It may run on the
 //   ENGINE thread (every WebCore invalidation) or on a RASTER WORKER (a tile replay landing), so
 //   all it is allowed to do is post: CoreDispatcher is agile, RunAsync is fire-and-forget, and the
@@ -4181,7 +4181,7 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
 }
 
 // ---- 实时渲染循环:唤醒驱动推进动画/SPA 渐进挂载 ----
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5): the loop used to be a fixed 200 ms DispatcherTimer
+// Apotheosis (event-driven present): the loop used to be a fixed 200 ms DispatcherTimer
 //   that composited whether or not anything had changed. It runs on engine wake-ups
 //   (WebCoreSetPresentRequestCallback -> PresentWakeThunk -> OnPresentWake), rate-limited to one
 //   present per ~16 ms, with a fallback tick as the safety net for anything not signalled.
@@ -4308,7 +4308,7 @@ void MainPage::DispatchLiveFrame()
         const ULONGLONG t0 = GetTickCount64();
         try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
         const unsigned durMs = (unsigned)(GetTickCount64() - t0);   // 事件驱动的限流按它走
-        // Apotheosis (MEMORY-PLAN.md §3/§4): sample here, on the engine thread, not in the UI
+        // Apotheosis: sample here, on the engine thread, not in the UI
         // continuation below — WebCoreGetMemoryStats()/WebCoreSetMemoryPressure() must never be
         // called from the UI thread, and the UI thread must never wait on the engine.
         SampleMemoryPressure();
@@ -5613,13 +5613,13 @@ void MainPage::UpdateTabCount()
 }
 
 // ---------------------------------------------------------------------------
-// Apotheosis: 标签切换快照(TABS-PLAN.md 方案 a)。
-// 切换仍是"拆会话 + 完整重载"(见 TABS-PLAN.md §1),但切过去的一瞬间先把目标标签上次离开时
+// Apotheosis: 标签切换快照。
+// 切换仍是"拆会话 + 完整重载",但切过去的一瞬间先把目标标签上次离开时
 // 的那帧贴出来,而不是让用户盯着上一个标签的画面等一次完整网络加载。快照是明确的占位图:
 // 真实重载在下面照跑,第一帧到位(OnNavDone)就换回真画面。
 // ---------------------------------------------------------------------------
 
-static const size_t kMaxTabSnapshots = 3;   // 3 × 720×1080×4 ≈ 9 MB 上限(32 位进程,内存紧,见 MEMORY-PLAN.md)
+static const size_t kMaxTabSnapshots = 3;   // 3 × 720×1080×4 ≈ 9 MB 上限(32 位进程,内存紧)
 
 // 把当前会话的最后一帧读回,存进**当前活动**标签(调用时它马上就要变成非活动的)。
 // 线程:读回排在引擎线程队列上,而 RestoreTab→NavigateTo 的 WebCoreSessionLoad 排在其后

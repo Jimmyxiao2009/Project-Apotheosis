@@ -31,7 +31,7 @@ namespace WebCorePort {
 // decoupled from the perf/crash-log internals. No-op when console logging is off.
 void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message);
 
-// Apotheosis (THREADED-COMPOSITOR-PLAN.md C5, event-driven present): "something wants to be
+// Apotheosis (event-driven present): "something wants to be
 // presented". Defined in WebCoreDriver.cpp, where the harness callback registered through
 // WebCoreSetPresentRequestCallback() lives. Fires that callback at most once between two
 // composites (an atomic arms it; WebCoreLiveTick disarms it at the start of every tick), so a
@@ -52,7 +52,7 @@ public:
     // Apotheosis (M4): non-consuming read, lets WebCoreLiveTick decide whether a tick may keep
     // the already-uploaded tiles (nothing asked for a rendering update since the last present).
     bool peekNeedsPresent() const { return m_needsPresent; }
-    // Apotheosis (OFFTHREAD-RASTER-LOG.md §4.2): arm a follow-up present from the driver itself.
+    // Apotheosis (threaded raster): arm a follow-up present from the driver itself.
     // With threaded raster on, a tile replay that lands after the last composite of an operation
     // would otherwise sit in its buffer until something else dirties the page; the driver sets this
     // whenever replays are still in flight, so the next tick composites and uploads them.
