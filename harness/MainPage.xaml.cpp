@@ -659,6 +659,11 @@ static const int kEngineShortSidePx = 720;
 // surface-mismatch path in UpdateEngineViewport - rastering several times the intended number of
 // pixels on an ARM32 phone is worse than the stretch it would be fixing.
 static const int kMaxEngineViewportPixels = 1800000;
+// Apotheosis (review fix, 0.1.9.48): how often a FAILED WebCoreResize is asked again, per target
+// size. kErrBusy is the case worth retrying (a pump was running and is over by the next turn of the
+// UI thread); the rest are retried because the alternative - a harness and an engine on different
+// viewports until the panel size changes again - is worse than three wasted posts.
+static const int kMaxResizeRetries = 3;
 
 // Apotheosis (landscape/rotation): the size every engine output buffer is allocated at - the
 // largest w*h this session has ever asked the engine for, times 4. The driver writes exactly
@@ -6748,14 +6753,14 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // as PumpScroll: not a token of its own, but superseded by one
-    WebEngine::instance().post([disp, self, ew, eh, present, staticPage, mySeq, occ]() {
+    WebEngine::instance().post([disp, self, ew, eh, oldW, oldH, present, staticPage, mySeq, occ]() {
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999, surfW = 0, surfH = 0;
         try { WebCoreSetBottomOcclusion(occ); } catch (...) {}
         try { rc = WebCoreResize(ew, eh, &surfW, &surfH, rgba->data()); } catch (...) { rc = -1000; }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, staticPage, ew, eh, surfW, surfH]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, staticPage, ew, eh, oldW, oldH, surfW, surfH]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 // What ANGLE really made of it (traced on the UI thread - WriteStage has one
                 //   truncate-once static and is not written for two writers). If this ever stops
@@ -6839,11 +6844,63 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
                                 + " cur=" + std::to_string(kW) + "x" + std::to_string(kH)
                                 + " surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)).c_str());
                 }
+                // Apotheosis (review fix, 0.1.9.48): a FAILED resize used to be traced and then
+                //   carried on from, with kW/kH already moved to the size the engine refused. The
+                //   two sides then disagreed for the REST OF THE SESSION: the next SizeChanged at
+                //   the same panel size returns early ("nothing moved"), so nothing ever asked
+                //   again, and every tap mapping, buffer allocation and snapshot check was computed
+                //   against a viewport the engine does not have - on the GPU path exactly the
+                //   surface-vs-viewport split the calibration above exists to prevent. WebCoreResize
+                //   is all-or-nothing with a live session (see WebCoreDriver.h), so the harness can
+                //   simply take its numbers back and ask again.
+                //   Deliberately ABOVE the m_opSeq guard: the split is real whether or not a newer
+                //   operation has started since, and a dropped callback would leave it in place.
+                if (rcCopy != 0) {
+                    const bool rolledBack = (ew == kW && eh == kH);   // else a newer resize owns kW/kH
+                    if (rolledBack) { kW = oldW; kH = oldH; }
+                    // Counted per target size, so a new panel size always gets its own tries and a
+                    //   size the driver keeps rejecting cannot become a resize loop.
+                    if (ew != s->m_resizeRetryW || eh != s->m_resizeRetryH) {
+                        s->m_resizeRetryW = ew;
+                        s->m_resizeRetryH = eh;
+                        s->m_resizeRetries = 0;
+                    }
+                    const int attempt = ++s->m_resizeRetries;
+                    WriteStage((std::string("resize-failed rc=") + std::to_string(rcCopy)
+                                + " attempt=" + std::to_string(attempt)
+                                + " want=" + std::to_string(ew) + "x" + std::to_string(eh)
+                                + " back=" + std::to_string(kW) + "x" + std::to_string(kH)
+                                + " rolled=" + (rolledBack ? "1" : "0")).c_str());
+                    // kErrNoSession / kErrFrameGone: the driver has no session left (kErrFrameGone
+                    //   tore it down before returning), so this is a lost session and not a resize
+                    //   to wait for - the same three lines every other entry point runs for -12/-14.
+                    //   The retry still goes out: with no session WebCoreResize only moves the GL
+                    //   viewport, which is exactly what has to catch up with the panel.
+                    if (rcCopy == -12 || rcCopy == -14) {
+                        s->m_sessionActive = false;
+                        s->ScrollFab->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+                        s->StopLiveMode();
+                    }
+                    // On a LATER turn of the UI thread, never from inside this callback: kErrBusy is
+                    //   a pump that was running, and the hop is what lets it finish.
+                    if (attempt <= kMaxResizeRetries) {
+                        try {
+                            s->Dispatcher->RunAsync(CoreDispatcherPriority::Low,
+                                ref new DispatchedHandler([self]() {
+                                    MainPage^ t = self.Get(); if (!t) return;
+                                    t->UpdateEngineViewport("resize-retry", /*force*/ true);
+                                }));
+                        } catch (...) {}
+                    }
+                    return;
+                }
+                s->m_resizeRetries = 0;             // this size took
                 if (s->m_opSeq != mySeq) return;     // a navigation/click has taken over since
                 // A static page's buffer was never filled here (WebCoreResize returns early with
                 //   no session), and RenderStaticPage's own frame is on its way - presenting this
-                //   one would be a black flash between the two.
-                if (rcCopy == 0 && !present && !staticPage) s->PresentSoftwareFrame(rgba);
+                //   one would be a black flash between the two. (rcCopy is 0 here: every failure
+                //   returned above.)
+                if (!present && !staticPage) s->PresentSoftwareFrame(rgba);
                 s->m_lastFrameHash = 0;              // force the next live frame to be re-shown
                 if (!staticPage) {
                     s->SyncLinksAfterScroll();       // the hit table was built for the old layout

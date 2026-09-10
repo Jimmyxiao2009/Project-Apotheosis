@@ -586,6 +586,13 @@ namespace Harness {
         // How many times the requested viewport has been corrected to the surface ANGLE reported.
         //   Bounded so a surface that never matches cannot turn into a resize loop.
         int m_engineCalibrations { 0 };
+        // Apotheosis (review fix, 0.1.9.48): a WebCoreResize that FAILED is asked again on later
+        //   turns of the UI thread, up to kMaxResizeRetries times PER TARGET SIZE - m_resizeRetryW/H
+        //   is that size, so a new panel size always gets its own tries while a size the driver keeps
+        //   rejecting cannot become a loop. Reset the moment a resize succeeds.
+        int m_resizeRetries { 0 };
+        int m_resizeRetryW { 0 };
+        int m_resizeRetryH { 0 };
         bool m_presentSizeHandlerWired { false };   // GpuPanel->SizeChanged (rotation), subscribed once
         bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
