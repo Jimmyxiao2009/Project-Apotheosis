@@ -1833,7 +1833,16 @@ void MainPage::ApplyViewInsets()
     //   with the strip drawing OVER the page there is nothing to be flush with. What is left below
     //   the strip is the same 6 DIP of PageBg the idle page has always had, 5 of them covered by
     //   the strip while it is up.
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + 6, 6, titleH);
+    // Apotheosis (review fix, 0.1.9.48): NO bottom inset for the title row either - the same change
+    //   the loading strip got just above, and for the same reason. The row is revealed on every
+    //   TitleText write (toasts, tab switches, the link card) and collapses ~2 s later, and each
+    //   flip of a 24 DIP bottom margin resized ContentArea -> OnPresentPanelSizeChanged ->
+    //   UpdateEngineViewport -> a WebCoreResize with a full relayout, plus a whole RenderStaticPage
+    //   re-render whenever the start page or an error page is on screen. That wiring is newer than
+    //   the inset, which is why the inset stopped being cheap. The row simply draws over the bottom
+    //   24 DIP now, which is what it has always done on the GPU path (GpuPanel is neither sized nor
+    //   translated by titleH), so both paths behave the same and the page stays put.
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + 6, 6, 0);
     // Apotheosis (2837ce0 review item 1): the suggestion dropdown is anchored to the same bottom
     //   edge as TitleRow and would otherwise cover it while the user types over a loading page.
     //   Lift it by titleH so the two stack (XAML Margin is "8,0" = the left/right 8 stays).

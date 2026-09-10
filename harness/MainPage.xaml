@@ -415,17 +415,18 @@
                  the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
                  the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
                  AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
-                 strip it covers is still handed back to the page on the SOFTWARE path —
-                 ApplyViewInsets() gives ContentBorder a bottom margin of titleH — while the GPU panel
-                 keeps its size and simply has that strip covered. The inset (titleH in
-                 ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide position,
-                 so it flips exactly when the row is fully shown/hidden — same as before, unaffected
-                 by swapping the fade for a slide.
-                 ☞ 0.1.9.47 note: the loading strip at the top edge no longer works this way — it is
-                 a plain overlay with no inset at all, because the inset was visibly displacing the
-                 page on every load. This row still has one, deliberately unchanged for now: on the
-                 GPU path it costs nothing (GpuPanel is neither sized nor translated by titleH), on
-                 the software path it does resize ContentArea. See the day report.
+                 strip it covers is simply covered on BOTH paths.
+                 ☞ 0.1.9.48: the row no longer takes a bottom inset out of the content either — the
+                 same change the loading strip got in 0.1.9.47, and for the same reason. It used to
+                 hand its 24 DIP back to the page on the SOFTWARE path (ApplyViewInsets gave
+                 ContentBorder a bottom margin of titleH), which resized ContentArea and cost a
+                 WebCoreResize plus a full relayout — and a whole static-page re-render — every time
+                 the row was revealed or collapsed, i.e. on every toast, tab switch and link card.
+                 It draws over the bottom 24 DIP now, which is exactly what it has always done on
+                 the GPU path (GpuPanel is neither sized nor translated by titleH), so both paths
+                 behave the same and the page underneath stays put. titleH survives in
+                 ApplyViewInsets for one job only: lifting SuggestPanel so the dropdown stacks
+                 above this row.
                  Explicit Height so ApplyViewInsets' titleH is deterministic before the first
                  arrange (ActualHeight is 0 until then). -->
             <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
