@@ -431,6 +431,7 @@ namespace Harness {
         //   panel instead of being the fixed 720x1080 it was until now - see the block above
         //   ComputeEngineViewport in MainPage.xaml.cpp for the root cause and the ANGLE side.
         bool ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH);
+        int BottomOcclusionEnginePx();
         // forceW/forceH > 0 bypass ComputeEngineViewport and install exactly that viewport - used
         //   by the surface-mismatch safety net, which has to adopt the EGL surface VERBATIM rather
         //   than a recomputed panel x scale that could round to a different number again.

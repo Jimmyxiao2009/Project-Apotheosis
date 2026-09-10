@@ -6495,6 +6495,40 @@ bool MainPage::ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH)
     return true;
 }
 
+// Apotheosis (0.1.9.45): how much of the presenting panel the on-screen keyboard covers, in ENGINE
+//   px. The keyboard is an OS overlay over the window: it does not resize the panel, and while a
+//   PAGE field has focus ApplyKeyboardShift deliberately moves nothing out of its way (only
+//   address-bar editing shifts the chrome). So the engine's viewport keeps including a strip the
+//   user cannot see, and a "scroll the focused field into the viewport" lands the field behind the
+//   keyboard - in landscape that strip is more than half the panel. WebCoreSetBottomOcclusion()
+//   hands this number over so the engine can leave that much room.
+//   Same element choice as ComputeEngineViewport (the panel that actually presents), and the same
+//   pinned DIP -> engine px factor. 0 = keyboard down, or it does not reach into the panel.
+//   UI THREAD ONLY.
+int MainPage::BottomOcclusionEnginePx()
+{
+    if (!m_kbVisible || !(m_kbHeight > 0.0) || !(m_engineScale > 0.0))
+        return 0;
+    double panelTop = 0.0, panelH = 0.0;
+    try {
+        Windows::UI::Xaml::UIElement^ el = nullptr;
+        if (m_engineFollowsGpuPanel && GpuPanel && GpuPanel->ActualHeight > 1.0) {
+            el = GpuPanel; panelH = GpuPanel->ActualHeight;
+        } else if (ContentArea && ContentArea->ActualHeight > 1.0) {
+            el = ContentArea; panelH = ContentArea->ActualHeight;
+        }
+        if (!el) return 0;
+        // Window coordinates, which is the space InputPane::OccludedRect answers in.
+        auto t = el->TransformToVisual(nullptr);
+        panelTop = (double)t->TransformPoint(Windows::Foundation::Point(0.0f, 0.0f)).Y;
+    } catch (...) { return 0; }
+    if (!(panelH > 0.0)) return 0;
+    double occ = (panelTop + panelH) - m_kbTop;   // how far the keyboard reaches up into the panel
+    if (occ <= 0.0) return 0;
+    if (occ > panelH) occ = panelH;
+    return (int)(occ * m_engineScale + 0.5);
+}
+
 // UI THREAD ONLY. Re-measure and, if the viewport moved, hand the new size to the engine.
 // `force` re-sends the current size even when it has not changed (used right after WebCoreGpuInit,
 // where the driver's GL viewport and a session that may already exist have to be brought together).
@@ -6537,12 +6571,16 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
 
     double panelW = 0.0, panelH = 0.0;
     try { if (GpuPanel) { panelW = GpuPanel->ActualWidth; panelH = GpuPanel->ActualHeight; } } catch (...) {}
+    // Measured HERE, on the UI thread, and carried to the engine thread below: the engine reveals
+    //   the focused field after the relayout and has no other way to know what the keyboard covers.
+    const int occ = BottomOcclusionEnginePx();
     WriteStage((std::string("resize why=") + (why ? why : "?")
                 + " eng=" + std::to_string(oldW) + "x" + std::to_string(oldH)
                 + "->" + std::to_string(ew) + "x" + std::to_string(eh)
                 + " panel=" + Dip(panelW) + "x" + Dip(panelH)
                 + " scale=" + Dip(m_engineScale)
-                + " gpu=" + (m_gpuPresent ? "1" : "0")).c_str());
+                + " gpu=" + (m_gpuPresent ? "1" : "0")
+                + " occ=" + std::to_string(occ)).c_str());
 
     // Apotheosis (landscape, 0.1.9.43): a static page (start page / error page) is a ONE-SHOT
     //   WebCoreRenderHtml with no session behind it, so WebCoreResize finds no LocalFrameView and
@@ -6562,9 +6600,10 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = m_opSeq;   // as PumpScroll: not a token of its own, but superseded by one
-    WebEngine::instance().post([disp, self, ew, eh, present, staticPage, mySeq]() {
+    WebEngine::instance().post([disp, self, ew, eh, present, staticPage, mySeq, occ]() {
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999, surfW = 0, surfH = 0;
+        try { WebCoreSetBottomOcclusion(occ); } catch (...) {}
         try { rc = WebCoreResize(ew, eh, &surfW, &surfH, rgba->data()); } catch (...) { rc = -1000; }
         int rcCopy = rc;
         try {

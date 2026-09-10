@@ -322,9 +322,11 @@ int WebCoreSessionPaint(uint8_t* outBuf);
 // forces the next composite to re-raster the whole tree, because every tile was painted for the
 // old viewport.
 //
-// A focused editable element is scrolled back into view after the relayout
-//   (scrollIntoViewIfNeeded): the keyboard survives a rotation, so the field being typed
-//   into has to survive it too. No-op when the field is still visible.
+// A focused editable element is scrolled back into view after the relayout: the keyboard survives a
+//   rotation, so the field being typed into has to survive it too. No-op when the field already
+//   sits comfortably inside the visible area. "Visible" here means the viewport MINUS the strip
+//   WebCoreSetBottomOcclusion() reported, plus a comfort gap, so the field ends up above the
+//   keyboard rather than one sliver inside the viewport's bottom edge.
 //
 // outRGBA: as everywhere else, the software path fills it with w*h*4 bytes and the GPU
 //   direct-present path does not touch it (the frame goes to the swap chain). It may be null ONLY
@@ -338,6 +340,11 @@ int WebCoreSessionPaint(uint8_t* outBuf);
 // Returns kOK, or the usual negative driver errors (kErrBadArgs for a size the surface limits
 //   reject, kErrBusy when a pump is already running - retry after it, nothing was changed).
 int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA);
+
+// 视口底部被"引擎看不见的东西"遮住多少引擎像素——实为屏幕键盘:它是覆盖在窗口之上的系统浮层,
+// 并不改变 harness 交给引擎的视口大小。粘性设置,0(默认)=整个视口都可见。引擎在需要把东西
+// 露给用户看时读它(目前是 WebCoreResize 的聚焦框回滚)。
+void WebCoreSetBottomOcclusion(int enginePx);
 
 // ---- 输入法/键盘 ----
 // 当前是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ 据此弹/收屏幕键盘。返回 1/0。

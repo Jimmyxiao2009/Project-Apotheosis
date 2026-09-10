@@ -344,9 +344,11 @@ int WebCoreSessionPaint(uint8_t* outRGBA);
 // forces the next composite to re-raster the whole tree, because every tile was painted for the
 // old viewport.
 //
-// A focused editable element is scrolled back into view after the relayout
-//   (scrollIntoViewIfNeeded): the keyboard survives a rotation, so the field being typed
-//   into has to survive it too. No-op when the field is still visible.
+// A focused editable element is scrolled back into view after the relayout: the keyboard survives a
+//   rotation, so the field being typed into has to survive it too. No-op when the field already
+//   sits comfortably inside the visible area. "Visible" here means the viewport MINUS the strip
+//   WebCoreSetBottomOcclusion() reported, plus a comfort gap, so the field ends up above the
+//   keyboard rather than one sliver inside the viewport's bottom edge.
 //
 // outRGBA: as everywhere else, the software path fills it with w*h*4 bytes and the GPU
 //   direct-present path does not touch it (the frame goes to the swap chain). It may be null ONLY
@@ -360,6 +362,13 @@ int WebCoreSessionPaint(uint8_t* outRGBA);
 // Returns kOK, or the usual negative driver errors (kErrBadArgs for a size the surface limits
 //   reject, kErrBusy when a pump is already running - retry after it, nothing was changed).
 int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA);
+
+// How many engine px at the BOTTOM of the viewport are covered by something the engine cannot see -
+// the on-screen keyboard, which is an OS overlay over the window and does not change the viewport
+// the harness hands us. Sticky; 0 (the default) means the whole viewport is visible. Read wherever
+// the engine has to reveal something to the USER (currently WebCoreResize's focused-field reveal).
+void WebCoreSetBottomOcclusion(int enginePx);
+
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable

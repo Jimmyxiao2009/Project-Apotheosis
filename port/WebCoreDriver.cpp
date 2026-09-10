@@ -231,7 +231,9 @@ unsigned wkWinUWPTexmapVisibleHoles();
 #include <WebCore/PlatformWheelEvent.h>      // PlatformWheelEvent(WebCoreWheelAt)
 #include <WebCore/ScrollingCoordinatorTypes.h> // WheelEventProcessingSteps(full definition; EventHandler.h only forward-declares it)
 #include <WebCore/RenderBox.h>               // RenderBox::canBeScrolledAndHasScrollableArea()(WebCoreIsScrollableAt)
-#include <WebCore/RenderElement.h>           // RenderObject::parent()
+#include <WebCore/RenderElement.h>           // RenderObject::parent(), absoluteAnchorRectWithScrollMargin()
+#include <WebCore/RenderLayer.h>             // ScrollRectToVisibleOptions / ShouldAllowCrossOriginScrolling
+#include <WebCore/ScrollAlignment.h>         // ScrollAlignment::alignCenterIfNeeded(WebCoreResize 聚焦回滚)
 #include <WebCore/ContainerNodeInlines.h>    // inline ContainerNode::renderer()(hit->renderer() in WebCoreIsScrollableAt)
 #include <WebCore/HTMLIFrameElement.h>       // is<HTMLIFrameElement>(WebCoreIsScrollableAt)
 #include <WebCore/ShadowRoot.h>              // ShadowRoot::mode()/elementFromPoint(WebCoreIsScrollableAt)
@@ -556,6 +558,13 @@ static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动
 static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tree this composite
 static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
 static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
+
+// Apotheosis (0.1.9.45): how many engine px at the BOTTOM of the viewport are covered by something
+// the engine cannot see - in practice the on-screen keyboard, which is an OS overlay on top of the
+// window and therefore changes nothing about the viewport the harness hands us. Set by
+// WebCoreSetBottomOcclusion(), read where the engine has to put something WHERE THE USER CAN SEE IT
+// (WebCoreResize's focused-field reveal). 0 = the whole viewport is visible.
+static int g_bottomOcclusionPx = 0;
 
 // ---------------------------------------------------------------------------
 // Apotheosis: event-driven present.
@@ -5914,6 +5923,16 @@ void WebCoreSetUserAgentMobile(int mobile)
     g_apoUaMobile = (mobile != 0);
 }
 
+// Apotheosis (0.1.9.45): tell the engine how much of the BOTTOM of the viewport the user cannot
+// actually see. The soft keyboard is an OS overlay over the window, not a change of the viewport,
+// and while a page field has focus the harness moves nothing out of its way - so without this the
+// engine's idea of "visible" includes the strip behind the keyboard. Sticky and cheap (one int);
+// call it from the engine thread with 0 as soon as the keyboard goes away again.
+void WebCoreSetBottomOcclusion(int enginePx)
+{
+    g_bottomOcclusionPx = (enginePx > 0) ? enginePx : 0;
+}
+
 // 自定义 UA:非空则 userAgent() 直接返回它(覆盖 mobile/desktop);空串=清除回退开关。切后 UI 重载生效。
 void WebCoreSetUserAgentString(const char* ua)
 {
@@ -6428,6 +6447,22 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
     // keyboard stays up, so typing continued into a field nobody could see. Only editable
     // elements, and only when the relayout actually moved it out of view - scrollIntoViewIfNeeded
     // is a no-op for a field that is still visible, so an ordinary rotation costs nothing.
+    //
+    // Apotheosis (0.1.9.45): with a MARGIN, and the margin is the whole point. scrollIntoViewIfNeeded
+    // reveals a field into the VIEWPORT, and the viewport is not what the user can see: the soft
+    // keyboard is an OS overlay over the bottom of the window, and while a PAGE field has focus the
+    // harness deliberately does not shift anything (only address-bar editing moves the chrome - see
+    // ApplyKeyboardShift), so the bottom g_bottomOcclusionPx of our own viewport are behind the
+    // keyboard. On top of that, alignCenterIfNeeded's PARTIAL behaviour is "align to the closest
+    // edge", which for a field hanging off the bottom means exactly one sliver of it comes back -
+    // which is what a rotation with the keyboard up produced on the device.
+    //
+    // So expand the rect to be revealed DOWNWARDS by the occluded strip plus a comfort gap, and
+    // reveal that: partial then lands the expanded rect's bottom on the viewport's bottom, i.e. the
+    // field's bottom a full gap above the keyboard, and hidden centres the expanded rect, which puts
+    // the field itself into the upper, visible part of the band. The margin is applied as a FRACTION
+    // of the visible content rect, so it is right at any page scale without converting anything:
+    // engine px and layout px differ by exactly that scale, and the fraction cancels it.
     if (RefPtr<Element> focused = doc->focusedElement()) {
         bool editable = focused->hasEditableStyle();
         if (!editable && is<HTMLInputElement>(*focused))
@@ -6435,7 +6470,32 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
         if (!editable && is<HTMLTextAreaElement>(*focused))
             editable = true;
         if (editable) {
-            focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
+            CheckedPtr renderer = focused->renderer();
+            LayoutRect visible = view->visibleContentRect();
+            const int occluded = (g_bottomOcclusionPx > 0 && g_bottomOcclusionPx < h) ? g_bottomOcclusionPx : 0;
+            const int comfort = std::max(96, h / 8);   // one line of chrome, never less than ~40 DIP
+            const double wanted = (h > 0) ? static_cast<double>(occluded + comfort) / h : 0.0;
+            if (!renderer || wanted <= 0.0 || visible.height() <= 0) {
+                focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
+            } else {
+                bool insideFixed = false;
+                LayoutRect bounds = renderer->absoluteAnchorRectWithScrollMargin(&insideFixed).marginRect;
+                // The expanded rect must stay SMALLER than the viewport: getRectToExposeForScrollIntoView
+                // treats a rect as big as the visible area as "visible" and does not scroll at all.
+                LayoutUnit pad { visible.height() * std::min(wanted, 0.8) };
+                LayoutUnit room = visible.height() - bounds.height() - LayoutUnit(2);
+                if (pad > room)
+                    pad = room;
+                auto alignX = ScrollAlignment::alignCenterIfNeeded;
+                alignX.disableLegacyHorizontalVisibilityThreshold();
+                auto alignY = ScrollAlignment::alignCenterIfNeeded;
+                if (pad > 0)
+                    bounds.setHeight(bounds.height() + pad);
+                else
+                    alignY = ScrollAlignment::alignTopAlways;   // field taller than the free band: show its top
+                LocalFrameView::scrollRectToVisible(bounds, *renderer, insideFixed,
+                    { SelectionRevealMode::Reveal, alignX, alignY, ShouldAllowCrossOriginScrolling::No });
+            }
             doc->updateLayoutIgnorePendingStylesheets();
         }
     }
