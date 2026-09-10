@@ -5401,7 +5401,11 @@ static std::wstring LinkMenuTargetText(const std::wstring& url)
     if (s.size() > 4 && s.compare(0, 4, L"www.") == 0) s = s.substr(4);
     // A trailing "/" on a bare host is noise; anything deeper keeps its path.
     if (s.size() > 1 && s.back() == L'/' && s.find(L'/') == s.size() - 1) s.pop_back();
-    const size_t kMaxChars = 76;   // the TextBlock elides as well, this only bounds what we hand it
+    // Apotheosis (0.1.9.44): no more eliding at 76 characters. The header is a ScrollViewer now,
+    //   so a target longer than the card is pannable and the whole URL can be read; cutting it
+    //   here would be cutting it everywhere. The remaining bound is a layout guard, not a design:
+    //   one TextBlock line measured at its full length is what the ScrollViewer's extent costs.
+    const size_t kMaxChars = 512;
     if (s.size() > kMaxChars) s = s.substr(0, kMaxChars - 1) + std::wstring(1, L'\x2026');
     return s;
 }
@@ -5448,11 +5452,20 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
     // measurement without guessing.
     if (!(cw > 0.0)) cw = 268.0;
     if (!(ch > 0.0)) ch = 96.0;
+    // Apotheosis (0.1.9.44): "above the finger" meant "its bottom edge a gap above the fingertip",
+    //   which on the device still reads as AT the finger - the hand covers the action row. Lift it
+    //   by half that row, so what the eye lands on is the row and not the fingertip. Read the row
+    //   back from the measurement that just ran (the button is part of the card), same
+    //   ActualHeight-free approach the rest of this function uses, with a literal fallback for the
+    //   case where XAML refused to measure.
+    double rowH = 0.0;
+    try { if (LinkMenuOpenBtn) rowH = LinkMenuOpenBtn->DesiredSize.Height; } catch (...) {}
+    if (!(rowH > 0.0)) rowH = 46.0;
     const double kGap = 14.0;    // clearance from the fingertip, so the card is not under it
     const double kEdge = 8.0;
     double left = fingerX - cw / 2.0;
     const char* place = "above";
-    double top = fingerY - kGap - ch;
+    double top = fingerY - kGap - ch - rowH / 2.0;
     if (top < kEdge) {                        // no room above the finger - go below it
         place = "below";
         top = fingerY + kGap;
@@ -5468,6 +5481,7 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
         + " dip=" + std::to_string((int)m_ctxDipX) + "," + std::to_string((int)m_ctxDipY)
         + " at=" + std::to_string((int)left) + "," + std::to_string((int)top)
         + " card=" + std::to_string((int)cw) + "x" + std::to_string((int)ch)
+        + " row=" + std::to_string((int)rowH)
         + " place=" + place
         + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)
         + " inset=" + std::to_string((int)m_lastInsetLeft) + "," + std::to_string((int)m_lastInsetRight)).c_str());
