@@ -5826,6 +5826,87 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     return kOK;
 }
 
+// Apotheosis (link context menu, 0.1.9.42): the absolute href of the innermost <a href> under
+// (x,y), or nothing. Read-only - no event dispatched, nothing in the session or the frame
+// mutated - so the harness can ask it from the long-press route and only then decide whether the
+// hold becomes a menu or is forwarded to the page as a real press.
+//
+// Why an engine call and not the harness' own link table (WebCoreGetLink): that table is a list
+// of rectangles harvested by extractLinks() after a load or a scroll settle. It is capped at 4000
+// entries, it knows nothing about what COVERS a link (a sticky header, a consent overlay, an
+// absolutely positioned box), and its rectangles are in CSS px while the harness asks in engine
+// px - at any page scale but 1.0 the two disagree, which is the bug family clientPointForEngine-
+// Point() exists for. This runs the same hit test the click path runs, so it is right at every
+// scale and it respects z-order.
+//
+// A drag widget wins: when the point belongs to something that drags itself (canvas /
+// touch-action:none - the same dragWidgetAtPoint() probe the pinch, drag and tap routes use)
+// this answers "no link", so a hold there keeps reaching the page exactly as it did before. Such
+// a widget owns the gesture, and a menu over a link it happens to have painted into its own
+// surface would take the press-and-hold away from it.
+//
+// x, y: viewport/BITMAP px, WebCoreClickAt's convention.
+// outUrl/cap: UTF-8 absolute URL, NUL-terminated, emptied on every path that is not a hit. Only
+//   http(s) is reported (the same filter extractLinks() applies) - javascript:, mailto: and
+//   fragment-only anchors are not something "open in a new tab" can do anything with.
+// Returns 1 = link written, 0 = no link under the point, or a negative driver error (no session,
+//   busy, no document, or a buffer too small for the URL).
+int WebCoreLinkAt(int x, int y, char* outUrl, int cap)
+{
+    using namespace WebCore;
+    if (outUrl && cap > 0)
+        outUrl[0] = '\0';
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;   // 任何返回路径复位 g_inPump
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+    if (dragWidgetAtPoint(*doc, x, y))
+        return 0;
+
+    DoublePoint cp = clientPointForEnginePoint(doc->page(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
+    if (!hit)
+        return 0;
+
+    // Same open-shadow descent as dragWidgetAtPoint()/WebCoreTapPolicyAt: elementFromPoint()
+    // retargets its result to the scope it was called on, so a link inside a custom element would
+    // otherwise only ever resolve to the host.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    // Walk the COMPOSED tree upwards, not the node tree: a link that wraps a custom element has a
+    // shadow boundary between it and the node the hit landed on, and parentElement() stops there.
+    for (RefPtr<Element> e = hit; e; e = e->parentElementInComposedTree()) {
+        if (!is<HTMLAnchorElement>(*e))
+            continue;
+        auto href = downcast<HTMLAnchorElement>(*e).href();
+        if (href.isEmpty() || !href.isValid() || !href.protocolIsInHTTPFamily())
+            return 0;   // an anchor, but not one a new tab could load
+        auto utf8 = href.string().utf8();   // WTF::CString, owns the buffer until the end of this scope
+        if (!outUrl || cap <= static_cast<int>(utf8.length()))
+            return kErrBadArgs;
+        std::memcpy(outUrl, utf8.data(), utf8.length());
+        outUrl[utf8.length()] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 // 当前会话是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ harness 据此弹/收输入法。
 // UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后由 UI 重新加载页面生效。
 void WebCoreSetUserAgentMobile(int mobile)

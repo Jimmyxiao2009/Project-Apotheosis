@@ -283,6 +283,18 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 // 照样安全降级)。
 int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
 
+// Apotheosis(链接上下文菜单 0.1.9.42):(x,y)(视口/位图像素,同 WebCoreClickAt)处最内层 <a> 的
+// 绝对 http(s) 链接,UTF-8 + NUL 写入 outUrl。只读:不派发事件、不改会话/帧,可在长按路径上先问
+// 它,再决定这次长按是弹菜单还是照旧转发给页面。
+//   * 命中测试与 WebCoreTapPolicyAt 走同一套客户端像素换算,故任意页面缩放下都正确,并且尊重
+//     z-order —— 这是 WebCoreGetLink 那张矩形表做不到的(它是布局后的一次性采集,看不见谁盖住了链接)。
+//   * 可拖拽控件优先:命中 canvas / touch-action:none(dragWidgetAtPoint,与捏合/拖拽/点击路由同一
+//     探针)时报"无链接",那里的长按行为一如既往 —— 该手势归控件所有。
+//   * 只报 http(s);javascript:、mailto:、纯 fragment 锚点新标签页打不开。
+// 返回 1=已写入链接,0=此处无链接(outUrl 置空),负数=常规驱动错误(kErrNoSession/kErrBusy/
+// kErrNoDocument,或 cap 装不下 URL 时 kErrBadArgs)。
+int WebCoreLinkAt(int x, int y, char* outUrl, int cap);
+
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();
 // 诊断:最近一次 WebCoreTypeText 的可编辑/聚焦/插入状态(排查"打字不进框")。

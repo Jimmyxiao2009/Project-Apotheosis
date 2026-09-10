@@ -309,6 +309,21 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 // outZoomable=0 as well, so a caller that only checks *outZoomable still degrades safely).
 int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
 
+// Apotheosis (link context menu, 0.1.9.42): the absolute http(s) href of the innermost <a> under
+// (x,y) (viewport/BITMAP px, WebCoreClickAt's convention), written UTF-8/NUL-terminated into
+// outUrl. Read-only: no event dispatched, no session or frame mutated, safe to call from the
+// long-press route before deciding whether the hold opens a menu or goes to the page.
+//   * The hit test goes through the same client-px conversion as WebCoreTapPolicyAt, so it is
+//     correct at any page scale, and it respects z-order - unlike the WebCoreGetLink rectangle
+//     table, which is a post-layout harvest that cannot see what covers a link.
+//   * A drag widget wins: over a canvas / touch-action:none element (dragWidgetAtPoint, the probe
+//     the pinch/drag/tap routes share) this reports no link, so a hold there keeps behaving as it
+//     always did - the widget owns that gesture.
+//   * Only http(s) is reported; javascript:, mailto: and fragment-only anchors are not openable.
+// Returns 1 = link written, 0 = no link here (outUrl emptied), negative = the usual driver errors
+// (kErrNoSession / kErrBusy / kErrNoDocument, or kErrBadArgs when cap is too small for the URL).
+int WebCoreLinkAt(int x, int y, char* outUrl, int cap);
+
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal
