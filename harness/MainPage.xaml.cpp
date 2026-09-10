@@ -2668,7 +2668,11 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
         int ctxRc = 0;
         try {
             if (longPress) {
-                char lu[1200] = "";
+                // Apotheosis (0.1.9.45): 4096, not the link table's 1200. WebCoreLinkAt reports
+                //   kErrBadArgs rather than truncating when the href does not fit, i.e. a hold on a
+                //   very long link used to open no menu at all - and the header shows up to 2048
+                //   characters now, so the URL has to arrive whole.
+                char lu[4096] = "";
                 ctxRc = WebCoreLinkAt(px, py, lu, sizeof lu);
                 if (ctxRc == 1 && lu[0]) *ctxUrl = Utf8ToWide(lu);
             }
@@ -5407,7 +5411,12 @@ static std::wstring LinkMenuTargetText(const std::wstring& url)
     //   so a target longer than the card is pannable and the whole URL can be read; cutting it
     //   here would be cutting it everywhere. The remaining bound is a layout guard, not a design:
     //   one TextBlock line measured at its full length is what the ScrollViewer's extent costs.
-    const size_t kMaxChars = 512;
+    // Apotheosis (0.1.9.45): 512 was still short of what a real deep link can be (tracking query
+    //   strings run into four figures), and a cut header is a header that cannot be checked before
+    //   opening it. 2048 characters at FontSize 12 is one NoWrap line about 12 000 px wide inside a
+    //   268 px ScrollViewer - a single glyph run, measured once per open, no wrapping and no layout
+    //   pass that depends on it (the card's width is declared in the XAML).
+    const size_t kMaxChars = 2048;
     if (s.size() > kMaxChars) s = s.substr(0, kMaxChars - 1) + std::wstring(1, L'\x2026');
     return s;
 }
