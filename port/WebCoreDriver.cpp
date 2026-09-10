@@ -122,7 +122,7 @@ void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& 
 // shown them yet", so it owes a present exactly like wkWinUWPTexmapTakeFinishedRasterTiles();
 // reading resets it. Declared by hand for the same reason as everything above.
 unsigned wkWinUWPTexmapTakeDeferredUploads();
-// Apotheosis (TILING-REWRITE-PLAN.md 5.3): the engine's TileGrid input trace - one `tg` line per
+// Apotheosis (docs/TILEGRID-DESIGN.md 5.3): the engine's TileGrid input trace - one `tg` line per
 // pass and per composite of every tiled layer store, a pass line being the complete PassInput, so
 // a device session replays on the PC (tests/tilegrid). This hands over the lines that have not been
 // read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine thread,
@@ -135,13 +135,13 @@ size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
 // WebCoreGpuLayerInfo() writes it before the layer tree rather than after it. Declared by hand for
 // the same reason as everything above.
 size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
-// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0", GraphicsLayerTextureMapper.cpp):
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3, GraphicsLayerTextureMapper.cpp):
 // per-cause breakdown of the wkTexmapDirtyFull count above - which of updateBackingStoreIfNeeded's
 // full-repaint conditions fired (a layer that hits more than one adds to more than one counter),
 // plus how many GraphicsLayerTextureMapper::setNeedsDisplay() calls actually flipped m_needsDisplay
 // false->true. Both reset on read. Declared by hand for the same reason as everything above.
 void wkWinUWPTexmapDirtySrcStats(unsigned& needsDisplay, unsigned& storeCreated, unsigned& sizeChange, unsigned& scaleChange, unsigned& setNeedsDisplayCalls);
-// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md sections 3 and 5.2, package 3): the one number
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md sections 3 and 5.2): the one number
 // the driver reads from the TileGrid (TextureMapperTiledStore.h). Declared by hand for the same
 // reason as everything above - that header pulls in the texmap GL headers. The v1/v2 switch that
 // used to sit here is gone with package 5; the TileGrid is the only store there is.
@@ -502,7 +502,7 @@ static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即�
 static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
-// Apotheosis (package 5, CLEANUP-LOG.md): the pan present handshake is gone. It let a gesture take
+// Apotheosis: the pan present handshake is gone. It let a gesture take
 // the presents away from the engine (defer eglSwapBuffers, release each frame by hand) so that the
 // engine's own composites could not race the XAML TranslateTransform the harness drew the pan with.
 // That preview is deleted, and with it the only caller WebCoreSetPanGesture(1) ever had: on the
@@ -527,7 +527,7 @@ static const int kDragTapSlopPx = 8;   // engine px (~4 DIP at 720 over a 360 DI
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
 
-// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04; TILING-REWRITE-PLAN.md section 3, package 4): a
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04; docs/TILEGRID-DESIGN.md section 3): a
 // composite can come up with no content at all.
 //
 // Who produces such a composite: every live tick takes the scroll fast path (WebCoreLiveTick sets
@@ -539,7 +539,7 @@ static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动
 //
 // The repair ledger that used to live here - gpuArmRepair(), gpuNoteRepairResult(),
 // g_gpuRepairMisses, the escalation cooldown and the `repairloop` stage line - is gone with the v1
-// mechanics it read (CLEANUP-LOG.md, "TileGrid package 4"). The TileGrid model answers one question
+// mechanics it read. The TileGrid model answers one question
 // after a composite instead: how many VISIBLE cells drew nothing and had no backdrop behind them
 // (wkWinUWPTexmapVisibleHoles). A cell can only be in that state while work the model has already
 // scheduled is running, and R5/R12 guarantee that work converges, so the only thing missing is a
@@ -1251,7 +1251,7 @@ static const char* const kPerfHeader =
     //   pump_ticks   settle callbacks (same number as `frames`, kept next to the two above so
     //                the row is readable on its own)
     "ms_tick_cb,ms_offpump,pump_ticks,"
-    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the split of ms_offpump, from the scoped
+    // Apotheosis (M4 load): the split of ms_offpump, from the scoped
     // accounting in wtf/ApoLoadPhase.h (armed by pumpLoop, only with perf logging on). Each
     // bucket holds the *self* time of its scopes, so they never overlap and an inner scope
     // always beats the generic run-loop one around it:
@@ -1266,7 +1266,7 @@ static const char* const kPerfHeader =
     //   off_other    ms_offpump minus the six, i.e. the run loop's own overhead and whatever
     //                still has no scope. A large off_other means this list is incomplete
     "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other,"
-    // Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2.10): how often, not how long. off_style
+    // Apotheosis (M4 load, 2026-09-07): how often, not how long. off_style
     // is one number for two very different things, and 1.4 s of it on a tech-news site reads the same
     // whether one style resolution was expensive or the pump forced twenty. Counted in
     // wtf/ApoLoadPhase.h at the same scopes, over the same window as the buckets:
@@ -1274,7 +1274,7 @@ static const char* const kPerfHeader =
     //   layout_n  LocalFrameViewLayoutContext::layout      forcing passes, not the page)
     //   timer_n   DOMTimer::fired entries                 (drops when the C2.9 alignment works)
     "style_n,layout_n,timer_n,"
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): why the layers dirty_full
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): why the layers dirty_full
     // counts were repainted in full, one string cell instead of six more columns so existing
     // scripts that address raster_deferred and everything before it by index (see the raster_
     // comment above) keep working - appended at the very END for the same reason. Format
@@ -1289,7 +1289,7 @@ static const char* const kPerfHeader =
     //      (g_gpuLastCompositeFull), else 0 - the only field NOT counted inside WebCore, so a
     //      row with e > 0 and f = 0 means WebCore itself asked for the repaint, not the driver
     "dirty_src,"
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.5/3, package 3): TileGrid v2's only output
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.5/3): TileGrid v2's only output
     // the driver reacts to - the sum over this operation's composites of visible cells that drew
     // NOTHING and had no backdrop behind them (wkWinUWPTexmapVisibleHoles, read once per composite
     // in gpuPresent). Empty while the v2 switch is off. 0 = every visible cell had pixels; a small
@@ -1312,14 +1312,14 @@ struct PerfRow {
     // Apotheosis (M4): TextureMapper layers repainted in full vs. by dirty rect in this operation
     // (wkWinUWPTexmapDirtyStats, WebKit winuwp f14d05ff1f); -1 = no composite happened.
     int dirtyFull = -1, dirtyPartial = -1;
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): per-cause breakdown of
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): per-cause breakdown of
     // dirtyFull above (wkWinUWPTexmapDirtySrcStats — see dirty_src in kPerfHeader),
     // accumulated across this operation the same way dirtyFull/dirtyPartial are. -1 = no
     // composite happened. dirtySrcForceDirty is not a sum: it is 1 if ANY composite in this
     // operation was one forceDirtyTree() had just walked (g_gpuLastCompositeFull).
     int dirtySrcNeedsDisplay = -1, dirtySrcStoreCreated = -1, dirtySrcSizeChange = -1,
         dirtySrcScaleChange = -1, dirtySrcSetNeedsDisplay = -1, dirtySrcForceDirty = -1;
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): tg_holes - the sum of
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes - the sum of
     // wkWinUWPTexmapVisibleHoles() over this operation's composites (see the column in
     // kPerfHeader). -1 = the TileGrid v2 switch was off, i.e. nobody could have reported a hole,
     // which is a different statement from "no hole was reported" and therefore a different cell.
@@ -1412,7 +1412,7 @@ static std::atomic<int> g_navSawFirstPaint { 0 };
 // fired its load event at 1820 ms and cap-load ended the pump at 4124 ms - 2.3 s for a 1 s cap.
 static std::atomic<double> g_navLoadEventSec { 0 };   // dispatchDidFinishLoad
 static std::atomic<double> g_navDomReadySec { 0 };    // dispatchDidFinishDocumentLoad
-// Apotheosis (M4 load, PERF-OPTIONS.md C2.9): the DOM timer alignment the load window asks for.
+// Apotheosis (M4 load): the DOM timer alignment the load window asks for.
 // Declared here because the stage.txt timeline line prints it; used by loadTimerThrottleSet().
 static constexpr unsigned kLoadTimerAlignMs = 250;
 static constexpr unsigned kLoadTimerNestedAlignMs = 1000;
@@ -1556,7 +1556,7 @@ static void perfFlushLocked()
         char pc[3][12];
         for (int k = 0; k < 3; ++k)
             perfFmtI(pc[k], sizeof pc[k], passInts[k]);
-        // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): dirty_src, appended at the
+        // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): dirty_src, appended at the
         // very end - see the comment on the column in kPerfHeader. -1 on dirtySrcNeedsDisplay means
         // no composite happened this operation, same convention as dirtyFull/dirtyPartial -> empty
         // cell rather than "0/0/0/0/0/0", which would misleadingly claim a composite ran clean.
@@ -1568,7 +1568,7 @@ static void perfFlushLocked()
                 r.dirtySrcNeedsDisplay, r.dirtySrcStoreCreated, r.dirtySrcSizeChange,
                 r.dirtySrcScaleChange, r.dirtySrcSetNeedsDisplay,
                 r.dirtySrcForceDirty > 0 ? 1 : 0);
-        // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): tg_holes, after it. Same
+        // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes, after it. Same
         // convention: -1 (the v2 switch was off for every composite of this operation) -> empty
         // cell, so a 0 always means "v2 ran and saw no hole".
         char tgh[12];
@@ -1736,7 +1736,7 @@ static void perfWriteStageTimeline(const PerfRow& r)
         r.settleWhy[0] ? r.settleWhy : "-",
         r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts,
         r.pumpTicks, r.msTickCb < 0 ? 0.0 : r.msTickCb, r.msOffPump < 0 ? 0.0 : r.msOffPump);
-    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the same split as the off_* columns, on a line
+    // Apotheosis (M4 load): the same split as the off_* columns, on a line
     // of its own so the timeline line above keeps the shape the existing notes quote.
     // Apotheosis (M4 load, 2026-09-07): style_n/layout_n/timer_n are pass *counts* over the
     // same window (wtf/ApoLoadPhase.h). A style time that is large because one resolution is
@@ -1761,7 +1761,7 @@ static void perfWriteStageTimeline(const PerfRow& r)
 // pending. Called at the end of every operation, not only of a navigation: the composites the
 // trace describes happen on the ticks *after* the pinch, never on the pinch's own row. Between
 // two zooms the take returns 0 and the file is not opened at all.
-// Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 5.3, package 3): the same take now also drains the
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 5.3): the same take now also drains the
 // TileGrid v2 input trace ("tg ..."), whose ring is 256 lines of up to 320 characters - up to ~82 kB
 // against the 2 kB buffer this used to pass, i.e. one call could carry seven lines and the model's
 // replay input (§5.4) would be full of gaps. The take copies WHOLE lines and leaves the rest in the
@@ -2115,7 +2115,7 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 
 } // namespace WebCorePort
 
-// ---- Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2 settle) ------------------------
+// ---- Apotheosis (M4 load, 2026-09-07) ------------------------
 // Can a pending load still change what the user is looking at?
 //
 // pumpLoop's "quiet" rule used to be DocumentLoader::isLoadingInAPISense(), i.e. "the frame tree
@@ -2261,7 +2261,7 @@ static void perfWriteStagePending(WebCore::LocalFrame& frame, const char* why, b
     std::fclose(fp);
 }
 
-// ---- Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2.9): DOM timer throttle -------------
+// ---- Apotheosis (M4 load, 2026-09-07): DOM timer throttle -------------
 // Between the commit of a real document and t_settle, align every DOM timer of every document
 // onto a 250 ms grid (1 s for the maximally nested ones WebCore already treats as pollers). The
 // engine thread is the only thread there is here, and during a load it has to serve the parser,
@@ -2299,7 +2299,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
                      int settleCapTicks, double watchdogSeconds, WebCore::Page* pageForRendering)
 {
     using namespace WebCore;
-    // Apotheosis (M4 load, PERF-OPTIONS.md C2.1): the ms_offpump split is accounted only while a
+    // Apotheosis (M4 load): the ms_offpump split is accounted only while a
     // pump is running - that is exactly the window ms_offpump measures. Saved and restored rather
     // than cleared, because isolatedUpdateRendering() can reach a nested pump. See
     // wtf/ApoLoadPhase.h; with perf logging off this stays false and every scope is a branch.
@@ -2412,7 +2412,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             bool realDocCommitted = committedLoader && committedLoader->isCommitted()
                 && frameRef->loader().stateMachine().committedFirstRealDocumentLoad();
             bool domReady = realDocCommitted && frameDoc && !frameDoc->parsing();
-            // Apotheosis (M4 load, PERF-OPTIONS.md C2.9): the DOM timer window opens at the
+            // Apotheosis (M4 load): the DOM timer window opens at the
             // commit of the real document - the parse is exactly where the ad timers hurt most -
             // and closes when this pump returns. Navigation pumps only.
             // The apoLoadTimerThrottleActive() term keeps a nested pump (isolatedUpdateRendering
@@ -2654,7 +2654,7 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
             }
         }
         {
-            // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md "package 0"): per-cause breakdown of
+            // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): per-cause breakdown of
             // the full-repaint count above, plus whether THIS composite is the one forceDirtyTree()
             // just walked (g_gpuLastCompositeFull, set two lines above from wkFullDirty) - together
             // they tell "WebCore dirtied it" apart from "forceDirtyTree ran", which is what the
@@ -2713,7 +2713,7 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
         PerfPhase perfPaint(&g_perfCur.paint);   // M4: TextureMapper composite of the layer tree
         glRoot.layer().paint(*g_textureMapper);
     }
-    // Apotheosis (TILING-REWRITE-PLAN.md section 3, package 4): this composite added to the engine's
+    // Apotheosis (docs/TILEGRID-DESIGN.md section 3): this composite added to the engine's
     // visible-hole accumulator like any other, and nothing here would ever read it - so gpuPresent()
     // would find this readback's holes on top of its own and owe a present for a frame the user is
     // not looking at. Drain and discard: the readback is a snapshot (a tab thumbnail, the offscreen
@@ -2784,7 +2784,7 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
         gpuPaintTree(glRoot);
         g_textureMapper->endPainting();
     }
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md 2.2b "driver repair machine" and 3): the
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.2b "driver repair machine" and 3): the
     // present-only repair. The TileGrid model answers one question after a composite - how many
     // VISIBLE cells drew nothing and had no backdrop behind them - and a cell can only be in that
     // state while its replay is in flight or its texture is waiting for the upload budget, i.e.
@@ -2862,7 +2862,7 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
 // perf row's raster_pending column, which is the only way to see whether the worker pool kept up.
 static void notePendingRasterTiles()
 {
-    // Apotheosis (2026-09-08, TILING-REWRITE-PLAN.md package 3): the TileGrid needs this even for
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): the TileGrid needs this even for
     // the passes it replays inline (an image store never goes to a worker), where nothing is
     // pending and nothing finishes on a worker - the tile still has to be UPLOADED, and the
     // per-composite upload budget applies to the inline path too. A pass that rasterises more cells

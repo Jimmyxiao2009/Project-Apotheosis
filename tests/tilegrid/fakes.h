@@ -1,5 +1,5 @@
 // Apotheosis: fake backends and the DrawRecorder for the TileGrid v2 core
-// (TILING-REWRITE-PLAN.md section 5.4).
+// (docs/TILEGRID-DESIGN.md section 5.4).
 //
 // The core (TextureMapperTileGridCore) talks to two interfaces. Here they are
 // implemented without pixels, without threads and without a clock: a replay

@@ -1,4 +1,4 @@
-// Apotheosis: the scenarios of TILING-REWRITE-PLAN.md section 5.4 run against
+// Apotheosis: the scenarios of docs/TILEGRID-DESIGN.md section 5.4 run against
 // the *core* (TextureMapperTileGridCore) with the fake backends, in all eight
 // combinations of worker latency {0, 1, 3, never} x upload budget {2,
 // unlimited}. scenarios.cpp runs the same list against the model alone.
@@ -6,7 +6,7 @@
 // What this file adds over scenarios.cpp is the screen: every composite goes
 // through the DrawRecorder, which knows for every sampled visible pixel which
 // texture painted it and what those pixels were rasterised for. The device
-// symptoms of the DAY-REPORTs are assertions here:
+// symptoms the device showed are assertions here:
 //
 //   "old tiles farther from the pinch origin"      -> screen.foreign == 0
 //   "doubled text after pinch" / "ghost band"      -> screen.doubleDrawn == 0

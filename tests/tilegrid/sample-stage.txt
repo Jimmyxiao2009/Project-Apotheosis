@@ -1,6 +1,6 @@
 sample stage.txt for tests/tilegrid/replay.cpp
 Synthetic until the first TileGrid v2 device round; the shape is exactly what
-wkWinUWPTakeTexmapZoomTrace writes (TILING-REWRITE-PLAN.md 5.3). Lines that are
+wkWinUWPTakeTexmapZoomTrace writes (docs/TILEGRID-DESIGN.md 5.3). Lines that are
 not `tg S<id> pass` are ignored by the parser, so a real stage.txt can be
 dropped in unchanged.
 stage load begin url=https://example.com/news/

@@ -1,5 +1,5 @@
 // Apotheosis: replay of a device trace. A `tg S<id> pass ...` line of
-// TILING-REWRITE-PLAN.md section 5.3 IS a PassInput, so a stage.txt pulled off
+// docs/TILEGRID-DESIGN.md section 5.3 IS a PassInput, so a stage.txt pulled off
 // the Lumia becomes a test case: one model per store id, every line fed in,
 // the invariants of section 4 asserted after each one.
 //

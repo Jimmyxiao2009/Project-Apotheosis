@@ -1,4 +1,4 @@
-// Apotheosis: host tests for the TileGrid v2 model (TILING-REWRITE-PLAN.md 5.4).
+// Apotheosis: host tests for the TileGrid v2 model (docs/TILEGRID-DESIGN.md 5.4).
 // No test framework: a CHECK macro, a failure counter, and a tiny harness that
 // every test file shares. The executable's exit code is the failure count.
 

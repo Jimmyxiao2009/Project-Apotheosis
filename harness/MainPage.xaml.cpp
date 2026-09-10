@@ -172,7 +172,7 @@ static void WriteStage(const char* stage)
 // 这三个 API 在 15254 上都有;取不到就返回 "mem=n/a",绝不影响调用点。
 // Apotheosis (review 2026-09-04 item 1): AppMemoryUsage/Limit only track the UWP App Container's
 // assigned memory budget, never the flat 32-bit address space every allocation still has to fit
-// in. The map-site abort (night6, 2026-09-04 ~02:35, DAY-REPORT.md) happened at 57% of that
+// in. The map-site abort of 2026-09-04 happened at 57% of that
 // budget (pressure level still 0) with GlobalMemoryStatusEx().ullAvailVirtual down to 271 MB — a
 // single large contiguous allocation (BitmapTexturePool::Entry vector) failed long before the
 // budget percentage said anything was wrong. The driver already reads this same field; sampled
@@ -641,7 +641,7 @@ static const int kW = 720, kH = 1080;
 //   width (kW), so zooming out does NOT reflow a wider desktop layout into the extra room —
 //   the same fit-to-width page is simply drawn smaller from the top-left and the right side
 //   stays blank. A real wide-viewport "desktop layout" mode (lay out at, say, 980 px and let
-//   the page scale be the fit-to-width ratio) is a separate feature; see PERF-OPTIONS.md.
+//   the page scale be the fit-to-width ratio) is a separate feature, not done here.
 static const float kMinPageScale = 0.5f;
 static const float kMaxPageScale = 6.0f;
 // The live preview never needs to go below what we can commit any more.

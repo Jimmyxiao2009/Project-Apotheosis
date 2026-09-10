@@ -1,5 +1,5 @@
 // Apotheosis: implementation of the fake backends and the DrawRecorder
-// (TILING-REWRITE-PLAN.md section 5.4). See fakes.h for what they are for.
+// (docs/TILEGRID-DESIGN.md section 5.4). See fakes.h for what they are for.
 
 #include "fakes.h"
 

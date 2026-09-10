@@ -327,7 +327,7 @@ void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
 // WebCorePresent / WebCoreGetOwedSwapScroll / WebCorePresentFrame. It let a gesture take the
 // presents away from the engine so its own composites could not race the XAML TranslateTransform
 // the harness drew a pan with; that preview is deleted, and it was the only caller the mode ever
-// had. The engine presents every composite as it makes it. See CLEANUP-LOG.md.
+// had. The engine presents every composite as it makes it.
 
 
 // 在当前会话主世界执行 JS,结果转字符串写入 out。诊断/注入用。返回 0 成功。

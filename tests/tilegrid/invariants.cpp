@@ -1,4 +1,4 @@
-// Apotheosis: invariants I1 - I17 of TILING-REWRITE-PLAN.md section 4, as
+// Apotheosis: invariants I1 - I18 of docs/TILEGRID-DESIGN.md section 4, as
 // functions the harness calls after every pass and every composite. They are
 // the specification the model is held to; the scenarios only supply the inputs.
 

@@ -1,4 +1,4 @@
-# Apotheosis: host tests for the TileGrid v2 model (TILING-REWRITE-PLAN.md 5.4).
+# Apotheosis: host tests for the TileGrid v2 model (docs/TILEGRID-DESIGN.md 5.4).
 #
 # The model is WebCore-free on purpose, so this builds it straight out of the
 # WebKit tree with MSVC x64 - no engine, no ARM cross build, no device.

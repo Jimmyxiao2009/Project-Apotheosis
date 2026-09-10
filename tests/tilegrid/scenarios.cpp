@@ -1,5 +1,5 @@
-// Apotheosis: the scripted scenarios of TILING-REWRITE-PLAN.md section 5.4.
-// Every one of them is a device complaint from the DAY-REPORTs, plus one
+// Apotheosis: the scripted scenarios of docs/TILEGRID-DESIGN.md section 5.4.
+// Every one of them is a complaint the device produced, plus one
 // mutation-style guard per rule R1 - R12. The comment above each test says
 // which rule it guards; removing that rule from the model must make it fail.
 //
