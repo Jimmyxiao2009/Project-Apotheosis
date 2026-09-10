@@ -272,9 +272,13 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 //     调用方转发 clickCount=2 的点击,而不是动画到原地。
 //   *outAnchorX/*outAnchorY:这次缩放的锚点,同 WebCoreSetPageScale 的 focalX/focalY 一样的
 //     视口/位图像素——总是原样回传 (x,y),调用方不必在按住间隔内自己记着点击点。
+//   *outReason (0.1.9.40):上面哪条规则决定了答案——0=可缩放(已算出 target),1=已处于缩放
+//     (规则 1),2=命中点下无元素,3=viewport 关闭缩放(规则 2),4=移动端优化 viewport(规则 3),
+//     5=touch-action opt-out(规则 4),6=目标与当前尺度相差不到 5%(不值得动画)。负数(错误)
+//     返回时留 -1——无会话/忙/无文档不是规则决定。
 // 任一输出指针可为 null。返回 kOK,或负数错误(无会话时也把 outZoomable 置 0,只查它的调用方
 // 照样安全降级)。
-int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY);
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
 
 // 滚动停止后刷新链接命中表(滚动期间为提速跳过了链接提取)。轻量:仅布局+提取,不绘制。返回 0。
 int WebCoreSyncLinks();
