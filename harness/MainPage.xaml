@@ -302,17 +302,28 @@
                  margin down by the status-bar inset — the rendered page used to start at y=0 inside
                  this row (only the chrome above it, Progress/FindBar/overlays, got the inset), so
                  the content ran under the shell's clock. -->
-            <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10">
+            <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10" IsDoubleTapEnabled="False">
                 <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖→引擎滚动+惯性,捏合→Scale)。
                      点击走 Tapped;坐标用 GetPosition(ContentArea) 映回引擎像素(MapTapToEngine)。 -->
+                <!-- Apotheosis (double-tap route, 2026-09-10): IsDoubleTapEnabled MUST stay False on
+                     every element in this subtree. With it on (the XAML default) UWP raises the
+                     SECOND tap of a pair as DoubleTapped ONLY - Tapped comes for the first tap and
+                     never again - so the harness' own double-tap recogniser (OnPageTapped, which
+                     pairs taps by time and distance) never saw a second tap and every held first tap
+                     died in its timer with second=0. We deliberately do not handle DoubleTapped
+                     instead: the pair has to be judged against the engine's tap policy, i.e. exactly
+                     where OnPageTapped judges it. Gesture recognition is per-element and the
+                     ORIGINAL SOURCE of the tap owns it, so the child (RenderImage, hit-testable in
+                     software mode) and the Border around it need the flag as much as the Grid does -
+                     otherwise their recogniser swallows the second tap before it can bubble. -->
                 <Grid x:Name="ContentArea" Background="White"
                        ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale"
-                       IsTapEnabled="True" Tapped="OnPageTapped"
+                       IsTapEnabled="True" Tapped="OnPageTapped" IsDoubleTapEnabled="False"
                        IsHoldingEnabled="True" Holding="OnPageHolding"
                        ManipulationDelta="OnImageManipDelta"
                        ManipulationCompleted="OnImageManipCompleted">
                     <!-- 固定 720x1080 的软件帧须随可用视口铺满；否则横屏时右侧会留下空白。 -->
-                    <Image x:Name="RenderImage" Stretch="Fill"/>
+                    <Image x:Name="RenderImage" Stretch="Fill" IsDoubleTapEnabled="False"/>
                 </Grid>
             </Border>
 

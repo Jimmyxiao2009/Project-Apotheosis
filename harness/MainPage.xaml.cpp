@@ -1414,7 +1414,33 @@ void MainPage::ApplyKeyboardShift(const char* why)
         else
             mode = "nowindow";
     }
+    // Consumed here, whichever way this call ends, so a ticket can never outlive its own call.
+    const bool bypass = m_kbShiftBypass;
+    m_kbShiftBypass = false;
     if (shiftUp == m_kbShiftApplied) return;
+    // Apotheosis (suggestion tap, 2026-09-10): THE reason a tapped suggestion only closed the list.
+    //   Tapping a suggestion presses a Button, a UWP Button takes focus in its OnPointerPressed, and
+    //   OnUrlLostFocus runs from there SYNCHRONOUSLY - i.e. with the finger still down - and calls
+    //   this. m_urlFocused is already false by then, so the shift drops straight back to 0 and
+    //   ShiftSuggestPanel() translates the whole dropdown down by the keyboard height (220 DIP on the
+    //   device, stage.txt: "why=show shift=220.0" immediately followed by "why=url-blur shift=0.0").
+    //   A RenderTransform moves hit-testing with it, so the button is no longer under the finger when
+    //   it lifts: the Button keeps the capture but Click needs the release to be over the button, and
+    //   the panel - now behind the still-open keyboard - merely looked closed. The 220 DIP jump also
+    //   beat the m_suggestPressed guard, which is set one step later, when the same PointerPressed
+    //   finally bubbles up to the panel. So: while the dropdown is up, moving BACK to rest goes through
+    //   QueueKeyboardShiftRestore(), which stands down under a finger and is re-armed by the panel's
+    //   own pointer handlers. Growing the shift (the keyboard coming up) is never deferred, and
+    //   m_kbShiftBypass is that deferred call's one-shot ticket back in here.
+    if (shiftUp < m_kbShiftApplied && !bypass
+        && SuggestPanel && SuggestPanel->Visibility == Windows::UI::Xaml::Visibility::Visible) {
+        WriteStage((std::string("suggest kbshift why=") + why
+                    + " from=" + Dip(m_kbShiftApplied) + " to=" + Dip(shiftUp)
+                    + " pressed=" + (m_suggestPressed ? "1" : "0")
+                    + " act=defer").c_str());
+        QueueKeyboardShiftRestore(why);
+        return;
+    }
     m_kbShiftApplied = shiftUp;
     if (NavBarShift) NavBarShift->Y = -shiftUp;
     ShiftSuggestPanel(-shiftUp);
@@ -4341,6 +4367,8 @@ void MainPage::DispatchLiveFrame()
 //   InputPane's Hiding handler, which calls ApplyKeyboardShift("hide") and slides the chrome back.
 void MainPage::CommitUrlNavigation(Platform::String^ url)
 {
+    WriteStage((std::string("suggest commit len=")
+                + std::to_string(url ? url->Length() : 0)).c_str());
     NavigateTo(NormalizeUrl(url), true);
     try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
     CloseKeyboard();
@@ -4799,6 +4827,10 @@ void MainPage::OnUrlGotFocus(Platform::Object^, RoutedEventArgs^)
 void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
 {
     m_urlFocused = false;
+    WriteStage((std::string("suggest blur panel=")
+                + ((SuggestPanel && SuggestPanel->Visibility == Windows::UI::Xaml::Visibility::Visible) ? "1" : "0")
+                + " pressed=" + (m_suggestPressed ? "1" : "0")
+                + " shift=" + Dip(m_kbShiftApplied)).c_str());
     // Apotheosis (2026-09-04): editing is over - let the row go back to its usual ~2 s grace period.
     //   The InputPane Hiding handler does the same for a keyboard dismissed without losing focus;
     //   whichever runs last re-arms the timer, and RevealTitleRow() is idempotent.
@@ -4837,33 +4869,66 @@ void MainPage::QueueSuggestionHide()
         MainPage^ s = self.Get(); if (!s) return;
         if (s->m_suggestHideToken != token) return;   // focus came back / a newer hide supersedes this
         if (s->m_suggestPressed) return;              // a finger is on the dropdown: it stays
+        WriteStage("suggest hide act=collapse");
         s->HideSuggestions();
+    }));
+}
+
+// Apotheosis (suggestion tap, 2026-09-10): the deferred half of ApplyKeyboardShift — see the block
+//   there for why moving the dropdown back to rest cannot happen while a finger is on it. Same shape
+//   as QueueSuggestionHide: a token so a newer request wins, a stand-down while pressed, and the
+//   pointer handlers below as the re-arm. m_kbShiftBypass is the one-shot ticket that lets this call
+//   through the deferral test it was born from, so the two can never ping-pong.
+void MainPage::QueueKeyboardShiftRestore(const char* why)
+{
+    ++m_kbShiftToken;
+    unsigned long long token = m_kbShiftToken;
+    std::string reason = std::string(why ? why : "?") + "-deferred";
+    Platform::Agile<MainPage^> self(this);
+    this->Dispatcher->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, token, reason]() {
+        MainPage^ s = self.Get(); if (!s) return;
+        if (s->m_kbShiftToken != token) return;
+        if (s->m_suggestPressed) return;   // finger on the dropdown: the pointer handlers re-arm this
+        s->m_kbShiftBypass = true;
+        s->ApplyKeyboardShift(reason.c_str());
+        s->m_kbShiftBypass = false;
     }));
 }
 
 void MainPage::OnSuggestPointerDown(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
 {
+    // NB this runs AFTER Button::OnPointerPressed (class handlers go first, and ours is an instance
+    // handler on the panel above it, reached by bubbling), i.e. after the button took focus and after
+    // OnUrlLostFocus already ran. It can therefore only stop what that blur QUEUED, never what it did
+    // synchronously — which is exactly why the keyboard shift had to become deferrable too.
     m_suggestPressed = true;
     ++m_suggestHideToken;   // whatever the blur queued a moment ago must not fire under this finger
+    WriteStage("suggest ptr act=down");
 }
 
 void MainPage::OnSuggestPointerUp(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
 {
     // The Button raised its Click before this routed event got here (Button::OnPointerReleased is a
     // class handler, ours is an instance handler on the panel above it), so by now the navigation
-    // has already happened and hidden the panel itself. Re-arming the collapse only matters for a
-    // release that hit no button at all.
+    // has already happened and hidden the panel itself. Re-arming only matters for a release that hit
+    // no button at all — but the keyboard shift has to be re-armed either way, because a deferred
+    // restore that stood down under this finger has nobody else left to run it.
     m_suggestPressed = false;
+    WriteStage((std::string("suggest ptr act=up urlfocus=") + (m_urlFocused ? "1" : "0")).c_str());
     if (!m_urlFocused)
         QueueSuggestionHide();
+    QueueKeyboardShiftRestore("suggest-up");
 }
 
 void MainPage::OnSuggestPointerCaptureLost(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
 {
     // Capture goes to the dropdown's ScrollViewer when the finger starts panning the list. The
-    // finger is still down and no PointerReleased will reach us, so only the flag is cleared — the
-    // panel stays up until something else closes it (page tap, navigation, hardware Back).
+    // finger is still down and no PointerReleased will reach us, so the panel itself stays up until
+    // something else closes it (page tap, navigation, hardware Back) — but the chrome underneath must
+    // not stay parked at the keyboard offset for that whole time, so the shift is re-armed here too.
     m_suggestPressed = false;
+    WriteStage("suggest ptr act=capturelost");
+    QueueKeyboardShiftRestore("suggest-capturelost");
 }
 
 // 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。
@@ -4911,6 +4976,7 @@ void MainPage::ShowSuggestions(const std::wstring& query)
         //   page it had just loaded and the address bar in its editing chrome.
         btn->Click += ref new RoutedEventHandler([self, u](Platform::Object^, RoutedEventArgs^) {
             MainPage^ s = self.Get(); if (!s) return;
+            WriteStage("suggest click act=commit");
             s->m_suggestPressed = false;
             s->HideSuggestions();
             s->m_urlSyncing = true; s->UrlBox->Text = ref new String(u.c_str()); s->m_urlSyncing = false;
@@ -4918,6 +4984,11 @@ void MainPage::ShowSuggestions(const std::wstring& query)
         });
         SuggestList->Children->Append(btn);
     }
+    // Apotheosis (suggestion tap, 2026-09-10): the query itself is never logged — only how many
+    //   matches it produced and how long it was. stage.txt is pulled off the device wholesale.
+    WriteStage((std::string("suggest show n=") + std::to_string(matches.size())
+                + " qlen=" + std::to_string(query.size())
+                + " shift=" + Dip(m_kbShiftApplied)).c_str());
     SuggestPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
 }
 

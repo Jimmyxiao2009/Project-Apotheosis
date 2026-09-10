@@ -94,6 +94,9 @@ namespace Harness {
         // Apotheosis (suggestion tap, 2026-09-10): queue the deferred collapse of the dropdown that
         //   OnUrlLostFocus and the pointer-up handler share (token + "not while pressed" guard).
         void QueueSuggestionHide();
+        // Apotheosis (suggestion tap, 2026-09-10): the same treatment for the keyboard shift — the
+        //   dropdown may not be translated out from under a finger either. See ApplyKeyboardShift().
+        void QueueKeyboardShiftRestore(const char* why);
         void OnUrlGotFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlLostFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 编辑地址时白色 ✕ 顶掉刷新/停止键:清空地址栏,不夺焦(IsTabStop=False)。
@@ -700,6 +703,12 @@ namespace Harness {
         bool   m_kbVisible { false };
         double m_kbTop { 0.0 }, m_kbHeight { 0.0 };
         double m_kbShiftApplied { 0.0 };
+        // Apotheosis (suggestion tap, 2026-09-10): a shift back to rest while the suggestion dropdown
+        //   is up is deferred (QueueKeyboardShiftRestore) instead of applied — moving the panel is what
+        //   made a tapped suggestion do nothing. The token retires a superseded restore; the bypass is
+        //   the one-shot ticket with which the deferred call gets past that same test.
+        unsigned long long m_kbShiftToken { 0 };
+        bool   m_kbShiftBypass { false };
         // The keyboard offset of the two bottom-anchored content-row overlays. SuggestPanel has no
         //   other transform; TitleRow's own TitleRowShift is ANIMATED (reveal/collapse slide) and a
         //   Storyboard's value overrides a local one both while it runs and, with HoldEnd, afterwards
