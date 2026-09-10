@@ -363,7 +363,7 @@ static void runDeviceReplay()
 // -------------------------------------------------------------------------
 // The 0.1.9.34 session (2026-09-09, an image-heavy social timeline, then a news site, package 4 with
 // image stores on v2), replays/lumia-0.1.9.34-offscreen.txt: the `tg` lines of
-// lines 14 047 - 32 000 of build-driver\logs\20260909-151015\stage.txt, 17 909
+// lines 14 047 - 32 000 of that session's stage.txt, 17 909
 // lines over ~220 stores.
 //
 // What it adds to scenario 12 is the composite side of the trace being ABSENT.

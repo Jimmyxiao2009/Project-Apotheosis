@@ -1168,7 +1168,7 @@ void deviceRound1_failedUploadUndoesReady()
 }
 
 // -------------------------------------------------------------------------
-// Device round 3 (0.1.9.34, build-driver\logs\20260909-151015): an OFF-SCREEN
+// Device round 3 (0.1.9.34): an OFF-SCREEN
 // layer store rasters for ever.
 //
 // A post card that is scrolled out of the viewport gets an empty visible rect

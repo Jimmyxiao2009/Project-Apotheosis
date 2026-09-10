@@ -2121,7 +2121,7 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 // pumpLoop's "quiet" rule used to be DocumentLoader::isLoadingInAPISense(), i.e. "the frame tree
 // has any load in flight at all". On a news site that is never satisfied: the consent and
 // analytics stack keeps firing beacons and XHRs for as long as the page is open, so every
-// navigation ran to a cap instead. Measured on build-driver\logs\20260907-084407, the news site warm:
+// navigation ran to a cap instead. Measured on a device session, the news site warm:
 // the load event fired at 1645 ms, the pump held the engine thread until 3501 ms, and the six
 // transfers still open at that moment were draws / count / raw / get_site_data - trackers, none
 // of which paints a pixel.
@@ -5878,7 +5878,7 @@ int WebCoreGpuLayerInfo(char* out, int len)
         // tree below describing scroll position 300 rather than the page the user is looking at.
     }
     // Apotheosis (2026-09-07): the texmap diagnostics before the layer tree, and the tree capped to
-    // whatever is left. Device (0.1.9.25, build-driver\logs\20260907-140444\layertree.txt): the file
+    // whatever is left. Device (0.1.9.25, layertree.txt): the file
     // was exactly 65535 bytes of layerTreeAsText() and did not contain a single texmap line - the
     // tree of a real page fills any buffer, so everything appended after it is lost. The per-store
     // block is the smaller and, for a ghost/stale-tile question, the only useful half.
