@@ -889,6 +889,23 @@ MainPage::MainPage()
     ContentArea->ManipulationStarted += ref new Windows::UI::Xaml::Input::ManipulationStartedEventHandler(
         this, &MainPage::OnImageManipStarted);
 
+    // Apotheosis (suggestion tap, 2026-09-10): the dropdown must not collapse while a finger is down
+    //   on it — see m_suggestPressed for why it did, and why that ate the tap. AddHandler with
+    //   handledEventsToo is required: the Button inside marks the pointer events handled, and a
+    //   plain `SuggestPanel->PointerPressed +=` would never see them.
+    try {
+        if (SuggestPanel) {
+            SuggestPanel->AddHandler(Windows::UI::Xaml::UIElement::PointerPressedEvent,
+                ref new Windows::UI::Xaml::Input::PointerEventHandler(this, &MainPage::OnSuggestPointerDown), true);
+            SuggestPanel->AddHandler(Windows::UI::Xaml::UIElement::PointerReleasedEvent,
+                ref new Windows::UI::Xaml::Input::PointerEventHandler(this, &MainPage::OnSuggestPointerUp), true);
+            SuggestPanel->AddHandler(Windows::UI::Xaml::UIElement::PointerCanceledEvent,
+                ref new Windows::UI::Xaml::Input::PointerEventHandler(this, &MainPage::OnSuggestPointerUp), true);
+            SuggestPanel->AddHandler(Windows::UI::Xaml::UIElement::PointerCaptureLostEvent,
+                ref new Windows::UI::Xaml::Input::PointerEventHandler(this, &MainPage::OnSuggestPointerCaptureLost), true);
+        }
+    } catch (...) {}
+
     // 分享:注册一次 DataRequested(原生分享契约,App Container/1607 起可用)。分享当前页 URL+标题。
     try {
         auto dtm = Windows::ApplicationModel::DataTransfer::DataTransferManager::GetForCurrentView();
@@ -4313,24 +4330,26 @@ void MainPage::DispatchLiveFrame()
 }
 
 // ---- 工具栏事件 ----
-void MainPage::OnGo(Platform::Object^, RoutedEventArgs^) { NavigateTo(NormalizeUrl(UrlBox->Text), true); }
+// Apotheosis (suggestion tap, 2026-09-10): ONE address-bar commit path — Enter, the go button and a
+//   tapped suggestion all end up here, so they cannot drift apart again.
+//   Apotheosis (2026-09-07): confirming must also put the on-screen keyboard away — TryHide() alone
+//   is not enough while UrlBox still holds focus (same reasoning as DismissKeyboardForOverlay(): any
+//   control regaining focus re-evaluates the input pane and can bring it right back). Move focus onto
+//   the page's own focus sink first; that runs OnUrlLostFocus synchronously, which already restores
+//   the address-bar chrome/blur state and — since NavigateTo() above wrote m_currentUrl/UrlBox->Text
+//   together before returning — finds nothing to revert. CloseKeyboard()'s TryHide() then fires the
+//   InputPane's Hiding handler, which calls ApplyKeyboardShift("hide") and slides the chrome back.
+void MainPage::CommitUrlNavigation(Platform::String^ url)
+{
+    NavigateTo(NormalizeUrl(url), true);
+    try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
+    CloseKeyboard();
+}
+void MainPage::OnGo(Platform::Object^, RoutedEventArgs^) { CommitUrlNavigation(UrlBox->Text); }
 void MainPage::OnUrlKeyDown(Platform::Object^, Windows::UI::Xaml::Input::KeyRoutedEventArgs^ e)
 {
-    if (e->Key == Windows::System::VirtualKey::Enter) {
-        NavigateTo(NormalizeUrl(UrlBox->Text), true);
-        // Apotheosis (2026-09-07): confirming with Enter must also put the on-screen keyboard away —
-        //   TryHide() alone is not enough while UrlBox still holds focus (same reasoning as
-        //   DismissKeyboardForOverlay(): any control regaining focus re-evaluates the input pane and
-        //   can bring it right back). Move focus onto the page's own focus sink first; that runs
-        //   OnUrlLostFocus synchronously, which already restores the address-bar chrome/blur state
-        //   and — since NavigateTo() above wrote m_currentUrl/UrlBox->Text together before returning —
-        //   finds nothing to revert. CloseKeyboard()'s TryHide() then fires the InputPane's Hiding
-        //   handler, which calls ApplyKeyboardShift("hide") and slides the bottom chrome back down.
-        //   This is a separate path from suggestion-button navigation (Button::Click), so nothing
-        //   here double-navigates.
-        try { this->Focus(Windows::UI::Xaml::FocusState::Programmatic); } catch (...) {}
-        CloseKeyboard();
-    }
+    if (e->Key == Windows::System::VirtualKey::Enter)
+        CommitUrlNavigation(UrlBox->Text);
 }
 void MainPage::OnHome(Platform::Object^, RoutedEventArgs^) { NavigateTo(ref new String(g_homeUrl.c_str()), true); }
 void MainPage::OnBack(Platform::Object^, RoutedEventArgs^)
@@ -4641,7 +4660,9 @@ void MainPage::OnUrlAction(Platform::Object^, RoutedEventArgs^)
     std::wstring boxText = UrlBox->Text ? std::wstring(UrlBox->Text->Data()) : L"";
     bool pendingEdit = (m_currentUrl == L"about:home") ? !boxText.empty() : (boxText != m_currentUrl);
     HideSuggestions();
-    if (pendingEdit) NavigateTo(NormalizeUrl(UrlBox->Text), true);
+    // Apotheosis (suggestion tap, 2026-09-10): the "→" glyph commits typed text, so it takes the
+    //   same path as Enter (keyboard away, focus off the field) instead of only navigating.
+    if (pendingEdit) CommitUrlNavigation(UrlBox->Text);
     else Reload();
 }
 
@@ -4798,13 +4819,51 @@ void MainPage::OnUrlLostFocus(Platform::Object^, RoutedEventArgs^)
     }
     SetUrlEditingChrome(false);
     UpdateUrlActionGlyph();
+    QueueSuggestionHide();
+}
+
+// Apotheosis (suggestion tap, 2026-09-10): the deferred collapse, shared by the blur handler and the
+//   pointer-up handler. The Low-priority defer is the old fix for "collapsing synchronously kills
+//   the suggestion's own Click"; it was not enough, because with TOUCH the button's Click only comes
+//   on release while the blur already happened on press, and a Low-priority item runs during the idle
+//   moment in between. m_suggestPressed closes that window: while a finger is on the panel this hide
+//   stands down entirely, and the pointer-up handler queues it again.
+void MainPage::QueueSuggestionHide()
+{
     ++m_suggestHideToken;
     unsigned long long token = m_suggestHideToken;
     Platform::Agile<MainPage^> self(this);
     this->Dispatcher->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, token]() {
         MainPage^ s = self.Get(); if (!s) return;
-        if (s->m_suggestHideToken == token) s->HideSuggestions();
+        if (s->m_suggestHideToken != token) return;   // focus came back / a newer hide supersedes this
+        if (s->m_suggestPressed) return;              // a finger is on the dropdown: it stays
+        s->HideSuggestions();
     }));
+}
+
+void MainPage::OnSuggestPointerDown(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
+{
+    m_suggestPressed = true;
+    ++m_suggestHideToken;   // whatever the blur queued a moment ago must not fire under this finger
+}
+
+void MainPage::OnSuggestPointerUp(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
+{
+    // The Button raised its Click before this routed event got here (Button::OnPointerReleased is a
+    // class handler, ours is an instance handler on the panel above it), so by now the navigation
+    // has already happened and hidden the panel itself. Re-arming the collapse only matters for a
+    // release that hit no button at all.
+    m_suggestPressed = false;
+    if (!m_urlFocused)
+        QueueSuggestionHide();
+}
+
+void MainPage::OnSuggestPointerCaptureLost(Platform::Object^, Windows::UI::Xaml::Input::PointerRoutedEventArgs^)
+{
+    // Capture goes to the dropdown's ScrollViewer when the finger starts panning the list. The
+    // finger is still down and no PointerReleased will reach us, so only the flag is cleared — the
+    // panel stays up until something else closes it (page tap, navigation, hardware Back).
+    m_suggestPressed = false;
 }
 
 // 历史 + 书签子串匹配(url/title,忽略大小写),去重,最多 8 条。点项即导航。
@@ -4846,11 +4905,16 @@ void MainPage::ShowSuggestions(const std::wstring& query)
         btn->HorizontalAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
         btn->HorizontalContentAlignment = Windows::UI::Xaml::HorizontalAlignment::Stretch;
         btn->Content = row;
+        // Apotheosis (suggestion tap, 2026-09-10): a tapped suggestion commits exactly like Enter —
+        //   same normalisation, same focus move, same keyboard dismissal (CommitUrlNavigation).
+        //   It used to call NavigateTo() directly, which left the on-screen keyboard up over the
+        //   page it had just loaded and the address bar in its editing chrome.
         btn->Click += ref new RoutedEventHandler([self, u](Platform::Object^, RoutedEventArgs^) {
             MainPage^ s = self.Get(); if (!s) return;
+            s->m_suggestPressed = false;
             s->HideSuggestions();
             s->m_urlSyncing = true; s->UrlBox->Text = ref new String(u.c_str()); s->m_urlSyncing = false;
-            s->NavigateTo(ref new String(u.c_str()), true);
+            s->CommitUrlNavigation(ref new String(u.c_str()));
         });
         SuggestList->Children->Append(btn);
     }

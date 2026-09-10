@@ -81,6 +81,19 @@ namespace Harness {
         void OnUrlChanged(Platform::Object^ sender, Windows::UI::Xaml::Controls::TextChangedEventArgs^ e);
         void ShowSuggestions(const std::wstring& query);
         void HideSuggestions();
+        // Apotheosis (suggestion tap, 2026-09-10): commit one address-bar navigation — the single
+        //   path Enter, the go button and a tapped suggestion all take (normalise, navigate, move
+        //   focus off the field so OnUrlLostFocus restores the chrome, put the keyboard away).
+        void CommitUrlNavigation(Platform::String^ url);
+        // Apotheosis (suggestion tap, 2026-09-10): SuggestPanel's own pointer handlers (added with
+        //   handledEventsToo, so a Button inside it that marks the event handled is still seen) —
+        //   they keep the panel alive while a finger is down on it. See m_suggestPressed.
+        void OnSuggestPointerDown(Platform::Object^ sender, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e);
+        void OnSuggestPointerUp(Platform::Object^ sender, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e);
+        void OnSuggestPointerCaptureLost(Platform::Object^ sender, Windows::UI::Xaml::Input::PointerRoutedEventArgs^ e);
+        // Apotheosis (suggestion tap, 2026-09-10): queue the deferred collapse of the dropdown that
+        //   OnUrlLostFocus and the pointer-up handler share (token + "not while pressed" guard).
+        void QueueSuggestionHide();
         void OnUrlGotFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnUrlLostFocus(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 编辑地址时白色 ✕ 顶掉刷新/停止键:清空地址栏,不夺焦(IsTabStop=False)。
@@ -462,6 +475,14 @@ namespace Harness {
         //   scheduled from OnUrlLostFocus — see its definition for why the collapse cannot be
         //   synchronous. Bumped on every LostFocus/GotFocus so a stale deferred hide is a no-op.
         unsigned long long m_suggestHideToken { 0 };
+        // Apotheosis (suggestion tap, 2026-09-10): a finger is down inside SuggestPanel. A UWP Button
+        //   takes focus in its OnPointerPressed, so tapping a suggestion runs OnUrlLostFocus while the
+        //   finger is STILL DOWN; the deferred collapse it queues then runs during that idle moment
+        //   (Low priority = as soon as the thread has nothing else to do) and collapses the panel out
+        //   from under the finger, so the button never gets to raise Click on release and the tap did
+        //   nothing but close the list. While this flag is set the deferred collapse stands down; the
+        //   pointer-up handler clears it and re-arms the collapse if the field is still unfocused.
+        bool m_suggestPressed { false };
         // 标签集合(Mode A:仅活动标签有引擎会话)。
         std::vector<Tab> m_tabs;
         int m_activeTab { 0 };
