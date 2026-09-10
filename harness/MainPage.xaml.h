@@ -228,6 +228,12 @@ namespace Harness {
         void ShowLinkMenu(const std::wstring& url);
         void HideLinkMenu(const char* why);          // why -> stage.txt "ctx dismiss why="
         void CancelPendingLinkMenu(const char* why); // hold turned into a pan: drop the answer in flight
+        // Apotheosis (0.1.9.46): the card is placed in DIP against the window it was opened in, so
+        //   a rotation (or the software navigation bar moving an edge) can leave it half off the
+        //   screen. Record that window when the hold starts, and dismiss the card when it changes -
+        //   the title row coming and going deliberately does not count as a change.
+        void NoteLinkMenuLayout();
+        void DismissLinkMenuIfLayoutMoved();   // -> stage.txt "ctx dismiss why=rotate"
         // Park a URL as a new tab WITHOUT switching to it. On this port's Mode A tab model that is a
         // queued tab, not a background load - see the comment on the definition.
         void OpenUrlInBackgroundTab(const std::wstring& url);
@@ -702,6 +708,9 @@ namespace Harness {
         //   menu will act on; it never leaves this object and is never traced.
         bool   m_ctxPending { false };
         double m_ctxDipX { 0.0 }, m_ctxDipY { 0.0 };
+        // Apotheosis (0.1.9.46): the window and the four insets the card was placed against.
+        double m_ctxWinW { 0.0 }, m_ctxWinH { 0.0 };
+        double m_ctxInsetL { 0.0 }, m_ctxInsetT { 0.0 }, m_ctxInsetR { 0.0 }, m_ctxInsetB { 0.0 };
         std::wstring m_ctxUrl;
         // Apotheosis (pinch on map widgets, 2026-09-06): this pinch is being fed to the page as
         //   ctrl+wheel notches (WebCoreZoomWheelAt) rather than scaled with WebCoreSetPageScale.

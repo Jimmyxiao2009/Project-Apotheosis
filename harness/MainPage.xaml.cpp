@@ -1881,6 +1881,11 @@ void MainPage::ApplyViewInsets()
     //   still owes on top of it has changed with it — recompute from the same single formula rather
     //   than letting the two mechanisms add up. No-op (and silent) when nothing is owed.
     RefreshKeyboardMetrics("insets");
+    // Apotheosis (0.1.9.46): the edges the link card was placed against have just moved - the
+    //   software navigation bar appearing or going away is enough, and in landscape it moves the
+    //   RIGHT edge the card is clamped to. Dismiss rather than re-place; the title row's own
+    //   comings and goings do not reach this line's test (see DismissLinkMenuIfLayoutMoved).
+    DismissLinkMenuIfLayoutMoved();
 }
 
 // Apotheosis (rotation with the keyboard up, 0.1.9.43): m_kbTop/m_kbHeight are written once, by
@@ -2608,6 +2613,7 @@ void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::Holdin
     // the hit test runs at, so a report of "the menu was in the wrong place" can be told apart from
     // "the menu was about the wrong link".
     m_ctxPending = true;
+    NoteLinkMenuLayout();   // Apotheosis (0.1.9.46): judge the answer against the window we held in
     try {
         auto rp = e->GetPosition(RootGrid);
         m_ctxDipX = rp.X;
@@ -5436,6 +5442,7 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
 {
     if (!LinkMenu || !LinkMenuCard || url.empty()) return;
     m_ctxUrl = url;
+    NoteLinkMenuLayout();   // Apotheosis (0.1.9.46): what the card is placed IN - see DismissLinkMenuIfLayoutMoved
     if (LinkMenuTarget) LinkMenuTarget->Text = ref new String(LinkMenuTargetText(url).c_str());
     // Written on every open rather than translated in place: the menu is filled from code, so it is
     // not part of the XAML tree kI18n/TranslateTree walk over (see the language switch).
@@ -5517,6 +5524,52 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
         + " place=" + place
         + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)
         + " inset=" + std::to_string((int)m_lastInsetLeft) + "," + std::to_string((int)m_lastInsetRight)).c_str());
+}
+
+// Apotheosis (0.1.9.46): the card is placed once, in DIP margins inside RootGrid's padded box,
+// against the window it was opened in. A rotation replaces that box (360x640 becomes 640x360 here)
+// and a software navigation bar appearing or going away moves its edges, so the card - and with it
+// the "open in new tab" row the finger is aiming at - can end up half off the screen or under the
+// buttons. Andreas' decision for this round: do not re-place it, DISMISS it. A context menu is a
+// momentary thing; the link is still under the finger.
+//
+// What must NOT dismiss it: the title row coming and going. That is a size change of the content
+// area (and an ApplyViewInsets pass) like any other, and ShowLinkMenu itself raises the row - so
+// judging "the layout moved" by a panel size alone would close the card at the moment it opened.
+// The window's own size and the four insets are the honest test: neither moves for the title row,
+// both move for a rotation and for the navigation bar.
+void MainPage::NoteLinkMenuLayout()
+{
+    m_ctxWinW = 0.0; m_ctxWinH = 0.0;
+    try {
+        auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (win) { m_ctxWinW = (double)win->Bounds.Width; m_ctxWinH = (double)win->Bounds.Height; }
+    } catch (...) {}
+    m_ctxInsetL = m_lastInsetLeft;
+    m_ctxInsetT = m_lastInsetTop;
+    m_ctxInsetR = m_lastInsetRight;
+    m_ctxInsetB = m_lastInsetBottom;
+}
+
+// Called from both paths that see the layout change - the presenting panel's SizeChanged (the
+// rotation itself) and ApplyViewInsets (the navigation bar, the status bar). Whichever arrives
+// first dismisses; the other one finds nothing open. A hold whose answer is still in flight is
+// dropped too: it would open a card placed against the window that has just gone.
+void MainPage::DismissLinkMenuIfLayoutMoved()
+{
+    const bool open = (LinkMenu && LinkMenu->Visibility == Windows::UI::Xaml::Visibility::Visible);
+    if (!open && !m_ctxPending) return;
+    double winW = 0.0, winH = 0.0;
+    try {
+        auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (win) { winW = (double)win->Bounds.Width; winH = (double)win->Bounds.Height; }
+    } catch (...) {}
+    if (winW == m_ctxWinW && winH == m_ctxWinH
+        && m_lastInsetLeft == m_ctxInsetL && m_lastInsetTop == m_ctxInsetT
+        && m_lastInsetRight == m_ctxInsetR && m_lastInsetBottom == m_ctxInsetB)
+        return;
+    if (m_ctxPending) CancelPendingLinkMenu("rotate");
+    if (open) HideLinkMenu("rotate");
 }
 
 void MainPage::HideLinkMenu(const char* why)
@@ -6888,6 +6941,7 @@ void MainPage::OnPresentPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::S
     //   VisibleBoundsChanged path calls this too, whichever of the two arrives with the final
     //   numbers wins and the other one is a no-op.
     RefreshKeyboardMetrics("panel");
+    DismissLinkMenuIfLayoutMoved();   // Apotheosis (0.1.9.46): a card placed in the old window
 }
 
 void MainPage::EnableGpu()
