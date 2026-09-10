@@ -6420,6 +6420,25 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
         view->setScrollPosition(settled);
         doc->updateLayoutIgnorePendingStylesheets();
     }
+
+    // Apotheosis (rotation with the keyboard up, 0.1.9.43): the focused text field is normally
+    // kept in view by the engine itself - but only when something SCROLLS. A rotation changes the
+    // viewport instead: the field the user is typing into can end up anywhere in the new layout
+    // (in landscape the visible strip above the keyboard is a fraction of what it was), and the
+    // keyboard stays up, so typing continued into a field nobody could see. Only editable
+    // elements, and only when the relayout actually moved it out of view - scrollIntoViewIfNeeded
+    // is a no-op for a field that is still visible, so an ordinary rotation costs nothing.
+    if (RefPtr<Element> focused = doc->focusedElement()) {
+        bool editable = focused->hasEditableStyle();
+        if (!editable && is<HTMLInputElement>(*focused))
+            editable = downcast<HTMLInputElement>(*focused).isTextField();
+        if (!editable && is<HTMLTextAreaElement>(*focused))
+            editable = true;
+        if (editable) {
+            focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
+            doc->updateLayoutIgnorePendingStylesheets();
+        }
+    }
     extractLinks(doc.get(), h);
 
     g_gpuForceFullNext = true;   // tiles were rastered for the old viewport - none of them is trustworthy

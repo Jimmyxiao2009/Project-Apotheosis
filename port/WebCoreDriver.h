@@ -344,6 +344,10 @@ int WebCoreSessionPaint(uint8_t* outRGBA);
 // forces the next composite to re-raster the whole tree, because every tile was painted for the
 // old viewport.
 //
+// A focused editable element is scrolled back into view after the relayout
+//   (scrollIntoViewIfNeeded): the keyboard survives a rotation, so the field being typed
+//   into has to survive it too. No-op when the field is still visible.
+//
 // outRGBA: as everywhere else, the software path fills it with w*h*4 bytes and the GPU
 //   direct-present path does not touch it (the frame goes to the swap chain). It may be null ONLY
 //   when there is no live session, which is also the case where this call does nothing but record

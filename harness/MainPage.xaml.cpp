@@ -1806,7 +1806,27 @@ void MainPage::ApplyViewInsets()
     // The bottom padding just moved the nav bar's resting position, so whatever the keyboard shift
     //   still owes on top of it has changed with it — recompute from the same single formula rather
     //   than letting the two mechanisms add up. No-op (and silent) when nothing is owed.
-    ApplyKeyboardShift("insets");
+    RefreshKeyboardMetrics("insets");
+}
+
+// Apotheosis (rotation with the keyboard up, 0.1.9.43): m_kbTop/m_kbHeight are written once, by
+// the InputPane Showing handler, and a rotation does not raise Showing again - the keyboard simply
+// becomes a different rectangle (it is much shorter in landscape). Everything computed from those
+// two numbers was therefore an orientation out of date until the keyboard was dismissed and
+// brought back. Re-query first, then let ApplyKeyboardShift decide; it is a no-op when nothing
+// moved and it is the only writer of the shift. UI THREAD ONLY.
+void MainPage::RefreshKeyboardMetrics(const char* why)
+{
+    if (m_kbVisible) {
+        try {
+            auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
+            if (ip) {
+                Windows::Foundation::Rect occ = ip->OccludedRect;
+                if (occ.Height > 1.0f) { m_kbTop = occ.Y; m_kbHeight = occ.Height; }
+            }
+        } catch (...) {}
+    }
+    ApplyKeyboardShift(why);
 }
 
 // ---- 持久化 ----
@@ -6529,6 +6549,10 @@ void MainPage::OnPresentPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::S
 {
     if (!e || e->NewSize.Width <= 1.0f || e->NewSize.Height <= 1.0f) return;
     UpdateEngineViewport("panel", false);
+    // The keyboard rectangle changes with the orientation without raising Showing again; the
+    //   VisibleBoundsChanged path calls this too, whichever of the two arrives with the final
+    //   numbers wins and the other one is a no-op.
+    RefreshKeyboardMetrics("panel");
 }
 
 void MainPage::EnableGpu()

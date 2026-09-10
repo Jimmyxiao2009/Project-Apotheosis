@@ -341,6 +341,9 @@ namespace Harness {
         //   address-bar editing state) and applies the difference; idempotent, so every input that can
         //   change one of the three just calls it. `why` only lands in the stage.txt line. UI thread only.
         void ApplyKeyboardShift(const char* why);
+        // Apotheosis (0.1.9.43): re-read the InputPane rectangle (it changes on a rotation without a
+        //   new Showing event), then ApplyKeyboardShift. UI thread only.
+        void RefreshKeyboardMetrics(const char* why);
         // Apotheosis (2837ce0 review item 1): the title/toast row auto-hides. Reveal() shows it and
         //   — unless a page is loading — arms the ~2 s hide; Collapse() fades it out and hands its
         //   strip back to the content area (ApplyViewInsets' titleH). Every write to TitleText::Text
