@@ -267,17 +267,31 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 // should zoom the PAGE (Safari/mobile-Chrome semantics) instead of the harness treating it as two
 // ordinary clicks. Read-only: no event dispatched, no session/frame mutated, safe to call from the
 // tap-hold path before deciding whether to actually click.
-//   *outZoomable: 1 if double-tap-to-zoom applies here, 0 if the page opted out — CSS
-//     touch-action other than auto on the hit element or an ancestor (mirrors WebKit's own
-//     Element::allowsDoubleTapGesture(), compiled out on this port since ENABLE_TOUCH_EVENTS=0),
-//     or the document's viewport meta disabling zoom (user-scalable=no, or minimum-scale ==
-//     maximum-scale). 0 also on no session/no hit.
-//   *outTargetScale: the scale a double tap here should animate to (already clamped to the
-//     driver's own [1.0, 3.0] double-tap range, a subrange of WebCoreSetPageScale's [0.5, 6.0]):
-//     if the current page scale is already > 1.05, this is 1.0 (double tap = toggle back to 1:1,
-//     the universal mobile-browser rule); otherwise it is viewport-width / (width of the innermost
-//     block-level ancestor of the hit point that is narrower than the layout viewport, Safari's
-//     "zoom to column" heuristic), or 2.0 when no such ancestor exists.
+// The rules, in the order they are applied (0.1.9.39):
+//   1. Current page scale > 1.05 — the harness' own pinch zoom — always wins: zoomable=1,
+//      target 1.0, whatever the page says. A double tap must always be able to undo a pinch,
+//      or an opted-out page traps the user at the scale the pinch left behind.
+//   2. Page opted out of zooming altogether (viewport meta user-scalable=no, or
+//      minimum-scale == maximum-scale): not zoomable.
+//   3. Page is mobile-optimised (viewport meta with width=device-width, or width unset with
+//      initial-scale=1) — Blink's WebViewImpl::ShouldDisableDesktopWorkarounds(): not zoomable.
+//      This is what makes taps immediate on every well-behaved mobile site, because the harness
+//      only pays the double-tap hold interval where a zoom could actually happen.
+//   4. CSS touch-action other than auto on the hit element or an ancestor: not zoomable
+//      (mirrors WebKit's own Element::allowsDoubleTapGesture(), compiled out on this port
+//      since ENABLE_TOUCH_EVENTS=0).
+//   5. Otherwise zoomable, at the target below.
+//   *outZoomable: 1 if double-tap-to-zoom applies here, 0 otherwise (including no session and
+//     no hit, and including a target that would not move the page, see below).
+//   *outTargetScale: the scale a double tap here should animate to, clamped to the driver's own
+//     [1.25, 3.0] double-tap range (a subrange of WebCoreSetPageScale's [0.5, 6.0]): 1.0 in
+//     case 1 above; otherwise viewport-width / (width of the innermost block-level ancestor of
+//     the hit point narrower than 90 % of the layout viewport — Safari's "zoom to column"
+//     heuristic), or 2.0 when no such ancestor exists. A block from 90 % of the viewport upwards
+//     is the page's own full-width layout, not a column: zooming to it is a no-op.
+//     A target within ±5 % of the current scale is never returned - it is reported as
+//     zoomable=0 instead, so the caller forwards a clickCount=2 click rather than animating
+//     to where it already is.
 //   *outAnchorX/*outAnchorY: the anchor for that zoom, in the same viewport/bitmap px
 //     WebCoreSetPageScale takes as focalX/focalY — always just (x,y) echoed back, so the caller
 //     does not have to remember the tap point across the hold interval.

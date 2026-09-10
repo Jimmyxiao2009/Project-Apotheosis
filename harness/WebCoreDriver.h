@@ -251,14 +251,25 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 // Apotheosis(双击缩放,2026-09-09):命中测试 (x,y),回答这里的第二次点击是否应该缩放页面
 // (Safari/移动 Chrome 语义)而不是被当成普通的第二次点击转发。只读:不派发事件,不改会话/文档
 // 状态——可以在 harness 还没决定要不要真的点击之前,在"按住"路径里调用。
-//   *outZoomable:1=此处适用双击缩放,0=页面主动关闭了它——命中元素或某个祖先的 CSS touch-action
-//     非 auto(镜像 WebKit 自己的 Element::allowsDoubleTapGesture(),此 port 因 ENABLE_TOUCH_EVENTS=0
-//     被编掉,故在此重新实现),或文档 viewport meta 关闭了缩放(user-scalable=no,或
-//     minimum-scale == maximum-scale)。无会话/未命中也是 0。
-//   *outTargetScale:双击应动画到的尺度(已钳到本驱动自己的双击区间 [1.0, 3.0],是
-//     WebCoreSetPageScale [0.5, 6.0] 的子区间):若当前页面尺度已 > 1.05,答 1.0(双击=回到
-//     1:1,移动浏览器的通用规则);否则答 视口宽度 / (命中点最内层、比布局视口窄的块级祖先宽度)
-//     (Safari 的"缩放到栏"启发式),没有这样的祖先时答 2.0。
+// 判定顺序(0.1.9.39):
+//   1. 当前页面尺度 > 1.05(= harness 自己的捏合缩放)一律优先:zoomable=1、target=1.0,
+//      不管页面怎么说。双击必须永远能撤销一次捏合,否则关掉双击缩放的页面会把用户
+//      困在捏合留下的尺度上。
+//   2. 页面整体关闭缩放(viewport meta user-scalable=no,或 minimum-scale == maximum-scale):不缩放。
+//   3. 页面是移动端优化的(viewport meta 带 width=device-width,或未设 width 而 initial-scale=1)
+//      —— 即 Blink 的 WebViewImpl::ShouldDisableDesktopWorkarounds():不缩放。这条让所有规矩的
+//      移动站点点击立即生效,因为 harness 只在真可能缩放的地方才付双击等待间隔。
+//   4. 命中元素或某个祖先的 CSS touch-action 非 auto:不缩放(镜像 WebKit 自己的
+//      Element::allowsDoubleTapGesture(),此 port 因 ENABLE_TOUCH_EVENTS=0 被编掉,故在此重新实现)。
+//   5. 否则可缩放,目标尺度见下。
+//   *outZoomable:1=此处适用双击缩放,0=不适用(含无会话/未命中,也含"目标尺度不会真的改变
+//     页面"的情况,见下)。
+//   *outTargetScale:双击应动画到的尺度(已钳到本驱动自己的双击区间 [1.25, 3.0],是
+//     WebCoreSetPageScale [0.5, 6.0] 的子区间):上面第 1 条答 1.0;否则答 视口宽度 /
+//     (命中点最内层、宽度小于布局视口 90% 的块级祖先宽度)(Safari 的"缩放到栏"启发式),
+//     没有这样的祖先时答 2.0。宽度在视口 90% 以上的块是页面自己的整宽布局而非栏,缩放到它
+//     等于什么都不做。与当前尺度相差不到 ±5% 的目标永远不会被返回——那种情况改答 zoomable=0,
+//     调用方转发 clickCount=2 的点击,而不是动画到原地。
 //   *outAnchorX/*outAnchorY:这次缩放的锚点,同 WebCoreSetPageScale 的 focalX/focalY 一样的
 //     视口/位图像素——总是原样回传 (x,y),调用方不必在按住间隔内自己记着点击点。
 // 任一输出指针可为 null。返回 kOK,或负数错误(无会话时也把 outZoomable 置 0,只查它的调用方

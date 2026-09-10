@@ -691,6 +691,20 @@ static float SnapAndClampPageScale(float s)
     return s;
 }
 
+// Apotheosis (double-tap zoom, 0.1.9.39): the same clamp WITHOUT the ±33 % snap to 1:1. That snap
+// exists so that a pinch, whose scale is whatever the fingers happened to leave behind, comes to
+// rest at exactly 1.0 instead of drifting a few percent every time. A double-tap target is not
+// that: the driver computed a deliberate number (the width of the column under the finger, or a
+// flat 2×) and a target of 1.25-1.32 would be snapped straight back to 1.0, i.e. a double tap that
+// visibly does nothing. Only WebCoreSetPageScale's own [0.5, 6.0] range still applies.
+static float ClampPageScale(float s)
+{
+    if (!(s > 0.0f)) s = 1.0f;
+    if (s < kMinPageScale) s = kMinPageScale;
+    if (s > kMaxPageScale) s = kMaxPageScale;
+    return s;
+}
+
 // Apotheosis (package 7 feedback: "clamp the live preview to the document edges like
 //   Safari/Chrome — content never leaves the viewport at >=1, centred below 1, small rubber-band
 //   allowed"): how far the live pinch preview is allowed to drift from a clean anchor-only scale,
@@ -2129,15 +2143,25 @@ void MainPage::DtapReset()
 
 void MainPage::DtapCompleteSecond()
 {
-    const bool zoomable = m_dtapPolicyReady && m_dtapZoomable;
-    const float target = m_dtapTargetScale;
+    // Apotheosis (0.1.9.39): the driver's "zoomable" is about the POINT; whether the page actually
+    // moves is decided here, after the harness' own clamp, because only the harness knows the live
+    // page scale and its [0.5, 6.0] range. A target that lands within 5 % of where we already are
+    // is not a zoom - it is a dead double tap, which is exactly what the 0.1.9.38 log recorded as
+    // "scale=1.0->1.0 act=zoom" three times on a mobile article. Such a tap gets the clickCount=2
+    // click instead, so the page's own dblclick handling still works, and the trace says so.
+    const float cur = (m_pageScale > 0.0f) ? m_pageScale : 1.0f;
+    const float target = ClampPageScale(m_dtapTargetScale);
+    const bool moves = std::fabs(target - cur) > 0.05f * cur;
+    const bool zoomable = m_dtapPolicyReady && m_dtapZoomable && moves;
     const double dipX = m_dtapDipX, dipY = m_dtapDipY;
     const int px = m_dtapPx, py = m_dtapPy;
     const bool blocked = (!m_sessionActive || m_loading || m_interacting);
     DtapTrace("second", std::string("at=") + std::to_string(px) + "," + std::to_string(py)
         + " zoomable=" + (zoomable ? "1" : "0")
+        + " policy=" + ((m_dtapPolicyReady && m_dtapZoomable) ? "1" : "0")
+        + " moves=" + (moves ? "1" : "0")
         + " ready=" + (m_dtapPolicyReady ? "1" : "0")
-        + " scale=" + Dip(m_pageScale) + "->" + Dip(zoomable ? target : m_pageScale)
+        + " scale=" + Dip(cur) + "->" + Dip(zoomable ? target : cur)
         + " act=" + (blocked ? "drop:busy" : (zoomable ? "zoom" : "dblclick")));
     DtapReset();
     if (blocked)
@@ -3911,7 +3935,7 @@ void MainPage::RunDoubleTapZoom(double dipX, double dipY, float targetScale)
     SetPinchAnchor(dipX, dipY);
     m_liveScale = 1.0f;
     ApplyLiveZoom();   // seeds the preview at scale 1 around this anchor before the spring animates it
-    float target = SnapAndClampPageScale(targetScale);
+    float target = ClampPageScale(targetScale);   // no ±33 % 1:1 snap here, see ClampPageScale
     float targetLive = (m_pageScale > 0.0f) ? target / m_pageScale : 1.0f;
     if (!(targetLive > 0.0f)) targetLive = 1.0f;
     SpringBackZoom(targetLive, target);   // eases the preview to targetLive, then PinchCommit(target)

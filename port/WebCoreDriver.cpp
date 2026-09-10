@@ -5607,7 +5607,22 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     if (!hit)
         return kOK;   // nothing under the point: leave *outZoomable at 0, not an error
 
-    // Apotheosis: document-level opt-out first (cheap, one struct already on Document) — a page
+    // Apotheosis (0.1.9.38): "already zoomed" is decided BEFORE any opt-out. The page scale above
+    // 1:1 is the harness' own pinch zoom, not something the page asked for, so a double tap must
+    // always be able to undo it — otherwise a page that opts out of double-tap-to-zoom (a map, a
+    // site with touch-action or user-scalable=no) traps the user at whatever scale the pinch left
+    // behind, which is exactly what the 0.1.9.38 log shows: two double taps at scale 3.3 answered
+    // zoomable=0 and dispatched a dblclick the page did nothing with.
+    RefPtr<Page> page = g_session->page;
+    float curScale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(curScale > 0.0f)) curScale = 1.0f;
+    if (curScale > 1.05f) {
+        if (outZoomable) *outZoomable = 1;
+        if (outTargetScale) *outTargetScale = 1.0f;
+        return kOK;
+    }
+
+    // Apotheosis: document-level opt-out (cheap, one struct already on Document) — a page
     // whose viewport meta disables zoom is asking every zoom gesture, not just pinch, to leave it
     // alone. userZoom is a tri-state float (ValueAuto=-1 unset, else the parsed boolean as 0.0/1.0 —
     // see ViewportArguments.h / dom/ViewportArguments.cpp findBooleanValue()); minZoom==maxZoom only
@@ -5617,6 +5632,23 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
         || (va.minZoom != ViewportArguments::ValueAuto && va.maxZoom != ViewportArguments::ValueAuto
             && va.minZoom == va.maxZoom);
     if (viewportDisablesZoom)
+        return kOK;
+
+    // Apotheosis (0.1.9.38): a mobile-optimised page is not double-tap-zoomable at all, which is
+    // what Chrome does and the single biggest reason double-tap-to-zoom feels right there. Blink
+    // calls this WebViewImpl::ShouldDisableDesktopWorkarounds(): a <meta name=viewport> that either
+    // asks for width=device-width, or leaves the width alone and pins initial-scale to 1, has laid
+    // itself out for this screen already — there is no "column narrower than the viewport" to zoom
+    // to, so the zoom would be a no-op, and the price of asking is that EVERY tap on such a page is
+    // held for the double-tap interval before it reaches the DOM. The 0.1.9.38 device log is that
+    // price being paid for nothing: three double taps on a mobile news article all came back
+    // zoomable=1 with target 1.0/1.1/1.3, i.e. the block heuristic below found the article column
+    // to be as wide as the viewport and asked to "zoom" to the scale we were already at.
+    // Type::Implicit means no viewport meta tag at all, i.e. a desktop-layout page.
+    const bool mobileOptimizedViewport = va.type != ViewportArguments::Type::Implicit
+        && (va.width == ViewportArguments::ValueDeviceWidth
+            || (va.width == ViewportArguments::ValueAuto && va.zoom == 1.0f));
+    if (mobileOptimizedViewport)
         return kOK;
 
     // Apotheosis: same open-shadow descent as dragWidgetAtPoint()/WebCoreIsScrollableAt — a point
@@ -5647,32 +5679,33 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
             break;
     }
 
-    if (outZoomable) *outZoomable = 1;
-
-    RefPtr<Page> page = g_session->page;
-    float curScale = page ? page->pageScaleFactor() : 1.0f;
-    if (!(curScale > 0.0f)) curScale = 1.0f;
-    if (curScale > 1.05f) {
-        if (outTargetScale) *outTargetScale = 1.0f;   // already zoomed: a double tap always returns to 1:1
-        return kOK;
-    }
-
     // Apotheosis: "zoom to column" — the innermost block-level ancestor of the hit point that is
     // narrower than the layout viewport (Safari's own double-tap-zoom heuristic), walked from the
     // hit element up towards <html> so the FIRST candidate found is the innermost/smallest one.
     // boundingClientRect() and (x,y) are read in the same viewport/bitmap px space this driver
     // already uses them in elsewhere with no extra scale conversion (extractLinks, dragWidgetAtPoint)
-    // — exact at scale 1.0 and close enough up to the 1.05 threshold just checked above; a bigger
+    // — exact at scale 1.0 and close enough up to the 1.05 threshold checked above; a bigger
     // current scale would need an extra factor of curScale (see WebCoreSetPageScale's own derivation
     // of engine-px-vs-CSS-px), which this branch never runs at.
+    //
+    // Apotheosis (0.1.9.38): a block only counts as a "column" if it is meaningfully narrower than
+    // the viewport. The old test was w < viewportW, and on a page whose content block fills the
+    // screen that yields viewportW/(viewportW + 8) ≈ 1.0 — a "zoom" to the scale we are already at,
+    // i.e. a dead double tap, which is what the device log showed as target=1.0/1.1/1.3. Anything
+    // from 90 % of the viewport upwards is the page's own full-width layout, not a column, and the
+    // right answer there is the plain 2× a touch browser gives you.
     const float viewportW = static_cast<float>(g_session->w);
     const float kZoomPadding = 8.0f;   // small breathing room so the column edge is not flush with the screen edge
-    float targetScale = 2.0f;          // Safari's fallback when no narrower block ancestor exists
+    const float kColumnMaxWidth = 0.9f * viewportW;
+    const float kFallbackScale = 2.0f; // no narrower block ancestor: what Safari/Chrome zoom to
+    const float kMinZoomTarget = 1.25f;// below this the zoom is not worth the animation
+    const float kMaxZoomTarget = 3.0f;
+    float targetScale = kFallbackScale;
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (RenderObject* r = e->renderer()) {
             if (r->isRenderBlock()) {
                 float w = e->boundingClientRect().width();
-                if (w > 0.0f && w < viewportW) {
+                if (w > 0.0f && w < kColumnMaxWidth) {
                     targetScale = viewportW / (w + kZoomPadding);
                     break;
                 }
@@ -5681,8 +5714,20 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
         if (e.get() == root)
             break;
     }
-    if (targetScale < 1.0f) targetScale = 1.0f;
-    if (targetScale > 3.0f) targetScale = 3.0f;
+    if (targetScale < kMinZoomTarget) targetScale = kMinZoomTarget;
+    if (targetScale > kMaxZoomTarget) targetScale = kMaxZoomTarget;
+
+    // Apotheosis (0.1.9.38): a target within ±5 % of where we already are is not a zoom. Report it
+    // as "not zoomable" so the harness forwards the second tap as a clickCount=2 click instead of
+    // running a spring animation that ends exactly where it started. With the clamp above this
+    // cannot trigger from the block heuristic any more; it is the invariant the caller relies on.
+    const float delta = (targetScale > curScale) ? (targetScale - curScale) : (curScale - targetScale);
+    if (delta <= 0.05f * curScale) {
+        if (outZoomable) *outZoomable = 0;
+        return kOK;
+    }
+
+    if (outZoomable) *outZoomable = 1;
     if (outTargetScale) *outTargetScale = targetScale;
     return kOK;
 }
