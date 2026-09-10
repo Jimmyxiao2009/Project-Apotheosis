@@ -6363,7 +6363,7 @@ bool MainPage::ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH)
 // UI THREAD ONLY. Re-measure and, if the viewport moved, hand the new size to the engine.
 // `force` re-sends the current size even when it has not changed (used right after WebCoreGpuInit,
 // where the driver's GL viewport and a session that may already exist have to be brought together).
-void MainPage::UpdateEngineViewport(const char* why, bool force)
+void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int forceH)
 {
     // A surface pinned to a fixed size (the no-arranged-panel fallback in EnableGpu) cannot follow
     //   the panel, and telling the driver otherwise would only desync the two. Rotation keeps
@@ -6372,8 +6372,14 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
     if (m_gpuOn && !m_engineFollowsGpuPanel)
         return;
     int ew = 0, eh = 0;
-    if (!ComputeEngineViewport(m_gpuPresent, ew, eh))
+    if (forceW > 0 && forceH > 0) {
+        // Adopt a measured surface verbatim (surface-mismatch below): the GL viewport has to be
+        //   the framebuffer's own size, not a recomputed panel x scale that can round elsewhere.
+        ew = forceW;
+        eh = forceH;
+    } else if (!ComputeEngineViewport(m_gpuPresent, ew, eh)) {
         return;
+    }
     const int oldW = kW, oldH = kH;
     if (!force && ew == oldW && eh == oldH)
         return;
@@ -6450,26 +6456,66 @@ void MainPage::UpdateEngineViewport(const char* why, bool force)
                 const bool surfaceKnown = (surfW > 0 && surfH > 0 && ew > 0 && eh > 0);
                 const bool surfaceDiffers = surfaceKnown
                     && (std::abs(surfW - ew) > 2 || std::abs(surfH - eh) > 2);
-                if (surfaceDiffers && s->m_engineFollowsGpuPanel && s->m_engineCalibrations < 2) {
-                    ++s->m_engineCalibrations;
-                    const long long px = (long long)surfW * (long long)surfH;
-                    if (px <= (long long)kMaxEngineViewportPixels) {
-                        // Correct OUR factor by exactly the ratio ANGLE applied, so that
-                        //   ComputeEngineViewport() produces the surface from now on - in this
-                        //   orientation and in the other one, since the same ratio applies to
-                        //   both. Yes, this moves m_engineScale after the surface was created:
-                        //   ANGLE keeps the value it was given, and the whole point is that our
-                        //   formula has to end up somewhere else to agree with it.
-                        s->m_engineScale *= (double)surfW / (double)ew;
-                        if (s->m_engineScale < 0.05) s->m_engineScale = 0.05;
-                        if (s->m_engineScale > 16.0) s->m_engineScale = 16.0;
-                        s->UpdateEngineViewport("surface-mismatch", /*force*/ true);
-                    } else {
-                        s->m_engineFollowsGpuPanel = false;   // stop chasing it; stretch as before
-                        WriteStage(("resize-giveup surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)
-                                    + " max=" + std::to_string(kMaxEngineViewportPixels)).c_str());
+                // Apotheosis (bug fix 0.1.9.44, half a page header missing at the top edge): TWO
+                //   guards this readback needs before a single number of it may be believed, both
+                //   of them missing in 0.1.9.41-43 - and the device log shows what that cost. A
+                //   rotation queues one WebCoreResize per panel size, each answering on a later
+                //   turn of the UI thread, and eglSwapBuffers only picks the panel's new size up
+                //   at the swap. So an answer can arrive (a) for a viewport a newer resize has
+                //   already superseded, and (b) carrying the surface of the PREVIOUS orientation.
+                //   Both happened at once: the readback for a portrait 831x1255 reported the
+                //   landscape 1477x720 still on the swap chain, this net multiplied m_engineScale
+                //   by 1477/831, and the second correction only walked it back to a value ANGLE
+                //   never had. From then on every viewport was ~2.5 % larger than the framebuffer
+                //   it was rendered into (852x1401 into 831x1366) - and since glViewport's origin
+                //   is the framebuffer's BOTTOM-left while TextureMapper puts the page's top edge
+                //   at the viewport's top, the excess is clipped off the TOP: 35 engine px of page
+                //   gone, i.e. half of a viewport-fixed header, in both orientations, for the rest
+                //   of the session.
+                //   (a) is caught by requiring the answer to be for the viewport that is current,
+                //   (b) by requiring the surface to have the same orientation as the request. A
+                //   clean readback re-arms the correction, so a scale that really is wrong still
+                //   gets fixed at the next rotation.
+                const bool currentViewport = (ew == kW && eh == kH);
+                const bool sameOrientation = surfaceKnown && ((ew >= eh) == (surfW >= surfH));
+                if (surfaceKnown && currentViewport && sameOrientation) {
+                    if (!surfaceDiffers) {
+                        s->m_engineCalibrations = 0;   // the two agree: allow a future correction
+                    } else if (s->m_engineFollowsGpuPanel && s->m_engineCalibrations < 3) {
+                        ++s->m_engineCalibrations;
+                        const long long px = (long long)surfW * (long long)surfH;
+                        if (px <= (long long)kMaxEngineViewportPixels) {
+                            // Correct OUR factor by the ratio ANGLE applied, so that
+                            //   ComputeEngineViewport() produces the surface from now on - in this
+                            //   orientation and in the other one, since the same ratio applies to
+                            //   both. Yes, this moves m_engineScale after the surface was created:
+                            //   ANGLE keeps the resolution scale it was handed at
+                            //   eglCreateWindowSurface and nothing can change it afterwards, so it
+                            //   is our formula that has to end up where ANGLE already is. The
+                            //   viewport itself is then the surface VERBATIM - rendering into a
+                            //   framebuffer even one pixel smaller is the bug described above.
+                            const double rx = (double)surfW / (double)ew;
+                            const double ry = (double)surfH / (double)eh;
+                            s->m_engineScale *= (rx + ry) * 0.5;
+                            if (s->m_engineScale < 0.05) s->m_engineScale = 0.05;
+                            if (s->m_engineScale > 16.0) s->m_engineScale = 16.0;
+                            s->UpdateEngineViewport("surface-mismatch", /*force*/ true, surfW, surfH);
+                        } else {
+                            s->m_engineFollowsGpuPanel = false;   // stop chasing it; stretch as before
+                            WriteStage(("resize-giveup surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)
+                                        + " max=" + std::to_string(kMaxEngineViewportPixels)).c_str());
+                        }
+                        return;
                     }
-                    return;
+                } else if (surfaceDiffers) {
+                    // Not acted on, but the one line that says a mismatch was seen and why it was
+                    //   not believed - without it the next round cannot tell "settled" from "the
+                    //   guards ate a real correction".
+                    WriteStage((std::string("resize-ignored why=")
+                                + (!currentViewport ? "stale" : "orientation")
+                                + " eng=" + std::to_string(ew) + "x" + std::to_string(eh)
+                                + " cur=" + std::to_string(kW) + "x" + std::to_string(kH)
+                                + " surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)).c_str());
                 }
                 if (s->m_opSeq != mySeq) return;     // a navigation/click has taken over since
                 // A static page's buffer was never filled here (WebCoreResize returns early with

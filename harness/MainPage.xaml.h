@@ -426,7 +426,10 @@ namespace Harness {
         //   panel instead of being the fixed 720x1080 it was until now - see the block above
         //   ComputeEngineViewport in MainPage.xaml.cpp for the root cause and the ANGLE side.
         bool ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH);
-        void UpdateEngineViewport(const char* why, bool force);
+        // forceW/forceH > 0 bypass ComputeEngineViewport and install exactly that viewport - used
+        //   by the surface-mismatch safety net, which has to adopt the EGL surface VERBATIM rather
+        //   than a recomputed panel x scale that could round to a different number again.
+        void UpdateEngineViewport(const char* why, bool force, int forceW = 0, int forceH = 0);
         void WirePresentPanelSizeChanged();
         void OnPresentPanelSizeChanged(Platform::Object^ sender, Windows::UI::Xaml::SizeChangedEventArgs^ e);
         // Apotheosis (landscape, 0.1.9.43): re-render the session-less page on screen (start page /
