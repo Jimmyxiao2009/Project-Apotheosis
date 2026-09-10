@@ -481,7 +481,7 @@ extern "C" bool g_apoNetTimingOn = false;
 static bool g_apoSpecPrefetch = false;
 // Apotheosis (M4): DNS warm-up, implemented in WebKit\Source\WebKitLegacy\WebCoreSupport\
 // WebResourceLoadScheduler.cpp, which is compiled straight into the driver
-// (local\link-driver-gpu.ps1) - a plain cross-TU call, like the one in
+// alongside this file - a plain cross-TU call, like the one in
 // LoadingFrameLoaderClient::prefetchDNS(). Used by WebCorePreconnect().
 extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
@@ -978,7 +978,7 @@ static void crashLogWrite(const char* reason, const CONTEXT* ctxOrNull)
     // nothing (the ARM32 abort tail), raw-scan this thread's stack for words that look
     // like Thumb return addresses inside the host image and log them as candidates.
     // Noisy by construction — stale frames survive on the stack — but "cand" lines feed
-    // local\symbolize-crash.ps1 exactly like "frame" lines and usually contain the real
+    // an offline symbolizer exactly like "frame" lines and usually contain the real
     // caller. Bounded scan, no allocation, VirtualQuery for the stack extent.
     if (captured < 4 && exe) {
         const uintptr_t exeBase = reinterpret_cast<uintptr_t>(exe);

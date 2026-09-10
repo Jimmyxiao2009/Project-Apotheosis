@@ -40,7 +40,7 @@ extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain
 
 // Apotheosis: DNS prefetch for <link rel="dns-prefetch">. Implemented in
 // WebKit\Source\WebKitLegacy\WebCoreSupport\WebResourceLoadScheduler.cpp, which is
-// compiled straight into the driver (local\link-driver-gpu.ps1), so this is a plain
+// compiled straight into the driver alongside this file, so this is a plain
 // cross-TU call. WebCore::prefetchDNS() itself is a no-op in the curl port - see the
 // comment on apotheosisPrefetchDNS() there.
 extern void apotheosisPrefetchDNS(const WTF::String& hostname);
