@@ -17,6 +17,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -630,7 +631,42 @@ static void WriteBmp32(const std::string& path, const uint8_t* rgba, int w, int 
     }
 }
 
-static const int kW = 720, kH = 1080;
+// Apotheosis (landscape/rotation, 0.1.9.41): the engine viewport, in engine pixels. NOT a constant
+// any more. It used to be, and that was the whole landscape bug: the ANGLE window surface was
+// created once at 720x1080 with EGLRenderSurfaceSizeProperty (a FIXED surface, which ANGLE then
+// scales to whatever the panel's rectangle is), and the engine laid out and composited at the same
+// two numbers for ever. Rotate the phone and the panel becomes landscape while the surface stays
+// portrait, so the portrait picture is stretched across it - exactly what it looked like.
+//
+// Now: 720 engine px on the SHORT side of the presenting panel, the long side in proportion, so
+// the engine viewport always has the panel's aspect ratio (no distortion in either orientation)
+// and a rotation lays the page out at the new width the way a phone browser does. The portrait
+// width is still 720, so nothing about the way pages look at rest has changed. See
+// MainPage::ComputeEngineViewport / UpdateEngineViewport, and EnableGpu() for the ANGLE side.
+//
+// THREADING: written on the UI thread only, read on both (every engine call sizes its buffer from
+// them). An aligned int is never torn on ARM32, and a stale read can only mean a buffer sized for
+// the other orientation - which is why every engine buffer is allocated at EngineBufferBytes(),
+// the high-water mark over every viewport this session has had, and never at kW*kH*4 directly.
+static int kW = 720, kH = 1080;
+// The reference short side. Portrait width stays exactly what it has always been.
+static const int kEngineShortSidePx = 720;
+
+// Apotheosis (landscape/rotation): the size every engine output buffer is allocated at - the
+// largest w*h this session has ever asked the engine for, times 4. The driver writes exactly
+// w*h*4 bytes for whatever viewport IT currently has, and the UI thread updates kW/kH before the
+// WebCoreResize that moves the engine, so during the hand-over one side is always ahead of the
+// other. Sizing every buffer at the high-water mark makes that gap harmless in both directions;
+// the two orientations differ by a few percent of the pixel count, so it costs nothing real.
+static std::atomic<size_t> g_engineBufferBytes { (size_t)720 * 1080 * 4 };
+static void NoteEngineViewport(int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    const size_t need = (size_t)w * (size_t)h * 4;
+    size_t cur = g_engineBufferBytes.load(std::memory_order_relaxed);
+    while (need > cur && !g_engineBufferBytes.compare_exchange_weak(cur, need, std::memory_order_relaxed)) { }
+}
+static size_t EngineBufferBytes() { return g_engineBufferBytes.load(std::memory_order_relaxed); }
 
 // Apotheosis (M4): 页面缩放边界不能超出引擎侧 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
 //   自己把 scale 钳到 [0.5, 6.0]；harness 若用更宽的上下界，超界的捏合会被引擎悄悄改成别的值，
@@ -878,12 +914,18 @@ static double ClampZoomAxis(double scrollPos, double contentSize, double anchor,
 // 逐键重绘)每帧 3MB 的分配+清零。软件模式必须每次新分配:UI 线程可能还拿着上一帧在读。
 static std::shared_ptr<std::vector<uint8_t>> AcquireEngineBuffer(bool present)
 {
+    // Apotheosis (landscape/rotation): both paths size from EngineBufferBytes(), never from
+    //   kW*kH directly - see the note at kW. The shared present buffer additionally has to GROW
+    //   when a rotation raises the high-water mark; replacing the shared_ptr is safe because every
+    //   caller captures its own copy into the engine lambda, so work already in flight keeps the
+    //   block it was handed alive until it is done with it.
     if (present) {
-        static std::shared_ptr<std::vector<uint8_t>> s_buf =
-            std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4);
+        static std::shared_ptr<std::vector<uint8_t>> s_buf;
+        if (!s_buf || s_buf->size() < EngineBufferBytes())
+            s_buf = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes());
         return s_buf;
     }
-    return std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+    return std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
 }
 
 // ============================================================================
@@ -902,6 +944,13 @@ MainPage::MainPage()
     // as early as possible, before the first ManipulationDelta of the gesture arrives.
     ContentArea->ManipulationStarted += ref new Windows::UI::Xaml::Input::ManipulationStartedEventHandler(
         this, &MainPage::OnImageManipStarted);
+
+    // Apotheosis (landscape/rotation, 0.1.9.41): watch the presenting elements for size changes
+    //   from the very first frame, so a rotation re-lays the page out at the new width instead of
+    //   stretching the old picture over the new panel. The software path is live before GPU comes
+    //   up (and stays the fallback), so ContentArea is wired here; GpuPanel is wired here too and
+    //   again when GPU comes up, whichever happens first.
+    WirePresentPanelSizeChanged();
 
     // Apotheosis (suggestion tap, 2026-09-10): the dropdown must not collapse while a finger is down
     //   on it — see m_suggestPressed for why it did, and why that ate the tap. AddHandler with
@@ -1212,7 +1261,7 @@ MainPage::MainPage()
             int gi = -999;
             try { gi = WebCoreGpuInit(nullptr, kW, kH); } catch (...) { gi = -1000; }
             dump += "WebCoreGpuInit(offscreen) rc=" + std::to_string(gi) + "\n\n";
-            auto rgba = std::vector<uint8_t>((size_t)kW * kH * 4, 0);
+            auto rgba = std::vector<uint8_t>(EngineBufferBytes(), 0);
             std::wstring dd = LocalStateDir();
             int idx = 0;
             for (const auto& rawUrl : diagUrls) {
@@ -1918,7 +1967,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     std::string homeHtml = isHome ? BuildHomeHtml(m_bookmarks, m_historyList) : std::string();
 
     WebEngine::instance().post([disp, self, surl, isHome, homeHtml, mySeq]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         bool loadOk = false;   // 网络加载是否真成功(区别于错误页渲染成功),决定是否进历史
         bool sessionActive = false;   // 是否建立了引擎常驻会话(决定点击转发/翻页按钮)
@@ -2413,7 +2462,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
     unsigned long long mySeq = ++m_opSeq;
 
     WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress, clickCount]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
         // Apotheosis (map-site pin, 2026-09-06; latency cut 2026-09-06, kLongPressEngineHoldMs):
@@ -2561,7 +2610,7 @@ void MainPage::EngineScroll(int dy)
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
     WebEngine::instance().post([disp, self, dy, mySeq]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try { rc = WebCoreScrollBy(0, dy, rgba->data()); } catch (...) { rc = -1000; }
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
@@ -3909,7 +3958,7 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
     unsigned long long mySeq = ++m_opSeq;
     bool present = m_gpuPresent;
     WebEngine::instance().post([disp, self, newScale, focalX, focalY, mySeq, present]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try { rc = WebCoreSetPageScale(newScale, focalX, focalY, rgba->data()); } catch (...) { rc = -1000; }
         int rcCopy = rc;
@@ -5647,7 +5696,7 @@ void MainPage::DoFind(int mode)
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
     WebEngine::instance().post([disp, self, q, mode, clear, present, mySeq]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try {
             if (clear) rc = WebCoreFindClear(rgba->data());
@@ -5714,7 +5763,11 @@ void MainPage::CaptureActiveTabSnapshot()
     Platform::Agile<MainPage^> self(this);
     const unsigned long long seq = ++m_snapSeq;
     WebEngine::instance().post([disp, self, idx, gpu, url, seq]() {
-        auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
+        auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
+        // Apotheosis (landscape/rotation): the viewport the engine is about to paint at, read on
+        //   the engine thread so it is the one the pixels really have (kW/kH move on the UI thread
+        //   ahead of the WebCoreResize that follows this call in the same FIFO queue).
+        const int snapW = kW, snapH = kH;
         int rc = -1;
         try {
             // ★ 直呈现模式下不能用 WebCoreSessionPaint:它会走 gpuPresent 再 swapBuffers 一次,
@@ -5724,7 +5777,7 @@ void MainPage::CaptureActiveTabSnapshot()
         } catch (...) { rc = -1; }
         if (rc != 0) return;   // 抓不到就没有快照,退回原来的行为(零回归)
         try {
-            disp->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, rgba, idx, url, seq]() {
+            disp->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([self, rgba, idx, url, seq, snapW, snapH]() {
                 MainPage^ s = self.Get();
                 if (!s) return;
                 if (idx < 0 || idx >= (int)s->m_tabs.size()) return;   // 期间关过标签
@@ -5732,6 +5785,8 @@ void MainPage::CaptureActiveTabSnapshot()
                 if (s->m_tabs[idx].currentUrl != url) return;          // 索引左移/该格换了页面
                 s->m_tabs[idx].snapshot = rgba;
                 s->m_tabs[idx].snapSeq = seq;
+                s->m_tabs[idx].snapW = snapW;
+                s->m_tabs[idx].snapH = snapH;
                 s->PruneTabSnapshots();
             }));
         } catch (...) {}
@@ -5763,9 +5818,15 @@ void MainPage::ShowTabSnapshot(int i)
 {
     if (i < 0 || i >= (int)m_tabs.size()) return;
     auto snap = m_tabs[i].snapshot;
+    const int snapW = m_tabs[i].snapW, snapH = m_tabs[i].snapH;
     m_tabs[i].snapshot.reset();
     m_tabs[i].snapSeq = 0;
-    if (!snap || snap->size() != (size_t)kW * kH * 4) return;
+    m_tabs[i].snapW = 0;
+    m_tabs[i].snapH = 0;
+    // Apotheosis (landscape/rotation): a snapshot is only a placeholder, so one taken in the other
+    //   orientation is dropped rather than stretched - the real reload underneath is on its way
+    //   anyway. The buffer is >= the frame (session high-water mark), hence the size check is >=.
+    if (!snap || snapW != kW || snapH != kH || snap->size() < (size_t)kW * kH * 4) return;
     if (!RenderImage || !GpuPanel) return;
     try {
         if (!m_snapBmp) m_snapBmp = ref new WriteableBitmap(kW, kH);
@@ -5968,26 +6029,235 @@ void MainPage::RebuildTabSwitcher()
 // ============================================================================
 // 默认 GPU:把 OnToggleGpu 首点路径抽出复用,带崩溃环路保护(GpuInit 硬崩→下次启动自动关)。
 // ============================================================================
+// ============================================================================
+// Apotheosis (landscape/rotation, 0.1.9.41): the engine viewport follows the panel.
+//
+// ROOT CAUSE of "landscape just stretches the picture". Two numbers decided everything the engine
+// drew, and both were written once and never again:
+//   * the ANGLE window surface, created in EnableGpu() with EGLRenderSurfaceSizeProperty. That
+//     property means "fixed size, scale it to the panel's rectangle" - which is a stretch by
+//     definition. In portrait the fixed 720x1080 happened to be near enough the panel's aspect
+//     that it read as right; rotate, and a portrait picture is scaled across a landscape panel.
+//   * kW/kH, the size the driver lays out and composites at (LocalFrameView + glViewport), passed
+//     to WebCoreGpuInit and WebCoreSessionLoad. Nothing ever told the engine the panel had
+//     changed, so no relayout at the new width could even happen.
+//
+// FIX, both halves. ANGLE gets EGLRenderResolutionScaleProperty instead: the surface is then the
+// panel's own size times that scale, and ANGLE resizes it when the panel resizes or rotates
+// (angle\include\angle_windowsstore.h documents exactly that). The scale is pinned once, from the
+// panel we bind to, so that the SHORT side of the viewport is kEngineShortSidePx - portrait width
+// stays the 720 it has always been - and the long side follows the panel in proportion, i.e. the
+// engine viewport always has the panel's aspect ratio. And UpdateEngineViewport() tells the driver
+// (WebCoreResize) whenever that size changes, which is what makes a rotation a real relayout at
+// the new width instead of a rescale of the old picture.
+//
+// Side effect worth knowing: the fixed 720x1080 was never the panel's aspect ratio even in
+// portrait (the panel is taller than 3:2 once the nav bar is subtracted), so the frame was already
+// being stretched vertically by roughly a tenth. Pages are laid out at their true proportions now,
+// in both orientations.
+// ============================================================================
+
+// The engine viewport for the panel that is presenting, in engine px. false = nothing usable to
+// measure yet (no arrange), in which case the caller leaves the current viewport alone.
+bool MainPage::ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH)
+{
+    double w = 0.0, h = 0.0;
+    try {
+        // The GPU panel IS the ANGLE surface, so in present mode its rectangle is the one the swap
+        //   chain has to match. In software mode the frame is an Image stretched over ContentArea.
+        // m_engineFollowsGpuPanel is set the moment EnableGpu() binds ANGLE to the panel, which is
+        //   several XAML layout passes before m_gpuPresent goes true - without it the panel's own
+        //   first SizeChanged would measure ContentArea and hand the driver a size the surface
+        //   does not have.
+        if ((useGpuPanel || m_engineFollowsGpuPanel) && GpuPanel
+            && GpuPanel->ActualWidth > 1.0 && GpuPanel->ActualHeight > 1.0) {
+            w = GpuPanel->ActualWidth;
+            h = GpuPanel->ActualHeight;
+        } else if (ContentArea && ContentArea->ActualWidth > 1.0 && ContentArea->ActualHeight > 1.0) {
+            w = ContentArea->ActualWidth;
+            h = ContentArea->ActualHeight;
+        }
+    } catch (...) { return false; }
+    if (!(w > 1.0) || !(h > 1.0)) return false;
+
+    // Pin the DIP -> engine-px scale the first time we can measure. It must never move afterwards:
+    //   ANGLE was handed this same number as the resolution scale when the surface was created, and
+    //   the two sides only stay in step while they use the same factor. EnableGpu() deliberately
+    //   clears it first, so it is pinned to whichever element actually ends up presenting.
+    if (!(m_engineScale > 0.0)) {
+        m_engineScale = (double)kEngineShortSidePx / (w < h ? w : h);
+        if (m_engineScale < 0.25) m_engineScale = 0.25;
+        if (m_engineScale > 8.0) m_engineScale = 8.0;
+    }
+
+    int ew = (int)(w * m_engineScale + 0.5);
+    int eh = (int)(h * m_engineScale + 0.5);
+    // Guard rails, not policy: the driver rejects sizes outside its own surface limits with
+    //   kErrBadArgs, and a viewport this far from the sane range means the measurement was junk.
+    if (ew < 240) ew = 240;
+    if (eh < 240) eh = 240;
+    if (ew > 2560) ew = 2560;
+    if (eh > 2560) eh = 2560;
+    outW = ew;
+    outH = eh;
+    return true;
+}
+
+// UI THREAD ONLY. Re-measure and, if the viewport moved, hand the new size to the engine.
+// `force` re-sends the current size even when it has not changed (used right after WebCoreGpuInit,
+// where the driver's GL viewport and a session that may already exist have to be brought together).
+void MainPage::UpdateEngineViewport(const char* why, bool force)
+{
+    // A surface pinned to a fixed size (the no-arranged-panel fallback in EnableGpu) cannot follow
+    //   the panel, and telling the driver otherwise would only desync the two. Rotation keeps
+    //   stretching in that case, exactly as it did before 0.1.9.41 - and the gpu-surface stage line
+    //   says which mode this run is in.
+    if (m_gpuOn && !m_engineFollowsGpuPanel)
+        return;
+    int ew = 0, eh = 0;
+    if (!ComputeEngineViewport(m_gpuPresent, ew, eh))
+        return;
+    const int oldW = kW, oldH = kH;
+    if (!force && ew == oldW && eh == oldH)
+        return;
+
+    // ORDER MATTERS. Raise the buffer high-water mark, then kW/kH, then post - so that every
+    //   engine call queued from here on allocates for the new viewport while the engine itself is
+    //   still on the old one, and every call queued before this runs against the old engine with
+    //   an old-sized buffer. Both are covered because every buffer is EngineBufferBytes() big.
+    NoteEngineViewport(ew, eh);
+    kW = ew;
+    kH = eh;
+
+    // Anything the harness itself keeps at the old size has to go: the software double buffer and
+    //   the snapshot bitmap are recreated on demand, and the cached scroll/content bounds are about
+    //   to be replaced by the relayout's.
+    m_frameBmpA = nullptr;
+    m_frameBmpB = nullptr;
+    m_snapBmp = nullptr;
+    m_scrollStateValid = false;
+
+    double panelW = 0.0, panelH = 0.0;
+    try { if (GpuPanel) { panelW = GpuPanel->ActualWidth; panelH = GpuPanel->ActualHeight; } } catch (...) {}
+    WriteStage((std::string("resize why=") + (why ? why : "?")
+                + " eng=" + std::to_string(oldW) + "x" + std::to_string(oldH)
+                + "->" + std::to_string(ew) + "x" + std::to_string(eh)
+                + " panel=" + Dip(panelW) + "x" + Dip(panelH)
+                + " scale=" + Dip(m_engineScale)
+                + " gpu=" + (m_gpuPresent ? "1" : "0")).c_str());
+
+    if (!m_sessionActive && !m_gpuOn)
+        return;   // nothing live to resize; the next WebCoreSessionLoad carries kW/kH itself
+
+    bool present = m_gpuPresent;
+    CoreDispatcher^ disp = this->Dispatcher;
+    Platform::Agile<MainPage^> self(this);
+    unsigned long long mySeq = m_opSeq;   // as PumpScroll: not a token of its own, but superseded by one
+    WebEngine::instance().post([disp, self, ew, eh, present, mySeq]() {
+        auto rgba = AcquireEngineBuffer(present);
+        int rc = -999, surfW = 0, surfH = 0;
+        try { rc = WebCoreResize(ew, eh, &surfW, &surfH, rgba->data()); } catch (...) { rc = -1000; }
+        int rcCopy = rc;
+        try {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, ew, eh, surfW, surfH]() {
+                MainPage^ s = self.Get(); if (!s) return;
+                // What ANGLE really made of it (traced on the UI thread - WriteStage has one
+                //   truncate-once static and is not written for two writers). If this ever stops
+                //   matching the requested size, the panel-to-surface scale is wrong and the
+                //   picture is being scaled again: the one number the next device round needs,
+                //   and the reason WebCoreResize reports it at all.
+                WriteStage((std::string("resized rc=") + std::to_string(rcCopy)
+                            + " eng=" + std::to_string(ew) + "x" + std::to_string(eh)
+                            + " surface=" + std::to_string(surfW) + "x" + std::to_string(surfH)).c_str());
+                if (s->m_opSeq != mySeq) return;     // a navigation/click has taken over since
+                if (rcCopy == 0 && !present) s->PresentSoftwareFrame(rgba);
+                s->m_lastFrameHash = 0;              // force the next live frame to be re-shown
+                s->SyncLinksAfterScroll();           // the hit table was built for the old layout
+                s->StartLiveMode();
+            }));
+        } catch (...) {}
+    });
+}
+
+// Subscribe the presenting elements' SizeChanged, once each. Idempotent: called from the
+// constructor (software path is live from the first frame) and again when GPU comes up.
+void MainPage::WirePresentPanelSizeChanged()
+{
+    auto handler = ref new Windows::UI::Xaml::SizeChangedEventHandler(this, &MainPage::OnPresentPanelSizeChanged);
+    try {
+        if (ContentArea && !m_contentSizeHandlerWired) {
+            m_contentSizeHandlerWired = true;
+            ContentArea->SizeChanged += handler;
+        }
+    } catch (...) {}
+    try {
+        if (GpuPanel && !m_presentSizeHandlerWired) {
+            m_presentSizeHandlerWired = true;
+            GpuPanel->SizeChanged += handler;
+        }
+    } catch (...) {}
+}
+
+// The panel changed size - a device rotation, or any other relayout that moves it. Both presenting
+// elements are wired: GpuPanel is Collapsed (and therefore silent) until GPU comes up, ContentArea
+// carries the software path and stays measurable throughout.
+void MainPage::OnPresentPanelSizeChanged(Platform::Object^, Windows::UI::Xaml::SizeChangedEventArgs^ e)
+{
+    if (!e || e->NewSize.Width <= 1.0f || e->NewSize.Height <= 1.0f) return;
+    UpdateEngineViewport("panel", false);
+}
+
 void MainPage::EnableGpu()
 {
     if (m_gpuOn) return;
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     GpuPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+
+    // Apotheosis (landscape/rotation, 0.1.9.41): pin the panel -> engine scale to the panel we are
+    //   about to bind ANGLE to, and give ANGLE that same scale rather than a fixed surface size.
+    //   See the block above ComputeEngineViewport for why the fixed size was the landscape bug.
+    m_engineScale = 0.0;   // re-pin: this panel, not whatever the software path measured earlier
+    int engW = kW, engH = kH;
+    const bool sized = ComputeEngineViewport(/*useGpuPanel*/ true, engW, engH);
+    m_engineFollowsGpuPanel = sized;
+
     auto props = ref new Windows::Foundation::Collections::PropertySet();
     props->Insert(L"EGLNativeWindowTypeProperty", GpuPanel);
-    props->Insert(L"EGLRenderSurfaceSizeProperty",
-                  Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
+    if (sized) {
+        // "If the window resizes or rotates then the surface will resize accordingly"
+        //   (angle\include\angle_windowsstore.h). Single, not Size - the two properties are
+        //   mutually exclusive, so EGLRenderSurfaceSizeProperty must NOT be set alongside it.
+        props->Insert(L"EGLRenderResolutionScaleProperty",
+                      Windows::Foundation::PropertyValue::CreateSingle((float)m_engineScale));
+    } else {
+        // No arranged panel to calibrate against (the 2 s startup fallback can get here). Keep the
+        //   pre-0.1.9.41 fixed-surface behaviour rather than guessing a scale: rotation will still
+        //   stretch, but startup is not made any more fragile than it was.
+        m_engineScale = 0.0;
+        props->Insert(L"EGLRenderSurfaceSizeProperty",
+                      Windows::Foundation::PropertyValue::CreateSize(Windows::Foundation::Size((float)kW, (float)kH)));
+    }
     m_gpuProps = props;
     void* win = reinterpret_cast<void*>(reinterpret_cast<IInspectable*>(props));
+    WriteStage((std::string("gpu-surface mode=") + (sized ? "scaled" : "fixed")
+                + " panel=" + GpuPanelSizeStr()
+                + " scale=" + Dip(m_engineScale)
+                + " eng=" + std::to_string(engW) + "x" + std::to_string(engH)).c_str());
+    // The surface is created at engW x engH, so that is what the driver must composite at. kW/kH
+    //   move here, on the UI thread, before anything can be queued for the new size - the same
+    //   ordering rule UpdateEngineViewport() documents.
+    NoteEngineViewport(engW, engH);
+    kW = engW;
+    kH = engH;
     // 崩溃环路保护:开 GPU 前落 gpu-crash.flag;回调(成功或优雅失败)删它。GpuInit 硬崩则无回调→标记残留→下次启动检测到→关默认GPU。
     {
         std::wstring fd = LocalStateDir();
         if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
     }
-    WebEngine::instance().post([disp, self, win]() {
+    WebEngine::instance().post([disp, self, win, engW, engH]() {
         int rc = -999;
-        try { rc = WebCoreGpuInit(win, kW, kH); } catch (...) { rc = -1000; }
+        try { rc = WebCoreGpuInit(win, engW, engH); } catch (...) { rc = -1000; }
         try {
             std::wstring d = LocalStateDir();
             if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
@@ -6005,6 +6275,13 @@ void MainPage::EnableGpu()
                     s->RenderImage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
                     s->GpuBtn->Content = GpuOrientLabel(s->m_gpuOrient);
                     s->GpuBtn->Foreground = ref new SolidColorBrush(Windows::UI::Colors::LimeGreen);
+                    // Apotheosis (landscape/rotation, 0.1.9.41): from here the GPU panel is the
+                    //   presenting element, and it may have been arranged (or the device rotated)
+                    //   while GpuInit was in flight. Force one pass so the driver's GL viewport,
+                    //   a session that already exists, and kW/kH are all the same size, and wire
+                    //   the panel's SizeChanged for every rotation from now on.
+                    s->WirePresentPanelSizeChanged();
+                    s->UpdateEngineViewport("gpu-init", /*force*/ true);
                     // Apotheosis (M4): 启动路径把第一次导航推迟到这里 → 首个会话直接带合成,不再"加载两遍"。
                     if (!s->m_pendingFirstNav.empty())
                         s->StartPendingFirstNav();

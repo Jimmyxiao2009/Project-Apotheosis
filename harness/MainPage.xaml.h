@@ -47,6 +47,13 @@ namespace Harness {
         // 上限时丢最老的一张。
         std::shared_ptr<std::vector<uint8_t>> snapshot;
         unsigned long long snapSeq { 0 };
+        // Apotheosis (landscape/rotation, 0.1.9.41): the engine viewport the snapshot was taken
+        //   at. The buffer itself is allocated at the session high-water mark, so its size no
+        //   longer says how the pixels are laid out, and a snapshot taken in the other orientation
+        //   would be blitted with the wrong stride. ShowTabSnapshot() drops any snapshot whose
+        //   size does not match the viewport in force when it is shown.
+        int snapW { 0 };
+        int snapH { 0 };
     };
 
     public ref class MainPage sealed {
@@ -396,6 +403,13 @@ namespace Harness {
         void OnGpuPanelLoaded(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 面板拿到非零尺寸(折叠元素尺寸恒 0)→ 可以建 ANGLE 窗口表面 → StartupGpuThenNav()。
         void OnGpuPanelSizeChanged(Platform::Object^ sender, Windows::UI::Xaml::SizeChangedEventArgs^ e);
+        // Apotheosis (landscape/rotation, 0.1.9.41): the engine viewport follows the presenting
+        //   panel instead of being the fixed 720x1080 it was until now - see the block above
+        //   ComputeEngineViewport in MainPage.xaml.cpp for the root cause and the ANGLE side.
+        bool ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH);
+        void UpdateEngineViewport(const char* why, bool force);
+        void WirePresentPanelSizeChanged();
+        void OnPresentPanelSizeChanged(Platform::Object^ sender, Windows::UI::Xaml::SizeChangedEventArgs^ e);
         // 把一帧引擎渲染结果(rgba)贴到位图 + 同步标题/地址/链接表;navUrl 非空表示会话内发生了导航。
         void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
                               Platform::String^ title, Platform::String^ navUrl,
@@ -509,7 +523,18 @@ namespace Harness {
         // Apotheosis (2026-09-03 崩溃修复): 见 HookGpuPanelForStartup。2s 等待真实面板尺寸的兜底定时器,
         //   与上面 6s 的 m_startupNavTimer 是两层不同的保险(这层等尺寸,那层等"有没有任何触发源")。
         Windows::UI::Xaml::DispatcherTimer^ m_gpuSizeWaitTimer;
-        bool m_gpuSizeHandlerWired { false };// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
+        bool m_gpuSizeHandlerWired { false };
+        // Apotheosis (landscape/rotation, 0.1.9.41): engine px per panel DIP. Pinned once, in
+        //   EnableGpu() (or on the first software measurement), so that the short side of the
+        //   viewport is kEngineShortSidePx; ANGLE was handed the same number as the surface
+        //   resolution scale, so it must not move afterwards. 0 = not pinned yet.
+        double m_engineScale { 0.0 };
+        // true once EnableGpu() has bound ANGLE to GpuPanel with a resolution scale, i.e. the
+        //   surface really does follow the panel. false = the fixed-surface fallback, where the
+        //   engine viewport must stay put whatever the panel does.
+        bool m_engineFollowsGpuPanel { false };
+        bool m_presentSizeHandlerWired { false };   // GpuPanel->SizeChanged (rotation), subscribed once
+        bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
         int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态
