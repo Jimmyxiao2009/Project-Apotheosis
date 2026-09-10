@@ -267,6 +267,12 @@ unsigned wkWinUWPTexmapVisibleHoles();
 #define GL_GLEXT_PROTOTYPES 1               // 这版 ms-master ANGLE 的 gl2.h 把核心 GL 原型放此宏下(否则 glReadPixels/glViewport C3861)
 #include <WebCore/PlatformDisplay.h>        // PlatformDisplay::sharedDisplay()(WIN→PlatformDisplayWin,起 ANGLE EGLDisplay)
 #include <WebCore/GLContext.h>              // GLContext::create/createOffscreen + makeContextCurrent + swapBuffers
+// Apotheosis (landscape/rotation, 0.1.9.41): raw EGL for ONE read-only question - how big is the
+// window surface ANGLE is actually handing us right now (querySurfaceSize, used by WebCoreResize's
+// diagnostic out-params). GLContext exposes no accessor for it, and the answer settles whether the
+// harness' idea of the panel-to-surface scale matches ANGLE's. Nothing here creates or resizes an
+// EGL object - that stays GLContext's job, see the note above.
+#include <EGL/egl.h>
 #include "texmap/TextureMapper.h"           // TextureMapper::create/beginPainting/endPainting(platform/graphics 已在 -I 上)
 #include "texmap/TextureMapperLayer.h"      // TextureMapperLayer::paint/applyAnimationsRecursively
 #include "texmap/GraphicsLayerTextureMapper.h" // 根 GraphicsLayer 实为它;.layer()/updateBackingStoreIncludingSubLayers
@@ -6239,6 +6245,112 @@ int WebCoreSessionPaint(uint8_t* outRGBA)
     if (prc != kOK)
         return prc;
     writeDiag(*doc, *view, g_session->w, g_session->h, nonWhite);
+    return kOK;
+}
+
+// Apotheosis (landscape/rotation, 0.1.9.41): the size of the EGL window surface currently bound to
+// the engine's context, or 0x0 when there is none (offscreen mode, or no context current). Pure
+// diagnostic: the harness computes the size it wants from the panel and ANGLE computes the surface
+// from the same panel times the resolution scale, and this is how a device log can show the two
+// agreeing. Never used to drive layout - a mismatch must be fixed in the formula, not papered over
+// by rendering at a size the harness does not know about.
+static void querySurfaceSize(int* outW, int* outH)
+{
+    if (!outW && !outH)
+        return;
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+    if (dpy == EGL_NO_DISPLAY || surf == EGL_NO_SURFACE)
+        return;
+    EGLint value = 0;
+    if (outW && eglQuerySurface(dpy, surf, EGL_WIDTH, &value))
+        *outW = static_cast<int>(value);
+    value = 0;
+    if (outH && eglQuerySurface(dpy, surf, EGL_HEIGHT, &value))
+        *outH = static_cast<int>(value);
+}
+
+// Apotheosis (landscape/rotation, 0.1.9.41): re-establish the engine viewport at w*h and re-lay
+// out the live page for it. See the contract in WebCoreDriver.h.
+//
+// Everything the driver renders is sized from exactly two places - g_gpuW/g_gpuH (the GL viewport
+// gpuPresent() paints into) and g_session->w/h (the LocalFrameView, every paintToRGBA and every
+// writeDiag). Both were written once, at WebCoreGpuInit / WebCoreSessionLoad, and never again, so
+// a device rotation left the engine laying out and compositing at the portrait size while the
+// window surface underneath it had become landscape-shaped: the same picture stretched over the
+// new panel, which is what it looked like on the phone.
+//
+// The relayout is deliberately the full one (updateLayoutIgnorePendingStylesheets, not the
+// isolated rendering update a tick uses): a viewport change moves every media query, every
+// percentage width and the layout viewport itself. g_gpuForceFullNext makes the next composite
+// re-raster the whole tree instead of trusting tiles that were painted for the old viewport - the
+// same lever WebCoreSessionLoad's teardown path uses.
+int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (outSurfaceW) *outSurfaceW = 0;
+    if (outSurfaceH) *outSurfaceH = 0;
+    if (!isValidSurfaceSize(w, h))
+        return kErrBadArgs;
+    if (g_inPump)
+        return kErrBusy;
+
+    // The GL viewport first: it is read by gpuPresent() on every composite, including composites
+    // that happen while there is no session at all, and by WebCoreCompositeReadback.
+    g_gpuW = w;
+    g_gpuH = h;
+
+    // No live page: nothing to lay out. The next WebCoreSessionLoad carries the new size itself,
+    // so this is a complete answer rather than an error.
+    if (!g_session || !g_session->page) {
+        querySurfaceSize(outSurfaceW, outSurfaceH);
+        return kOK;
+    }
+    if (!outRGBA)
+        return kErrBadArgs;
+
+    g_session->w = w;
+    g_session->h = h;
+
+    RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+
+    g_inPump = true;
+    PumpGuard guard;
+    PerfOpGuard perfOp("resize", nullptr, w, h);
+
+    view->resize(IntSize(w, h));   // Widget::resize -> setFrameRect -> layout viewport + needsLayout
+    doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });
+    // A viewport change can shorten the document (a wider layout is a shorter one), so the scroll
+    // position that was valid a moment ago may now be past the end. Pull it back the same way
+    // WebCoreSetPageScale does after its relayout.
+    IntPoint settled = view->constrainedScrollPosition(view->scrollPosition());
+    if (view->scrollPosition() != settled) {
+        view->setScrollPosition(settled);
+        doc->updateLayoutIgnorePendingStylesheets();
+    }
+    extractLinks(doc.get(), h);
+
+    g_gpuForceFullNext = true;   // tiles were rastered for the old viewport - none of them is trustworthy
+    g_gpuScrollFast = false;
+    int nonWhite = 0;
+    int prc = paintToRGBA(*view, w, h, outRGBA, nonWhite);
+    // After the composite: the swap is what makes ANGLE pick up the panel's new size, so this is
+    // the first moment the real surface can be read back.
+    querySurfaceSize(outSurfaceW, outSurfaceH);
+    if (prc != kOK)
+        return prc;
+    writeDiag(*doc, *view, w, h, nonWhite);
     return kOK;
 }
 

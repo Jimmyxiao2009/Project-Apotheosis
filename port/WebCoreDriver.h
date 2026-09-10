@@ -314,6 +314,33 @@ int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal
 int WebCoreGetPageScale();             // M4: current pageScaleFactor ×1000
 int WebCoreSessionPaint(uint8_t* outRGBA);
+
+// Apotheosis (landscape/rotation, 0.1.9.41): re-establish the engine viewport at w*h. Call it
+// whenever the presenting panel changes size - a device rotation is the case that matters, but a
+// window resize on any host is the same event. Engine thread only, like every other session call.
+//
+// Until this existed the viewport was written exactly twice, by WebCoreGpuInit (the GL viewport)
+// and by WebCoreSessionLoad (the LocalFrameView), and never again: after a rotation the engine
+// kept laying out and compositing at the old size while the window surface under it had the new
+// shape, so the previous picture was simply stretched over it. This does the full job - GL
+// viewport, LocalFrameView, a real relayout at the new width (media queries, percentage widths and
+// the layout viewport all move), the scroll position re-clamped against the document the relayout
+// produced, the link table re-extracted, and one composite so the caller has a correct frame - and
+// forces the next composite to re-raster the whole tree, because every tile was painted for the
+// old viewport.
+//
+// outRGBA: as everywhere else, the software path fills it with w*h*4 bytes and the GPU
+//   direct-present path does not touch it (the frame goes to the swap chain). It may be null ONLY
+//   when there is no live session, which is also the case where this call does nothing but record
+//   the size for the next WebCoreSessionLoad.
+// outSurfaceW/outSurfaceH (either may be null): DIAGNOSTIC. The size of the EGL window surface
+//   after the composite, i.e. what ANGLE actually resized the swap chain to for the panel, or 0x0
+//   when there is no window surface. The caller asks for w*h; ANGLE derives its own size from the
+//   panel and the resolution scale the caller set at WebCoreGpuInit time, and these two numbers
+//   are how a device log shows whether the two agree. Nothing in the engine acts on them.
+// Returns kOK, or the usual negative driver errors (kErrBadArgs for a size the surface limits
+//   reject, kErrBusy when a pump is already running - retry after it, nothing was changed).
+int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA);
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable
