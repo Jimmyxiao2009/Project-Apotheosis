@@ -2671,6 +2671,9 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
+    // Apotheosis (review fix, 0.1.9.48): which hold m_ctxPending belongs to, so a late answer that
+    // the m_opSeq guard drops can clear the flag it armed without clearing a NEWER hold's.
+    if (longPress) m_ctxPendingSeq = mySeq;
     // Apotheosis (link context menu, 0.1.9.42): filled by the engine when a long press turns out to
     // be over a link. Non-empty means the page was told NOTHING and the UI callback opens the menu.
     auto ctxUrl = std::make_shared<std::wstring>();
@@ -2750,7 +2753,15 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
             disp->RunAsync(CoreDispatcherPriority::Normal,
                 ref new DispatchedHandler([self, rgba, titleW, navW, links, rcCopy, changedCopy, editableCopy, linkHit, mySeq, ctxUrl, ctxRcCopy, longPress]() {
                     MainPage^ s = self.Get(); if (!s) return;
-                    if (s->m_opSeq != mySeq) return;   // 已被取代/看门狗复位,丢弃迟到回调
+                    if (s->m_opSeq != mySeq) {
+                        // Apotheosis (review fix, 0.1.9.48): the hold this answer belongs to is over,
+                        //   so its pending flag has to go with it - otherwise the next pan or layout
+                        //   move traces `ctx dismiss ... pending=1` for a hold that ended long ago,
+                        //   noise in exactly the trace this feature is read from. Only when the flag
+                        //   is still the one THIS hold armed: a newer hold owns it otherwise.
+                        if (longPress && s->m_ctxPendingSeq == mySeq) s->m_ctxPending = false;
+                        return;   // 已被取代/看门狗复位,丢弃迟到回调
+                    }
                     s->m_interacting = false;
                     if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
                     // Apotheosis (link context menu, 0.1.9.42): the hold was over a link, so the
@@ -6593,14 +6604,29 @@ bool MainPage::ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH)
         if (m_engineScale > 8.0) m_engineScale = 8.0;
     }
 
-    int ew = (int)(w * m_engineScale + 0.5);
-    int eh = (int)(h * m_engineScale + 0.5);
+    double rawW = w * m_engineScale;
+    double rawH = h * m_engineScale;
     // Guard rails, not policy: the driver rejects sizes outside its own surface limits with
     //   kErrBadArgs, and a viewport this far from the sane range means the measurement was junk.
-    if (ew < 240) ew = 240;
-    if (eh < 240) eh = 240;
-    if (ew > 2560) ew = 2560;
-    if (eh > 2560) eh = 2560;
+    //   Apotheosis (review fix, 0.1.9.48): ONE factor for BOTH axes. Clamping width and height
+    //   independently changed the aspect ratio silently, and the panel's aspect ratio is the single
+    //   invariant the whole rotation path rests on - a viewport that no longer has it is exactly
+    //   what the surface-mismatch net in UpdateEngineViewport reads as "the scale is wrong", so a
+    //   clamp would have been "corrected" by permanently moving m_engineScale. The upper bound wins
+    //   if the two ever disagree (a panel too elongated to satisfy both).
+    constexpr double kMinEngineSidePx = 240.0;
+    constexpr double kMaxEngineSidePx = 2560.0;
+    const double shortSide = (rawW < rawH) ? rawW : rawH;
+    const double longSide  = (rawW > rawH) ? rawW : rawH;
+    double k = 1.0;
+    if (shortSide > 0.0 && shortSide < kMinEngineSidePx) k = kMinEngineSidePx / shortSide;
+    if (longSide > 0.0 && longSide * k > kMaxEngineSidePx) k = kMaxEngineSidePx / longSide;
+    int ew = (int)(rawW * k + 0.5);
+    int eh = (int)(rawH * k + 0.5);
+    if (k != 1.0)
+        WriteStage((std::string("viewport-clamp k=") + Dip(k)
+                    + " raw=" + std::to_string((int)(rawW + 0.5)) + "x" + std::to_string((int)(rawH + 0.5))
+                    + " eng=" + std::to_string(ew) + "x" + std::to_string(eh)).c_str());
     outW = ew;
     outH = eh;
     return true;

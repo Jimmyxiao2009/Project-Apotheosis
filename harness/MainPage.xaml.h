@@ -569,7 +569,7 @@ namespace Harness {
         // Apotheosis (2026-09-03 崩溃修复): 见 HookGpuPanelForStartup。2s 等待真实面板尺寸的兜底定时器,
         //   与上面 6s 的 m_startupNavTimer 是两层不同的保险(这层等尺寸,那层等"有没有任何触发源")。
         Windows::UI::Xaml::DispatcherTimer^ m_gpuSizeWaitTimer;
-        bool m_gpuSizeHandlerWired { false };
+        bool m_gpuSizeHandlerWired { false };   // GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
         // Apotheosis (landscape/rotation, 0.1.9.41): engine px per panel DIP. Pinned once, in
         //   EnableGpu() (or on the first software measurement), so that the short side of the
         //   viewport is kEngineShortSidePx; ANGLE was handed the same number as the surface
@@ -594,7 +594,7 @@ namespace Harness {
         int m_resizeRetryW { 0 };
         int m_resizeRetryH { 0 };
         bool m_presentSizeHandlerWired { false };   // GpuPanel->SizeChanged (rotation), subscribed once
-        bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once// GpuPanel->SizeChanged 是否已经挂过(避免 HookGpuPanelForStartup 重入重复订阅)
+        bool m_contentSizeHandlerWired { false };   // ContentArea->SizeChanged (software path), once
         Windows::Foundation::Collections::PropertySet^ m_gpuProps;  // ANGLE 原生窗口(SwapChainPanel 包装),保活
         int  m_gpuOrient { 0 };       // 离屏 readback 朝向(bit0=H,bit1=V):0=none(真机实测正确),1=H,2=V,3=HV
         // 自由滚动状态
@@ -714,6 +714,10 @@ namespace Harness {
         //   hold started because the engine answer carries no position. m_ctxUrl is what the open
         //   menu will act on; it never leaves this object and is never traced.
         bool   m_ctxPending { false };
+        // Apotheosis (review fix, 0.1.9.48): the m_opSeq the pending hold was armed under, so a late
+        //   engine answer that the sequence guard drops can clear the flag IT armed without touching
+        //   a newer hold's.
+        unsigned long long m_ctxPendingSeq { 0 };
         double m_ctxDipX { 0.0 }, m_ctxDipY { 0.0 };
         // Apotheosis (0.1.9.46): the window and the four insets the card was placed against.
         double m_ctxWinW { 0.0 }, m_ctxWinH { 0.0 };
