@@ -2425,12 +2425,37 @@ void MainPage::OnPageHolding(Platform::Object^, Windows::UI::Xaml::Input::Holdin
         + " sincehold=" + std::to_string(sinceHold)
         + " hold=" + std::to_string(kLongPressEngineHoldMs)).c_str());
 
-    if (!started) return;
+    if (!started) {
+        // Apotheosis (link context menu, 0.1.9.42): Canceled means the hold became a manipulation,
+        // i.e. the finger is panning or pinching. The engine's link answer may still be in flight;
+        // dropping it here is what keeps a menu from popping up on top of a pan. Completed (finger
+        // lifted) is deliberately NOT a cancel - that is the normal way a long press ends, and the
+        // menu is supposed to be there afterwards.
+        if (holdState == static_cast<int>(Windows::UI::Input::HoldingState::Canceled))
+            CancelPendingLinkMenu("canceled");
+        return;
+    }
     if (!m_sessionActive || m_loading || m_interacting) return;
     if (!inBounds) return;
+    if (LinkMenu && LinkMenu->Visibility == Windows::UI::Xaml::Visibility::Visible) return;   // menu is up: it owns the screen
     HideSuggestions();
     m_holdAtMs = GetTickCount64();
     e->Handled = true;
+    // Apotheosis (link context menu, 0.1.9.42): where to put the card if this hold turns out to be
+    // over a link. Taken HERE, in RootGrid DIP, because the engine's answer arrives on a later turn
+    // of the UI thread with no position on it, and because the menu is a XAML element - engine px
+    // would be the wrong space and the wrong scale. (px,py) on the trace line is the engine point
+    // the hit test runs at, so a report of "the menu was in the wrong place" can be told apart from
+    // "the menu was about the wrong link".
+    m_ctxPending = true;
+    try {
+        auto rp = e->GetPosition(RootGrid);
+        m_ctxDipX = rp.X;
+        m_ctxDipY = rp.Y;
+    } catch (...) {}
+    WriteStage((std::string("ctx hold at=") + std::to_string(px) + "," + std::to_string(py)
+        + " dip=" + std::to_string((int)m_ctxDipX) + "," + std::to_string((int)m_ctxDipY)
+        + " scale=" + std::to_string((int)(m_pageScale * 100 + 0.5f))).c_str());
     ForwardClickToEngine(px, py, /*longPress*/ true);
 }
 
@@ -2465,8 +2490,11 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);
     unsigned long long mySeq = ++m_opSeq;
+    // Apotheosis (link context menu, 0.1.9.42): filled by the engine when a long press turns out to
+    // be over a link. Non-empty means the page was told NOTHING and the UI callback opens the menu.
+    auto ctxUrl = std::make_shared<std::wstring>();
 
-    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress, clickCount]() {
+    WebEngine::instance().post([disp, self, px, py, linkHit, prevUrl, mySeq, longPress, clickCount, ctxUrl]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
@@ -2479,8 +2507,27 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
         // WebCoreTapPolicyAt said is NOT zoomable) goes through WebCoreClickAtCount so the page gets
         // a real 'dblclick'; an ordinary tap (clickCount=1, the overwhelming common case) still calls
         // plain WebCoreClickAt, unchanged.
+        // Apotheosis (link context menu, 0.1.9.42): a long press asks the engine what is under the
+        // finger BEFORE it presses anything. WebCoreLinkAt is a read-only hit test on this same
+        // engine thread, so the probe costs a hit test and not a second round trip - and a hold over
+        // a link now answers in milliseconds instead of after kLongPressEngineHoldMs, because the
+        // hold pump is never started at all. That is also the whole suppression story: the page is
+        // sent no press, no release and no contextmenu, so there is nothing to take back on the UI
+        // side (OnPageTapped's existing holdTail rule already drops the tap the release raises).
+        // A point that is not an http(s) link - plain text, a canvas / touch-action:none widget, an
+        // image, a button - reports 0 and falls straight through to the unchanged long press.
+        int ctxRc = 0;
         try {
-            rc = longPress
+            if (longPress) {
+                char lu[1200] = "";
+                ctxRc = WebCoreLinkAt(px, py, lu, sizeof lu);
+                if (ctxRc == 1 && lu[0]) *ctxUrl = Utf8ToWide(lu);
+            }
+        } catch (...) { ctxRc = -1000; }
+        try {
+            if (!ctxUrl->empty())
+                rc = 0;                      // menu case: nothing dispatched, no frame produced
+            else rc = longPress
                 ? WebCoreLongPressAt(px, py, kLongPressEngineHoldMs,
                                      WEBCORE_LONGPRESS_CONTEXTMENU | WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY,
                                      rgba->data())
@@ -2494,7 +2541,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
 
         std::wstring navUrl, title;
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
-        if (rc == 0) {
+        if (rc == 0 && ctxUrl->empty()) {
             char t[512] = ""; WebCoreGetTitle(t, sizeof t); title = ToWide(t);
             char u[1024] = ""; WebCoreGetUrl(u, sizeof u);
             std::wstring newUrl = ToWide(u);
@@ -2513,13 +2560,32 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
         int rcCopy = rc;
         bool changedCopy = changed;
         int editableCopy = editable;
+        int ctxRcCopy = ctxRc;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, titleW, navW, links, rcCopy, changedCopy, editableCopy, linkHit, mySeq]() {
+                ref new DispatchedHandler([self, rgba, titleW, navW, links, rcCopy, changedCopy, editableCopy, linkHit, mySeq, ctxUrl, ctxRcCopy, longPress]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被取代/看门狗复位,丢弃迟到回调
                     s->m_interacting = false;
                     if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
+                    // Apotheosis (link context menu, 0.1.9.42): the hold was over a link, so the
+                    // page was never touched - there is no frame to apply, no navigation to sync and
+                    // no link table to refresh. Open the menu and stop here, unless the gesture
+                    // became a pan while the probe was in flight (m_ctxPending already cleared).
+                    if (!ctxUrl->empty()) {
+                        s->SetLoading(false);
+                        s->TitleText->Text = ref new String(s->m_currentTitle.empty() ? L"EdgeHTML Reborn" : s->m_currentTitle.c_str());
+                        if (s->m_ctxPending) s->ShowLinkMenu(*ctxUrl);
+                        s->m_ctxPending = false;
+                        return;
+                    }
+                    if (longPress) {
+                        // No link here: the page got the long press it always got. ctxRc is the
+                        // probe's answer (0 = no link, negative = no session / busy / no document),
+                        // which tells "the hold was over plain text" from "the probe never ran".
+                        WriteStage((std::string("ctx none rc=") + std::to_string(ctxRcCopy)).c_str());
+                        s->m_ctxPending = false;
+                    }
                     if (rcCopy == 0) {
                         Platform::String^ title = ref new String(titleW->c_str());
                         Platform::String^ navUrl = navW->empty() ? nullptr : ref new String(navW->c_str());
@@ -3410,6 +3476,11 @@ void MainPage::ApplyEventPresentSetting()
 // 区分点按 vs 拖拽,小位移=Tapped、越阈值=Manipulation,不会冲突)。
 void MainPage::OnImageManipDelta(Platform::Object^, Windows::UI::Xaml::Input::ManipulationDeltaRoutedEventArgs^ e)
 {
+    // Apotheosis (link context menu, 0.1.9.42): the finger is moving, so whatever this gesture
+    // started as, it is a pan or a pinch now - a link menu must not appear on top of it. XAML's own
+    // HoldingState::Canceled says the same thing (OnPageHolding), but it is not guaranteed to have
+    // been raised by the time the first delta arrives, and this is the cheaper of the two gates.
+    if (m_ctxPending) CancelPendingLinkMenu("manip");
     if (!m_sessionActive) return;
     // M4 捏合缩放:本次增量 Scale≠1(或已进入捏合)→ 捏合模式:只对显示层做实时 ScaleTransform(零引擎调用,
     //   丝滑),不走引擎滚动;松手(OnImageManipCompleted)再把累计缩放提交给引擎按新尺度重栅格。
@@ -4530,6 +4601,8 @@ void MainPage::OnHardwareBack(Platform::Object^, Windows::UI::Core::BackRequeste
 {
     using V = Windows::UI::Xaml::Visibility;
     if (OobePanel && OobePanel->Visibility == V::Visible) { e->Handled = true; return; }   // 选语言前拦住,别退出
+    // Apotheosis (link context menu, 0.1.9.42): topmost light-dismiss surface, so it goes first.
+    if (LinkMenu && LinkMenu->Visibility == V::Visible) { HideLinkMenu("back"); e->Handled = true; return; }
     if (SuggestPanel && SuggestPanel->Visibility == V::Visible) { HideSuggestions(); e->Handled = true; return; }
     if (FindBar && FindBar->Visibility == V::Visible) { OnFindClose(nullptr, nullptr); e->Handled = true; return; }
     if (ActionMenu && ActionMenu->Visibility == V::Visible) { HideActionMenu(); e->Handled = true; return; }
@@ -5161,6 +5234,137 @@ void MainPage::OnActionScrimTap(Platform::Object^, Windows::UI::Xaml::Input::Tap
 void MainPage::OnSheetTap(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
 {
     e->Handled = true;  // 点面板本体不冒泡到遮罩(否则点空白区会误关)
+}
+
+// ============================================================================
+// Apotheosis (link context menu, 0.1.9.42): long press on a link.
+//
+// One action for now - "open in new tab". Text selection, copy link and save image are
+// deliberately NOT here: each needs engine work this port does not have yet (a selection model
+// driven by touch, a clipboard round trip, a decoded image handed back to the harness), and a
+// menu that offers them greyed out is worse than a menu that does one thing well.
+// ============================================================================
+
+// 菜单头部显示的目标:去掉协议和 www.,再按长度截断。仅供辨认,不可点。
+static std::wstring LinkMenuTargetText(const std::wstring& url)
+{
+    std::wstring s = url;
+    size_t p = s.find(L"://");
+    if (p != std::wstring::npos) s = s.substr(p + 3);
+    if (s.size() > 4 && s.compare(0, 4, L"www.") == 0) s = s.substr(4);
+    // A trailing "/" on a bare host is noise; anything deeper keeps its path.
+    if (s.size() > 1 && s.back() == L'/' && s.find(L'/') == s.size() - 1) s.pop_back();
+    const size_t kMaxChars = 76;   // the TextBlock elides as well, this only bounds what we hand it
+    if (s.size() > kMaxChars) s = s.substr(0, kMaxChars - 1) + std::wstring(1, L'\x2026');
+    return s;
+}
+
+void MainPage::ShowLinkMenu(const std::wstring& url)
+{
+    if (!LinkMenu || !LinkMenuCard || url.empty()) return;
+    m_ctxUrl = url;
+    if (LinkMenuTarget) LinkMenuTarget->Text = ref new String(LinkMenuTargetText(url).c_str());
+    // Written on every open rather than translated in place: the menu is filled from code, so it is
+    // not part of the XAML tree kI18n/TranslateTree walk over (see the language switch).
+    if (LinkMenuOpenLabel) LinkMenuOpenLabel->Text = L8(L"在新标签页中打开", L"Open in new tab");
+    LinkMenu->Visibility = Windows::UI::Xaml::Visibility::Visible;
+
+    // Placement: centred under the finger, flipped above it when it would not fit, then clamped
+    // into the window. Measure() is called by hand because the card has only just become visible
+    // and its DesiredSize is otherwise the previous open's (or zero on the first one); the literals
+    // are the fallback for the case where XAML refuses to measure outside a layout pass.
+    double availW = RootGrid ? RootGrid->ActualWidth : 0.0;
+    double availH = RootGrid ? RootGrid->ActualHeight : 0.0;
+    if (!(availW > 0.0)) availW = 400.0;
+    if (!(availH > 0.0)) availH = 640.0;
+    double cw = 0.0, ch = 0.0;
+    try {
+        LinkMenuCard->Measure(Windows::Foundation::Size((float)availW, (float)availH));
+        Windows::Foundation::Size d = LinkMenuCard->DesiredSize;
+        cw = d.Width; ch = d.Height;
+    } catch (...) {}
+    if (!(cw > 0.0)) cw = 268.0;
+    if (!(ch > 0.0)) ch = 96.0;
+    const double kGap = 14.0;    // clearance from the fingertip, so the card is not under it
+    const double kEdge = 8.0;
+    double left = m_ctxDipX - cw / 2.0;
+    double top  = m_ctxDipY + kGap;
+    if (top + ch > availH - kEdge) top = m_ctxDipY - kGap - ch;
+    if (left > availW - cw - kEdge) left = availW - cw - kEdge;
+    if (left < kEdge) left = kEdge;
+    if (top > availH - ch - kEdge) top = availH - ch - kEdge;
+    if (top < kEdge) top = kEdge;
+    LinkMenuCard->Margin = Windows::UI::Xaml::Thickness(left, top, 0, 0);
+
+    // Diagnostics carry lengths and positions only - never the URL, never page text.
+    WriteStage((std::string("ctx open len=") + std::to_string(url.size())
+        + " dip=" + std::to_string((int)m_ctxDipX) + "," + std::to_string((int)m_ctxDipY)
+        + " at=" + std::to_string((int)left) + "," + std::to_string((int)top)
+        + " card=" + std::to_string((int)cw) + "x" + std::to_string((int)ch)
+        + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)).c_str());
+}
+
+void MainPage::HideLinkMenu(const char* why)
+{
+    if (!LinkMenu) return;
+    const bool wasOpen = (LinkMenu->Visibility == Windows::UI::Xaml::Visibility::Visible);
+    LinkMenu->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+    m_ctxUrl.clear();
+    if (wasOpen) WriteStage((std::string("ctx dismiss why=") + (why ? why : "?")).c_str());
+}
+
+void MainPage::CancelPendingLinkMenu(const char* why)
+{
+    if (!m_ctxPending) return;
+    m_ctxPending = false;
+    WriteStage((std::string("ctx dismiss why=") + (why ? why : "?") + " pending=1").c_str());
+}
+
+// Apotheosis (link context menu, 0.1.9.42): "open in new tab" here means a new tab that is NOT
+// loaded yet, and that is the tab model working as designed rather than a shortcut.
+//
+// Tabs on this port are Mode A: exactly ONE tab is a live engine session (the active one); every
+// other tab is a record - URL, title, nav stack, page scale, and at most a snapshot of the frame
+// it last showed (see the Tab struct and RestoreTab). There is no second Page to load into, and
+// deliberately so: one document tree in a 32-bit app container is already the memory wall this
+// project keeps hitting, and a second live session would double the worst case. So a background
+// tab is a QUEUED tab - the URL is parked, the tab counter goes up, the page in front keeps its
+// session, its scroll position and its pixels untouched, and the load happens on the first switch
+// to it (RestoreTab -> NavigateTo), exactly as it does for every other non-resident tab here.
+// The user-visible promise ("the current page stays in front") is kept; the network fetch simply
+// does not start until the tab is looked at.
+void MainPage::OpenUrlInBackgroundTab(const std::wstring& url)
+{
+    if (url.empty()) return;
+    Tab t;
+    t.currentUrl = url;
+    t.navStack.push_back(url);   // 新标签的历史起点:该标签内后退无处可去
+    t.navIndex = 0;
+    m_tabs.push_back(t);
+    UpdateTabCount();
+    WriteStage((std::string("ctx action=newtab tabs=") + std::to_string(m_tabs.size())
+        + " len=" + std::to_string(url.size())).c_str());
+    // The only visible feedback a background tab can give: the tab counter moved, and the status
+    // row says why. Writing TitleText reveals that row on its own (property-changed callback).
+    TitleText->Text = L8(L"已在新标签页中打开", L"Opened in a new tab");
+}
+
+void MainPage::OnLinkMenuScrimTap(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
+{
+    if (e) e->Handled = true;   // 点空白处只关菜单,别落到页面上变成一次点击
+    HideLinkMenu("outside");
+}
+
+void MainPage::OnLinkMenuCardTap(Platform::Object^, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e)
+{
+    if (e) e->Handled = true;   // 点卡片本体不冒泡到遮罩(否则点标题行会误关)
+}
+
+void MainPage::OnLinkMenuOpenNewTab(Platform::Object^, RoutedEventArgs^)
+{
+    std::wstring url = m_ctxUrl;   // HideLinkMenu clears it
+    HideLinkMenu("action");
+    OpenUrlInBackgroundTab(url);
 }
 
 // 动作分发:读 Button.Tag。先关面板再执行(避免动作触发的 UI 变化被面板挡住)。

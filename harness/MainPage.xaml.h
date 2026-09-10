@@ -218,6 +218,22 @@ namespace Harness {
         // Holding for touch while the finger is still on the glass; the engine then gets a real
         // long press (WebCoreLongPressAt) instead of the click a tap delivers.
         void OnPageHolding(Platform::Object^ sender, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e);
+
+        // ---- Apotheosis (link context menu, 0.1.9.42): long press on a link ----
+        // The long-press route asks the engine (WebCoreLinkAt) what is under the finger before it
+        // presses anything. A link opens this menu and the page is told NOTHING - neither the long
+        // press nor the click on release - so a hold over a link can no longer navigate by accident.
+        // Any other point falls through to the press-and-hold the page has always been given.
+        // ShowLinkMenu places the card at m_ctxDip{X,Y} (RootGrid DIP, taken when the hold started).
+        void ShowLinkMenu(const std::wstring& url);
+        void HideLinkMenu(const char* why);          // why -> stage.txt "ctx dismiss why="
+        void CancelPendingLinkMenu(const char* why); // hold turned into a pan: drop the answer in flight
+        // Park a URL as a new tab WITHOUT switching to it. On this port's Mode A tab model that is a
+        // queued tab, not a background load - see the comment on the definition.
+        void OpenUrlInBackgroundTab(const std::wstring& url);
+        void OnLinkMenuScrimTap(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        void OnLinkMenuCardTap(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
+        void OnLinkMenuOpenNewTab(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 把内容区显示坐标(DIP)映回引擎像素空间(直呈现下表面被拉伸+设备分辨率缩放),修点击/焦点偏移。
         void MapTapToEngine(double dipX, double dipY, int& outPx, int& outPy);
         // 把位图像素 (px,py) 的点击转发到引擎活会话(WebCoreClickAt),完成后同步地址栏/历史/链接表。
@@ -653,6 +669,16 @@ namespace Harness {
         //   Tapped within a second of one is the tail of that same gesture and must not reach the
         //   page as a second click.
         unsigned long long m_holdAtMs { 0 };
+        // Apotheosis (link context menu, 0.1.9.42): state of the one hold that may still become a
+        //   menu. m_ctxPending is set when a hold is routed to the engine's link probe and cleared
+        //   by the answer, by a Holding Canceled, or by the first manipulation delta - the gate that
+        //   keeps a hold-then-pan from popping a menu after the finger has left. m_ctxDip{X,Y} is
+        //   the finger in RootGrid DIP (NOT engine px: the menu is a XAML element), taken when the
+        //   hold started because the engine answer carries no position. m_ctxUrl is what the open
+        //   menu will act on; it never leaves this object and is never traced.
+        bool   m_ctxPending { false };
+        double m_ctxDipX { 0.0 }, m_ctxDipY { 0.0 };
+        std::wstring m_ctxUrl;
         // Apotheosis (pinch on map widgets, 2026-09-06): this pinch is being fed to the page as
         //   ctrl+wheel notches (WebCoreZoomWheelAt) rather than scaled with WebCoreSetPageScale.
         //   Decided once, at the first pinch delta, and cleared by EndGesture with the rest of the

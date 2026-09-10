@@ -946,6 +946,49 @@
             </Button>
         </Grid>
 
+        <!-- ===== Apotheosis (link context menu, 0.1.9.42):长按链接弹出的小菜单 =====
+             Hand-built instead of a MenuFlyout on purpose. A flyout can only be placed at an
+             arbitrary point through ShowAt(UIElement, FlyoutShowOptions), which is 10.0.15063+,
+             and this package declares TargetDeviceFamily MinVersion 10.0.14393 - a menu that has
+             to appear AT THE FINGER cannot depend on an API the manifest says may not be there.
+             As an overlay it is also the same shape as every other panel in this file (Grid.Row=0
+             + RowSpan=2 over the whole RootGrid, Visibility toggled from code, Back handled in
+             OnHardwareBack), so light dismiss, keyboard handling and the Back key need no new
+             machinery.
+             Background="Transparent" and NOT a Scrim: this is a small menu next to a link, not a
+             modal sheet, so the page stays fully visible - but the grid must still be hit-testable
+             (Transparent is; a null Background is not) or a tap outside would fall through to the
+             page and scroll it instead of dismissing.
+             The card is Left/Top aligned and positioned by its Margin from code (ShowLinkMenu),
+             which is why it declares an explicit Width: the placement math needs a width before
+             the first arrange.
+             IsHoldingEnabled/IsDoubleTapEnabled False throughout - a hold or a double tap on the
+             menu itself is not a gesture, and the double-tap flag has the same "the recogniser
+             belongs to the original source" trap as ContentArea's (see the comment there). -->
+        <Grid x:Name="LinkMenu" Grid.Row="0" Grid.RowSpan="2" Background="Transparent" Visibility="Collapsed"
+              Tapped="OnLinkMenuScrimTap" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+            <Border x:Name="LinkMenuCard" Width="268" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="8,8,0,0"
+                    Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="12"
+                    Tapped="OnLinkMenuCardTap" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+                <StackPanel Margin="0,10,0,4">
+                    <!-- 目标链接:仅供辨认,不可点(IsHitTestVisible=False),文本由代码写入并已截断。 -->
+                    <TextBlock x:Name="LinkMenuTarget" Text="" Foreground="{StaticResource TxtLo}" FontSize="12"
+                               Margin="14,0,14,9" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" IsHitTestVisible="False"/>
+                    <Border Height="1" Background="{StaticResource Sep}"/>
+                    <Button x:Name="LinkMenuOpenBtn" Click="OnLinkMenuOpenNewTab" Background="Transparent" BorderThickness="0"
+                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="14,13"
+                            IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE8A7;" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}"/>
+                            <!-- 文本每次弹出时由 ShowLinkMenu 按当前语言重写(L8),此处仅为设计期占位。 -->
+                            <TextBlock x:Name="LinkMenuOpenLabel" Text="在新标签页中打开" Margin="10,0,0,0" VerticalAlignment="Center"
+                                       Foreground="{StaticResource TxtHi}" FontSize="15"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </Border>
+        </Grid>
+
         <!-- ===== 首启 OOBE:欢迎 + 选语言(English / 中文)。仅全新安装(settings.ini 无 lang)弹出。 ===== -->
         <Grid x:Name="OobePanel" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="36,0" MaxWidth="380">
