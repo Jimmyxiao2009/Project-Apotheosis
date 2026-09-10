@@ -432,6 +432,11 @@ namespace Harness {
         //   ComputeEngineViewport in MainPage.xaml.cpp for the root cause and the ANGLE side.
         bool ComputeEngineViewport(bool useGpuPanel, int& outW, int& outH);
         int BottomOcclusionEnginePx();
+        // Apotheosis (0.1.9.46): send the current bottom occlusion to the engine and have it
+        //   re-reveal the focused field with it, outside a resize - a rotation only learns the
+        //   keyboard's new rectangle a few dispatcher hops after the resize has already run.
+        //   Silent when the number has not changed. why -> stage.txt "reveal why=".
+        void PushBottomOcclusion(const char* why);
         // forceW/forceH > 0 bypass ComputeEngineViewport and install exactly that viewport - used
         //   by the surface-mismatch safety net, which has to adopt the EGL surface VERBATIM rather
         //   than a recomputed panel x scale that could round to a different number again.
@@ -799,6 +804,9 @@ namespace Harness {
         //   this is set: the shift stays where it is until a plausible rectangle or a Showing event
         //   arrives. m_kbRecheckTries bounds the deferred re-query so it cannot become a loop.
         bool   m_kbMetricsStale { false };
+        // Apotheosis (0.1.9.46): the last value handed to WebCoreSetBottomOcclusion(), so a push
+        //   that changes nothing costs nothing. -1 = never sent (0 is a legitimate value).
+        int    m_bottomOccSent { -1 };
         int    m_kbRecheckTries { 0 };
         double m_kbShiftApplied { 0.0 };
         // Apotheosis (suggestion tap, 2026-09-10): a shift back to rest while the suggestion dropdown

@@ -1177,6 +1177,11 @@ MainPage::MainPage()
                             + " inset=" + Dip(m_lastInsetBottom)
                             + " scale=" + Dip(CurrentDeviceScale())).c_str());
                 ApplyKeyboardShift("show");
+                // Apotheosis (0.1.9.46): a rectangle from the shell itself is current by
+                //   construction, so this is also the path that repairs a rotation whose re-query
+                //   never succeeded - and the one that gives a field tapped WITHOUT a rotation the
+                //   same margin above the keyboard.
+                PushBottomOcclusion("show");
                 if (m_kbShiftApplied > 0.0 && e)
                     e->EnsuredFocusedElementInView = true;   // 已自行让位,系统勿再额外滚动
             });
@@ -1199,6 +1204,7 @@ MainPage::MainPage()
                             + " inset=" + Dip(m_lastInsetBottom)
                             + " prevshift=" + Dip(prev)).c_str());
                 ApplyKeyboardShift("hide");
+                PushBottomOcclusion("hide");   // nothing is covered any more - and the engine is sticky
                 if (prev > 0.0 && e)   // 仅当我们上移过才认领(设置页文本框靠系统自身滚动恢复,别干扰)
                     e->EnsuredFocusedElementInView = true;
             });
@@ -1910,6 +1916,11 @@ void MainPage::RefreshKeyboardMetrics(const char* why)
         m_kbHeight = occ.Height;
         m_kbMetricsStale = false;
         m_kbRecheckTries = 0;
+        // Apotheosis (0.1.9.46): THIS is the moment the rotation's occlusion becomes knowable. The
+        //   resize is long gone (it ran with 0 - the rectangle it would have measured was the old
+        //   orientation's), so hand the real number over and let the engine re-reveal the focused
+        //   field with it. Silent unless the number actually changed.
+        PushBottomOcclusion("kbfix");
     } else {
         m_kbMetricsStale = true;
         WriteStage((std::string("keyboard-stale why=") + (why ? why : "?")
@@ -6541,6 +6552,16 @@ int MainPage::BottomOcclusionEnginePx()
 {
     if (!m_kbVisible || !(m_kbHeight > 0.0) || !(m_engineScale > 0.0))
         return 0;
+    // Apotheosis (0.1.9.46): m_kbTop belongs to the orientation we just LEFT - RefreshKeyboardMetrics
+    //   has rejected the shell's answer and is asking again (see KeyboardRectPlausible). Measuring
+    //   the panel against it gives a number that is wrong in whichever direction the rotation went:
+    //   a portrait rectangle against the landscape panel says "nothing is covered" (the device log
+    //   for 0.1.9.45: occ=0 on every rotation INTO landscape, hence no margin), a landscape one
+    //   against the portrait panel says almost the whole panel is (occ=800 of 1088). Report nothing
+    //   covered and let PushBottomOcclusion redo the reveal when the real rectangle arrives - a
+    //   reveal without a margin is what 0.1.9.44 did, a reveal with a made-up one is worse.
+    if (m_kbMetricsStale)
+        return 0;
     double panelTop = 0.0, panelH = 0.0;
     try {
         Windows::UI::Xaml::UIElement^ el = nullptr;
@@ -6559,6 +6580,44 @@ int MainPage::BottomOcclusionEnginePx()
     if (occ <= 0.0) return 0;
     if (occ > panelH) occ = panelH;
     return (int)(occ * m_engineScale + 0.5);
+}
+
+// Apotheosis (0.1.9.46): hand the current bottom occlusion to the engine and let it re-reveal the
+// focused field with it - outside a resize.
+//
+// The problem this closes (device round 0.1.9.45, "the margin only works from the SECOND rotation
+// to landscape"): the occlusion is measured once, in UpdateEngineViewport, and handed over with the
+// WebCoreResize that the rotation triggers - but at that moment the shell is still answering
+// InputPane::OccludedRect with the previous orientation's rectangle, which 0.1.9.44 refuses to
+// believe. So the resize's reveal ran with occ=0 and nothing re-ran it when the real rectangle
+// turned up one or two dispatcher hops later; only the NEXT rotation, which found the metrics
+// already correct, produced a margin. Every path that ends up with a trustworthy rectangle calls
+// this: the bounded re-query when it finally succeeds, and the shell's own Showing/Hiding.
+//
+// Cheap and idempotent: nothing is posted while the number has not changed, and the engine side is
+// one int plus a reveal that is a no-op for a field which is already comfortably visible.
+// The reveal is skipped while the ADDRESS BAR is the thing being typed into - that keyboard belongs
+// to the harness' own field, the page's focused element is whatever it was, and scrolling the page
+// under a user who is typing a URL would be a bug. The occlusion is still sent: it is sticky state,
+// and the next reveal (a rotation, or the page field being tapped) has to have it.
+// UI THREAD ONLY.
+void MainPage::PushBottomOcclusion(const char* why)
+{
+    const int occ = BottomOcclusionEnginePx();
+    if (occ == m_bottomOccSent)
+        return;
+    if (!m_sessionActive)
+        return;   // nothing to tell, and nothing sent - so do NOT record it as sent
+    m_bottomOccSent = occ;
+    const bool reveal = !m_urlFocused;
+    WriteStage((std::string("reveal why=") + (why ? why : "?")
+                + " occ=" + std::to_string(occ)
+                + " url=" + (m_urlFocused ? "1" : "0")).c_str());
+    WebEngine::instance().post([occ, reveal]() {
+        try { WebCoreSetBottomOcclusion(occ); } catch (...) {}
+        if (reveal)
+            try { WebCoreRevealFocusedElement(); } catch (...) {}
+    });
 }
 
 // UI THREAD ONLY. Re-measure and, if the viewport moved, hand the new size to the engine.
@@ -6628,6 +6687,15 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
         return;
     }
 
+    // Apotheosis (0.1.9.46): from here on the occlusion IS sent (in the post below, before the
+    //   resize) - remember it, so PushBottomOcclusion can tell a real change from a repeat. The
+    //   correction after a rotation comes through that path a few dispatcher hops from here.
+    m_bottomOccSent = occ;
+    // The resize below carries a reveal of its own (WebCoreResize does it after the relayout), so
+    //   trace it the way PushBottomOcclusion traces the later corrections: one grep for `reveal`
+    //   then shows the whole sequence a rotation produced, in order.
+    WriteStage((std::string("reveal why=resize occ=") + std::to_string(occ)
+                + " url=" + (m_urlFocused ? "1" : "0")).c_str());
     bool present = m_gpuPresent;
     CoreDispatcher^ disp = this->Dispatcher;
     Platform::Agile<MainPage^> self(this);

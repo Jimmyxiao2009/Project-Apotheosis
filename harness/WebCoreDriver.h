@@ -346,6 +346,14 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
 // 露给用户看时读它(目前是 WebCoreResize 的聚焦框回滚)。
 void WebCoreSetBottomOcclusion(int enginePx);
 
+// Apotheosis (0.1.9.46): 单独执行 WebCoreResize 里的"聚焦框回滚",不做 resize。
+// 旋转后屏幕键盘在新方向下的矩形要晚几拍才到(壳先回答上一个方向的矩形,
+// 0.1.9.44 会拒绝它),所以 resize 当时那次回滚是按遮挡 0 算的,输入框仍在键盘后面。
+// 等真矩形到手后:先 WebCoreSetBottomOcclusion(),再调这个(引擎线程)。
+// 开销很小:文档不脏就不重排,也不自己合成(滚动会点亮下一帧)。
+// 返回 kOK(没有聚焦可编辑元素也是 kOK)/ kErrNoSession / kErrBusy。
+int WebCoreRevealFocusedElement(void);
+
 // ---- 输入法/键盘 ----
 // 当前是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ 据此弹/收屏幕键盘。返回 1/0。
 int WebCoreFocusedEditable();

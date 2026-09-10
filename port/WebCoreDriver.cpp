@@ -6370,6 +6370,82 @@ static void querySurfaceSize(int* outW, int* outH)
         *outH = static_cast<int>(value);
 }
 
+// Apotheosis (rotation with the keyboard up, 0.1.9.43): the focused text field is normally
+// kept in view by the engine itself - but only when something SCROLLS. A rotation changes the
+// viewport instead: the field the user is typing into can end up anywhere in the new layout
+// (in landscape the visible strip above the keyboard is a fraction of what it was), and the
+// keyboard stays up, so typing continued into a field nobody could see. Only editable
+// elements, and only when the relayout actually moved it out of view - scrollIntoViewIfNeeded
+// is a no-op for a field that is still visible, so an ordinary rotation costs nothing.
+//
+// Apotheosis (0.1.9.45): with a MARGIN, and the margin is the whole point. scrollIntoViewIfNeeded
+// reveals a field into the VIEWPORT, and the viewport is not what the user can see: the soft
+// keyboard is an OS overlay over the bottom of the window, and while a PAGE field has focus the
+// harness deliberately does not shift anything (only address-bar editing moves the chrome - see
+// ApplyKeyboardShift), so the bottom g_bottomOcclusionPx of our own viewport are behind the
+// keyboard. On top of that, alignCenterIfNeeded's PARTIAL behaviour is "align to the closest
+// edge", which for a field hanging off the bottom means exactly one sliver of it comes back -
+// which is what a rotation with the keyboard up produced on the device.
+//
+// So expand the rect to be revealed DOWNWARDS by the occluded strip plus a comfort gap, and
+// reveal that: partial then lands the expanded rect's bottom on the viewport's bottom, i.e. the
+// field's bottom a full gap above the keyboard, and hidden centres the expanded rect, which puts
+// the field itself into the upper, visible part of the band. The margin is applied as a FRACTION
+// of the visible content rect, so it is right at any page scale without converting anything:
+// engine px and layout px differ by exactly that scale, and the fraction cancels it.
+//
+// Apotheosis (0.1.9.46): a function of its own, because the rotation is no longer the only moment
+// that needs it. On a rotation the harness does not yet KNOW the occlusion: the shell answers with
+// the previous orientation's keyboard rectangle for a few dispatcher hops and 0.1.9.44 refuses to
+// believe it, so the reveal inside WebCoreResize runs with 0 and the field comes back as the sliver
+// this margin exists to prevent. WebCoreRevealFocusedElement() re-runs exactly this, once the real
+// rectangle is in.
+//
+// viewportH is the viewport's height in engine px (WebCoreResize's new h; g_session->h otherwise).
+// Returns true when a focused editable element was found (and therefore revealed).
+static bool revealFocusedEditable(WebCore::Document& doc, WebCore::LocalFrameView& view, int viewportH)
+{
+    using namespace WebCore;
+    RefPtr<Element> focused = doc.focusedElement();
+    if (!focused)
+        return false;
+    bool editable = focused->hasEditableStyle();
+    if (!editable && is<HTMLInputElement>(*focused))
+        editable = downcast<HTMLInputElement>(*focused).isTextField();
+    if (!editable && is<HTMLTextAreaElement>(*focused))
+        editable = true;
+    if (!editable)
+        return false;
+    CheckedPtr renderer = focused->renderer();
+    LayoutRect visible = view.visibleContentRect();
+    const int occluded = (g_bottomOcclusionPx > 0 && g_bottomOcclusionPx < viewportH) ? g_bottomOcclusionPx : 0;
+    const int comfort = std::max(96, viewportH / 8);   // one line of chrome, never less than ~40 DIP
+    const double wanted = (viewportH > 0) ? static_cast<double>(occluded + comfort) / viewportH : 0.0;
+    if (!renderer || wanted <= 0.0 || visible.height() <= 0) {
+        focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
+    } else {
+        bool insideFixed = false;
+        LayoutRect bounds = renderer->absoluteAnchorRectWithScrollMargin(&insideFixed).marginRect;
+        // The expanded rect must stay SMALLER than the viewport: getRectToExposeForScrollIntoView
+        // treats a rect as big as the visible area as "visible" and does not scroll at all.
+        LayoutUnit pad { visible.height() * std::min(wanted, 0.8) };
+        LayoutUnit room = visible.height() - bounds.height() - LayoutUnit(2);
+        if (pad > room)
+            pad = room;
+        auto alignX = ScrollAlignment::alignCenterIfNeeded;
+        alignX.disableLegacyHorizontalVisibilityThreshold();
+        auto alignY = ScrollAlignment::alignCenterIfNeeded;
+        if (pad > 0)
+            bounds.setHeight(bounds.height() + pad);
+        else
+            alignY = ScrollAlignment::alignTopAlways;   // field taller than the free band: show its top
+        LocalFrameView::scrollRectToVisible(bounds, *renderer, insideFixed,
+            { SelectionRevealMode::Reveal, alignX, alignY, ShouldAllowCrossOriginScrolling::No });
+    }
+    doc.updateLayoutIgnorePendingStylesheets();
+    return true;
+}
+
 // Apotheosis (landscape/rotation, 0.1.9.41): re-establish the engine viewport at w*h and re-lay
 // out the live page for it. See the contract in WebCoreDriver.h.
 //
@@ -6440,65 +6516,10 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
         doc->updateLayoutIgnorePendingStylesheets();
     }
 
-    // Apotheosis (rotation with the keyboard up, 0.1.9.43): the focused text field is normally
-    // kept in view by the engine itself - but only when something SCROLLS. A rotation changes the
-    // viewport instead: the field the user is typing into can end up anywhere in the new layout
-    // (in landscape the visible strip above the keyboard is a fraction of what it was), and the
-    // keyboard stays up, so typing continued into a field nobody could see. Only editable
-    // elements, and only when the relayout actually moved it out of view - scrollIntoViewIfNeeded
-    // is a no-op for a field that is still visible, so an ordinary rotation costs nothing.
-    //
-    // Apotheosis (0.1.9.45): with a MARGIN, and the margin is the whole point. scrollIntoViewIfNeeded
-    // reveals a field into the VIEWPORT, and the viewport is not what the user can see: the soft
-    // keyboard is an OS overlay over the bottom of the window, and while a PAGE field has focus the
-    // harness deliberately does not shift anything (only address-bar editing moves the chrome - see
-    // ApplyKeyboardShift), so the bottom g_bottomOcclusionPx of our own viewport are behind the
-    // keyboard. On top of that, alignCenterIfNeeded's PARTIAL behaviour is "align to the closest
-    // edge", which for a field hanging off the bottom means exactly one sliver of it comes back -
-    // which is what a rotation with the keyboard up produced on the device.
-    //
-    // So expand the rect to be revealed DOWNWARDS by the occluded strip plus a comfort gap, and
-    // reveal that: partial then lands the expanded rect's bottom on the viewport's bottom, i.e. the
-    // field's bottom a full gap above the keyboard, and hidden centres the expanded rect, which puts
-    // the field itself into the upper, visible part of the band. The margin is applied as a FRACTION
-    // of the visible content rect, so it is right at any page scale without converting anything:
-    // engine px and layout px differ by exactly that scale, and the fraction cancels it.
-    if (RefPtr<Element> focused = doc->focusedElement()) {
-        bool editable = focused->hasEditableStyle();
-        if (!editable && is<HTMLInputElement>(*focused))
-            editable = downcast<HTMLInputElement>(*focused).isTextField();
-        if (!editable && is<HTMLTextAreaElement>(*focused))
-            editable = true;
-        if (editable) {
-            CheckedPtr renderer = focused->renderer();
-            LayoutRect visible = view->visibleContentRect();
-            const int occluded = (g_bottomOcclusionPx > 0 && g_bottomOcclusionPx < h) ? g_bottomOcclusionPx : 0;
-            const int comfort = std::max(96, h / 8);   // one line of chrome, never less than ~40 DIP
-            const double wanted = (h > 0) ? static_cast<double>(occluded + comfort) / h : 0.0;
-            if (!renderer || wanted <= 0.0 || visible.height() <= 0) {
-                focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
-            } else {
-                bool insideFixed = false;
-                LayoutRect bounds = renderer->absoluteAnchorRectWithScrollMargin(&insideFixed).marginRect;
-                // The expanded rect must stay SMALLER than the viewport: getRectToExposeForScrollIntoView
-                // treats a rect as big as the visible area as "visible" and does not scroll at all.
-                LayoutUnit pad { visible.height() * std::min(wanted, 0.8) };
-                LayoutUnit room = visible.height() - bounds.height() - LayoutUnit(2);
-                if (pad > room)
-                    pad = room;
-                auto alignX = ScrollAlignment::alignCenterIfNeeded;
-                alignX.disableLegacyHorizontalVisibilityThreshold();
-                auto alignY = ScrollAlignment::alignCenterIfNeeded;
-                if (pad > 0)
-                    bounds.setHeight(bounds.height() + pad);
-                else
-                    alignY = ScrollAlignment::alignTopAlways;   // field taller than the free band: show its top
-                LocalFrameView::scrollRectToVisible(bounds, *renderer, insideFixed,
-                    { SelectionRevealMode::Reveal, alignX, alignY, ShouldAllowCrossOriginScrolling::No });
-            }
-            doc->updateLayoutIgnorePendingStylesheets();
-        }
-    }
+    // The field the user is typing into has to survive the rotation the keyboard survives - see
+    // revealFocusedEditable() above. A no-op for a field that is still comfortably visible, so an
+    // ordinary rotation costs nothing.
+    revealFocusedEditable(*doc, *view, h);
     extractLinks(doc.get(), h);
 
     g_gpuForceFullNext = true;   // tiles were rastered for the old viewport - none of them is trustworthy
@@ -6511,6 +6532,46 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
     if (prc != kOK)
         return prc;
     writeDiag(*doc, *view, w, h, nonWhite);
+    return kOK;
+}
+
+// Apotheosis (0.1.9.46): run the focused-field reveal on its own, WITHOUT a resize.
+//
+// Why it has to be callable separately: the reveal is only as good as g_bottomOcclusionPx, and on a
+// rotation that number is not knowable yet. The soft keyboard's rectangle for the new orientation
+// reaches the harness a few dispatcher hops after the panel has resized (until then the shell
+// answers with the previous orientation's rectangle, which must not be believed - it would move the
+// whole chrome by half a screen), so WebCoreResize's own reveal runs with an occlusion of 0 and
+// leaves the field at the bottom edge, behind the keyboard. The harness calls this once the real
+// rectangle is in, after WebCoreSetBottomOcclusion().
+//
+// Cheap by design: layout only if the document needs it, no composite of its own - the scroll arms
+// the chrome's needsPresent, so the next live tick shows the result.
+// Returns kOK (also when nothing editable is focused, which is a complete answer), or the usual
+// negative errors.
+int WebCoreRevealFocusedElement(void)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->page || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+
+    g_inPump = true;
+    PumpGuard guard;
+    doc->updateLayoutIgnorePendingStylesheets();   // no-op when nothing is dirty
+    const IntPoint before = view->scrollPosition();
+    if (revealFocusedEditable(*doc, *view, g_session->h) && view->scrollPosition() != before) {
+        if (g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+    }
     return kOK;
 }
 

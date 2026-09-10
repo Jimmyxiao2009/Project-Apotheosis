@@ -369,6 +369,16 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
 // the engine has to reveal something to the USER (currently WebCoreResize's focused-field reveal).
 void WebCoreSetBottomOcclusion(int enginePx);
 
+// Apotheosis (0.1.9.46): run WebCoreResize's focused-field reveal on its own, without a resize.
+// The occlusion above is only correct a few dispatcher hops AFTER a rotation - the shell answers
+// with the previous orientation's keyboard rectangle first, and a rectangle that cannot belong to
+// the current window must not be believed - so the reveal that ran inside the resize ran without a
+// margin and left the field at the bottom edge, behind the keyboard. Call this once the real
+// rectangle is in, right after WebCoreSetBottomOcclusion(), on the engine thread. Cheap: layout
+// only if the document is dirty, no composite of its own (the scroll arms the next tick's).
+// Returns kOK - also when nothing editable is focused - or kErrNoSession / kErrBusy.
+int WebCoreRevealFocusedElement(void);
+
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable
