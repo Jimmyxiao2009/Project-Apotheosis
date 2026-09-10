@@ -203,7 +203,7 @@ int WebCoreIsScrollableAt(int x, int y);
 // (与 WebCoreScrollBy 相同的 paintToRGBA 调用)——harness 不需要再补一次呈现才能看到嵌套滚动体动。
 int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outBuf);
 
-// Apotheosis(拖拽即指针事件):地图类控件(Google 地图 / OpenStreetMap-Leaflet / canvas 应用)
+// Apotheosis(拖拽即指针事件):地图类控件(Leaflet / MapLibre / canvas 应用)
 // 自己监听 pointerdown/mousedown 并移动自身内容,不滚动任何可滚动盒 —— 对它们来说
 // WebCoreScrollBy 和 WebCoreWheelAt 都是错的路。下面两个导出让 harness 把这种手势按真实鼠标
 // 拖拽交给页面。
@@ -218,15 +218,15 @@ int WebCoreWantsDragAt(int x, int y);
 // 按下未被消费时 phase 1-3 直接返回 0 且不派发,故某个页面不理会的 mousemove 不会在拖拽中途把手势夺走。
 // Apotheosis (2026-09-04): the press is owned when EITHER the engine reported it handled OR the
 // point is still a drag widget (the WebCoreWantsDragAt walk, re-run here). A map that listens for
-// pointerdown without calling preventDefault - Google Maps does exactly that - answers "not
+// pointerdown without calling preventDefault - a map site does exactly that - answers "not
 // handled" and would otherwise lose the whole gesture on its first event.
 // 返回 1 时已按 WebCoreWheelAt 的方式合成/呈现到 outBuf;outBuf 可为 null(则不呈现)。
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outBuf);
-// Apotheosis (Google Maps pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
+// Apotheosis (map-site pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
 // on this port and nothing synthesises Touch/Pointer input, so a touch long press cannot be
 // delivered as one; what this does deliver is everything a page can key a long press off with a
 // mouse: mousedown, the button STAYS DOWN while the engine turns its run loop for holdMs (so a
-// press-and-hold timer inside the page - Google Maps drops its pin from exactly such a timer - gets
+// press-and-hold timer inside the page - a map site drops its pin from exactly such a timer - gets
 // the time it waits for), then mouseup + DOM click, and optionally a 'contextmenu' event at the
 // same point (on desktop Maps the right-click menu is the usable "drop a pin / What's here?" path,
 // and a long press is what a browser turns into a contextmenu).
@@ -297,7 +297,7 @@ void WebCoreSetSpeculativePrefetch(int enabled);
 
 // Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is
 // being typed (debounced, e.g. once per suggestion update) so the DNS lookup is already done when
-// Enter arrives. Accepts a full URL or a bare host ("ntv.de"); anything else is ignored. DNS only:
+// Enter arrives. Accepts a full URL or a bare host ("example.com"); anything else is ignored. DNS only:
 // libcurl cannot open a reusable connection ahead of time (see WebCoreDriver.cpp). Non-blocking
 // (resolves on a work queue), idempotent per host, engine thread.
 void WebCorePreconnect(const char* url);

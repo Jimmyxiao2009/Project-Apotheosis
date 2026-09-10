@@ -167,12 +167,12 @@ static void WriteStage(const char* stage)
 }
 
 // Apotheosis (M4): UWP enforces a per-app memory cap; on a Lumia 950 the app is terminated with no
-// crash dump once it is exceeded (github.com ≈620 MB → ntv.de). One compact snapshot of the OS view
+// crash dump once it is exceeded (a code-hosting site ≈620 MB → a news site). One compact snapshot of the OS view
 // of our own working set, appended to the stage lines so WDP can pull the numbers back.
 // 这三个 API 在 15254 上都有;取不到就返回 "mem=n/a",绝不影响调用点。
 // Apotheosis (review 2026-09-04 item 1): AppMemoryUsage/Limit only track the UWP App Container's
 // assigned memory budget, never the flat 32-bit address space every allocation still has to fit
-// in. The Google Maps abort (night6, 2026-09-04 ~02:35, DAY-REPORT.md) happened at 57% of that
+// in. The map-site abort (night6, 2026-09-04 ~02:35, DAY-REPORT.md) happened at 57% of that
 // budget (pressure level still 0) with GlobalMemoryStatusEx().ullAvailVirtual down to 271 MB — a
 // single large contiguous allocation (BitmapTexturePool::Entry vector) failed long before the
 // budget percentage said anything was wrong. The driver already reads this same field; sampled
@@ -276,7 +276,7 @@ static void ApplyMemoryPressure(int level, const std::string& why)
 // transition. Two independent signals, each with its own hysteresis (up at 65%/80% budget or
 // <400/<250 MB free address space, down at 60%/75% or >450/>300 MB, never straight from 2 back to
 // 0) — whichever wants more pressure wins, since either running out is a real abort risk (review
-// 2026-09-04 item 1: the Google Maps abort happened with the budget signal still at level 0).
+// 2026-09-04 item 1: the map-site abort happened with the budget signal still at level 0).
 static void SampleMemoryPressure()
 {
     unsigned long long used = 0, limit = 0;
@@ -698,7 +698,7 @@ static float SnapAndClampPageScale(float s)
 //   release, exactly like the ±33% page-scale snap band above is eased.
 static const double kZoomRubberBandDip = 40.0;
 
-// Apotheosis (Google Maps pin): how long WebCoreLongPressAt keeps the mouse button down before
+// Apotheosis (map-site pin): how long WebCoreLongPressAt keeps the mouse button down before
 //   releasing with the click and the contextmenu event.
 //
 //   REVERTED to 600 ms on 2026-09-07 after the device A/B this value accidentally became. The
@@ -2132,7 +2132,7 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
     auto pt = e->GetPosition(ContentArea);
     int px = -1, py = -1; MapTapToEngine(pt.X, pt.Y, px, py);
     const bool inBounds = (px >= 0 && py >= 0 && px < kW && py < kH);
-    // Apotheosis (Google Maps pin, 2026-09-06): the tail of a long press is not a tap. XAML normally
+    // Apotheosis (map-site pin, 2026-09-06): the tail of a long press is not a tap. XAML normally
     // raises RightTapped rather than Tapped once a hold has been recognised, but the engine has been
     // given the whole press/hold/release either way - a click on top of it would toggle the map view
     // the long press was meant to avoid.
@@ -2256,7 +2256,7 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
     }
 }
 
-// Apotheosis (Google Maps pin, 2026-09-06): press and hold on a map.
+// Apotheosis (map-site pin, 2026-09-06): press and hold on a map.
 //
 // Why this is a gesture of its own: a tap already reaches the page as a clean click - hover move,
 // mousedown (buttons 1), mouseup at the identical point, DOM click (WebCoreClickAt) - and on the
@@ -2353,7 +2353,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
         auto rgba = std::make_shared<std::vector<uint8_t>>((size_t)kW * kH * 4, 0);
         int rc = -999;
         unsigned hashBefore = WebCoreGetFrameHash();
-        // Apotheosis (Google Maps pin, 2026-09-06; latency cut 2026-09-06, kLongPressEngineHoldMs):
+        // Apotheosis (map-site pin, 2026-09-06; latency cut 2026-09-06, kLongPressEngineHoldMs):
         // the long press holds the button down in the engine for kLongPressEngineHoldMs, then
         // releases with the click and sends a contextmenu at the same point - the two things a map
         // can turn into a dropped pin. DRAG_WIDGET_ONLY makes it a no-op (kOK, current frame painted)
@@ -2698,7 +2698,7 @@ void MainPage::PumpNestedScroll()
 // ===========================================================================
 // Apotheosis (drag as pointer events): the WebCoreDragAt route.
 //
-// Google Maps, OpenStreetMap/Leaflet and canvas apps pan by handling
+// Map widgets - Leaflet, MapLibre, canvas apps - pan by handling
 // pointerdown/mousedown and moving their own content — no scrollable box is
 // involved anywhere, so translating the gesture into scrolling (either route
 // above) leaves the widget frozen and drags the document behind it instead.
@@ -4211,7 +4211,7 @@ void MainPage::ScheduleWakeComposite()
         || TabSwitcher->Visibility == Windows::UI::Xaml::Visibility::Visible) return;
     if (m_wakeTimer && m_wakeTimer->IsEnabled) return;   // 已经排好队了
     // 最小间隔 16ms(≈60Hz)。上一帧比这贵 → 按上一帧的耗时来(占空比 ≤50%,别把这台机器打满:
-    // github 那种"每帧都请求渲染更新"的页面否则会从 5fps 直接变成背靠背合成)。上限 200ms = 旧 tick。
+    // 代码托管站那种"每帧都请求渲染更新"的页面否则会从 5fps 直接变成背靠背合成)。上限 200ms = 旧 tick。
     // 连续动画 150 帧(≈30s)无交互 → 至少 1s 一帧,搬的是旧 tick 的防永久动画降速。
     unsigned minGap = 16;
     if (m_lastPresentDurMs > minGap) minGap = (m_lastPresentDurMs > 200) ? 200 : m_lastPresentDurMs;

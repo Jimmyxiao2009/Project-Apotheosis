@@ -204,7 +204,7 @@ namespace Harness {
         void OnLoadWatchdog(Platform::Object^ sender, Platform::Object^ e);
         // 网页点击:有会话则把点击转发到引擎(按钮/表单/链接统一走真实事件);无会话(主页)走链接表。
         void OnPageTapped(Platform::Object^ sender, Windows::UI::Xaml::Input::TappedRoutedEventArgs^ e);
-        // Apotheosis (Google Maps pin, 2026-09-06): press and hold on a map/canvas. XAML raises
+        // Apotheosis (map-site pin, 2026-09-06): press and hold on a map/canvas. XAML raises
         // Holding for touch while the finger is still on the glass; the engine then gets a real
         // long press (WebCoreLongPressAt) instead of the click a tap delivers.
         void OnPageHolding(Platform::Object^ sender, Windows::UI::Xaml::Input::HoldingRoutedEventArgs^ e);
@@ -608,7 +608,7 @@ namespace Harness {
         int  m_dragFallbackDx { 0 }, m_dragFallbackDy { 0 };
         // M4 捏合缩放状态
         bool   m_pinching { false };   // 正在捏合(双指 Scale 手势);期间只变换显示层,松手提交引擎
-        // Apotheosis (Google Maps pin, 2026-09-06): tick count of the last Holding(Started) that was
+        // Apotheosis (map-site pin, 2026-09-06): tick count of the last Holding(Started) that was
         //   turned into a long press. A hold normally ends in RightTapped rather than Tapped, but a
         //   Tapped within a second of one is the tail of that same gesture and must not reach the
         //   page as a second click.

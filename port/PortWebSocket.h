@@ -5,7 +5,7 @@
 // EmptySocketProvider — createWebSocketChannel() returns nullptr. WebSocket.cpp:288 then
 // hits `RELEASE_ASSERT(m_channel)` ("Every ScriptExecutionContext should have a
 // SocketProvider") and the app dies with SIGABRT on the first `new WebSocket(...)`.
-// Device (0.1.9.23, build-driver\logs\20260907-114911\crash.txt): mapy.com aborts every
+// Device (0.1.9.23, build-driver\logs\20260907-114911\crash.txt): a map site aborts every
 // time, and any SPA with a live connection would do the same.
 //
 // This port has no NetworkProcess, so there is no WebSocketTask to talk to over IPC.

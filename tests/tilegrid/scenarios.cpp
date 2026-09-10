@@ -1028,12 +1028,12 @@ void traceFormat()
 }
 
 // -------------------------------------------------------------------------
-// Device round 1 (0.1.9.29, n-tv.de) - the three failures the first v2 package
+// Device round 1 (0.1.9.29, a news site) - the three failures the first v2 package
 // showed on the Lumia, as tests. Each one is written so that it fails against
 // the model as it was shipped in that package.
 // -------------------------------------------------------------------------
 
-// F2(a). A store whose visible rect is unknown (a mask, a replica, the n-tv
+// F2(a). A store whose visible rect is unknown (a mask, a replica, the news site's
 // sticky header S100, the 508x1080 layers S2000/S2001) composites against all
 // of B. Holes used to be counted over cells(B), so every cell beyond the budget
 // was a hole for ever - and the driver's "holes > 0 => one more composite" rule

@@ -324,7 +324,7 @@ static bool isValidSurfaceSize(int w, int h)
 static constexpr unsigned kMB = 1024u * 1024u;
 // MemoryCache budgets per level: (minDeadBytes, maxDeadBytes, totalBytes).
 // Apotheosis: the unpressured budget was 0/16/32 MB, which is smaller than a single image-heavy
-// viewport once the frames are decoded. On chaos.social (200+ images) mem.txt showed dec=32 MB
+// viewport once the frames are decoded. On an image-heavy social timeline (200+ images) mem.txt showed dec=32 MB
 // against cap=32 MB while the process sat at 35 % of the App Container limit: every insert pruned
 // what the previous decode had just produced, so large images ping-ponged between the async decode
 // queue (11b3bbd2b9) and the pruner and some never reached a paint at all. 32/64/128 MB is still a
@@ -516,7 +516,7 @@ static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyT
 static bool g_dragActive = false;
 // Apotheosis (map tap, 2026-09-06): where that press landed, and whether the finger has since
 // travelled far enough that the gesture stopped being a tap. A touch pan must NOT end in a click:
-// on maps.google.com every pan ended with a click on the map canvas, which is the site's own
+// on the map site every pan ended with a click on the map canvas, which is the site's own
 // "toggle the full-screen map view" action - the reported "a tap/drag flips the map view".
 // (A mouse drag inside one element does fire a click in a desktop browser; a touch pan never does,
 // and every gesture that reaches WebCoreDragAt came from a finger.) Engine thread only.
@@ -773,7 +773,7 @@ struct PumpGuard { ~PumpGuard() { g_inPump = false; } };
 // Apotheosis: on Windows 10 Mobile WER writes no dump for the way this engine
 // dies (WTF's CRASH() is std::abort(), whose UWP CRT tail is __fastfail, and
 // WTFBreakpointTrap() is a `bkpt #0` trap) — the app just vanishes, which is
-// exactly what ntv.de does on a Lumia 950. So the driver writes the crashing
+// exactly what a news site does on a Lumia 950. So the driver writes the crashing
 // stack itself, appended to LocalState\crash.txt, from three independent
 // sources that all funnel into crashLogWrite():
 //   (a) the WTF crash hook (Source/WTF/wtf/Assertions.cpp, WK_WINUWP) — fires
@@ -1247,7 +1247,7 @@ static const char* const kPerfHeader =
     //   ms_tick_cb   sum of the settle callbacks themselves (ms_render_update is inside this)
     //   ms_offpump   sum of max(0, period - max(50 ms, callback)) = main-thread work that was
     //                NOT ours. On the 2026-09-07 log this is the biggest single bucket of a
-    //                cold ntv.de load, and it is invisible in every other column
+    //                cold news-site load, and it is invisible in every other column
     //   pump_ticks   settle callbacks (same number as `frames`, kept next to the two above so
     //                the row is readable on its own)
     "ms_tick_cb,ms_offpump,pump_ticks,"
@@ -1267,7 +1267,7 @@ static const char* const kPerfHeader =
     //                still has no scope. A large off_other means this list is incomplete
     "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other,"
     // Apotheosis (M4 load, 2026-09-07, PERF-OPTIONS.md C2.10): how often, not how long. off_style
-    // is one number for two very different things, and 1.4 s of it on heise.de reads the same
+    // is one number for two very different things, and 1.4 s of it on a tech-news site reads the same
     // whether one style resolution was expensive or the pump forced twenty. Counted in
     // wtf/ApoLoadPhase.h at the same scopes, over the same window as the buckets:
     //   style_n   Document::resolveStyle entries          (> ~10 per navigation = the driver is
@@ -1406,9 +1406,9 @@ static std::atomic<int> g_navSawFirstPaint { 0 };
 // perf-independent (the caps run with logging off) and 0 = "not reached in this navigation".
 //
 // This is a real bug, not tidiness. The settle timer ticks every 50 ms plus its callback plus
-// whatever the run loop does in between, which on ntv.de is 160 ms on average and over a second
+// whatever the run loop does in between, which on a news site is 160 ms on average and over a second
 // when an ad timer chain runs; anchoring a 1 s deadline on the first tick that observed the event
-// therefore pushed the deadline out by a whole gap. Measured (log 20260907-100044): ntv.de warm
+// therefore pushed the deadline out by a whole gap. Measured (log 20260907-100044): the news site warm
 // fired its load event at 1820 ms and cap-load ended the pump at 4124 ms - 2.3 s for a 1 s cap.
 static std::atomic<double> g_navLoadEventSec { 0 };   // dispatchDidFinishLoad
 static std::atomic<double> g_navDomReadySec { 0 };    // dispatchDidFinishDocumentLoad
@@ -1869,7 +1869,7 @@ static void perfEnd()
     if (g_perfRows < kPerfRingSize)
         g_perfRing[g_perfRows++] = g_perfCur;
     // Flush on nav completion, and every 32 rows so a crash mid-session (seen
-    // on ntv.de) does not take the whole ring with it - still one file open per
+    // on a news site) does not take the whole ring with it - still one file open per
     // ~6 s of ticks, not per frame.
     if (g_perfOpIsNav || g_perfRows >= 32)
         perfFlush();
@@ -1986,7 +1986,7 @@ void perfNavVisuallyNonEmpty()
 // Apotheosis (M4 load waterfall, 2026-09-07): every other response lands here too and feeds
 // two things - the net_sub_* aggregate of the perf row, and a small "slowest transfers" table
 // that perfWriteStageWaterfall() prints into stage.txt. Both exist to answer the one question
-// the old main-resource-only columns could not: on a page like ntv.de, whose load event is 6.6 s
+// the old main-resource-only columns could not: on a news front page, whose load event is 6.6 s
 // after DOMContentLoaded and whose engine-thread work in that window is ~1.1 s, are the 261
 // subresources waiting on the network or on us?
 extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double connectMs,
@@ -2121,7 +2121,7 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 // pumpLoop's "quiet" rule used to be DocumentLoader::isLoadingInAPISense(), i.e. "the frame tree
 // has any load in flight at all". On a news site that is never satisfied: the consent and
 // analytics stack keeps firing beacons and XHRs for as long as the page is open, so every
-// navigation ran to a cap instead. Measured on build-driver\logs\20260907-084407, ntv.de warm:
+// navigation ran to a cap instead. Measured on build-driver\logs\20260907-084407, the news site warm:
 // the load event fired at 1645 ms, the pump held the engine thread until 3501 ms, and the six
 // transfers still open at that moment were draws / count / raw / get_site_data - trackers, none
 // of which paints a pixel.
@@ -2137,14 +2137,14 @@ void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineN
 // by "images", because a pending CachedResource cannot be walked back to a renderer cheaply -
 // CachedResourceClient carries no geometry. Lazy image loading (C1.1) is what keeps that honest:
 // on a page that marks its images the off-screen ones are never requested in the first place, and
-// ntv.de went from 261 subresources to 88 because of it.
+// The news site went from 261 subresources to 88 because of it.
 //
 // Apotheosis (2026-09-07, second pass): images stop blocking once the load event has fired.
 // The load event is by definition "every subresource the document declared is done", so an image
 // that is still pending after it is a lazy one, a JS-inserted one or a late `srcset` pick - all
 // of them below the fold or invisible, none of them worth holding the engine thread for. Before
 // the load event images still block: that is the article's own imagery and the first screen.
-// Measured motivation: ntv.de warm fired `load` at 1820 ms and settled at 4124 ms on the cap,
+// Measured motivation: the news site warm fired `load` at 1820 ms and settled at 4124 ms on the cap,
 // with only image and beacon traffic left (the new settle-pending line below names it).
 static bool apoIsRenderAffecting(WebCore::CachedResource::Type type, bool afterLoadEvent)
 {
@@ -2204,7 +2204,7 @@ static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame, bool afterLoa
 
 // Apotheosis (M4 load, 2026-09-07): "settle-pending" - what was still open when a settle cap
 // fired. The caps exist because the viewport-quiet rule did not trip, and until now nothing said
-// what kept it from tripping: on ntv.de and heise.de every navigation of log 20260907-100044
+// what kept it from tripping: on a news site and a tech-news site every navigation of log 20260907-100044
 // ended on cap-load / cap-dcl, never on quiet-vp. One line per capped navigation, listing up to
 // eight pending render-affecting loads with type, age and the tail of the URL, plus the count of
 // the pending loads the rule already ignores. Read it as: many old `img` entries mean the page
@@ -2266,7 +2266,7 @@ static void perfWriteStagePending(WebCore::LocalFrame& frame, const char* why, b
 // onto a 250 ms grid (1 s for the maximally nested ones WebCore already treats as pollers). The
 // engine thread is the only thread there is here, and during a load it has to serve the parser,
 // the first style resolution and the first paint *and* the ad/consent stack's setTimeout chains:
-// the ms_offpump split of a warm ntv.de load is timers=1030 js=867 style=911 of 2508 ms.
+// the ms_offpump split of a warm news-site load is timers=1030 js=867 style=911 of 2508 ms.
 // Alignment does not drop a timer and delays none by more than one grid step; it makes a burst
 // of unrelated timers land in one wake-up, so the page pays one script entry and one style
 // resolution for the lot. See wtf/ApoLoadThrottle.h for the engine half.
@@ -2325,9 +2325,9 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
     int quietTicks = 0;
     // Apotheosis (M4 load, 2026-09-07): the tick counters below were written as time budgets
     // ("20 ticks = 1 s") but a tick is 50 ms *plus* whatever isolatedUpdateRendering costs, and
-    // on a heavy page that is 100-200 ms. Measured on the Lumia (logs 20260907-023940): ntv.de
+    // on a heavy page that is 100-200 ms. Measured on the Lumia (logs 20260907-023940): a news site
     // warm fired its load event at 1716 ms and the pump did not return until 4849 ms - 3.1 s of
-    // "1 s hard cap"; google.de/maps 2034 -> 3427 ms. Deadlines are therefore wall clock now,
+    // "1 s hard cap"; a map site 2034 -> 3427 ms. Deadlines are therefore wall clock now,
     // and the tick counts stay only as the secondary guard they always were.
     MonotonicTime navDoneAt;      // the load event (fallback: first tick that saw it)
     MonotonicTime domReadyAt;     // DOMContentLoaded (fallback: first tick that saw it)
@@ -2405,7 +2405,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             // the navigation commits, loader().documentLoader() is still the *initial empty
             // document* that LocalFrame::init() created - committed, parsed, and holding no
             // resources - so this expression was true on the very first tick of every load. That
-            // anchored cap-dcl at the start of the pump instead of at DOMContentLoaded (heise.de
+            // anchored cap-dcl at the start of the pump instead of at DOMContentLoaded (a tech-news site
             // in log 20260907-100044: dcl at 2390 ms, cap-dcl at 3184 ms, i.e. 0.8 s after a
             // "3 s" cap), and with the viewport-quiet rule of 831097a it could also let a
             // navigation settle on the empty document's zero pending resources after 500 ms.
@@ -2428,7 +2428,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             // Apotheosis (M4 settle): how long the pump keeps the UI hostage after the page is
             // usable. It used to be one rule for everything - "the loader has been quiet for 16
             // ticks (0.8 s)", capped at settleCapTicks (160 = 8 s) after the load event. A page
-            // with hundreds of subresources never gives us 0.8 s of quiet in a row (ntv.de: 255
+            // with hundreds of subresources never gives us 0.8 s of quiet in a row (a news site: 255
             // subresources), so every navigation ran to the cap: stage.txt showed load at 1.4 s
             // and settle at 4.8-6.0 s, i.e. ~4 s of spinner after the page was done. The load
             // event is the point at which the *page* calls itself loaded, so make it ours too:
@@ -2451,7 +2451,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             //
             // (2) before the load event: nothing bounded this phase at all except the 30 s
             //     watchdog, and on a page whose load event waits for hundreds of images it is
-            //     the whole problem. ntv.de cold (same log): DOMContentLoaded 2349 ms, first
+            //     the whole problem. The news site cold (same log): DOMContentLoaded 2349 ms, first
             //     paint 1311 ms, load event 8961 ms - 6.6 s in which the page was already on
             //     screen but every C ABI call (scroll, tap, the next navigation) queued behind
             //     this pump on the engine thread. That is the "initial page load is still quite
@@ -2466,7 +2466,7 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             //
             // Apotheosis (2026-09-07, second pass): and anchor them on the *events*, not on the
             // tick that noticed them. A tick is 50 ms plus the callback plus whatever the run
-            // loop did in between, which on ntv.de averages 160 ms and exceeds a second when an
+            // loop did in between, which on a news site averages 160 ms and exceeds a second when an
             // ad timer chain runs, so "first tick that saw the load event" was up to a full gap
             // late and the 1 s cap measured 2.3 s (log 20260907-100044: load 1820, cap-load
             // 4124). perfNavLoadEvent / perfNavDocumentReady now stamp the wall clock at the
@@ -2658,7 +2658,7 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
             // the full-repaint count above, plus whether THIS composite is the one forceDirtyTree()
             // just walked (g_gpuLastCompositeFull, set two lines above from wkFullDirty) - together
             // they tell "WebCore dirtied it" apart from "forceDirtyTree ran", which is what the
-            // github dirty_full=54 rows need (the repair-escalation cap, 9df4438, never fired for
+            // a code-hosting site's dirty_full=54 rows need (the repair-escalation cap, 9df4438, never fired for
             // them, so something else is force-dirtying the tree). Accumulated across this
             // operation like dirtyFull/dirtyPartial above; dirtySrcForceDirty is an OR, not a sum -
             // one force-dirtied composite in the operation is enough to answer "did it happen".
@@ -3018,7 +3018,7 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
             }
             if (drow[x * 4 + 0] != 255 || drow[x * 4 + 1] != 255 || drow[x * 4 + 2] != 255)
                 ++nonWhite;
-            // 每 4 像素采样进哈希(原 16px 网格太疏,漏掉 Bing 小加载圈等小动画 → 误判静止停帧;
+            // 每 4 像素采样进哈希(原 16px 网格太疏,漏掉搜索页小加载圈等小动画 → 误判静止停帧;
             // 4px 网格密 16 倍,能侦测到小圈圈的变化,让实时循环对动画持续重绘;真静止页仍会停帧省电)。
             if (((x | y) & 3) == 0) {
                 hash = (hash ^ drow[x * 4 + 0]) * 16777619u;
@@ -3216,7 +3216,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // EmptyClients.cpp's EmptySocketProvider, whose createWebSocketChannel() returns nullptr -
     // and WebSocket.cpp:288 answers that with RELEASE_ASSERT(m_channel) ("Every
     // ScriptExecutionContext should have a SocketProvider"). So the first `new WebSocket(...)`
-    // on a page killed the app: mapy.com every time, and any SPA with a live connection.
+    // on a page killed the app: a map site every time, and any SPA with a live connection.
     // PortSocketProvider hands out a real channel that speaks the protocol over curl streams;
     // see PortWebSocket.h.
     pageConfiguration.socketProvider = WebCorePort::PortSocketProvider::create();
@@ -3275,7 +3275,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // or more composites late, so a fixed/sticky header is drawn where it was, rides the page down
     // (or up) and snaps back when the replay arrives - the "header comes down piecewise and jumps
     // back" of 0.1.9.21/22, worst exactly where the raster workers are busy with something else
-    // (n-tv's lazy images in the lower page, claude.ai's polling bot check, Maps' tiles).
+    // (a news site's lazy images in the lower page, a chat/AI site's polling bot check, a map site's tiles).
     // With the preference on, RenderLayerCompositor::updateCompositingLayers(OnScroll) - which
     // WebCore runs for us because there is no ScrollingCoordinator - re-positions those layers
     // instead: a layer move per scroll frame, no raster and no upload. Sticky needs the WK_WINUWP
@@ -3296,7 +3296,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // Apotheosis (M4 load, 2026-09-07): honour loading="lazy". WebCore's own default for this
     // preference is false (UnifiedWebPreferences.yaml: WebKit true, WebCore false) and we build
     // the Page directly, so we inherited the off state and fetched every image of a document up
-    // front. On ntv.de that is 261 subresources for a 42424 px tall page whose viewport is 1080
+    // front. On a news front page that is 261 subresources for a 42424 px tall page whose viewport is 1080
     // px - the load event waits 6.6 s past DOMContentLoaded for images ~39 screens down. The
     // implementation is complete in this tree (html/LazyLoadImageObserver.cpp): a deferred image
     // is observed by an IntersectionObserver with a 100 % root margin, i.e. it loads one screen
@@ -3346,7 +3346,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     Ref<FrameLoader> loader = localMainFrame->loader();
     loader->load(WTF::move(frameLoadRequest));
 
-    // 初次加载:等主文档完成 + 空闲;每 tick isolatedUpdateRendering 让 SPA(claude.ai 等)的
+    // 初次加载:等主文档完成 + 空闲;每 tick isolatedUpdateRendering 让 SPA(聊天/AI 站等)的
     // rAF 驱动渲染推进(否则 JS 站点 settle 后仍空白)。
     {
         PerfPhase perfSettle(&g_perfCur.settle);   // M4: network + settle wall time (tick count → `frames`)
@@ -4284,7 +4284,7 @@ void WebCoreCloseSession()
 // the mouse pointer type - `pressure` from it (PointerEvent.cpp:202/207,
 // pressureForPressureInsensitiveInputDevices(buttons())). So every mouse event this driver
 // synthesised reached the page as `buttons: 0, pressure: 0`, i.e. a pointermove with nothing
-// pressed. Widgets that pan on pointer events (Google Maps, Leaflet, canvas apps) test exactly
+// pressed. Widgets that pan on pointer events (Leaflet, MapLibre, canvas apps) test exactly
 // that field to tell a drag from a hover, which is why the one-finger drag did nothing on Maps.
 // PlatformMouseEventWin.cpp is the reference for the real values: a WM_MOUSEMOVE during a left
 // drag carries button=Left AND buttons=1 (buttonsForEvent(), GDIUtilities.h:44), WM_LBUTTONDOWN
@@ -4353,7 +4353,7 @@ static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y);
 
 // Apotheosis (long press, 2026-09-06): turn the run loop for `seconds` with the mouse button held
 // down. A touch long press is a *timed* gesture: the widget starts a timer on pointerdown and does
-// its thing (Google Maps drops a pin) when the timer fires, with the pointer still down. Nothing in
+// its thing (a map site drops a pin) when the timer fires, with the pointer still down. Nothing in
 // this driver ever kept a button pressed across time before — WebCoreClickAt presses and releases
 // in the same call, and WebCoreDragAt only holds the press between two harness calls — so the hold
 // needs its own pump. Same shape as pumpLoop's settle timer (isolatedUpdateRendering per tick to
@@ -4777,7 +4777,7 @@ int WebCoreIsScrollableAt(int x, int y)
 // WebCoreScrollBy double-moving the main frame for the same delta).
 // Apotheosis (pinch on map widgets, 2026-09-06): the body of WebCoreWheelAt, with the two knobs
 // the zoom variant below needs.
-//   ctrlKey     — a wheel with ctrl held is what a page reads as "zoom me" (Google Maps, Leaflet
+//   ctrlKey     — a wheel with ctrl held is what a page reads as "zoom me" (Leaflet, MapLibre
 //                 and OpenLayers all zoom on a plain wheel over the map AND on ctrl+wheel; the
 //                 modifier is what stops an embedded map from merely scrolling the page).
 //   zoomMode    — changes what counts as "the page took it" and what happens to the main frame.
@@ -4898,7 +4898,7 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 }
 
 // ===========================================================================
-// Apotheosis (drag as pointer events): map widgets — Google Maps, OpenStreetMap /
+// Apotheosis (drag as pointer events): map widgets — Leaflet, MapLibre /
 // Leaflet, canvas apps — pan by listening to pointerdown/mousedown themselves and
 // moving their own content. They scroll no scrollable box at all, so BOTH of the
 // harness' existing gesture routes are wrong for them: the main-frame fast path
@@ -4912,7 +4912,7 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 // left-button mouse drag (mousedown → mousemove* → mouseup, which the engine also
 // turns into pointerdown/pointermove/pointerup — PointerEvent is built in this
 // port even though ENABLE_TOUCH_EVENTS is off, so pointer-first libraries like
-// Leaflet and Google Maps get the events they actually listen for).
+// Leaflet and MapLibre get the events they actually listen for).
 // ===========================================================================
 
 // Hit test only, no event dispatched — same shape as WebCoreIsScrollableAt above
@@ -4920,7 +4920,7 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 // chain). Returns 1 when the element under (x,y) or one of its ancestors looks
 // like it handles dragging itself:
 //   * a JS listener for pointerdown / mousedown / touchstart / pointermove /
-//     touchmove (Leaflet, Google Maps, OpenLayers, MapLibre and every canvas app
+//     touchmove (Leaflet, OpenLayers, MapLibre and every canvas app
 //     register at least one of these on their container; hasEventListeners() is a
 //     hash lookup on the target's listener map, so this stays cheap even though
 //     five names are asked per ancestor). touchstart/touchmove are worth asking
@@ -4931,7 +4931,7 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 //     a drag over it could sensibly mean)
 //   * CSS touch-action other than auto/manipulation: none / pan-x / pan-y is
 //     precisely how a widget tells the UA "I take this gesture", and it is what
-//     .leaflet-container, .maplibregl-canvas and the Google Maps root all set.
+//     .leaflet-container, .maplibregl-canvas and the map roots all set.
 // The walk deliberately stops at <body>/<html>: page-wide mousedown handlers
 // (dropdown menus, "click outside to close", analytics) sit on the document and
 // body of half the web, and treating those as drag widgets would make ordinary
@@ -4956,7 +4956,7 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
 // Maps, the widget 037eef0 was written for, is one), or touch-action: none. Note that pan-x/pan-y
 // deliberately do NOT count: they say the page wants the BROWSER to pan in the other axis, which is
 // the opposite of claiming the gesture, and a `touch-action: pan-y` wrapper (an extremely common
-// way to suppress horizontal overscroll - ntv.de has one) is exactly what stole every vertical pan
+// way to suppress horizontal overscroll - a news site has one) is exactly what stole every vertical pan
 // on device package 14 with `wants=1 own=1` on ordinary article text.
 static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
 {
@@ -5019,9 +5019,9 @@ int WebCoreWantsDragAt(int x, int y)
 //
 // The press is the decision point, and (2026-09-04) it is NOT decided by handleMousePressEvent()'s
 // result alone. That result is only true when a listener called preventDefault() or a WebCore
-// default action took the press, and the widgets this export exists for do neither: Google Maps
+// default action took the press, and the widgets this export exists for do neither: a map site
 // listens for pointerdown, stores the anchor and lets the event through. On device every press on
-// maps.google.com answered `handled=0`, so the gesture was handed back before a single mousemove was
+// the map site answered `handled=0`, so the gesture was handed back before a single mousemove was
 // sent. The press is therefore owned when EITHER it was handled OR the point still looks like a drag
 // widget (dragWidgetAtPoint(), the same walk WebCoreWantsDragAt() runs - the harness has already
 // asked it once at gesture start, and asking again here costs one hit test and keeps the two
@@ -5104,7 +5104,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // as at the top of WebCoreClickAt.
         if (lf->eventHandler().mousePressed())
             releaseDanglingPress(*lf, p, mods);
-        // Apotheosis (Google Maps, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
+        // Apotheosis (map site, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
         // the same point and the layout we just updated, BEFORE dispatching - the press itself can
         // run script that changes the tree. See the decision below.
         const bool wants = dragWidgetAtPoint(*doc, x, y);
@@ -5114,12 +5114,12 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         lf->eventHandler().handleMouseMoveEvent(hover);
         DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
         handled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
-        // Apotheosis (Google Maps, 2026-09-04): "the press was handled" was the WRONG criterion for
+        // Apotheosis (map site, 2026-09-04): "the press was handled" was the WRONG criterion for
         // owning the gesture. handleMousePressEvent() reports handled only when a listener called
         // preventDefault() or a WebCore default action took the press - and a map does neither: it
         // listens for pointerdown, records the anchor and returns without preventing anything
         // (preventing it would break its own click handling). Device evidence: every single
-        // drag-press line on maps.google.com read `handled=0 unwound=1`, so not one mousemove was
+        // drag-press line on the map site read `handled=0 unwound=1`, so not one mousemove was
         // ever dispatched, while the canvas visibly grew on first contact - the events did arrive,
         // we just threw the gesture away one event in. The honest question is the one
         // WebCoreWantsDragAt already answers ("does this point belong to something that drags
@@ -5163,7 +5163,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
         // Apotheosis (map tap, 2026-09-06): a gesture that actually travelled must not end in a
         // click either. WebCore fires the DOM 'click' on the release whenever press and release
         // share the same target — on a map that is the one canvas for the whole pan, so every
-        // finger pan on maps.google.com ended with a click on the map, which is the site's own
+        // finger pan on the map site ended with a click on the map, which is the site's own
         // "toggle full-screen map view" action. A touch pan never produces a click in a real
         // browser; a gesture that stayed inside the slop is a tap that only reached this route
         // because XAML raised a manipulation, and it keeps its click.
@@ -5214,7 +5214,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
 }
 
 // ===========================================================================
-// Apotheosis (Google Maps pin, 2026-09-06): LONG PRESS.
+// Apotheosis (map-site pin, 2026-09-06): LONG PRESS.
 //
 // What a long press is on this port: ENABLE_TOUCH_EVENTS is 0 (OptionsWinUWP.cmake) and nothing
 // synthesises Touch or raw Pointer input, so every gesture reaches the page as mouse input, which
@@ -5222,7 +5222,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
 // therefore not expressible one-to-one; what IS expressible is everything a widget can key a long
 // press off with a mouse:
 //   * mousedown / pointerdown, then the button STAYS DOWN while the run loop turns, so a
-//     press-and-hold timer inside the page (Google Maps drops its pin from exactly such a timer)
+//     press-and-hold timer inside the page (a map site drops its pin from exactly such a timer)
 //     gets the time it is waiting for. This is the part no existing export could do: WebCoreClickAt
 //     releases in the same call, and WebCoreDragAt's press is only held between harness calls
 //     during which the engine dispatches nothing.
@@ -5730,7 +5730,7 @@ void WebCoreSetSpeculativePrefetch(int enabled)
 // request to a host reuses its TLS session anyway - the resolver is the part still worth
 // warming. Same conclusion as WebResourceLoadScheduler::preconnectTo() for <link rel=preconnect>.
 //
-// Accepts a full URL or a bare host ("ntv.de"); anything else is ignored. Idempotent and cheap
+// Accepts a full URL or a bare host ("example.com"); anything else is ignored. Idempotent and cheap
 // (apotheosisPrefetchDNS resolves on a work queue and keeps a capped set of hosts it has already
 // done), and it never touches the live Page.
 void WebCorePreconnect(const char* url)
@@ -6181,7 +6181,7 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // take the scroll fast path and keep the uploaded tiles. Any invalidation
     // (JS/DOM change, image decode, new layers) sets needsPresent through
     // triggerRenderingUpdate and still gets the full dirty-tree composite.
-    // Experiment F (2026-09-02) then set it on EVERY tick, because on github.com not
+    // Experiment F (2026-09-02) then set it on EVERY tick, because on a code-hosting site not
     // one of 84 ticks took the fast path - the page requests a rendering update every
     // tick, so each tick still re-rasterised the whole tree (0.8-1.1 s).
     //
@@ -6193,7 +6193,7 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     // Apotheosis (2026-09-06, package 0.1.9.16 device regression): that theory is wrong
     // and its cost is the stall the user sees. peekNeedsPresent() is "somebody asked for
     // a rendering update", which on any page with a timer, an animation or an
-    // IntersectionObserver is EVERY tick - on n-tv.de all 626 ticks of session
+    // IntersectionObserver is EVERY tick - on a news site all 626 ticks of session
     // 20260906-180145 force-dirtied all ~90 layers at 400-1100 ms of ms_backing each,
     // against 15 such ticks in ~900 rows of the 0.1.9.15 session (20260904-161535) and 17
     // in 1895 rows of 0.1.9.12. Scrolling is smooth until a tick lands, then stalls for

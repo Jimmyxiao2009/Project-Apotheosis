@@ -191,8 +191,8 @@ void runReplay()
 }
 
 // -------------------------------------------------------------------------
-// Scenario 12 - the first v2 device session (0.1.9.29, n-tv.de, 2026-09-08),
-// replays/lumia-0.1.9.29-ntv.txt: the `tg` lines of the first 26 000 lines of
+// Scenario 12 - the first v2 device session (0.1.9.29, a news site, 2026-09-08),
+// replays/lumia-0.1.9.29-news.txt: the `tg` lines of the first 26 000 lines of
 // that session's stage.txt, 107 stores, 12 407 passes, covering the load, the
 // 1:1 scroll, the pinch to 4.05x and the long zoomed steady state after it.
 //
@@ -202,7 +202,7 @@ void runReplay()
 //    Harness runs them after every pass and every composite);
 //  * no machine of section 2.2b takes an illegal arrow anywhere in it;
 //  * every store CONVERGES once its input stops changing (R12) - this is F1.
-//    On the device store S100 (the n-tv sticky header) reported
+//    On the device store S100 (the news site's sticky header) reported
 //    `rast=4 land=0 ready=0 jobs=0/0` for 1 900 consecutive passes because a
 //    refused raster request left its tiles in Rastering with no job behind
 //    them, and store S1 held the driver in an extra-composite loop.
@@ -218,7 +218,7 @@ void runReplay()
 static void runDeviceReplay()
 {
     check::currentTest = "replay_device_0_1_9_29";
-    const std::string path = std::string(TILEGRID_TEST_DATA_DIR) + "/replays/lumia-0.1.9.29-ntv.txt";
+    const std::string path = std::string(TILEGRID_TEST_DATA_DIR) + "/replays/lumia-0.1.9.29-news.txt";
     std::ifstream stream(path.c_str());
     if (!stream) {
         ::check::fail(__FILE__, __LINE__, "device replay not found", path);
@@ -361,7 +361,7 @@ static void runDeviceReplay()
 }
 
 // -------------------------------------------------------------------------
-// The 0.1.9.34 session (2026-09-09, chaos.social then n-tv.de, package 4 with
+// The 0.1.9.34 session (2026-09-09, an image-heavy social timeline, then a news site, package 4 with
 // image stores on v2), replays/lumia-0.1.9.34-offscreen.txt: the `tg` lines of
 // lines 14 047 - 32 000 of build-driver\logs\20260909-151015\stage.txt, 17 909
 // lines over ~220 stores.

@@ -69,7 +69,7 @@ bool immediate(const CoreHarness& harness) { return harness.variant.latency <= 1
 bool lands(const CoreVariant& variant) { return variant.latency != kNeverLands; }
 
 // -------------------------------------------------------------------------
-// Scenario 1 - scroll 1:1 on a long page (R1, R2, R12; device: n-tv front page)
+// Scenario 1 - scroll 1:1 on a long page (R1, R2, R12; device: a news front page)
 // -------------------------------------------------------------------------
 void coreScenario1_scroll(const CoreVariant& variant)
 {

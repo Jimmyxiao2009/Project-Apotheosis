@@ -3,7 +3,7 @@ Synthetic until the first TileGrid v2 device round; the shape is exactly what
 wkWinUWPTakeTexmapZoomTrace writes (TILING-REWRITE-PLAN.md 5.3). Lines that are
 not `tg S<id> pass` are ignored by the parser, so a real stage.txt can be
 dropped in unchanged.
-stage load begin url=https://www.n-tv.de/
+stage load begin url=https://example.com/news/
 tg S1 pass  s=1 B=720x8000 V=0,0,720,1280 d=0,0,720,8000 pan=0 budget=24
 tg S1 out   miss=2 rast=0 land=0 ready=0 jobs=0/2 cancel=0 rm=0 holes=2 bd=-
 tg S1 comp  V=0,0,720,1280 holes=0 bdclips=0

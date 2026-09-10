@@ -214,7 +214,7 @@ int WebCoreIsScrollableAt(int x, int y);
 // harness does not need a follow-up call to see the nested scroller move.
 int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA);
 
-// Apotheosis (drag as pointer events): map widgets (Google Maps, OpenStreetMap/Leaflet, canvas
+// Apotheosis (drag as pointer events): map widgets (Leaflet, MapLibre, canvas
 // apps) pan by handling pointerdown/mousedown themselves and moving their own content — they
 // scroll no scrollable box, so neither WebCoreScrollBy nor WebCoreWheelAt does anything useful
 // over them. These two let the harness hand such a gesture to the page as a real mouse drag.
@@ -232,16 +232,16 @@ int WebCoreWantsDragAt(int x, int y);
 // unless the press was consumed, so an individual mousemove that the page ignores never yanks the
 // gesture away mid-pan. Apotheosis (2026-09-04): the press is owned when EITHER the engine reported
 // it handled OR the point is still a drag widget (the WebCoreWantsDragAt walk, re-run here). A map
-// that listens for pointerdown without calling preventDefault - Google Maps does exactly that -
+// that listens for pointerdown without calling preventDefault - a map site does exactly that -
 // answers "not handled" and would otherwise lose the whole gesture on its first event. On a 1
 // return the frame is already composited/presented into outRGBA the
 // way WebCoreWheelAt does it; outRGBA may be null (no present attempted).
 int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA);
-// Apotheosis (Google Maps pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
+// Apotheosis (map-site pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
 // on this port and nothing synthesises Touch/Pointer input, so a touch long press cannot be
 // delivered as one; what this does deliver is everything a page can key a long press off with a
 // mouse: mousedown, the button STAYS DOWN while the engine turns its run loop for holdMs (so a
-// press-and-hold timer inside the page - Google Maps drops its pin from exactly such a timer - gets
+// press-and-hold timer inside the page - a map site drops its pin from exactly such a timer - gets
 // the time it waits for), then mouseup + DOM click, and optionally a 'contextmenu' event at the
 // same point (on desktop Maps the right-click menu is the usable "drop a pin / What's here?" path,
 // and a long press is what a browser turns into a contextmenu).
@@ -298,7 +298,7 @@ void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (def
 void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
 void WebCoreSetSpeculativePrefetch(int enabled);      // <script type="speculationrules"> prefetch, default off; sticky (live page + new sessions)
 // Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is being
-// typed (debounced) so the DNS lookup is done when Enter arrives. Full URL or bare host ("ntv.de");
+// typed (debounced) so the DNS lookup is done when Enter arrives. Full URL or bare host ("example.com");
 // anything else ignored. DNS only: libcurl cannot open a reusable connection ahead of time (see
 // WebCoreDriver.cpp). Non-blocking (work queue), idempotent per host, engine thread.
 void WebCorePreconnect(const char* url);
