@@ -2228,6 +2228,12 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                         s->m_pageLinks = *links;   // 存当前页链接表供点击命中
                     }
                     s->m_sessionActive = sessionActive;
+                    // Apotheosis (review fix, 0.1.9.48): this load ran the engine's teardown, which
+                    //   drops the bottom occlusion together with the session it was measured for.
+                    //   Whatever the harness last sent is gone with it, so forget it and hand the
+                    //   CURRENT number over - the keyboard may well still be up from typing the URL.
+                    s->m_bottomOccSent = -1;
+                    s->PushBottomOcclusion("navdone");
                     s->UpdateScrollFab();
                     // 实时渲染:有会话则启动(让动画动、SPA 渐进挂载);无会话(主页/错误页)停。
                     s->m_lastFrameHash = 0;
@@ -6659,9 +6665,17 @@ void MainPage::PushBottomOcclusion(const char* why)
     const int occ = BottomOcclusionEnginePx();
     if (occ == m_bottomOccSent)
         return;
-    if (!m_sessionActive)
-        return;   // nothing to tell, and nothing sent - so do NOT record it as sent
+    // Apotheosis (review fix, 0.1.9.48): RECORD it either way. This used to bail before the
+    //   assignment when no session was live, so m_bottomOccSent kept a number the engine no longer
+    //   had: "keyboard up on a page (occlusion sent) - navigate away - session closed - keyboard
+    //   hides" saw the drop to 0 suppressed as a repeat, and the next reveal reserved a band
+    //   nothing covers (in landscape more than half the panel, i.e. a tapped field scrolled far
+    //   past where it belongs). The value is now remembered for the next resize, which sends it
+    //   unconditionally, and the completed-load path below re-arms this after the engine's own
+    //   teardown has dropped it.
     m_bottomOccSent = occ;
+    if (!m_sessionActive)
+        return;   // nothing live to tell
     const bool reveal = !m_urlFocused;
     WriteStage((std::string("reveal why=") + (why ? why : "?")
                 + " occ=" + std::to_string(occ)

@@ -3184,6 +3184,12 @@ static void teardownSession()
     // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
     // mousemove/mouseup into a document that never saw the press.
     g_dragActive = false;
+    // Apotheosis (review fix, 0.1.9.48): the bottom occlusion was measured for the viewport of the
+    // page that is going away. It is sticky ON PURPOSE within one page, but carrying it into the
+    // next session made the first focused-field reveal there reserve a band nothing covers - in
+    // landscape more than half the panel, so a tapped field was scrolled far past where it belongs.
+    // The harness re-sends the real number with the next resize and from its own keyboard events.
+    g_bottomOcclusionPx = 0;
     if (g_session->client)
         g_session->client->setLoadCompletionHandler({});       // (b)
     if (g_session->mainFrame)
