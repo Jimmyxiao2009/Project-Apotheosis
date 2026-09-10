@@ -5302,31 +5302,45 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
     if (LinkMenuOpenLabel) LinkMenuOpenLabel->Text = L8(L"在新标签页中打开", L"Open in new tab");
     LinkMenu->Visibility = Windows::UI::Xaml::Visibility::Visible;
 
-    // Placement: centred under the finger, flipped above it when it would not fit, then clamped
-    // into the window. Measure() is called by hand because the card has only just become visible
-    // and its DesiredSize is otherwise the previous open's (or zero on the first one); the literals
-    // are the fallback for the case where XAML refuses to measure outside a layout pass.
+    // Placement: ABOVE the finger by default (that is where the hand is not), flipped below only
+    // when the card would not fit up there, then clamped into the window.
+    //
+    // Apotheosis (0.1.9.43): the card was measured with its PREVIOUS placement still on it, and
+    // FrameworkElement::DesiredSize INCLUDES the element's Margin - which is exactly what this
+    // code uses to position the card. So every open after the first measured "card size + last
+    // open's left/top" (device log: at=69,395 -> the next open reported card=337x483 for a card
+    // that is 268x88), the flip-if-it-does-not-fit test then fired on a height of 483 in a 640
+    // DIP window whatever the finger did, and the card landed on the clamp at the top of the
+    // screen. Reset the margin first and the measurement is the card again.
     double availW = RootGrid ? RootGrid->ActualWidth : 0.0;
     double availH = RootGrid ? RootGrid->ActualHeight : 0.0;
     if (!(availW > 0.0)) availW = 400.0;
     if (!(availH > 0.0)) availH = 640.0;
     double cw = 0.0, ch = 0.0;
     try {
+        LinkMenuCard->Margin = Windows::UI::Xaml::Thickness(0, 0, 0, 0);
         LinkMenuCard->Measure(Windows::Foundation::Size((float)availW, (float)availH));
         Windows::Foundation::Size d = LinkMenuCard->DesiredSize;
         cw = d.Width; ch = d.Height;
     } catch (...) {}
+    // Fallback only for the case where XAML refuses to measure outside a layout pass. `card=` on
+    // the trace line is what actually ran, so a wrong placement can be told apart from a wrong
+    // measurement without guessing.
     if (!(cw > 0.0)) cw = 268.0;
     if (!(ch > 0.0)) ch = 96.0;
     const double kGap = 14.0;    // clearance from the fingertip, so the card is not under it
     const double kEdge = 8.0;
     double left = m_ctxDipX - cw / 2.0;
-    double top  = m_ctxDipY + kGap;
-    if (top + ch > availH - kEdge) top = m_ctxDipY - kGap - ch;
+    const char* place = "above";
+    double top = m_ctxDipY - kGap - ch;
+    if (top < kEdge) {                        // no room above the finger - go below it
+        place = "below";
+        top = m_ctxDipY + kGap;
+    }
     if (left > availW - cw - kEdge) left = availW - cw - kEdge;
     if (left < kEdge) left = kEdge;
-    if (top > availH - ch - kEdge) top = availH - ch - kEdge;
-    if (top < kEdge) top = kEdge;
+    if (top > availH - ch - kEdge) { top = availH - ch - kEdge; place = "clamp"; }
+    if (top < kEdge) { top = kEdge; place = "clamp"; }
     LinkMenuCard->Margin = Windows::UI::Xaml::Thickness(left, top, 0, 0);
 
     // Diagnostics carry lengths and positions only - never the URL, never page text.
@@ -5334,6 +5348,7 @@ void MainPage::ShowLinkMenu(const std::wstring& url)
         + " dip=" + std::to_string((int)m_ctxDipX) + "," + std::to_string((int)m_ctxDipY)
         + " at=" + std::to_string((int)left) + "," + std::to_string((int)top)
         + " card=" + std::to_string((int)cw) + "x" + std::to_string((int)ch)
+        + " place=" + place
         + " avail=" + std::to_string((int)availW) + "x" + std::to_string((int)availH)).c_str());
 }
 
