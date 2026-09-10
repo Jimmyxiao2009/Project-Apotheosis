@@ -787,12 +787,9 @@ namespace Harness {
         //   portrait. Nothing looked at those two numbers until now, which is why the settings
         //   panel and the suggestion dropdown ran under the buttons.
         double m_lastInsetLeft { 0.0 }, m_lastInsetRight { 0.0 };
-        // Apotheosis (2026-09-04 review, title row reverted to the bottom): Progress's height while
-        //   the loading strip is visible, as XAML reports it — part of the cache key, both because it
-        //   goes 0 -> its real value at the first arrange and because it now flips between 0 and that
-        //   value every time SetLoading() shows/hides the strip.
-        double m_lastStripH { 0.0 };
-        // Apotheosis (2837ce0 review item 1): same for TitleRow, the auto-hiding title/toast strip
+        // Apotheosis (0.1.9.47): m_lastStripH is gone with the loading strip's top inset — the strip
+        //   is a pure overlay and no longer part of this cache key (nor of any layout).
+        // Apotheosis (2837ce0 review item 1): TitleRow, the auto-hiding title/toast strip
         //   at the bottom edge of the content row — 0 while it is collapsed, its height while it is
         //   shown. It is an overlay, so this is the content area's BOTTOM inset; GpuPanel keeps its
         //   size (see the XAML comment) and simply has that strip covered.

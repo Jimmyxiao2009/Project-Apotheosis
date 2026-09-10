@@ -346,10 +346,23 @@
                  size was right but the strip around them read as too thick at 8 DIP — trimmed to 5 (a
                  little separation around the dots, not much). Background is solid black (not
                  Transparent) so the strip stays OLED-friendly and the dots stay visible over any page
-                 colour. Visibility (SetLoading) drives both the animation and whether ApplyViewInsets
-                 gives content/GpuPanel the extra top inset for it — idle pages get the space back. -->
+                 colour.
+                 ★ Apotheosis (0.1.9.47): the strip is a pure OVERLAY. It always was in layout terms —
+                 a top-anchored sibling in this Grid cell costs the cell no height — but
+                 ApplyViewInsets() used to hand its 5 DIP to the content as an extra top inset
+                 (ContentBorder's top margin and GpuPanel's translate), so the whole page slid down 5
+                 DIP the moment a load started and back up when it ended, and on the software path
+                 (start page, pre-GPU window) the margin change resized ContentArea and cost a
+                 WebCoreResize + relayout per load start/end. It draws OVER the page now and the
+                 engine viewport never moves for it; see ApplyViewInsets. Consequences that belong
+                 here: it must not eat taps meant for the page underneath (IsHitTestVisible), and it
+                 must be above the presenting elements (declaration order already does that in a
+                 Grid, but GpuPanel is a SwapChainPanel — say it explicitly rather than rely on how
+                 a composed swap-chain visual sorts against its XAML siblings). Left/right insets
+                 come from RootGrid's Padding, the status-bar inset from the Margin below. -->
             <ProgressBar x:Name="Progress" Height="5" VerticalAlignment="Top" Foreground="{StaticResource Accent}"
-                         Background="#000000" IsIndeterminate="False" Visibility="Collapsed"/>
+                         Background="#000000" IsIndeterminate="False" Visibility="Collapsed"
+                         IsHitTestVisible="False" Canvas.ZIndex="10"/>
 
             <!-- 悬浮翻页键(触发懒加载/看下方内容)。仅有会话时显示。 -->
             <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom"
@@ -402,14 +415,19 @@
                  the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
                  the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
                  AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
-                 strip it covers is handed back to the page exactly like the loading strip's at the
-                 top edge — ApplyViewInsets() gives ContentBorder a bottom margin for the software
-                 path, while the GPU panel keeps its size and simply has that strip covered. The inset
-                 (titleH in ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide
-                 position, so it flips exactly when the row is fully shown/hidden — same as before,
-                 unaffected by swapping the fade for a slide.
+                 strip it covers is still handed back to the page on the SOFTWARE path —
+                 ApplyViewInsets() gives ContentBorder a bottom margin of titleH — while the GPU panel
+                 keeps its size and simply has that strip covered. The inset (titleH in
+                 ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide position,
+                 so it flips exactly when the row is fully shown/hidden — same as before, unaffected
+                 by swapping the fade for a slide.
+                 ☞ 0.1.9.47 note: the loading strip at the top edge no longer works this way — it is
+                 a plain overlay with no inset at all, because the inset was visibly displacing the
+                 page on every load. This row still has one, deliberately unchanged for now: on the
+                 GPU path it costs nothing (GpuPanel is neither sized nor translated by titleH), on
+                 the software path it does resize ContentArea. See the day report.
                  Explicit Height so ApplyViewInsets' titleH is deterministic before the first
-                 arrange (same technique as Progress/stripH). -->
+                 arrange (ActualHeight is 0 until then). -->
             <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
                     Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
                 <Border.RenderTransform>

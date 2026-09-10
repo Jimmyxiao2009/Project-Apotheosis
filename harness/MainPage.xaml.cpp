@@ -1772,26 +1772,25 @@ void MainPage::ApplyViewInsets()
     //   several of them repeatedly for one user action. Everything below writes layout properties
     //   and rebuilds the presenting element's transform stack, so do none of it while the edges are
     //   where we last left them.
-    // Apotheosis (2026-09-04 review, title row reverted to the bottom): TitleBar is gone from up
-    //   here — the only thing left at the top edge is Progress, the loading-dots strip, and only
-    //   while a page is actually loading. Read its height back from XAML instead of duplicating the
-    //   literal (same technique the old titleH used): before the first arrange ActualHeight is still
-    //   0, so fall back to the declared Height, then to a literal if that's ever unset.
-    double stripH = 0.0;
-    if (Progress && Progress->Visibility == Windows::UI::Xaml::Visibility::Visible) {
-        stripH = Progress->ActualHeight;
-        if (!(stripH > 0.0)) {
-            const double declared = Progress->Height;
-            if (declared > 0.0 && declared < 1.0e6) stripH = declared;   // false for NaN
-        }
-        if (!(stripH > 0.0)) stripH = 5.0;
-    }
+    // Apotheosis (0.1.9.47, "the loading strip pushes the page down"): the loading strip does NOT
+    //   appear in this function any more. It used to contribute a `stripH` top inset to both
+    //   presenting elements while it was visible, which is exactly the displacement the user saw —
+    //   5 DIP down at load start, 5 DIP back up at load end, on every navigation — and on the
+    //   software path (about:home, the pre-GPU window) that margin change resized ContentArea, so
+    //   every load start/end also cost a WebCoreResize + relayout. It is a top-anchored sibling in
+    //   the content cell and therefore already free of layout; all it needed was to stop being paid
+    //   for twice. It now draws over the top 5 DIP of the page, hit-test transparent (see
+    //   MainPage.xaml). Nothing else read stripH: MapTapToEngine/SetPinchAnchor and
+    //   BottomOcclusionEnginePx all go through TransformToVisual or the panel's own ActualSize, so
+    //   they follow whatever the inset below happens to be.
     // Apotheosis (2837ce0 review item 1): the title/toast row is a bottom-anchored OVERLAY in the
     //   content row now (it used to be a layout row of the bottom chrome, permanently costing an
-    //   idle page ~24 DIP). Same treatment as the loading strip, mirrored to the bottom edge: while
+    //   idle page ~24 DIP). It keeps an inset of its own at the bottom edge (which is what the
+    //   loading strip above just lost): while
     //   it is shown its height is the content area's bottom inset, and once RevealTitleRow's timer
     //   has faded it away the page gets that strip back. Read the height from XAML with the same
-    //   ActualHeight → declared Height → literal fallback chain as stripH.
+    //   ActualHeight → declared Height → literal fallback chain: before the first arrange
+    //   ActualHeight is still 0, so fall back to the declared Height, then to a literal.
     double titleH = 0.0;
     if (TitleRow && TitleRow->Visibility == Windows::UI::Xaml::Visibility::Visible) {
         titleH = TitleRow->ActualHeight;
@@ -1801,7 +1800,7 @@ void MainPage::ApplyViewInsets()
         }
         if (!(titleH > 0.0)) titleH = 24.0;
     }
-    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom && stripH == m_lastStripH
+    if (m_insetsValid && top == m_lastInsetTop && bottom == m_lastInsetBottom
         && titleH == m_lastTitleH && left == m_lastInsetLeft && right == m_lastInsetRight)
         return;
     m_insetsValid = true;
@@ -1809,7 +1808,6 @@ void MainPage::ApplyViewInsets()
     m_lastInsetBottom = bottom;
     m_lastInsetLeft = left;
     m_lastInsetRight = right;
-    m_lastStripH = stripH;
     m_lastTitleH = titleH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
     if (Progress) Progress->Margin = topPad;
@@ -1821,22 +1819,16 @@ void MainPage::ApplyViewInsets()
     // Apotheosis (review 2026-09-04 item 2a/3, updated for the title-row revert): the elements that
     //   actually show engine output — the white content Border in software mode, GpuPanel in
     //   direct-present mode — used to start at y=0 inside their row, so the page ran under the
-    //   shell's clock. They get the status-bar inset always, plus the loading strip's height only
-    //   while it is visible (stripH is 0 once SetLoading(false) collapses it, called from there so
-    //   this re-evaluates on every loading start/stop) — an idle page gets that space back instead
-    //   of permanently losing it to a strip nothing is drawing in.
-    //   (2837ce0 review item 1) The bottom edge now works the same way for the title/toast row.
-    // Apotheosis (bug fix 2026-09-07, first-load loading-strip band): the "+6" breathing gap below
-    //   is meant for the IDLE top edge (card look between the status bar and the white content),
-    //   but was added unconditionally, so it also landed *below the loading strip itself* — visible
-    //   as an extra thin PageBg-coloured band under the dots. That only showed up wherever this
-    //   software path is what's on screen while loading — about:home (always software, so every
-    //   first-run/new-tab load) and the cold-start window before GPU turns on — because the GPU
-    //   panel's translate below (top + stripH, no "+6") has never had that gap, and once GPU takes
-    //   over for real navigations the strip already reads flush. Drop the gap while the strip is
-    //   visible so both paths match: flush under the dots, breathing room back once idle.
-    const double contentTopGap = (stripH > 0.0) ? 0.0 : 6.0;
-    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + stripH + contentTopGap, 6, titleH);
+    //   shell's clock. They get the status-bar inset, and nothing else that comes and goes.
+    //   (2837ce0 review item 1) The bottom edge works the same way for the title/toast row.
+    // Apotheosis (0.1.9.47): the "+6" is the IDLE breathing gap that makes the white content read
+    //   as a card under the status bar, matching the 6 at either side. It is unconditional again:
+    //   the conditional form (0 while the loading strip was up, 82c8cd6) only existed to keep the
+    //   software path flush under a strip that was pushing the content down in the first place, and
+    //   with the strip drawing OVER the page there is nothing to be flush with. What is left below
+    //   the strip is the same 6 DIP of PageBg the idle page has always had, 5 of them covered by
+    //   the strip while it is up.
+    if (ContentBorder) ContentBorder->Margin = Windows::UI::Xaml::Thickness(6, top + 6, 6, titleH);
     // Apotheosis (2837ce0 review item 1): the suggestion dropdown is anchored to the same bottom
     //   edge as TitleRow and would otherwise cover it while the user types over a loading page.
     //   Lift it by titleH so the two stack (XAML Margin is "8,0" = the left/right 8 stays).
@@ -1849,11 +1841,14 @@ void MainPage::ApplyViewInsets()
     //   they were when the surface was created, so the kW/ActualWidth mapping in MapTapToEngine()
     //   and SetPinchAnchor() stays valid, and TransformToVisual(ContentArea -> GpuPanel) folds the
     //   translation in on its own (the target space is the panel's own pre-RenderTransform space).
-    //   Cost: the bottom `top + stripH` DIPs of the composited frame fall off the screen edge.
+    //   Cost: the bottom `top` DIPs of the composited frame fall off the screen edge. (0.1.9.47:
+    //   this used to be `top + stripH`, i.e. it moved by 5 DIP twice per navigation — that IS the
+    //   "the strip pushes the page down" the user reported, since the whole composited page rides
+    //   on this translate. Only the status bar moves it now, which happens on a settings change.)
     if (GpuPanel) {
         if (m_gpuInset == nullptr) m_gpuInset = ref new Windows::UI::Xaml::Media::TranslateTransform();
         m_gpuInset->X = 0.0;
-        m_gpuInset->Y = top + stripH;
+        m_gpuInset->Y = top;
         ApplyPresentTransform();   // re-composes preview transforms + inset onto the right element
     }
     // Apotheosis (landscape, 0.1.9.44): the horizontal insets go on RootGrid together with the
@@ -1873,7 +1868,7 @@ void MainPage::ApplyViewInsets()
     //   by side and the next session can be diagnosed from stage.txt alone.
     WriteStage(("insets l=" + Dip(left) + " t=" + Dip(top)
                 + " r=" + Dip(right) + " b=" + Dip(bottom)
-                + " strip=" + Dip(stripH) + " title=" + Dip(titleH)
+                + " title=" + Dip(titleH)
                 + " vb=" + Dip(vbX) + "," + Dip(vbY) + " " + Dip(vbW) + "x" + Dip(vbH)
                 + " wb=" + Dip(wbX) + "," + Dip(wbY) + " " + Dip(wbW) + "x" + Dip(wbH)
                 + " kb=" + (m_kbVisible ? "1" : "0")).c_str());
@@ -2036,10 +2031,10 @@ void MainPage::SetLoading(bool loading)
     Progress->IsIndeterminate = loading;
     Progress->Visibility = loading ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
     UpdateUrlActionGlyph();   // 加载态切到 ✕ 停止 / 结束回 → 或 ⟳
-    // Apotheosis (2026-09-04 review item 2): the loading strip's visibility is now part of the
-    //   content/GpuPanel top-inset math (ApplyViewInsets' stripH) — re-run it here so the inset
-    //   actually follows the strip appearing/collapsing instead of only the next unrelated call.
-    ApplyViewInsets();
+    // Apotheosis (0.1.9.47): no ApplyViewInsets() here any more. The strip's visibility used to
+    //   feed the content/GpuPanel top inset (stripH), so this call was what made the page slide
+    //   down 5 DIP at every load start and back up at every load end. The strip is an overlay now
+    //   and moves nothing; there is nothing left for this to re-evaluate.
     // Apotheosis (2837ce0 review item 1): the title row is "what am I looking at / what is going
     //   on", so it belongs on screen exactly while something is going on. Loading start pins it
     //   (RevealTitleRow stops the hide timer while m_loading), loading end re-arms the ~2 s grace
