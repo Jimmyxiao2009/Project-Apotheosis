@@ -856,6 +856,32 @@ static std::string Dip(double v)
     return std::string(buf);
 }
 
+// Apotheosis (bug fix 0.1.9.44, "rotate with the keyboard up and the whole page jumps"): does
+// this InputPane rectangle belong to the window we are in right now? A rotation does not raise
+// Showing before the panel resizes, and InputPane::OccludedRect keeps answering with the PREVIOUS
+// orientation's rectangle for a moment - so 0.1.9.43's re-query picked up a landscape rect
+// (top 186.3, height 173.8), measured it against the portrait window height of 640, and asked
+// KeyboardShiftFor for a 454 DIP shift of the whole bottom chrome. The rectangle carries its own
+// proof: the on-screen keyboard is docked, so it spans the window's width and its bottom edge IS
+// the window's bottom edge (at most the navigation-bar strip short of it, which is what
+// insetBottom allows for). A landscape rectangle fails both tests against a portrait window.
+// Rejecting is safe: the shift stays where it is until the shell answers properly or raises
+// Showing, which it does on the device within a few hundred ms.
+static bool KeyboardRectPlausible(double winW, double winH, double insetBottom,
+                                  const Windows::Foundation::Rect& occ)
+{
+    if (!(winH > 0.0) || !(occ.Height > 1.0f))
+        return false;
+    if (occ.Y < 0.0f || (double)occ.Y > winH)
+        return false;
+    const double bottomEdge = (double)occ.Y + (double)occ.Height;
+    if (bottomEdge < winH - insetBottom - 8.0 || bottomEdge > winH + 8.0)
+        return false;
+    if (winW > 0.0 && std::abs((double)occ.Width - winW) > 8.0)
+        return false;
+    return true;
+}
+
 // Apotheosis (bug fix 2026-09-06 evening): the one keyboard geometry computation — see the block
 //   comment above for the derivation. Everything is in CoreWindow-local DIP: winHeight is
 //   CoreWindow::Bounds.Height, insetBottom is what ApplyViewInsets() last put into RootGrid's bottom
@@ -1140,6 +1166,10 @@ MainPage::MainPage()
                 m_kbVisible = occ.Height > 0.0f;
                 m_kbTop = m_kbVisible ? (double)occ.Y : 0.0;
                 m_kbHeight = m_kbVisible ? (double)occ.Height : 0.0;
+                // Apotheosis (0.1.9.44): the shell telling us where the keyboard IS retires any
+                //   rejected re-query - this rectangle is current by construction.
+                m_kbMetricsStale = false;
+                m_kbRecheckTries = 0;
                 WriteStage(("keyboard-show occ=" + Dip(occ.X) + "," + Dip(occ.Y)
                             + " " + Dip(occ.Width) + "x" + Dip(occ.Height)
                             + " src=" + src
@@ -1163,6 +1193,8 @@ MainPage::MainPage()
                 m_kbVisible = false;
                 m_kbTop = 0.0;
                 m_kbHeight = 0.0;
+                m_kbMetricsStale = false;
+                m_kbRecheckTries = 0;
                 WriteStage(("keyboard-hide occ=" + Dip(e ? e->OccludedRect.Height : 0.0f)
                             + " inset=" + Dip(m_lastInsetBottom)
                             + " prevshift=" + Dip(prev)).c_str());
@@ -1488,6 +1520,11 @@ void MainPage::ApplyKeyboardShift(const char* why)
     // Consumed here, whichever way this call ends, so a ticket can never outlive its own call.
     const bool bypass = m_kbShiftBypass;
     m_kbShiftBypass = false;
+    // Apotheosis (0.1.9.44): the recorded rectangle is known not to belong to this window (see
+    //   KeyboardRectPlausible). Everything computed from it above is meaningless, so leave the
+    //   chrome where it is - RefreshKeyboardMetrics has already traced the rejection and armed a
+    //   re-query, and the shell's own Showing event repairs it in any case.
+    if (m_kbVisible && m_urlFocused && m_kbMetricsStale) return;
     if (shiftUp == m_kbShiftApplied) return;
     // Apotheosis (suggestion tap, 2026-09-10): THE reason a tapped suggestion only closed the list.
     //   Tapping a suggestion presses a Button, a UWP Button takes focus in its OnPointerPressed, and
@@ -1817,16 +1854,64 @@ void MainPage::ApplyViewInsets()
 // moved and it is the only writer of the shift. UI THREAD ONLY.
 void MainPage::RefreshKeyboardMetrics(const char* why)
 {
-    if (m_kbVisible) {
-        try {
-            auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
-            if (ip) {
-                Windows::Foundation::Rect occ = ip->OccludedRect;
-                if (occ.Height > 1.0f) { m_kbTop = occ.Y; m_kbHeight = occ.Height; }
-            }
-        } catch (...) {}
+    if (!m_kbVisible) {
+        m_kbMetricsStale = false;
+        m_kbRecheckTries = 0;
+        ApplyKeyboardShift(why);
+        return;
+    }
+    double winW = 0.0, winH = 0.0;
+    try {
+        auto win = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (win) { winW = (double)win->Bounds.Width; winH = (double)win->Bounds.Height; }
+    } catch (...) {}
+    Windows::Foundation::Rect occ(0.0f, 0.0f, 0.0f, 0.0f);
+    bool answered = false;
+    try {
+        auto ip = Windows::UI::ViewManagement::InputPane::GetForCurrentView();
+        if (ip) { occ = ip->OccludedRect; answered = true; }
+    } catch (...) {}
+    // Apotheosis (0.1.9.44): the whole point of this function is that it runs while the window is
+    //   changing shape, so what comes back has to be checked against the window it claims to
+    //   occlude before a single number of it is kept - see KeyboardRectPlausible.
+    if (answered && KeyboardRectPlausible(winW, winH, m_lastInsetBottom, occ)) {
+        m_kbTop = occ.Y;
+        m_kbHeight = occ.Height;
+        m_kbMetricsStale = false;
+        m_kbRecheckTries = 0;
+    } else {
+        m_kbMetricsStale = true;
+        WriteStage((std::string("keyboard-stale why=") + (why ? why : "?")
+                    + " occ=" + Dip(occ.Y) + "+" + Dip(occ.Height)
+                    + " occw=" + Dip(occ.Width)
+                    + " win=" + Dip(winW) + "x" + Dip(winH)
+                    + " inset=" + Dip(m_lastInsetBottom)
+                    + " keep=" + Dip(m_kbShiftApplied)
+                    + " try=" + std::to_string(m_kbRecheckTries)).c_str());
+        QueueKeyboardMetricsRecheck(why);
     }
     ApplyKeyboardShift(why);
+}
+
+// Apotheosis (0.1.9.44): the InputPane answered with a rectangle from the orientation we just
+// left. It settles on its own within a frame or two, so ask again on a LOW priority dispatcher hop
+// - behind the layout and render work the rotation itself has queued, which is exactly what has to
+// finish before the answer can be right. Bounded, and every path that gets a good rectangle (a
+// plausible re-query, a Showing event, the keyboard going away) resets the count. UI THREAD ONLY.
+void MainPage::QueueKeyboardMetricsRecheck(const char* why)
+{
+    (void)why;
+    if (m_kbRecheckTries >= 4) return;
+    ++m_kbRecheckTries;
+    Platform::Agile<MainPage^> self(this);
+    try {
+        this->Dispatcher->RunAsync(Windows::UI::Core::CoreDispatcherPriority::Low,
+            ref new Windows::UI::Core::DispatchedHandler([self]() {
+                MainPage^ s = self.Get();
+                if (!s) return;
+                s->RefreshKeyboardMetrics("kb-recheck");
+            }));
+    } catch (...) {}
 }
 
 // ---- 持久化 ----

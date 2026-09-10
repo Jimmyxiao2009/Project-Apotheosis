@@ -342,8 +342,13 @@ namespace Harness {
         //   change one of the three just calls it. `why` only lands in the stage.txt line. UI thread only.
         void ApplyKeyboardShift(const char* why);
         // Apotheosis (0.1.9.43): re-read the InputPane rectangle (it changes on a rotation without a
-        //   new Showing event), then ApplyKeyboardShift. UI thread only.
+        //   new Showing event), then ApplyKeyboardShift. The rectangle is sanity-checked against the
+        //   window it is supposed to belong to (0.1.9.44) - a rotation is exactly the moment the
+        //   shell still answers with the previous orientation's. UI thread only.
         void RefreshKeyboardMetrics(const char* why);
+        // Apotheosis (0.1.9.44): ask again on a low-priority dispatcher hop after the InputPane
+        //   answered with a rectangle that cannot belong to the current window. Bounded.
+        void QueueKeyboardMetricsRecheck(const char* why);
         // Apotheosis (2837ce0 review item 1): the title/toast row auto-hides. Reveal() shows it and
         //   — unless a page is loading — arms the ~2 s hide; Collapse() fades it out and hands its
         //   strip back to the content area (ApplyViewInsets' titleH). Every write to TitleText::Text
@@ -781,6 +786,13 @@ namespace Harness {
         //   can be called from anywhere and stays silent when nothing changes.
         bool   m_kbVisible { false };
         double m_kbTop { 0.0 }, m_kbHeight { 0.0 };
+        // Apotheosis (0.1.9.44): true while the recorded rectangle is known NOT to belong to the
+        //   current window (it fails KeyboardRectPlausible) - the shell answers a rotation with the
+        //   previous orientation's rectangle for a moment. Nothing may be computed from it while
+        //   this is set: the shift stays where it is until a plausible rectangle or a Showing event
+        //   arrives. m_kbRecheckTries bounds the deferred re-query so it cannot become a loop.
+        bool   m_kbMetricsStale { false };
+        int    m_kbRecheckTries { 0 };
         double m_kbShiftApplied { 0.0 };
         // Apotheosis (suggestion tap, 2026-09-10): a shift back to rest while the suggestion dropdown
         //   is up is deferred (QueueKeyboardShiftRestore) instead of applied — moving the panel is what
