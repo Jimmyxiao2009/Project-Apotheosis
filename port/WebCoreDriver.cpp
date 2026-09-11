@@ -496,6 +496,9 @@ static bool g_apoSpecPrefetch = false;
 // LoadingFrameLoaderClient::prefetchDNS(). Used by WebCorePreconnect().
 extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
+static char g_pageProbe[256] = "";    // Apotheosis: per-document content summary (counts/lengths only, see writeDiag)
+static int g_paintProbeNonWhite = 0;  // Apotheosis: non-white pixels of the downscaled probe paint (the GPU present has no readback)
+static int g_paintProbeSampled = 0;   // Apotheosis: pixels that probe paint sampled (0 = it did not run)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
 // GPU 合成是否就绪:仅当 WebCoreGpuInit 成功建好 GL 上下文 + TextureMapper 后才置 true。
@@ -3052,6 +3055,89 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     return kOK;
 }
 
+static int evalJS(WebCore::LocalFrame& frame, const char* script, char* out, int len);   // defined below; the diag probes use it
+
+// Apotheosis: "is the page blank?" used to be answered by paintToRGBA()'s nonWhite counter.
+// The direct GPU present has no readback, so that counter stays 0 for every page and the
+// signal has been dead since the GPU path became the default. Take it here instead, from a
+// software paint of the visible rect at a quarter of the size in each axis (1/16 of the
+// pixels, compositing layers flattened in exactly as on the software path). It cannot say
+// which pixels are wrong, but it separates the two cases that matter when a page comes up
+// white: the engine painted nothing, or it painted and the composite/upload lost the result.
+// Runs once per document (see writeDiag), never per frame.
+static int probePaintNonWhite(WebCore::LocalFrameView& view, int w, int h, int& sampledOut)
+{
+    using namespace WebCore;
+    sampledOut = 0;
+    const int kProbeShrink = 4;
+    const int pw = w / kProbeShrink;
+    const int ph = h / kProbeShrink;
+    if (pw <= 0 || ph <= 0)
+        return 0;
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+    if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        if (surface) cairo_surface_destroy(surface);
+        return 0;
+    }
+    cairo_t* cr = cairo_create(surface);
+    if (!cr || cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+        if (cr) cairo_destroy(cr);
+        cairo_surface_destroy(surface);
+        return 0;
+    }
+    // Start from opaque white, so "nothing was painted" really counts as zero non-white
+    // pixels (a fresh ARGB32 surface is transparent black, which would count as non-white).
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_paint(cr);
+    cairo_scale(cr, 1.0 / kProbeShrink, 1.0 / kProbeShrink);
+    {
+        GraphicsContextCairo context(adoptRef(cr));   // takes the reference; cr must not be destroyed below
+        auto oldBehavior = view.paintBehavior();
+        view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
+        view.paint(context, IntRect(IntPoint(), IntSize(w, h)));
+        view.setPaintBehavior(oldBehavior);
+    }
+    cairo_surface_flush(surface);
+    const unsigned char* src = cairo_image_surface_get_data(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    int nonWhite = 0;
+    if (src) {
+        for (int y = 0; y < ph; ++y) {
+            const unsigned char* row = src + static_cast<size_t>(y) * stride;
+            for (int x = 0; x < pw; ++x) {
+                // Comparing all three colour bytes to 255 is byte-order independent and
+                // true only for opaque white in this premultiplied format.
+                if (row[x * 4 + 0] != 255 || row[x * 4 + 1] != 255 || row[x * 4 + 2] != 255)
+                    ++nonWhite;
+            }
+        }
+        sampledOut = pw * ph;
+    }
+    cairo_surface_destroy(surface);
+    return nonWhite;
+}
+
+// Apotheosis: one compact summary of what the finished document actually contains, so that a
+// "the page shows up white" report can be answered from a device log instead of a guess: how
+// many elements and links there are, how much text the document renders, how tall it lays
+// out, how many boxes have a non-empty rect and how many of those reach the viewport, plus
+// the body's own colours and whether the page sees a dark colour scheme. Counts and lengths
+// only - never page text, a query or a URL - so it stays safe to read off a shared log.
+static const char* const kPageProbeScript =
+    "(function(){try{var d=document,b=d.body;if(!b)return 'nobody';"
+    "var all=d.getElementsByTagName('*'),n=all.length;"
+    "var a=d.querySelectorAll('a[href]'),ext=0,hs=location.hostname;"
+    "for(var i=0;i<a.length;i++){var hh=a[i].hostname;if(hh&&hh!==hs)ext++;}"
+    "var vh=innerHeight||1,box=0,inview=0,lim=n<400?n:400;"
+    "for(var j=0;j<lim;j++){var r=all[j].getBoundingClientRect();"
+    "if(r.width>0&&r.height>0){box++;if(r.bottom>0&&r.top<vh)inview++;}}"
+    "var st=getComputedStyle(b);"
+    "return 'els='+n+' a='+a.length+'/'+ext+' txt='+((b.innerText||'').length)"
+    "+' docH='+d.documentElement.scrollHeight+' box='+box+'/'+lim+' inview='+inview"
+    "+' fg='+st.color.replace(/ /g,'')+' bg='+st.backgroundColor.replace(/ /g,'')"
+    "+' dark='+(matchMedia('(prefers-color-scheme:dark)').matches?1:0);"
+    "}catch(e){return 'ERR:'+(e&&(e.message||e.name)||'?');}})()";
+
 // 渲染诊断写入 g_lastTitle/g_lastDiag(白屏定性 + 子资源计数),供 WebCoreGetDiag/GetTitle 取走。
 static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view, int w, int h, int nonWhite)
 {
@@ -3073,14 +3159,25 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     int bodyKids = document.body() ? static_cast<int>(document.body()->childElementCount()) : -1;
     int pendingResources = countPendingResources(document);
     g_lastPendingResources = pendingResources;
+    // Apotheosis: both probes cost a paint and a script evaluation, so they run once per
+    // document instead of on every interactive writeDiag(). The document URL is the identity
+    // here, which also re-probes after an in-page route change; g_lastUrl still holds the
+    // previous diag's URL at this point.
+    if (std::strcmp(g_lastUrl, urlStr.data() ? urlStr.data() : "")) {
+        // Only the direct GPU present needs the probe paint; on the software path the nonwhite=
+        // field above is already the real count and paint= stays 0/0 ("probe did not run").
+        if (g_gpuPresentMode)
+            g_paintProbeNonWhite = probePaintNonWhite(view, w, h, g_paintProbeSampled);
+        evalJS(view.frame(), kPageProbeScript, g_pageProbe, sizeof g_pageProbe);
+    }
     std::snprintf(g_lastTitle, sizeof g_lastTitle, "%s", titleStr.data());
     std::snprintf(g_lastUrl, sizeof g_lastUrl, "%s", urlStr.data());
     int mainLen = std::snprintf(g_lastDiag, sizeof g_lastDiag,
-        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d spa=[%.220s] lasterr=[%.150s]",
+        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d paint=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d page=[%.200s] spa=[%.220s] lasterr=[%.150s]",
         urlStr.data(), titleStr.data(), cs.width(), cs.height(),
-        document.body() ? 1 : 0, nonWhite, w * h,
+        document.body() ? 1 : 0, nonWhite, w * h, g_paintProbeNonWhite, g_paintProbeSampled,
         g_loadStarted, g_loadResponse, g_loadComplete, g_loadFail, pendingResources,
-        jsEnabled, canExec, scriptCount, rootKids, bodyKids, g_spaProbe, g_lastNetError);
+        jsEnabled, canExec, scriptCount, rootKids, bodyKids, g_pageProbe, g_spaProbe, g_lastNetError);
     // 已请求资源清单(诊断 SPA 模块图):每项 文件名(s状态)。status: 0未知 1加载中 2成功 3加载失败 4解码失败。
     // 若 pigai.shop 的 5 个 chunk(react-core/semi-ui/...)根本不在表里 = import 没去拉(模块图没解析);
     // 在表里但 s3 = 拉了但失败(网络/CORS)。
@@ -4099,6 +4196,8 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrBadArgs;
 
     g_lastNetError[0] = '\0';   // clear any stale diagnostic from a prior call
+    g_pageProbe[0] = '\0';
+    g_paintProbeNonWhite = g_paintProbeSampled = 0;
     g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;   // 重置子资源计数
 
     // process init (JSC/MainThread/AtomStrings) + installPortPlatformStrategies()
@@ -4273,6 +4372,8 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
     teardownSession();
     g_lastNetError[0] = '\0';
     g_spaProbe[0] = '\0';
+    g_pageProbe[0] = '\0';
+    g_paintProbeNonWhite = g_paintProbeSampled = 0;
     g_lastPendingResources = 0;
     g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
     PerfOpGuard perfOp("nav", url, w, h);   // M4: one CSV row for this navigation (flushed on completion)

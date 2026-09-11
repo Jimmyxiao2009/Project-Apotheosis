@@ -156,6 +156,12 @@ project's own version.
 - Opt-in `perf.csv` columns and `stage.txt` trace families cover loads,
   scrolling, tiles, gestures and the keyboard, `crash.txt` records the aborts an
   App Container leaves no dump for, and everything stays off without its file.
+- The render diagnostic answers "is this page blank?" again. Its non-white pixel
+  count came from the software readback, which the direct GPU present does not
+  do, so it read zero for every page; it is now taken once per document from a
+  quarter-size probe paint. The same line carries a short content summary of the
+  finished document — element, link, box and text-length counts, laid-out height
+  and the body colours — in counts and lengths only, never page text or a query.
 
 ### Build and packaging
 
