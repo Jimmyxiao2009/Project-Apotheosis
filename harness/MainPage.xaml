@@ -360,9 +360,23 @@
                  Grid, but GpuPanel is a SwapChainPanel — say it explicitly rather than rely on how
                  a composed swap-chain visual sorts against its XAML siblings). Left/right insets
                  come from RootGrid's Padding, the status-bar inset from the Margin below. -->
-            <ProgressBar x:Name="Progress" Height="5" VerticalAlignment="Top" Foreground="{StaticResource Accent}"
-                         Background="#000000" IsIndeterminate="False" Visibility="Collapsed"
-                         IsHitTestVisible="False" Canvas.ZIndex="10"/>
+            <!-- Apotheosis (0.1.9.49): the black comes from THIS Border, not from the
+                 ProgressBar's own Background. The stock indeterminate template collapses the
+                 element that carries Background and animates the dots on a separate, fully
+                 transparent one, so the strip's black was never actually drawn. It went
+                 unnoticed while the strip pushed the page down (0.1.9.46 and earlier): the 5
+                 DIP it uncovered were the window's own dark chrome. As an overlay (0.1.9.47)
+                 it draws straight onto the page, and the dots were marching over white.
+                 The Border is the visible strip and therefore owns everything about it: the
+                 status-bar inset (ApplyViewInsets sets ITS margin), the height, the hit-test
+                 exemption, the z-order and the visibility SetLoading toggles. -->
+            <Border x:Name="ProgressStrip" Height="5" VerticalAlignment="Top"
+                    HorizontalAlignment="Stretch" Background="#000000" Visibility="Collapsed"
+                    IsHitTestVisible="False" Canvas.ZIndex="10">
+                <ProgressBar x:Name="Progress" Height="5" MinHeight="5" Foreground="{StaticResource Accent}"
+                             Background="Transparent" IsIndeterminate="False" Visibility="Collapsed"
+                             IsHitTestVisible="False"/>
+            </Border>
 
             <!-- 悬浮翻页键(触发懒加载/看下方内容)。仅有会话时显示。 -->
             <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom"
