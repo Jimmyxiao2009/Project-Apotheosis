@@ -393,6 +393,15 @@ void WebCoreSetUserAgentString(const char* ua);
 // enabled!=0 时网页可预取用户未点击的 URL。仅引擎线程调；对当前会话和新建会话都生效。
 void WebCoreSetSpeculativePrefetch(int enabled);
 
+// Apotheosis (page width, 0.1.9.58): the page-width factor = the engine's device scale factor.
+// The engine lays a page out at (engine px / factor) CSS px, so 1.5 gives a 480 CSS px layout
+// viewport on a 720 engine px wide portrait panel - a phone-sized viewport instead of a tablet
+// one - while tiles still raster at the full engine resolution, so text stays sharp. Clamped to
+// [1.0, 2.0]; the default is 1.5. Stores the value only: it reaches a live page through the next
+// WebCoreResize() (which re-lays the document out at the new CSS viewport) or through the next
+// WebCoreSessionLoad()/WebCoreRenderHtml(). Engine thread only, like every other setter here.
+void WebCoreSetPageWidthFactor(float factor);
+
 // Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is
 // being typed (debounced, e.g. once per suggestion update) so the DNS lookup is already done when
 // Enter arrives. Accepts a full URL or a bare host ("example.com"); anything else is ignored. DNS only:

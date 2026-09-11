@@ -326,6 +326,89 @@ static bool isValidSurfaceSize(int w, int h)
 }
 
 // ---------------------------------------------------------------------------
+// Apotheosis (page width, 0.1.9.58): the page-width factor - which is WebKit's DEVICE SCALE FACTOR.
+//
+// Why it exists: the panel is 360 DIP wide and the harness runs the engine at two engine px per
+// DIP, so the engine was handed a 720 px wide LocalFrameView at device scale factor 1, i.e. a
+// 720 CSS px layout viewport. Every site read that as a small tablet, served its wide layout, and
+// 16 px text came out 8 DIP tall - half the size of the same page in any phone browser. A real
+// phone reports 360-430 CSS px at a device pixel ratio of 2-3, and the mechanism WebKit has for
+// exactly that is the device scale factor: Page::setDeviceScaleFactor(f) leaves the raster
+// resolution alone (a composited layer's contentsScale is pageScaleFactor * deviceScaleFactor, so
+// a tile is still rastered at the full engine resolution and text stays as sharp as it was) while
+// the LocalFrameView is sized in CSS px, i.e. engine px / f. At the default 1.5 the layout viewport
+// is 480 CSS px and window.devicePixelRatio is 1.5. This is not page zoom and not text autosizing:
+// both of those enlarge a layout that is still a tablet layout.
+//
+// The C ABI does NOT change: every coordinate in and out of this driver is still viewport/BITMAP px
+// (see WebCoreDriver.h), and the conversion happens here, at the boundary. Three coordinate spaces
+// meet in this file and the factor is the difference between the first and the other two:
+//
+//   engine px   what the harness talks in; the GL viewport, the RGBA buffer, g_gpuW/H, g_session->w/h.
+//   event px    what WebCore's mouse/wheel events and ScrollView scroll positions use. That space
+//               is CSS px * pageScaleFactor (WebCoreSetPageScale derives the page-scale half in
+//               detail), so engine = event * f.
+//   client px   what elementFromPoint() and boundingClientRect() use: plain CSS px, so
+//               engine = client * pageScaleFactor * f (see clientPointForEnginePoint()).
+//
+// Engine thread only, like every other piece of state in this file.
+// ---------------------------------------------------------------------------
+static constexpr float kPageWidthFactorMin = 1.0f;
+static constexpr float kPageWidthFactorMax = 2.0f;
+static constexpr float kPageWidthFactorDefault = 1.5f;
+static float g_pageWidthFactor = kPageWidthFactorDefault;
+
+static inline float wkPageWidthFactor()
+{
+    return (g_pageWidthFactor >= kPageWidthFactorMin && g_pageWidthFactor <= kPageWidthFactorMax)
+        ? g_pageWidthFactor : 1.0f;
+}
+
+static inline int wkRoundToInt(double v)
+{
+    return static_cast<int>(v < 0.0 ? v - 0.5 : v + 0.5);
+}
+
+// A viewport size in engine px -> the LocalFrameView's size, in CSS px. Never zero: a degenerate
+// view size is a layout with no viewport at all, which is not a state any caller can mean.
+static WebCore::IntSize wkViewSizeFromEngine(int w, int h)
+{
+    const double f = static_cast<double>(wkPageWidthFactor());
+    const int cw = wkRoundToInt(static_cast<double>(w) / f);
+    const int ch = wkRoundToInt(static_cast<double>(h) / f);
+    return WebCore::IntSize(cw > 0 ? cw : 1, ch > 0 ? ch : 1);
+}
+
+// engine px <-> event px (mouse/wheel positions, scroll positions, scroll deltas).
+static inline double wkEventFromEngine(double v) { return v / static_cast<double>(wkPageWidthFactor()); }
+static inline int wkEngineFromEvent(double v) { return wkRoundToInt(v * static_cast<double>(wkPageWidthFactor())); }
+static inline WebCore::DoublePoint wkEventPointFromEngine(int x, int y)
+{
+    return WebCore::DoublePoint(wkEventFromEngine(static_cast<double>(x)),
+        wkEventFromEngine(static_cast<double>(y)));
+}
+
+// Apotheosis (page width, 0.1.9.58): put the factor on the Page. Called wherever this driver
+// creates one and again from WebCoreResize(), which is the path a factor CHANGE takes to a live
+// document (the harness re-runs the viewport after writing the setting). Page::setDeviceScaleFactor
+// is a no-op when the value is unchanged, so calling it on every resize costs nothing.
+static void wkApplyPageWidthFactor(WebCore::Page& page)
+{
+    page.setDeviceScaleFactor(wkPageWidthFactor());
+}
+
+// engine px <-> CSS client px. One engine px is one CSS px times the page scale times the
+// page-width factor; clientPointForEnginePoint() below is the point-shaped form of the same thing.
+static double wkClientToEngineScale(WebCore::Page* page)
+{
+    float scale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(scale > 0.0f)) scale = 1.0f;
+    return static_cast<double>(scale) * static_cast<double>(wkPageWidthFactor());
+}
+static inline double wkEngineLengthFromClient(WebCore::Page* page, double v) { return v * wkClientToEngineScale(page); }
+static inline double wkClientLengthFromEngine(WebCore::Page* page, double v) { return v / wkClientToEngineScale(page); }
+
+// ---------------------------------------------------------------------------
 // Apotheosis: memory-pressure state.
 // The App Container cap is 1536 MB and the OS kills us at it with no exception and no dump,
 // so the only defence is to shrink before we get there. The numbers come from the harness
@@ -739,6 +822,13 @@ static void extractLinks(WebCore::Document* document, int renderH)
     g_links.clear();
     if (!document)
         return;
+    // Apotheosis (page width, 0.1.9.58): boundingClientRect() answers in CSS client px while
+    // renderH arrives in engine px and the harness reads these rectangles as engine px
+    // (WebCoreGetLink), so both ends of this loop convert. The factor the conversion carries is
+    // pageScaleFactor * page-width factor - the page scale was missing here before, which is the
+    // same mismatch WebCoreLinkAt's header describes; at 1:1 with a factor of 1 nothing changes.
+    WebCore::Page* page = document->page();
+    const double cssRenderH = wkClientLengthFromEngine(page, static_cast<double>(renderH));
     Ref<WebCore::HTMLCollection> links = document->links();
     unsigned n = links->length();
     for (unsigned i = 0; i < n && g_links.size() < 4000; ++i) {
@@ -752,13 +842,13 @@ static void extractLinks(WebCore::Document* document, int renderH)
         WebCore::FloatRect r = el->boundingClientRect();
         if (r.width() <= 0 || r.height() <= 0)
             continue;
-        if (r.maxY() < 0 || r.y() > static_cast<float>(renderH))
+        if (r.maxY() < 0 || r.y() > static_cast<float>(cssRenderH))
             continue;   // 只收落在已渲染视口内的链接(屏外的点不到)
         LinkRect lr;
-        lr.x = static_cast<int>(r.x());
-        lr.y = static_cast<int>(r.y());
-        lr.w = static_cast<int>(r.width());
-        lr.h = static_cast<int>(r.height());
+        lr.x = wkRoundToInt(wkEngineLengthFromClient(page, r.x()));
+        lr.y = wkRoundToInt(wkEngineLengthFromClient(page, r.y()));
+        lr.w = wkRoundToInt(wkEngineLengthFromClient(page, r.width()));
+        lr.h = wkRoundToInt(wkEngineLengthFromClient(page, r.height()));
         lr.url = href.string().utf8().data();
         g_links.push_back(std::move(lr));
     }
@@ -2616,6 +2706,34 @@ static void forceDirtyTree(WebCore::GraphicsLayer& l)
 static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerTextureMapper& glRoot)
 {
     using namespace WebCore;
+    // Apotheosis (page width, 0.1.9.58): the device scale factor does NOT reach the layer tree.
+    // WebCore keeps every GraphicsLayer's position and size in CSS px and expresses the device
+    // scale only as the backing store's contentsScale (pageScaleFactor * deviceScaleFactor, see
+    // GraphicsLayerTextureMapper::updateBackingStoreIfNeeded), so a tree laid out at 480 CSS px
+    // would be composited into the top-left 480 px of a 720 px framebuffer. Every port that
+    // composites through TextureMapper therefore applies the factor as a transform on the ROOT at
+    // composite time, and this is that transform. The root layer here is the compositor's host
+    // layer: it is 0x0 and paints nothing of its own, so a transform on it is a plain scale of the
+    // whole subtree about the origin (TextureMapperLayer::computeTransformsRecursive composes it as
+    // translate(anchor + pos) * transform, and both are zero).
+    //
+    // Deliberately NOT setChildrenTransform(): wkVisibleRectForChildren() refuses to map a visible
+    // rect through a non-identity children transform and falls back to tiling the whole subtree,
+    // which on a long page is hundreds of MB. The rect the compositor flushes down is the
+    // LocalFrameView's own visible content rect, i.e. already in the layer tree's CSS px, so
+    // nothing else in the tiling machinery needs to know this factor exists.
+    //
+    // Set before the flush so flushCompositingStateForThisLayerOnly() pushes it in the same pass;
+    // GraphicsLayer::setTransform() is a no-op when the value is unchanged, so a steady factor
+    // costs one matrix compare per composite. Nothing in RenderLayerCompositor ever writes a
+    // transform on a root layer, so ours is not fighting anyone for it.
+    {
+        TransformationMatrix wantedRootTransform;
+        wantedRootTransform.scale(static_cast<double>(wkPageWidthFactor()));
+        if (glRoot.transform() != wantedRootTransform)
+            glRoot.setTransform(wantedRootTransform);
+    }
+
     // flushCompositingStateForThisFrame 在 needsLayout() 时直接返回不 flush → 先确保布局就绪。
     {
         PerfPhase perfLayout(&g_perfCur.styleLayout);
@@ -2996,7 +3114,6 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     // 有意义,这里必须清掉,否则残留到下一次真 GPU 合成(如点击后)会错误跳过 forceDirtyTree → 停留旧内容。
     g_gpuScrollFast = false;
 
-    const IntSize size(w, h);
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
         if (surface) cairo_surface_destroy(surface);
@@ -3009,6 +3126,12 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
         return kErrCairoContext;
     }
     {
+        // Apotheosis (page width, 0.1.9.58): the software path is the embedder's own paint, so the
+        // device scale factor is ours to apply - WebCore paints the view in CSS px and expects the
+        // context to carry the factor (the GPU path does the same thing as a root layer transform,
+        // see gpuPrepare). Without it a 480 CSS px layout would be blitted into the top-left corner
+        // of the 720 px buffer.
+        cairo_scale(cr, wkPageWidthFactor(), wkPageWidthFactor());
         GraphicsContextCairo context(adoptRef(cr));
         // ScrollView::paint 内部已按 -scrollPosition 平移,始终从原点绘制,绝不另加 scrollY。
         // ★ M1:开合成后页面内容进 GraphicsLayer,普通 paint 会漏合成层 → 软件渲染变空。
@@ -3018,7 +3141,7 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
         view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
         {
             PerfPhase perfPaint(&g_perfCur.paint);   // M4: software raster (Cairo)
-            view.paint(context, IntRect(IntPoint(), size));
+            view.paint(context, IntRect(IntPoint(), wkViewSizeFromEngine(w, h)));
         }
         view.setPaintBehavior(oldBehavior);
     }
@@ -3101,12 +3224,14 @@ static int probePaintNonWhite(WebCore::LocalFrameView& view, int w, int h, int& 
     // pixels (a fresh ARGB32 surface is transparent black, which would count as non-white).
     cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
     cairo_paint(cr);
-    cairo_scale(cr, 1.0 / kProbeShrink, 1.0 / kProbeShrink);
+    // Apotheosis (page width, 0.1.9.58): the device scale factor belongs in the embedder's
+    // context here too, exactly as in paintToRGBA - the view is painted in CSS px.
+    cairo_scale(cr, wkPageWidthFactor() / kProbeShrink, wkPageWidthFactor() / kProbeShrink);
     {
         GraphicsContextCairo context(adoptRef(cr));   // takes the reference; cr must not be destroyed below
         auto oldBehavior = view.paintBehavior();
         view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
-        view.paint(context, IntRect(IntPoint(), IntSize(w, h)));
+        view.paint(context, IntRect(IntPoint(), wkViewSizeFromEngine(w, h)));
         view.setPaintBehavior(oldBehavior);
     }
     cairo_surface_flush(surface);
@@ -3175,6 +3300,8 @@ static const char* const kPageProbeScript =
     "+' docH='+d.documentElement.scrollHeight+' box='+box+'/'+lim+' inview='+inview"
     "+' hid='+hid+' root='+ch.join('/')+' cover='+cov+'/'+zmax+' ck='+ck+'/'+ckRaw.length"
     "+' fg='+st.color.replace(/ /g,'')+' bg='+st.backgroundColor.replace(/ /g,'')"
+    "+' vw='+vw+'x'+vh"
+    "+' dpr='+(devicePixelRatio||1)"
     "+' dark='+(matchMedia('(prefers-color-scheme:dark)').matches?1:0);"
     "}catch(e){return 'ERR:'+(e&&(e.message||e.name)||'?');}})()";
 
@@ -3421,6 +3548,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     Ref<Page> page = Page::create(WTF::move(pageConfiguration));
     g_session->page = page.ptr();   // 立即存活到会话:后续失败路径 teardown 才能安全访问 client/frame
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
 
     page->settings().setScriptEnabled(true);
     page->settings().setLoadsImagesAutomatically(true);
@@ -3493,7 +3621,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
     view->setCanHaveScrollbars(true);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     // headless 页面标记为 active + focused,否则 EventHandler 命中/默认动作、:focus、表单交互、依赖
     // document.hasFocus()/可见性的脚本会被当后台页抑制 → 点击像没反应。
@@ -3538,7 +3666,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     RefPtr<Document> document = localMainFrame->protectedDocument();
     if (!document)
@@ -3560,7 +3688,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
     document = localMainFrame->protectedDocument();
     if (!document)
         return kErrNoDocument;
@@ -3600,7 +3728,7 @@ static int finishInteractionPaint(uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(g_session->w, g_session->h));
+    view->resize(wkViewSizeFromEngine(g_session->w, g_session->h));
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
@@ -4203,6 +4331,8 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     page->settings().setMediaEnabled(false);
 #endif
 
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
+
     // ---- 4. Main frame + view ----
     RefPtr<LocalFrame> localMainFrame = page->localMainFrame();
     if (!localMainFrame)
@@ -4239,8 +4369,8 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     writer.end();   // finishes parsing synchronously for this in-memory document
 
     // ---- 6. Size + layout ----
-    const IntSize size(w, h);
-    view->resize(size);   // Widget::resize -> setFrameRect; establishes layout viewport
+    const IntSize size = wkViewSizeFromEngine(w, h);   // CSS px, see wkViewSizeFromEngine
+    view->resize(size);   // Widget::resize -> setFrameRect; establishes the layout viewport
 
     RefPtr<Document> document = localMainFrame->protectedDocument();
     if (!document)
@@ -4264,6 +4394,10 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     }
 
     {
+        // Apotheosis (page width, 0.1.9.58): this path has its own cairo context (it predates
+        // paintToRGBA) and needs the same device scale factor - the view is laid out and painted in
+        // CSS px, the surface is engine px. The built-in start and error pages come through here.
+        cairo_scale(cr, wkPageWidthFactor(), wkPageWidthFactor());
         // GraphicsContextCairo adopts a RefPtr<cairo_t>. We created cr with a
         // refcount of 1, so hand ownership over via adoptRef (no extra ref).
         GraphicsContextCairo context(adoptRef(cr));   // RefPtr<cairo_t>&& ctor
@@ -4391,6 +4525,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
 #if ENABLE(VIDEO)
     page->settings().setMediaEnabled(false);
 #endif
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
     // 标记页面可见,否则后台节流会推迟图片/定时器/资源加载(headless 默认可能非可见)。
     page->setIsVisible(true);
 
@@ -4409,7 +4544,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
     view->setCanHaveScrollbars(true);
-    view->resize(IntSize(w, h));   // establish viewport BEFORE load
+    view->resize(wkViewSizeFromEngine(w, h));   // establish viewport BEFORE load
 
     // ---- Issue the network load ----
     ResourceRequest request { WTF::move(parsedURL) };
@@ -4472,7 +4607,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     document->updateLayoutIgnorePendingStylesheets();
     extractLinks(document.get(), h);                    // 提取链接命中表(点击交互)
@@ -4646,11 +4781,15 @@ static void inputNote(const char* text)
 // derivation above) with no separate multiply, landing directly in the space the layout tree's
 // RenderView scale transform produces. Apply this ONLY to elementFromPoint()-style client-coordinate
 // calls, never to PlatformMouseEvent positions.
+//
+// Apotheosis (page width, 0.1.9.58): the page-width factor is the SECOND half of the same
+// conversion. A client point is plain CSS px; an engine px is one CSS px times the page scale times
+// the device scale factor, so both divisions belong here. Without the factor every hit test in this
+// driver would land at 1/f of the point the finger actually touched.
 static WebCore::DoublePoint clientPointForEnginePoint(WebCore::Page* page, int x, int y)
 {
-    float scale = page ? page->pageScaleFactor() : 1.0f;
-    if (!(scale > 0.0f)) scale = 1.0f;
-    return WebCore::DoublePoint(static_cast<double>(x) / scale, static_cast<double>(y) / scale);
+    const double d = wkClientToEngineScale(page);
+    return WebCore::DoublePoint(static_cast<double>(x) / d, static_cast<double>(y) / d);
 }
 
 // Apotheosis: the drag-widget walk (canvas / touch-action:none), defined with WebCoreWantsDragAt
@@ -4736,7 +4875,7 @@ static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
     // releaseDanglingPress(). Normally a no-op; WebCoreDragAt now unwinds its own presses.
     const bool tapUnwound = lf->eventHandler().mousePressed();
     if (tapUnwound) {
-        releaseDanglingPress(*lf, DoublePoint(static_cast<double>(x), static_cast<double>(y)), { });
+        releaseDanglingPress(*lf, wkEventPointFromEngine(x, y), { });
         // That release dispatches a mouseup, which runs script and in the worst case navigates.
         lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
         if (!lf)
@@ -4773,7 +4912,7 @@ static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
         });
     }
 
-    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
     OptionSet<PlatformEvent::Modifier> mods;
     MonotonicTime t = MonotonicTime::now();
     // Apotheosis (2026-09-04): the press carries buttons=1, the release buttons=0, exactly as the
@@ -4841,7 +4980,7 @@ static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(g_session->w, g_session->h));
+    view->resize(wkViewSizeFromEngine(g_session->w, g_session->h));
     doc = lf->document();
     if (!doc)
         return kErrNoDocument;
@@ -4912,8 +5051,22 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     ScrollPosition cur = view->scrollPosition();
     ScrollPosition minP = view->minimumScrollPosition();
     ScrollPosition maxP = view->maximumScrollPosition();
-    int tx = cur.x() + dx;
-    int ty = cur.y() + dy;
+    // Apotheosis (page width, 0.1.9.58): dx/dy arrive in engine px and a scroll position is in
+    // event px (CSS px * page scale), so the delta is divided by the page-width factor. The
+    // remainder is CARRIED rather than rounded away: at 1.5 one engine px is 0.67 scroll units, and
+    // rounding every step on its own would make a slow fling either 50 % too fast (each step
+    // rounded up) or completely motionless (each step rounded down). At a factor of 1 the division
+    // is exact, the remainders stay zero and this is the arithmetic it always was.
+    static double scrollResidualX = 0.0;
+    static double scrollResidualY = 0.0;
+    const double wantX = scrollResidualX + wkEventFromEngine(static_cast<double>(dx));
+    const double wantY = scrollResidualY + wkEventFromEngine(static_cast<double>(dy));
+    const int stepX = wkRoundToInt(wantX);
+    const int stepY = wkRoundToInt(wantY);
+    scrollResidualX = wantX - static_cast<double>(stepX);
+    scrollResidualY = wantY - static_cast<double>(stepY);
+    int tx = cur.x() + stepX;
+    int ty = cur.y() + stepY;
     if (tx < minP.x()) tx = minP.x();
     if (tx > maxP.x()) tx = maxP.x();
     if (ty < minP.y()) ty = minP.y();
@@ -4961,12 +5114,15 @@ int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* vie
     const ScrollPosition cur = view->scrollPosition();
     const ScrollPosition maxP = view->maximumScrollPosition();
     const IntSize contents = view->contentsSize();
-    if (x) *x = cur.x();
-    if (y) *y = cur.y();
-    if (contentW) *contentW = contents.width();
-    if (contentH) *contentH = contents.height();
-    if (viewW) *viewW = contents.width() - maxP.x();
-    if (viewH) *viewH = contents.height() - maxP.y();
+    // Apotheosis (page width, 0.1.9.58): the frame view answers in event px; the harness asks in
+    // engine px, exactly the units it passes to WebCoreScrollBy. Convert on the way out so the two
+    // keep agreeing, whatever the page-width factor is.
+    if (x) *x = wkEngineFromEvent(cur.x());
+    if (y) *y = wkEngineFromEvent(cur.y());
+    if (contentW) *contentW = wkEngineFromEvent(contents.width());
+    if (contentH) *contentH = wkEngineFromEvent(contents.height());
+    if (viewW) *viewW = wkEngineFromEvent(contents.width() - maxP.x());
+    if (viewH) *viewH = wkEngineFromEvent(contents.height() - maxP.y());
     return kOK;
 }
 
@@ -5130,7 +5286,11 @@ static int wheelAtImpl(int x, int y, float deltaX, float deltaY, float ticksX, f
 
     const ScrollPosition beforeMain = view->scrollPosition();
 
-    IntPoint p(x, y);
+    // Apotheosis (page width, 0.1.9.58): the position is engine px on the way in, event px for
+    // WebCore. The deltas are converted by WebCoreWheelAt (the scroll route, where they are pixel
+    // distances); WebCoreZoomWheelAt's are wheel notches and must not be scaled.
+    const IntPoint p(wkRoundToInt(wkEventFromEngine(static_cast<double>(x))),
+        wkRoundToInt(wkEventFromEngine(static_cast<double>(y))));
     PlatformWheelEvent wheelEvent(p, p, deltaX, deltaY, ticksX, ticksY,
         PlatformWheelEventGranularity::ScrollByPixelWheelEvent,
         /* shiftKey */ false, ctrlKey, /* altKey */ false, /* metaKey */ false);
@@ -5190,7 +5350,12 @@ static int wheelAtImpl(int x, int y, float deltaX, float deltaY, float ticksX, f
 int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA)
 {
     (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
-    return wheelAtImpl(x, y, deltaX, deltaY, deltaX, deltaY, /*ctrlKey*/ false, /*zoomMode*/ false, outRGBA);
+    // Apotheosis (page width, 0.1.9.58): deltaX/deltaY are pixel distances in engine px, like every
+    // other length in this ABI, and a wheel delta scrolls a nested box by exactly that many event
+    // px - so the page-width factor divides them the same way WebCoreScrollBy's dx/dy are divided.
+    const float dxEvent = static_cast<float>(wkEventFromEngine(static_cast<double>(deltaX)));
+    const float dyEvent = static_cast<float>(wkEventFromEngine(static_cast<double>(deltaY)));
+    return wheelAtImpl(x, y, dxEvent, dyEvent, dxEvent, dyEvent, /*ctrlKey*/ false, /*zoomMode*/ false, outRGBA);
 }
 
 // Apotheosis (pinch on map widgets, 2026-09-06): `notches` wheel clicks with ctrl held at (x,y),
@@ -5412,7 +5577,7 @@ int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
     if (phase == 0)
         doc->updateLayoutIgnorePendingStylesheets();   // the press hit-tests; moves reuse that layout
 
-    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
     OptionSet<PlatformEvent::Modifier> mods;
     MonotonicTime t = MonotonicTime::now();
     bool handled = false;
@@ -5597,7 +5762,7 @@ int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA)
         return kOK;
     }
 
-    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
     OptionSet<PlatformEvent::Modifier> mods;
     MonotonicTime t = MonotonicTime::now();
 
@@ -5860,8 +6025,12 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     // towards the top on release, exactly the reported symptom. The error grows with P0, so
     // it looked like "it snaps to the top-of-page view" far down a long page.
     double ratio = static_cast<double>(scale) / static_cast<double>(oldScale);
-    double nx = (static_cast<double>(scroll.x()) + static_cast<double>(focalX)) * ratio - static_cast<double>(focalX);
-    double ny = (static_cast<double>(scroll.y()) + static_cast<double>(focalY)) * ratio - static_cast<double>(focalY);
+    // Apotheosis (page width, 0.1.9.58): the focal point arrives in engine px and every term of
+    // this derivation is in the frame view's own scroll space (event px), so convert it once here.
+    const double focalEventX = wkEventFromEngine(static_cast<double>(focalX));
+    const double focalEventY = wkEventFromEngine(static_cast<double>(focalY));
+    double nx = (static_cast<double>(scroll.x()) + focalEventX) * ratio - focalEventX;
+    double ny = (static_cast<double>(scroll.y()) + focalEventY) * ratio - focalEventY;
     int nsx = static_cast<int>(nx < 0 ? nx - 0.5 : nx + 0.5);
     int nsy = static_cast<int>(ny < 0 ? ny - 0.5 : ny + 0.5);
     IntPoint wanted = view->constrainedScrollPosition(IntPoint(nsx, nsy));
@@ -5984,10 +6153,14 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
             if (RefPtr<LocalFrameView> view = lf->view()) {
                 const double r = 1.0 / static_cast<double>(curScale);
                 const double p0 = static_cast<double>(view->scrollPosition().x());
-                const double viewW = static_cast<double>(g_session->w);
+                // Apotheosis (page width, 0.1.9.58): scroll positions and contentsSize() are event
+                // px, so the viewport width and the tap x are converted into that space and the
+                // anchor is converted back to engine px where it is written out.
+                const double viewW = wkEventFromEngine(static_cast<double>(g_session->w));
+                const double xEvent = wkEventFromEngine(static_cast<double>(x));
                 double maxX1 = static_cast<double>(view->contentsSize().width()) * r - viewW;
                 if (!(maxX1 > 0.0)) maxX1 = 0.0;
-                const double p1 = (p0 + static_cast<double>(x)) * r - static_cast<double>(x);
+                const double p1 = (p0 + xEvent) * r - xEvent;
                 const double settled = (p1 < 0.0) ? 0.0 : (p1 > maxX1 ? maxX1 : p1);
                 if (settled != p1) {
                     double anchor = (settled - p0 * r) / (r - 1.0);
@@ -5997,7 +6170,7 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
                     // transform centre and the commit's.
                     if (anchor < 0.0) anchor = 0.0;
                     if (anchor > viewW) anchor = viewW;
-                    *outAnchorX = static_cast<int>(anchor + 0.5);
+                    *outAnchorX = wkEngineFromEvent(anchor);
                 }
             }
         }
@@ -6088,11 +6261,11 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     // Apotheosis: "zoom to column" — the innermost block-level ancestor of the hit point that is
     // narrower than the layout viewport (Safari's own double-tap-zoom heuristic), walked from the
     // hit element up towards <html> so the FIRST candidate found is the innermost/smallest one.
-    // boundingClientRect() and (x,y) are read in the same viewport/bitmap px space this driver
-    // already uses them in elsewhere with no extra scale conversion (extractLinks, dragWidgetAtPoint)
-    // — exact at scale 1.0 and close enough inside the ±5 % band around 1:1 checked above; any
-    // other current scale would need an extra factor of curScale (see WebCoreSetPageScale's own
-    // derivation of engine-px-vs-CSS-px), which this branch never runs at.
+    // Everything in this block is in CSS CLIENT px - boundingClientRect()'s own space, and `cp`'s -
+    // so the comparison and the ratio below need no conversion at all; the two conversions are at
+    // the edges (viewportW in, the anchor out). curScale is within 5 % of 1:1 here, the branch
+    // above having returned otherwise, so the page-scale half of the client/engine factor is
+    // ~1 in practice; it is carried anyway rather than assumed.
     //
     // Apotheosis (0.1.9.38): a block only counts as a "column" if it is meaningfully narrower than
     // the viewport. The old test was w < viewportW, and on a page whose content block fills the
@@ -6100,18 +6273,24 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     // i.e. a dead double tap, which is what the device log showed as target=1.0/1.1/1.3. Anything
     // from 90 % of the viewport upwards is the page's own full-width layout, not a column, and the
     // right answer there is the plain 2× a touch browser gives you.
-    const float viewportW = static_cast<float>(g_session->w);
+    // Apotheosis (page width, 0.1.9.58): boundingClientRect() answers in CSS client px, so the
+    // viewport this compares against has to be in CSS client px too - otherwise at a factor of 1.5
+    // every block would look 1.5x narrower than the screen and the "zoom to column" rule would fire
+    // on a full-width layout. The ratio viewportW / (w + padding) is then unit-free, so the target
+    // scale it produces is a page scale exactly as before, and the anchor is converted back to
+    // engine px where it is written out.
+    const float viewportW = static_cast<float>(wkClientLengthFromEngine(page.get(), static_cast<double>(g_session->w)));
     const float kZoomPadding = 8.0f;   // small breathing room so the column edge is not flush with the screen edge
     const float kColumnMaxWidth = 0.9f * viewportW;
     const float kFallbackScale = 2.0f; // no narrower block ancestor: what Safari/Chrome zoom to
     const float kMinZoomTarget = 1.25f;// below this the zoom is not worth the animation
     const float kMaxZoomTarget = 3.0f;
     float targetScale = kFallbackScale;
-    // Apotheosis (0.1.9.40): the column's horizontal centre, in the same viewport/bitmap px space
-    // as (x,y) — see the comment above. Defaults to the tap x itself: the fallback 2x zoom (no
-    // narrower block ancestor found) has no column to centre on, and Safari leaves the tap x alone
-    // in that case too, only the vertical stays under the finger either way.
-    float anchorXf = static_cast<float>(x);
+    // Apotheosis (0.1.9.40): the column's horizontal centre, in CSS client px like the rects it is
+    // read from. Defaults to the tap point itself: the fallback 2x zoom (no narrower block ancestor
+    // found) has no column to centre on, and Safari leaves the tap x alone in that case too, only
+    // the vertical stays under the finger either way.
+    float anchorXf = static_cast<float>(cp.x());   // CSS client px, like the rects below
     for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
         if (RenderObject* r = e->renderer()) {
             if (r->isRenderBlock()) {
@@ -6136,6 +6315,7 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     if (targetScale > kMaxZoomTarget) targetScale = kMaxZoomTarget;
     if (anchorXf < 0.0f) anchorXf = 0.0f;
     if (anchorXf > viewportW) anchorXf = viewportW;
+    const int anchorEngineX = wkRoundToInt(wkEngineLengthFromClient(page.get(), static_cast<double>(anchorXf)));
 
     // Apotheosis (0.1.9.38): a target within ±5 % of where we already are is not a zoom. Report it
     // as "not zoomable" so the harness forwards the second tap as a clickCount=2 click instead of
@@ -6153,7 +6333,7 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     // Apotheosis (0.1.9.40): outAnchorX becomes the column centre when the zoom is to a column;
     // outAnchorY stays the tap y (set at function entry, never touched again) — vertically the
     // tapped point must stay under the finger regardless of the horizontal case.
-    if (outAnchorX) *outAnchorX = static_cast<int>(anchorXf + 0.5f);
+    if (outAnchorX) *outAnchorX = anchorEngineX;
     if (outReason) *outReason = 0;   // zoomable, target computed
     return kOK;
 }
@@ -6165,11 +6345,9 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
 //
 // Why an engine call and not the harness' own link table (WebCoreGetLink): that table is a list
 // of rectangles harvested by extractLinks() after a load or a scroll settle. It is capped at 4000
-// entries, it knows nothing about what COVERS a link (a sticky header, a consent overlay, an
-// absolutely positioned box), and its rectangles are in CSS px while the harness asks in engine
-// px - at any page scale but 1.0 the two disagree, which is the bug family clientPointForEngine-
-// Point() exists for. This runs the same hit test the click path runs, so it is right at every
-// scale and it respects z-order.
+// entries and it knows nothing about what COVERS a link (a sticky header, a consent overlay, an
+// absolutely positioned box). This runs the same hit test the click path runs, so it is right at
+// every scale and it respects z-order.
 //
 // A drag widget wins: when the point belongs to something that drags itself (canvas /
 // touch-action:none - the same dragWidgetAtPoint() probe the pinch, drag and tap routes use)
@@ -6277,6 +6455,23 @@ void WebCoreSetSpeculativePrefetch(int enabled)
     g_apoSpecPrefetch = (enabled != 0);
     if (g_session && g_session->page)
         g_session->page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);
+}
+
+// Apotheosis (page width, 0.1.9.58): set the page-width factor - see the contract in
+// WebCoreDriver.h and the derivation next to wkPageWidthFactor() at the top of this file.
+//
+// Stores only. A live document does NOT relayout here: the whole of that work (device scale factor
+// on the Page, a LocalFrameView sized in the new CSS px, full relayout, scroll re-clamp, focused
+// field reveal, link table, a composite that trusts no tile painted for the old layout) is
+// WebCoreResize()'s job and it does all of it already, so the harness writes the factor and then
+// forces a viewport update. An out-of-range value falls back to the default rather than being
+// clamped silently to an edge: a caller that passes 0 or a NaN has a bug, and 1.5 is the answer
+// that leaves the user with a readable page while it is found.
+void WebCoreSetPageWidthFactor(float factor)
+{
+    if (!(factor >= kPageWidthFactorMin) || !(factor <= kPageWidthFactorMax))
+        factor = kPageWidthFactorDefault;
+    g_pageWidthFactor = factor;
 }
 
 // Apotheosis (M4): warm up an origin the user is about to visit - the harness calls this while
@@ -6834,12 +7029,19 @@ int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* out
     g_session->mainFrame = lf;
     g_session->w = w;
     g_session->h = h;
+    // Apotheosis (page width, 0.1.9.58): this is also the path a CHANGED page-width factor takes to
+    // a live document - the harness writes the setting and then forces a viewport update, because
+    // everything that has to happen afterwards (full relayout, scroll re-clamp, focused-field
+    // reveal, link table, a composite that trusts no tile painted for the old layout) is what this
+    // function already does. Page::setDeviceScaleFactor() is a no-op when the value is unchanged,
+    // so an ordinary rotation pays nothing for it.
+    wkApplyPageWidthFactor(*g_session->page);
 
     g_inPump = true;
     PumpGuard guard;
     PerfOpGuard perfOp("resize", nullptr, w, h);
 
-    view->resize(IntSize(w, h));   // Widget::resize -> setFrameRect -> layout viewport + needsLayout
+    view->resize(wkViewSizeFromEngine(w, h));   // Widget::resize -> setFrameRect -> layout viewport + needsLayout
     doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });
     // A viewport change can shorten the document (a wider layout is a shorter one), so the scroll
     // position that was valid a moment ago may now be past the end. Pull it back the same way

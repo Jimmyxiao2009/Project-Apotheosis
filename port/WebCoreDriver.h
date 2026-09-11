@@ -414,6 +414,24 @@ int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Edge UA
 void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
 void WebCoreSetSpeculativePrefetch(int enabled);      // <script type="speculationrules"> prefetch, default off; sticky (live page + new sessions)
+
+// Apotheosis (page width, 0.1.9.58): the page-width factor, which is the engine's DEVICE SCALE
+// FACTOR. The engine lays a page out at (engine px / factor) CSS px, so on a 720 engine px wide
+// portrait panel a factor of 1.5 gives a 480 CSS px layout viewport - phone-sized, where 1.0 gave a
+// 720 px one every site answers with its tablet layout and half-height text. Raster resolution is
+// unchanged: a composited layer's contentsScale is pageScaleFactor * deviceScaleFactor, so tiles
+// are still painted at the full engine resolution and text stays as sharp as it was. This is not
+// page zoom and not text autosizing, both of which only enlarge a layout that is still a wide one.
+// window.devicePixelRatio becomes the factor.
+//
+// Nothing else in this ABI changes: every coordinate in and out of the driver is still viewport/
+// BITMAP px, and the driver converts at the boundary.
+//
+// Range [1.0, 2.0], default 1.5; anything outside falls back to the default. Stores the value only
+// - it reaches a live document through the next WebCoreResize() (which relays the page out at the
+// new CSS viewport, re-clamps the scroll position and forces a full repaint) and a new one through
+// WebCoreSessionLoad()/WebCoreRenderHtml(). Engine thread, like every other setter here.
+void WebCoreSetPageWidthFactor(float factor);
 // Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is being
 // typed (debounced) so the DNS lookup is done when Enter arrives. Full URL or bare host ("example.com");
 // anything else ignored. DNS only: libcurl cannot open a reusable connection ahead of time (see
