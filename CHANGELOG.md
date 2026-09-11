@@ -88,7 +88,9 @@ project's own version.
   under the finger, anchored on that block's centre.
 - **Double tap returns to 1:1 from either direction**: the undo-a-pinch rule
   measures the distance from 1:1 instead of only the scale above it, so a page
-  the user pinched out below 1:1 is brought back by a double tap as well.
+  the user pinched out below 1:1 is brought back by a double tap as well. From
+  below 1:1 the content grows to the right from its own left edge, where the
+  committed frame lands, instead of growing around the tap and sliding back.
 - **Long press on a link** opens a context menu with one action, open in new
   tab. The card is placed clear of the finger, shows a long target that can be
   dragged sideways, and is dismissed by a rotation or a window change.
