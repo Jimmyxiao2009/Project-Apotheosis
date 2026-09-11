@@ -80,7 +80,7 @@ static std::wstring InstallDir()
 static bool g_perfLogEnabled = false;
 static unsigned g_memTickCount = 0;
 
-// ===== 运行期配置:fontconfig(含 SimHei CJK 回退)+ CA blob =====
+// ===== 运行期配置:fontconfig(含 Noto CJK/符号/emoji 回退)+ CA blob =====
 static void SetupRuntimeEnv()
 {
     try {
@@ -90,21 +90,44 @@ static void SetupRuntimeEnv()
             return;
 
         std::string fontsDir = installDir + "\\Assets\\fonts";
-        std::string cacheDir = localDir + "\\fontconfig-cache";
+        // Apotheosis: fontconfig decides whether a directory cache is still valid from that
+        // directory's path and mtime, and knows nothing about the rules in fonts.conf. The cache
+        // directory therefore carries a revision: bumping it is a one-character edit that forces a
+        // full rescan, which is what a changed packaged font set or a changed fallback order needs.
+        // A cache written under an earlier revision is left behind - a few hundred kilobytes in
+        // LocalState - because an app container has no cheap way to delete a directory tree.
+        std::string cacheDir = localDir + "\\fontconfig-cache-2";
         std::string confPath = localDir + "\\fonts.conf";
+
         std::ofstream conf(confPath, std::ios::binary | std::ios::trunc);
         if (conf) {
             conf << "<?xml version=\"1.0\"?>\n<fontconfig>\n";
             conf << "  <dir>" << fontsDir << "</dir>\n";
             conf << "  <cachedir>" << cacheDir << "</cachedir>\n";
             conf << "  <match target=\"pattern\"><test name=\"family\"><string>sans-serif</string></test>"
-                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Segoe UI</string><string>Arial</string><string>SimHei</string></edit></match>\n";
+                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Segoe UI</string><string>Arial</string><string>Noto Sans SC</string></edit></match>\n";
             conf << "  <match target=\"pattern\"><test name=\"family\"><string>serif</string></test>"
-                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Times New Roman</string><string>SimHei</string></edit></match>\n";
+                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Times New Roman</string><string>Noto Sans SC</string></edit></match>\n";
             conf << "  <match target=\"pattern\"><test name=\"family\"><string>monospace</string></test>"
-                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Courier New</string><string>SimHei</string></edit></match>\n";
-            // 兜底:任何字族缺字形 → Segoe UI 再 → SimHei(CJK)。
-            conf << "  <match target=\"pattern\"><edit name=\"family\" mode=\"append\" binding=\"weak\"><string>Segoe UI</string><string>SimHei</string></edit></match>\n";
+                    "<edit name=\"family\" mode=\"prepend\" binding=\"strong\"><string>Courier New</string><string>Noto Sans SC</string></edit></match>\n";
+            // Apotheosis: the missing-glyph path. The engine's fallback (FontSetCache) sorts the
+            // whole packaged set with FcFontSort against a pattern that carries no family at all,
+            // then picks the first sorted face whose charset covers the characters - so a face is
+            // reachable simply by living in <dir>, and this untested weak append is what biases the
+            // order in which the covering faces are tried. Latin first (Segoe UI), then the two
+            // symbol faces, whose arrows and check marks are drawn on Latin metrics and whose files
+            // are small, then the CJK face, then emoji as outlines. Ordering the 8 MB CJK face
+            // after the 0.3/1.2 MB symbol faces keeps a single arrow on a Latin page from pulling
+            // the whole Simplified Chinese font into a 32-bit address space.
+            conf << "  <match target=\"pattern\"><edit name=\"family\" mode=\"append\" binding=\"weak\">"
+                    "<string>Segoe UI</string><string>Noto Sans Symbols</string><string>Noto Sans Symbols 2</string>"
+                    "<string>Noto Sans SC</string><string>Noto Emoji</string></edit></match>\n";
+            // No rule can prefer the CJK face for Chinese text specifically, and none is needed.
+            // The engine never puts the content language on the pattern, and the locale-derived
+            // one arrives too late to test: both call sites run FcConfigSubstitute(FcMatchPattern)
+            // before FcDefaultSubstitute, which is what synthesises lang - so a pattern-target
+            // lang test sees no value and never fires. The append above carries Chinese anyway,
+            // because no other packaged face has a single CJK glyph to compete with.
             conf << "</fontconfig>\n";
             conf.close();
             _putenv_s("FONTCONFIG_FILE", confPath.c_str());
