@@ -303,6 +303,13 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 //     wherever inside it was tapped, so a tap near a column's edge does not zoom in with most of
 //     the column off-screen. The caller does not have to remember the tap point across the hold
 //     interval either way.
+//     In the zoomed-OUT half of rule 1 (0.1.9.51) *outAnchorX is instead the anchor that makes the
+//     zoom back to 1:1 END on the scroll position the commit will settle on — the document's own
+//     left edge (0) at the usual overview position, so the content simply grows to the right until
+//     it fills the screen instead of growing around the tap point and then sliding sideways once
+//     WebCoreSetPageScale clamps the position it was asked for. A tap that needs no clamping (a
+//     page still wider than the viewport at 1:1) keeps the tap x. *outAnchorY is the tap y here
+//     too: zooming back UP can never need a vertical correction.
 //   *outReason (0.1.9.40): which rule above decided the answer — 0 = zoomable (target computed),
 //     1 = zoomed IN (rule 1), 7 = zoomed OUT (rule 1's other half, 0.1.9.50), 2 = no element under
 //     the point, 3 = viewport disables zoom (rule 2), 4 = mobile-optimised viewport (rule 3),

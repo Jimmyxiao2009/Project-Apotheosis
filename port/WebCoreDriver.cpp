@@ -5694,7 +5694,54 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     if (offOneToOne > 0.05f) {
         if (outZoomable) *outZoomable = 1;
         if (outTargetScale) *outTargetScale = 1.0f;
-        if (outReason) *outReason = (curScale > 1.0f) ? 1 : 7;   // zoomed in / zoomed out
+        const bool zoomedOut = !(curScale > 1.0f);
+        if (outReason) *outReason = zoomedOut ? 7 : 1;   // zoomed out / zoomed in
+        // Apotheosis (0.1.9.51): the zoomed-OUT half needs its horizontal anchor pre-clamped, or
+        // the animation ends somewhere the committed frame is not and the page slides sideways
+        // after it. Below 1:1 the document is narrower than the viewport (contentsWidth scales
+        // with the page scale, see WebCoreSetPageScale's derivation), so it is drawn from the
+        // viewport's left edge with the remainder in the base background colour — ScrollView::paint
+        // translates by -scrollPosition and nothing centres it — and scrollPosition().x() is pinned
+        // at 0 because constrainedScrollPosition() has no range to give. Zooming back to 1:1 around
+        // the tap x therefore asks for a scroll position the new layout cannot honour either
+        // (the document then exactly fills the viewport again: max scroll x = 0), the commit clamps
+        // it, and the difference is the slide the caller just animated into.
+        //
+        // So solve the anchor for the position the commit will actually settle on. With target
+        // scale 1 and r = 1/curScale, WebCoreSetPageScale computes P1 = (P0 + F) * r - F and then
+        // constrains it to [0, maxX1]; that is linear in F, so the F landing on a chosen P1 is
+        // F = (P1 - P0 * r) / (r - 1), and r - 1 > 0.05 here. At the overview position (P0 = 0,
+        // P1 = 0) that is F = 0 — the document's own left edge, i.e. the content simply grows to
+        // the right until it fills the screen. A tap whose P1 needs no clamping (a page still
+        // wider than the viewport at 1:1) keeps the tap x, unchanged.
+        //
+        // The vertical anchor stays the tap y, and needs no such correction: for r > 1 the same
+        // formula gives P1 = P0 * r + F * (r - 1), which is >= 0 for every F >= 0, and at the
+        // bottom of the document (P0 = contentsHeight * curScale - viewH) it stays <= the new
+        // maximum for every F <= viewH — i.e. for every anchor inside the viewport. The zoomed-IN
+        // half (r < 1) can clamp vertically, but that is the behaviour 0.1.9.50 shipped and the
+        // device round accepted; it is deliberately left alone.
+        if (zoomedOut && outAnchorX) {
+            if (RefPtr<LocalFrameView> view = lf->view()) {
+                const double r = 1.0 / static_cast<double>(curScale);
+                const double p0 = static_cast<double>(view->scrollPosition().x());
+                const double viewW = static_cast<double>(g_session->w);
+                double maxX1 = static_cast<double>(view->contentsSize().width()) * r - viewW;
+                if (!(maxX1 > 0.0)) maxX1 = 0.0;
+                const double p1 = (p0 + static_cast<double>(x)) * r - static_cast<double>(x);
+                const double settled = (p1 < 0.0) ? 0.0 : (p1 > maxX1 ? maxX1 : p1);
+                if (settled != p1) {
+                    double anchor = (settled - p0 * r) / (r - 1.0);
+                    // Keep it inside the viewport: the caller's own anchor plumbing clamps the
+                    // engine-px focal to [0, width] before it reaches WebCoreSetPageScale, so an
+                    // anchor outside would only reintroduce a mismatch between the preview's
+                    // transform centre and the commit's.
+                    if (anchor < 0.0) anchor = 0.0;
+                    if (anchor > viewW) anchor = viewW;
+                    *outAnchorX = static_cast<int>(anchor + 0.5);
+                }
+            }
+        }
         return kOK;
     }
 
