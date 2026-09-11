@@ -53,6 +53,14 @@ project's own version.
 - Text: glyphs no longer rasterise with subpixel antialiasing and the synthetic
   bold offset walks in device-pixel steps, which removes the doubled text after
   a pinch when only the regular font cuts are installed.
+- The package carries fallback faces for the characters the eight Latin cuts do
+  not have: Simplified Chinese, the symbol blocks (arrows, check marks,
+  technical and miscellaneous symbols) and emoji as monochrome outlines. They
+  are Noto under the SIL Open Font License 1.1, fetched by `port/fetch-fonts.ps1`
+  against pinned URLs and SHA-256 hashes, and the generated `fonts.conf` orders
+  them after the Latin faces so a missing glyph is filled instead of drawn as a
+  box. The fontconfig cache is stamped with the font set it was built for and
+  dropped when that changes.
 
 ### Performance
 
