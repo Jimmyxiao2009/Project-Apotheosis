@@ -513,7 +513,7 @@ namespace Harness {
         bool m_updateAutoChecked { false };  // 启动后已静默自检过一次(首个网络页加载完触发,CA 此时已就绪)
         // 设置(持久化到 LocalState\settings.ini;搜索前缀/主页是全局,见 .cpp)
         bool m_langSet { false };     // settings.ini 里是否已存过 lang(否=首次启动→弹 OOBE)
-        int  m_setSearch { 4 };       // 搜索引擎索引(0 Bing/1 Google/2 DuckDuckGo/3 百度/4 Qwant);新装默认 Qwant
+        int  m_setSearch { 2 };       // 搜索引擎索引(0 Bing/1 Google/2 DuckDuckGo/3 百度/4 Qwant);新装默认 DuckDuckGo
         bool m_setUaDesktop { false };// 启动默认请求桌面版网站
         int  m_defaultZoom { 100 };   // 默认缩放百分比(50–200)
         std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom

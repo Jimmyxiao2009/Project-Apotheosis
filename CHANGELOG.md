@@ -141,9 +141,14 @@ project's own version.
 
 - Every user-visible string goes through the language table, and the language
   can be chosen in Settings.
-- Privacy defaults: the update check is opt-in, Qwant is available and the
-  default search engine, speculation-rules prefetch is off, and `<a ping>` is
-  never sent.
+- Privacy defaults: the update check is opt-in, DuckDuckGo is the default search
+  engine, speculation-rules prefetch is off, and `<a ping>` is never sent.
+  DuckDuckGo replaces Qwant as the fresh-install default — both state that they
+  do not track or profile their users, but Qwant's results page is one of the
+  pages this engine cannot get past a bot check (see Known limitations), so a
+  search ended on a white page. Qwant is still in the list, and a settings file
+  that already names an engine keeps it: the indices are part of the stored
+  settings and are never renumbered.
 - The developer switches that carried features through bring-up — the two tile
   grids, off-thread rasterisation, the presenter thread, stale placeholders,
   event-driven present — are deleted now that the features are proven; axis
@@ -176,6 +181,17 @@ project's own version.
   certificate rejection), and only when the first attempt gave up in under
   eight seconds, so a slow link is not made to wait twice. Each retry writes
   one `netretry` line naming the host, the code and the resolve mode.
+
+### Known limitations
+
+- Sites behind a commercial bot-protection service can be unreachable. The
+  cookie half is fixed (see the Public Suffix List above), but the script these
+  services run also fingerprints the browser, and this port compiles out most
+  of what it looks for — Web Audio, WebRTC, WebAssembly, gamepads, WebGL — so
+  the score is refused, the document comes back as a challenge, and the
+  challenge frame itself does not render here. The page is then a white
+  full-viewport overlay above content that loaded correctly underneath; the
+  render diagnostic's opaque-cover field is what identifies it.
 
 ### Diagnostics
 

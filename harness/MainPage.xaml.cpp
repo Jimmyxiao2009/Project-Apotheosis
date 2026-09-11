@@ -413,13 +413,17 @@ static std::string MakeErrorHtml(const std::string& url, const char* err)
 }
 
 // 设置:搜索引擎前缀 + 主页(默认值;LoadSettings 从 settings.ini 覆盖)。free 函数 NormalizeUrl/构造用,故放全局。
-static std::wstring g_searchPrefix = L"https://www.qwant.com/?q=";
+static std::wstring g_searchPrefix = L"https://duckduckgo.com/?q=";
 static std::wstring g_homeUrl = L"about:home";
-// Apotheosis (privacy review): index 4 = Qwant, the default for a fresh
-//   install - it is the only one of these that states it does not track or profile its users, and
-//   the previous default (cn.bing.com, Bing China) was a poor fit outside China. Bing now goes to
-//   www.bing.com. Existing users keep whatever settings.ini already stores, so the indices below
-//   must never be renumbered - new engines are appended.
+// Apotheosis (privacy review): index 2 = DuckDuckGo, the default for a fresh install - it states
+//   that it does not track or profile its users, and its results page works in this engine.
+//   History of this line: the original default was cn.bing.com (Bing China), a poor fit outside
+//   China; Bing now goes to www.bing.com. It was then Qwant (index 4), chosen for the same privacy
+//   reason, but its results page cannot be shown here at all: the site is behind a bot check that
+//   refuses this engine on fingerprint (see the known limitation in CHANGELOG.md), so a search
+//   ended on a white page. Qwant stays in the list for anyone who wants it.
+//   Existing users keep whatever settings.ini already stores, so the indices below must never be
+//   renumbered - new engines are appended.
 static std::wstring SearchPrefixFor(int idx)
 {
     switch (idx) {
@@ -427,7 +431,7 @@ static std::wstring SearchPrefixFor(int idx)
         case 1: return L"https://www.google.com/search?q=";
         case 2: return L"https://duckduckgo.com/?q=";
         case 3: return L"https://www.baidu.com/s?wd=";
-        default: return L"https://www.qwant.com/?q=";   // 4 = Qwant, also the fallback for a bad index
+        default: return L"https://www.qwant.com/?q=";   // 4 = Qwant, also the fallback for an out-of-range index
     }
 }
 
@@ -5931,7 +5935,7 @@ void MainPage::LoadSettings()
             else if (k == "lang") { g_lang = Utf8ToWide(v); m_langSet = true; }
         }
     }
-    if (m_setSearch < 0 || m_setSearch > 4) m_setSearch = 4;   // Apotheosis: unknown index -> Qwant
+    if (m_setSearch < 0 || m_setSearch > 4) m_setSearch = 2;   // Apotheosis: unknown index -> the fresh-install default
     if (g_lang != L"en" && g_lang != L"zh") g_lang = L"zh";
     ApplySettings();
 }
