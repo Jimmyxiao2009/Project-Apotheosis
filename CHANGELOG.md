@@ -95,6 +95,17 @@ project's own version.
 
 ### Interaction
 
+- **Page width**: the engine lays a page out at a phone-sized CSS viewport
+  instead of a tablet-sized one. The panel is 360 DIP wide and the engine runs
+  at two engine pixels per DIP, so WebKit was handed a 720 CSS pixel layout
+  viewport at device scale factor 1 - every site answered with its wide layout
+  and 16 pixel text came out half the height it has in any phone browser. The
+  factor is WebKit's device scale factor, so the layout narrows while tiles
+  still rasterise at the full engine resolution and text stays sharp. Settings
+  offers five steps from 1.0x (720 px) to 2.0x (360 px); the default is 1.5x,
+  i.e. 480 CSS px. Changing it re-lays the page out without a reload. Every
+  coordinate crossing the driver's C ABI is still in engine pixels - the
+  conversion happens inside the driver.
 - **Double-tap zoom** with the tap policy a mobile browser is expected to have:
   a page that opts out of zooming or declares itself mobile-optimised is not
   zoomable, a pinch is always undoable, and the target is the innermost block
