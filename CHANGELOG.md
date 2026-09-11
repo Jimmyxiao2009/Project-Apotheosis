@@ -110,6 +110,20 @@ project's own version.
   page nor costs a relayout when it appears.
 - A tab switch shows the target tab's last frame while it reloads.
 
+### Start page
+
+- The built-in start page is BUILT for the viewport and the language it is
+  shown at, every time it is shown, instead of being rendered once and replayed:
+  the page at app start, the page a new tab gets and the page after a rotation
+  or a language change are the same page.
+- A language change reaches it as well. Before, the page that was on screen when
+  the first-run language choice was made kept the language it was built with -
+  and with no CJK face in the package, Chinese strings on an engine-rendered
+  page are empty boxes.
+- The speed-dial grid is exactly two columns in portrait and four in landscape.
+  The auto-fill rule it replaces was written for a 360 px CSS viewport and fitted
+  four postage stamps across a portrait screen.
+
 ### Settings and cleanup
 
 - Every user-visible string goes through the language table, and the language
