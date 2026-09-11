@@ -57,6 +57,7 @@ jitresult.txt
 *.ttf
 *.ttc
 *.otf
+harness/Assets/fonts/OFL-*.txt
 
 # ==== fork 临时备份 ====
 .gpu-backup/
