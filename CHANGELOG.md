@@ -61,6 +61,11 @@ project's own version.
   them after the Latin faces so a missing glyph is filled instead of drawn as a
   box. The fontconfig cache is stamped with the font set it was built for and
   dropped when that changes.
+- A character outside the Basic Multilingual Plane is no longer followed by an
+  empty box. The simple text path appends a placeholder glyph after every
+  surrogate pair for a shaping routine to remove again; this port has none, and
+  glyph 0 is the font's `.notdef`, so emoji, plane-2 ideographs and mathematical
+  alphanumerics each drew a box flush against them.
 
 ### Performance
 
