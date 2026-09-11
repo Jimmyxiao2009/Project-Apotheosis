@@ -194,14 +194,26 @@
          twice, offset by one CSS pixel - which the page-scale factor multiplies, so a pinch-zoomed
          headline shows two copies of every letter about ten device pixels apart (the "doubled
          text" of packages 11-16). Real bold faces make syntheticBold false and cost ~3.8 MB.
-         Conditional like SimHei below: fonts are gitignored, so a fresh clone may not have them. -->
+         Conditional like the Noto faces below: fonts are gitignored, so a fresh clone may not have them. -->
     <None Include="Assets\fonts\segoeuib.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\segoeuib.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeuib.ttf</Link></None>
     <None Include="Assets\fonts\arialbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\arialbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arialbd.ttf</Link></None>
     <None Include="Assets\fonts\timesbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\timesbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\timesbd.ttf</Link></None>
     <None Include="Assets\fonts\courbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\courbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\courbd.ttf</Link></None>
-    <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
-    <!-- Apotheosis: fonts are gitignored; skip SimHei on machines that do not have it instead of failing the package step. -->
-    <None Include="Assets\fonts\simhei.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\simhei.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
+    <!-- Apotheosis: the fallback faces for everything the eight Latin cuts above do not cover -
+         Simplified Chinese, the symbol blocks (arrows, check marks, technical and miscellaneous
+         symbols) and emoji as monochrome outlines. All four are Noto under the SIL Open Font
+         License 1.1, so they may travel inside the package; the licence text of each ships next
+         to it. Fetch them with port\fetch-fonts.ps1 - the binaries are gitignored like the
+         Microsoft cuts, so the entries stay conditional and a clone that has not run the script
+         still packages (it will draw boxes for those characters, which is the old behaviour). -->
+    <None Include="Assets\fonts\NotoSansSC-Regular.otf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSC-Regular.otf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSC-Regular.otf</Link></None>
+    <None Include="Assets\fonts\NotoSansSymbols-Regular.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSymbols-Regular.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSymbols-Regular.ttf</Link></None>
+    <None Include="Assets\fonts\NotoSansSymbols2-Regular.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSymbols2-Regular.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSymbols2-Regular.ttf</Link></None>
+    <None Include="Assets\fonts\NotoEmoji-VariableFont_wght.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoEmoji-VariableFont_wght.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoEmoji-VariableFont_wght.ttf</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSC.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSC.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSC.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSymbols.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSymbols.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSymbols.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSymbols2.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSymbols2.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSymbols2.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoEmoji.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoEmoji.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoEmoji.txt</Link></None>
   </ItemGroup>
 
   <ItemGroup>
