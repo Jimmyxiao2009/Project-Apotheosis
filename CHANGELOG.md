@@ -151,6 +151,22 @@ project's own version.
 - The presenter thread is gone: ANGLE 2.1.13 on D3D11 cannot be driven from two
   GL threads, and serialising every call behind one lock removed its advantage.
 
+### Networking and cookies
+
+- The engine ships the Public Suffix List, so it can tell a registry apart from
+  a site. Without it `PublicSuffixStore` answered "no top-private domain" and
+  `RegistrableDomain` fell back to the whole host name, which made every host
+  its own site: the cookie jar's accept policy then refused a cookie that one
+  subdomain sets for another, and the read path — which filters by registrable
+  domain too — would not have sent it either. Anything that signs in, keeps a
+  session or clears a bot check on one host and uses it on a sibling host was
+  silently broken, while plain first-party cookies worked, so it looked like a
+  rendering fault rather than a cookie one. The list is fetched by
+  `port/fetch-publicsuffix.ps1` (pinned and hash-checked, internationalised
+  rules punycoded at fetch time) and handed to the engine as a blob, like the
+  CA bundle; without the file the engine falls back to a last-two-labels guess
+  instead of the whole host.
+
 ### Diagnostics
 
 - Opt-in `perf.csv` columns and `stage.txt` trace families cover loads,
@@ -162,6 +178,11 @@ project's own version.
   quarter-size probe paint. The same line carries a short content summary of the
   finished document — element, link, box and text-length counts, laid-out height
   and the body colours — in counts and lengths only, never page text or a query.
+  It also reports how many in-view elements are transparent or hidden, the
+  mount point's own first three levels, how many full-viewport opaque elements
+  sit outside it (which is how a third-party interstitial covers a page that
+  rendered correctly underneath), and how many cookies the document can see —
+  again as counts and lengths, never a name or a value.
 
 ### Build and packaging
 

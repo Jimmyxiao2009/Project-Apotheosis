@@ -59,6 +59,10 @@ jitresult.txt
 *.otf
 harness/Assets/fonts/OFL-*.txt
 
+# ==== 公共后缀表(几百 KB,port/fetch-publicsuffix.ps1 按 pin 的 commit 重新获取)====
+harness/Assets/public_suffix_list.dat
+harness/Assets/MPL-2.0-PublicSuffixList.txt
+
 # ==== fork 临时备份 ====
 .gpu-backup/
 

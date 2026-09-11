@@ -80,7 +80,9 @@ static std::wstring InstallDir()
 static bool g_perfLogEnabled = false;
 static unsigned g_memTickCount = 0;
 
-// ===== 运行期配置:fontconfig(含 Noto CJK/符号/emoji 回退)+ CA blob =====
+static void WriteStage(const char* stage);   // 定义在下面;SetupRuntimeEnv 记一行 psl 条数
+
+// ===== 运行期配置:fontconfig(含 Noto CJK/符号/emoji 回退)+ CA blob + 公共后缀表 =====
 static void SetupRuntimeEnv()
 {
     try {
@@ -168,6 +170,25 @@ static void SetupRuntimeEnv()
         }
         if (!caBytes.empty())
             WebCoreSetCACertBlob(caBytes.data(), (int)caBytes.size());
+
+        // 公共后缀表:同样用 blob 注入(引擎在 App Container 里读不到安装目录)。没有它,
+        // RegistrableDomain 会把整个主机名当作 registrable domain,站点在 a.example.com
+        // Set-Cookie、在 b.example.com 读的 cookie 存不下也发不出去(见 WebCoreDriver.h)。
+        // 文件由 port\fetch-publicsuffix.ps1 取,Harness.vcxproj 条件打包;缺了不致命。
+        std::string srcPsl = installDir + "\\public_suffix_list.dat";
+        std::vector<uint8_t> pslBytes;
+        std::ifstream pslIn(srcPsl, std::ios::binary | std::ios::ate);
+        if (pslIn) {
+            std::streamsize n = pslIn.tellg();
+            if (n > 0) {
+                pslBytes.resize((size_t)n);
+                pslIn.seekg(0);
+                pslIn.read(reinterpret_cast<char*>(pslBytes.data()), n);
+            }
+        }
+        int pslRules = pslBytes.empty() ? 0 : WebCoreSetPublicSuffixListBlob(pslBytes.data(), (int)pslBytes.size());
+        // 只记条数(纯数字,无主机名),够一次真机回合区分"表在"与"表没打包"。
+        WriteStage(("psl rules=" + std::to_string(pslRules)).c_str());
     } catch (...) {}
 }
 

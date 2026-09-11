@@ -40,6 +40,15 @@ void WebCoreSetCACertPath(const char* path);
 // the one that works. `data` = raw cacert.pem bytes; call before the first load.
 void WebCoreSetCACertBlob(const uint8_t* data, int len);
 
+// The Public Suffix List, as the bytes of the publicsuffix.org data file. Same
+// reason as the CA blob: the engine cannot reach the install directory, so the
+// harness reads the packaged file and passes it in. Without it the engine has
+// no way to tell a registry apart from a site, and treats every host as its own
+// registrable domain - which silently breaks every cookie a site sets on one
+// subdomain and reads on another. Call before the first load; returns the
+// number of rules parsed (0 = no list, old behaviour).
+int WebCoreSetPublicSuffixListBlob(const uint8_t* data, int len);
+
 // Explicit cookie-jar SQLite path. UNSAFE on device as of 2026-07-03 (crashes —
 // SQLite's Win32 VFS null-derefs opening a real file in this ARM32 UWP App
 // Container build; see project memory cookie-persistence). Do not call; kept

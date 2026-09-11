@@ -76,6 +76,13 @@ void WebCoreClearCookies();
 // data 是 cacert.pem 原始字节,须在首个 WebCoreLoadUrl 之前调用。
 void WebCoreSetCACertBlob(const uint8_t* data, int len);
 
+// 公共后缀表(publicsuffix.org 数据文件原始字节)。理由同 CA blob:引擎读不到安装目录,
+// 由 harness 读出打包文件再传入。没有它引擎分不清"注册局"与"站点",会把每个主机名当成
+// 自己的 registrable domain —— 于是站点在一个子域 Set-Cookie、在另一个子域读的 cookie
+// 全被丢弃(存与读两条路都按 registrable domain 过滤)。须在首个 WebCoreLoadUrl 之前调用;
+// 返回解析到的规则条数(0 = 没有表,退回旧行为)。
+int WebCoreSetPublicSuffixListBlob(const uint8_t* data, int len);
+
 // ⚠ 设 cookie jar 落盘 SQLite 路径。2026-07-03 真机验证会崩(这个 ARM32 UWP App Container 构建
 // 的 SQLite Win32 VFS 打开真实文件时空指针,详见项目记忆 cookie-persistence)。harness 不要调用
 // 这个 —— 保留仅为坑修好后备用。cookie 持久化改用下面两个(JSON Lines 旁路快照)。

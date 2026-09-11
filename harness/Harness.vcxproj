@@ -184,6 +184,12 @@
     <None Include="$(ApotheosisDriverDir)\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
     <!-- CA 根证书包(App Container 无系统证书库,curl 用 CURLOPT_CAINFO 指向它做 TLS 校验)。 -->
     <None Include="Assets\cacert.pem"><DeploymentContent>true</DeploymentContent><Link>cacert.pem</Link></None>
+    <!-- Public Suffix List (port\fetch-publicsuffix.ps1, gitignored like the fonts): the engine
+         needs it to tell a registry apart from a site, which is what cookie sharing between the
+         subdomains of one site is built on. Conditional, so a clone that has not fetched it
+         still builds - the engine falls back to a last-two-labels guess. -->
+    <None Include="Assets\public_suffix_list.dat" Condition="Exists('$(ProjectDir)Assets\public_suffix_list.dat')"><DeploymentContent>true</DeploymentContent><Link>public_suffix_list.dat</Link></None>
+    <None Include="Assets\MPL-2.0-PublicSuffixList.txt" Condition="Exists('$(ProjectDir)Assets\MPL-2.0-PublicSuffixList.txt')"><DeploymentContent>true</DeploymentContent><Link>MPL-2.0-PublicSuffixList.txt</Link></None>
     <!-- 字体(App Container 拿不到设备系统字体,必须打包;fontconfig 在运行期经 LocalFolder\fonts.conf 指向这里)。 -->
     <None Include="Assets\fonts\segoeui.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeui.ttf</Link></None>
     <None Include="Assets\fonts\arial.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arial.ttf</Link></None>

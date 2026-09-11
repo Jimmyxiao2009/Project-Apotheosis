@@ -496,7 +496,7 @@ static bool g_apoSpecPrefetch = false;
 // LoadingFrameLoaderClient::prefetchDNS(). Used by WebCorePreconnect().
 extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
-static char g_pageProbe[256] = "";    // Apotheosis: per-document content summary (counts/lengths only, see writeDiag)
+static char g_pageProbe[384] = "";    // Apotheosis: per-document content summary (counts/lengths only, see writeDiag)
 static int g_paintProbeNonWhite = 0;  // Apotheosis: non-white pixels of the downscaled probe paint (the GPU present has no readback)
 static int g_paintProbeSampled = 0;   // Apotheosis: pixels that probe paint sampled (0 = it did not run)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
@@ -3128,12 +3128,40 @@ static const char* const kPageProbeScript =
     "var all=d.getElementsByTagName('*'),n=all.length;"
     "var a=d.querySelectorAll('a[href]'),ext=0,hs=location.hostname;"
     "for(var i=0;i<a.length;i++){var hh=a[i].hostname;if(hh&&hh!==hs)ext++;}"
-    "var vh=innerHeight||1,box=0,inview=0,lim=n<400?n:400;"
-    "for(var j=0;j<lim;j++){var r=all[j].getBoundingClientRect();"
-    "if(r.width>0&&r.height>0){box++;if(r.bottom>0&&r.top<vh)inview++;}}"
+    "var vh=innerHeight||1,box=0,inview=0,hid=0,lim=n<400?n:400;"
+    "for(var j=0;j<lim;j++){var el=all[j],r=el.getBoundingClientRect();"
+    "if(r.width>0&&r.height>0){box++;if(r.bottom>0&&r.top<vh){inview++;"
+    // An element that has a box in the viewport and still paints nothing is the
+    // difference between "the page rendered and we lost it" and "the page chose
+    // to show nothing" - a shell waiting on data usually hides itself this way.
+    "var cs=getComputedStyle(el);"
+    "if(+cs.opacity===0||cs.visibility==='hidden')hid++;}}}"
+    // The mount point's own first three levels, as flags: opacity, then v/h for
+    // visibility and d/n for display. A React tree that mounted but rendered an
+    // empty or faded-out route shows up here and nowhere else.
+    "var rt=d.getElementById('root')||b,ch=[],e=rt;"
+    "for(var k=0;k<3&&e;k++){var s2=getComputedStyle(e);"
+    "ch.push((+s2.opacity).toFixed(2)+(s2.visibility==='hidden'?'h':'v')+(s2.display==='none'?'n':'d'));"
+    "e=e.firstElementChild;}"
+    // A full-viewport, opaque element parked directly under <body> - outside the
+    // app's own mount point - is how a third-party interstitial covers a page
+    // that rendered perfectly well underneath it. Count them, with the highest
+    // z-index seen, so a white screen can be told apart from an empty one.
+    "var cov=0,zmax=0,vw=innerWidth||1;"
+    "for(var m=0;m<b.children.length;m++){var c2=b.children[m];if(c2===rt)continue;"
+    "var cr=c2.getBoundingClientRect();if(cr.width<vw*0.9||cr.height<vh*0.9)continue;"
+    "var cst=getComputedStyle(c2);"
+    "if(cst.position!=='fixed'&&cst.position!=='absolute')continue;"
+    "if(+cst.opacity===0||cst.visibility==='hidden'||cst.display==='none')continue;"
+    "cov++;var z=parseInt(cst.zIndex,10);if(z>zmax)zmax=z;}"
+    // How many cookies this document can see, and how long they are in total.
+    // Counts and lengths only - never a name and never a value. A site that
+    // depends on a cookie it set from a sibling host shows up as a zero here.
+    "var ckRaw=(d.cookie||''),ck=ckRaw?ckRaw.split(';').length:0;"
     "var st=getComputedStyle(b);"
     "return 'els='+n+' a='+a.length+'/'+ext+' txt='+((b.innerText||'').length)"
     "+' docH='+d.documentElement.scrollHeight+' box='+box+'/'+lim+' inview='+inview"
+    "+' hid='+hid+' root='+ch.join('/')+' cover='+cov+'/'+zmax+' ck='+ck+'/'+ckRaw.length"
     "+' fg='+st.color.replace(/ /g,'')+' bg='+st.backgroundColor.replace(/ /g,'')"
     "+' dark='+(matchMedia('(prefers-color-scheme:dark)').matches?1:0);"
     "}catch(e){return 'ERR:'+(e&&(e.message||e.name)||'?');}})()";
@@ -3173,7 +3201,7 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     std::snprintf(g_lastTitle, sizeof g_lastTitle, "%s", titleStr.data());
     std::snprintf(g_lastUrl, sizeof g_lastUrl, "%s", urlStr.data());
     int mainLen = std::snprintf(g_lastDiag, sizeof g_lastDiag,
-        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d paint=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d page=[%.200s] spa=[%.220s] lasterr=[%.150s]",
+        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d paint=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d page=[%.300s] spa=[%.220s] lasterr=[%.150s]",
         urlStr.data(), titleStr.data(), cs.width(), cs.height(),
         document.body() ? 1 : 0, nonWhite, w * h, g_paintProbeNonWhite, g_paintProbeSampled,
         g_loadStarted, g_loadResponse, g_loadComplete, g_loadFail, pendingResources,
