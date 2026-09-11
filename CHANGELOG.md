@@ -166,6 +166,16 @@ project's own version.
   rules punycoded at fetch time) and handed to the engine as a blob, like the
   CA bundle; without the file the engine falls back to a last-two-labels guess
   instead of the whole host.
+- A navigation whose transport never came up is retried once. The curl backend
+  has no retry of its own, so a single failed name lookup or TLS handshake —
+  routine on a phone's Wi-Fi, and in the device logs always the first contact
+  with a host in an app session — went straight to the error page, while the
+  same address typed again loaded normally. Only a main-frame provisional
+  failure counts (a failed subresource must never restart a page), only the
+  codes that mean the connection never happened (6, 7, 28, 35, 56 — never a
+  certificate rejection), and only when the first attempt gave up in under
+  eight seconds, so a slow link is not made to wait twice. Each retry writes
+  one `netretry` line naming the host, the code and the resolve mode.
 
 ### Diagnostics
 

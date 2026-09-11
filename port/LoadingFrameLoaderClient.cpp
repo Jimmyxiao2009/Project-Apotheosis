@@ -38,6 +38,14 @@
 // Cancellation 一律吞掉的分支。
 extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain, const char* desc, const char* url);
 
+// Apotheosis (2026-09-11): the narrow sibling of the channel above, also defined in
+// WebCoreDriver.cpp. It is told only about a main-frame PROVISIONAL load that has failed for
+// good - the navigation never committed a byte - because that is the single case the driver is
+// allowed to retry. The wide channel cannot serve that purpose: recordNetError() below also runs
+// for every failed subresource, so whatever it holds when a navigation returns is usually some
+// image's error, and retrying a page because a tracking pixel failed would be a bug.
+extern "C" void WebCorePortRecordMainLoadFailure(int code, int type, const char* url);
+
 // Apotheosis: DNS prefetch for <link rel="dns-prefetch">. Implemented in
 // WebKit\Source\WebKitLegacy\WebCoreSupport\WebResourceLoadScheduler.cpp, which is
 // compiled straight into the driver alongside this file, so this is a plain
@@ -168,6 +176,14 @@ void LoadingFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceErro
     //   (curl 非取消错误仍立即终结显示错误页);真卡住由 pumpLoop 的看门狗兜底。
     if (willContinue == WillContinueLoading::Yes || error.isCancellation())
         return;
+    // Apotheosis (2026-09-11): past this point the navigation is over and nothing was committed -
+    // the harness will show its error page. Report it on the narrow channel so the driver can
+    // decide whether the transport merely never came up (then it retries once); see
+    // isRetriableTransportError() in WebCoreDriver.cpp.
+    {
+        auto url = error.failingURL().string().utf8();
+        WebCorePortRecordMainLoadFailure(error.errorCode(), static_cast<int>(error.type()), url.data());
+    }
     signalLoadComplete(true);
 }
 

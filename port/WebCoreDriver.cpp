@@ -472,6 +472,18 @@ bool ensureWebCoreInitialized()
 // WebCoreLoadUrl 返回负值时取走写进 LocalFolder,便于真机失败定位(App Container 无
 // 控制台/调试器输出通道)。单线程(WebKit 主线程)写,无需加锁。
 static char g_lastNetError[512] = "";
+// Apotheosis (2026-09-11): the same channel, but narrowed to the ONE failure a retry may act on -
+// the main frame's provisional load, i.e. a navigation that never got a byte of its document.
+// g_lastNetError above cannot be used for that decision: LoadingFrameLoaderClient also records
+// every failed SUBRESOURCE through it (dispatchDidFailLoading), so by the time a navigation
+// returns, the code stored there is usually some image's, not the document's.
+// Written only by WebCorePortRecordMainLoadFailure(), on the engine thread, and cleared before
+// each attempt. The host is stored without the path or query - a retry decision never needs, and
+// a log line must never carry, what the user searched for.
+static int  g_mainFailCode = 0;        // curl error code of that failure (0 = none recorded)
+static int  g_mainFailType = 0;        // WebCore::ResourceError::Type as an int (see recordNetError)
+static char g_mainFailHost[160] = "";  // host of the failing URL, no scheme/path/query
+static int  g_ipv4Only = 0;            // mirror of the last WebCoreSetIPv4Only(); for the netretry line
 static char g_lastDiag[4096] = "";   // 渲染诊断(URL/标题/内容尺寸/非白像素数 + 已缓存资源清单)
 static char g_lastTitle[512] = "";   // 最近加载页面的标题(供历史/书签用)
 static char g_lastUrl[1024] = "";    // 最近渲染文档的最终 URL(会话点击/导航后检测 URL 变化用)
@@ -3621,6 +3633,95 @@ extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain
         code, type, domain ? domain : "", desc ? desc : "", url ? url : "");
 }
 
+// Apotheosis (2026-09-11): copy the host out of an absolute URL - "https://example.com/a?b" ->
+// "example.com". Deliberately string-level and not URL{}: this runs on a failure path where the
+// only thing wanted is a label for a log line, and the label must never be able to carry a query.
+static void copyUrlHost(char* out, size_t outLen, const char* url)
+{
+    if (!out || !outLen)
+        return;
+    out[0] = '\0';
+    if (!url || !*url)
+        return;
+    const char* p = std::strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char* at = nullptr;
+    size_t n = 0;
+    for (const char* q = p; *q && *q != '/' && *q != '?' && *q != '#'; ++q) {
+        if (*q == '@')
+            at = q + 1;         // strip any userinfo
+        ++n;
+    }
+    if (at) {
+        n -= static_cast<size_t>(at - p);
+        p = at;
+    }
+    if (n > outLen - 1)
+        n = outLen - 1;
+    std::memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+// Apotheosis (2026-09-11): the main frame's provisional load failed for good - no document byte
+// ever arrived, so the harness is about to show its error page. Recorded separately from
+// g_lastNetError (see there) because this is the only failure WebCoreSessionLoad may retry.
+extern "C" void WebCorePortRecordMainLoadFailure(int code, int type, const char* url)
+{
+    g_mainFailCode = code;
+    g_mainFailType = type;
+    copyUrlHost(g_mainFailHost, sizeof g_mainFailHost, url);
+}
+
+// Apotheosis (2026-09-11): curl codes that mean "the transport never came up", as opposed to
+// "the server answered something we do not like". Every one of these can and does happen once on
+// a phone Wi-Fi link and succeed on the very next attempt - the device logs of 2026-09-03 to
+// 2026-09-11 show six of them, all on the first contact with a host in an app session, all
+// failing in under a second, and the one that was retried by hand loaded normally 13 s later.
+// A browser is expected to absorb that; this port had no retry at all and turned each one into
+// an error page.
+//   6  CURLE_COULDNT_RESOLVE_HOST   28  CURLE_OPERATION_TIMEDOUT
+//   7  CURLE_COULDNT_CONNECT        35  CURLE_SSL_CONNECT_ERROR
+//   56 CURLE_RECV_ERROR
+// 6 is included on purpose: curl caches no negative DNS answer, so a genuinely dead name costs
+// one extra lookup (~0.4 s in the logs) while a resolver that was not ready yet - the single
+// most common first-navigation failure here - is repaired.
+// Codes deliberately NOT retried: 60/58/77 (certificate problems - a retry cannot change the
+// verdict and re-trying a rejected certificate is exactly the wrong instinct), 16 (HTTP/2 framing,
+// which needs a protocol downgrade rather than a repeat), and everything >= 400 HTTP, which never
+// reaches here at all.
+// Upper bound on how long the FIRST attempt may have taken for a retry to still make sense. The
+// failures this repairs gave up in 0.4-1.0 s; a load that burned longer than this has a link that
+// answers too slowly, and a second full attempt (up to the 30 s pump watchdog) would only double
+// the spinner the user is already staring at.
+static constexpr double kNetRetryMaxFirstAttemptSeconds = 8.0;
+
+static bool isRetriableTransportError(int curlCode)
+{
+    switch (curlCode) {
+    case 6: case 7: case 28: case 35: case 56:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Apotheosis (2026-09-11): one line per retry, next to the timeline/tgloop lines. Host only -
+// never the path and never the query, so a search a user typed can never end up in a log that
+// leaves the phone. ipv4= is the current resolve mode (WebCoreSetIPv4Only), which the retry does
+// not change: it is a process-wide switch, not a per-host one, and IPv6 works on this link for
+// every other load in the same session.
+static void writeNetRetryStage(const char* host, int code, int attempt)
+{
+    if (g_stagePath.empty())
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "netretry url-host=%s code=%d attempt=%d ipv4=%d\n",
+        host && *host ? host : "-", code, attempt, g_ipv4Only ? 1 : 0);
+    std::fclose(fp);
+}
+
 // Apotheosis: 内存压力释放。harness 监听 UWP MemoryManager.AppMemoryUsageIncreased,
 // 到 High/OverLimit 时经引擎线程调本函数 → 一把清资源缓存 + 后退页面缓存 + JSC GC + 字体缓存。
 // critical: 1=严重(连活资源解码数据也丢);0=温和。须在引擎线程调(C ABI 已串行化)。
@@ -3871,6 +3972,7 @@ extern "C" void WebCorePortSetIPv4Only(int on);
 
 void WebCoreSetIPv4Only(int enable)
 {
+    g_ipv4Only = enable ? 1 : 0;   // Apotheosis: mirrored so the netretry stage line can report it
     WebCorePortSetIPv4Only(enable);
 }
 
@@ -4398,19 +4500,47 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
     teardownSession();
-    g_lastNetError[0] = '\0';
-    g_spaProbe[0] = '\0';
-    g_pageProbe[0] = '\0';
-    g_paintProbeNonWhite = g_paintProbeSampled = 0;
-    g_lastPendingResources = 0;
-    g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
     PerfOpGuard perfOp("nav", url, w, h);   // M4: one CSV row for this navigation (flushed on completion)
-    g_session.emplace();
-    g_session->w = w;
-    g_session->h = h;
-    int rc = buildSession(url, w, h, outRGBA);
-    if (rc != kOK)
-        teardownSession();   // 失败不留半截会话
+
+    // One attempt at the navigation, from a clean slate. Everything a previous attempt could have
+    // left behind is reset here rather than above, so a retry starts exactly where the first one did.
+    auto attemptLoad = [&]() -> int {
+        g_lastNetError[0] = '\0';
+        g_spaProbe[0] = '\0';
+        g_pageProbe[0] = '\0';
+        g_paintProbeNonWhite = g_paintProbeSampled = 0;
+        g_lastPendingResources = 0;
+        g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
+        g_mainFailCode = 0;
+        g_mainFailType = 0;
+        g_mainFailHost[0] = '\0';
+        g_session.emplace();
+        g_session->w = w;
+        g_session->h = h;
+        int r = buildSession(url, w, h, outRGBA);
+        if (r != kOK)
+            teardownSession();   // 失败不留半截会话
+        return r;
+    };
+
+    // Apotheosis (2026-09-11): retry the MAIN RESOURCE once when the transport never came up.
+    // Why this exists: every curl failure in the device logs so far (codes 6 and 35, six of them
+    // across nine days) was the first contact with that host in the app session, failed in well
+    // under a second, and went straight to the harness' error page - while the very same URL
+    // typed again loaded normally. WebKit's curl backend has no retry of its own and neither had
+    // this driver, so a single dropped handshake on the phone's Wi-Fi was a dead page.
+    // Three guards keep this from becoming a way to wait twice as long for a site that is simply
+    // down: only a main-frame PROVISIONAL failure counts (g_mainFailCode - a failed subresource
+    // must never restart the page), only the transport codes in isRetriableTransportError(), and
+    // only when the first attempt gave up quickly. A slow failure (connect timeout, the 30 s
+    // watchdog) is a link that is answering too slowly for a second helping to help.
+    const MonotonicTime attemptStart = MonotonicTime::now();
+    int rc = attemptLoad();
+    if (rc != kOK && g_mainFailCode && isRetriableTransportError(g_mainFailCode)
+        && (MonotonicTime::now() - attemptStart).seconds() < kNetRetryMaxFirstAttemptSeconds) {
+        writeNetRetryStage(g_mainFailHost, g_mainFailCode, 1);
+        rc = attemptLoad();
+    }
     return rc;
 }
 
