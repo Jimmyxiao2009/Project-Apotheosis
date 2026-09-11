@@ -453,11 +453,13 @@ namespace Harness {
         //   error page) at the current viewport - see RenderStaticPage in MainPage.xaml.cpp.
         void RenderStaticPage(const char* why);
         // 把一帧引擎渲染结果(rgba)贴到位图 + 同步标题/地址/链接表;navUrl 非空表示会话内发生了导航。
-        void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
+        void ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba, int w, int h,
                               Platform::String^ title, Platform::String^ navUrl,
                               const std::shared_ptr<std::vector<PageLink>>& links);
         // 软件模式:把引擎 RGBA 帧贴上 RenderImage(WriteableBitmap 双缓冲复用);直呈现模式内部自跳过。
-        void PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba);
+        // Apotheosis (crash fix, 0.1.9.49): w/h are the viewport THIS frame was rendered at (read off
+        //   the engine thread next to the call that produced it), not the harness' current kW/kH.
+        void PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba, int w, int h);
 
         // ---- 抽屉 UI ----
         void ShowDrawer(DrawerTab tab);

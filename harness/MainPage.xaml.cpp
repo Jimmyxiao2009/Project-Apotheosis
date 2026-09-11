@@ -681,6 +681,33 @@ static void NoteEngineViewport(int w, int h)
 }
 static size_t EngineBufferBytes() { return g_engineBufferBytes.load(std::memory_order_relaxed); }
 
+// Apotheosis (crash fix, 0.1.9.49): the viewport the ENGINE really rendered a frame at, as opposed
+// to the one the harness currently wants (kW/kH). The software present used to blit every frame at
+// kW x kH, which is a LIE for any frame that was already in flight when a viewport change moved
+// those two: the engine wrote the smaller old rectangle, the blit read the larger new one, and the
+// read ran off the end of the buffer into reserved address space (0xC0000005, access=read) - the
+// app died at startup whenever the first static page was rendered before the panel's first real
+// SizeChanged and presented after it.
+//   Every sizing call (RenderHtml / SessionLoad / Resize / GpuInit) runs on the one serial engine
+// thread, so the size the engine has when a frame is produced is simply the last one noted there.
+// Each producer reads it right after its engine call and carries the pair to the present, which is
+// what makes the frame self-describing. UI-thread reads (the present) are therefore per-frame
+// values, never this global.
+static std::atomic<int> g_engFrameW { 720 };
+static std::atomic<int> g_engFrameH { 1080 };
+// ENGINE THREAD ONLY (both of these; the values travel to the UI thread inside each frame's lambda).
+static void NoteEngineFrameSize(int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    g_engFrameW.store(w, std::memory_order_relaxed);
+    g_engFrameH.store(h, std::memory_order_relaxed);
+}
+static void EngineFrameSize(int& outW, int& outH)
+{
+    outW = g_engFrameW.load(std::memory_order_relaxed);
+    outH = g_engFrameH.load(std::memory_order_relaxed);
+}
+
 // Apotheosis (M4): 页面缩放边界不能超出引擎侧 —— port\WebCoreDriver.cpp 的 WebCoreSetPageScale
 //   自己把 scale 钳到 [0.5, 6.0]；harness 若用更宽的上下界，超界的捏合会被引擎悄悄改成别的值，
 //   harness 记的 m_pageScale 就和 Page::pageScaleFactor() 对不上（下次捏合基准错）。子区间是安全的。
@@ -1310,7 +1337,9 @@ MainPage::MainPage()
         WebEngine::instance().post([disp, self, diagUrls]() {
             std::string dump;
             int gi = -999;
-            try { gi = WebCoreGpuInit(nullptr, kW, kH); } catch (...) { gi = -1000; }
+            const int dw = kW, dh = kH;
+            try { gi = WebCoreGpuInit(nullptr, dw, dh); } catch (...) { gi = -1000; }
+            NoteEngineFrameSize(dw, dh);
             dump += "WebCoreGpuInit(offscreen) rc=" + std::to_string(gi) + "\n\n";
             auto rgba = std::vector<uint8_t>(EngineBufferBytes(), 0);
             std::wstring dd = LocalStateDir();
@@ -1322,7 +1351,7 @@ MainPage::MainPage()
                 try { WebCoreSetUserAgentMobile(desktop ? 0 : 1); } catch (...) {}
                 dump += "########## URL: " + url + (desktop ? " [desktop UA]" : " [mobile UA]") + " ##########\n";
                 int lrc = -999;
-                try { lrc = WebCoreSessionLoad(url.c_str(), kW, kH, rgba.data()); } catch (...) { lrc = -1000; }
+                try { lrc = WebCoreSessionLoad(url.c_str(), dw, dh, rgba.data()); } catch (...) { lrc = -1000; }
                 dump += "SessionLoad rc=" + std::to_string(lrc) + "\n";
                 std::vector<char> dg(4096, 0);
                 try { WebCoreGetDiag(dg.data(), (int)dg.size()); } catch (...) {}
@@ -1336,7 +1365,7 @@ MainPage::MainPage()
                 try { WebCoreEvalJS("document.cookie", ck.data(), (int)ck.size()); } catch (...) {}
                 dump += "document.cookie: [" + std::string(ck.data()) + "]\n\n";
                 // 落盘这页 GPU readback 的实际帧(BMP),供 WDP 拉回当截图看
-                try { if (!dd.empty()) WriteBmp32(WideToUtf8(dd) + "\\shot_" + std::to_string(idx) + ".bmp", rgba.data(), kW, kH); } catch (...) {}
+                try { if (!dd.empty()) WriteBmp32(WideToUtf8(dd) + "\\shot_" + std::to_string(idx) + ".bmp", rgba.data(), dw, dh); } catch (...) {}
                 ++idx;
             }
             // cookie 持久化调试:主动落盘(平时靠切后台 VisibilityChanged 触发;autodiag 不经 UI 生命周期,
@@ -1815,7 +1844,8 @@ void MainPage::ApplyViewInsets()
     m_lastInsetRight = right;
     m_lastTitleH = titleH;
     Windows::UI::Xaml::Thickness topPad(0, top, 0, 0);
-    if (Progress) Progress->Margin = topPad;
+    // Apotheosis (0.1.9.49): the strip's Border owns the inset - it IS the visible strip now.
+    if (ProgressStrip) ProgressStrip->Margin = topPad;
     if (FindBar) FindBar->Margin = topPad;
     if (Drawer) Drawer->Padding = topPad;
     if (SettingsPage) SettingsPage->Padding = topPad;
@@ -2042,8 +2072,12 @@ void MainPage::UpdateNavButtons()
 void MainPage::SetLoading(bool loading)
 {
     m_loading = loading;
+    const auto strip = loading ? Windows::UI::Xaml::Visibility::Visible
+                               : Windows::UI::Xaml::Visibility::Collapsed;
     Progress->IsIndeterminate = loading;
-    Progress->Visibility = loading ? Windows::UI::Xaml::Visibility::Visible : Windows::UI::Xaml::Visibility::Collapsed;
+    Progress->Visibility = strip;
+    // Apotheosis (0.1.9.49): the black Border around the dots - see MainPage.xaml.
+    if (ProgressStrip) ProgressStrip->Visibility = strip;
     UpdateUrlActionGlyph();   // 加载态切到 ✕ 停止 / 结束回 → 或 ⟳
     // Apotheosis (0.1.9.47): no ApplyViewInsets() here any more. The strip's visibility used to
     //   feed the content/GpuPanel top inset (stripH), so this call was what made the page slide
@@ -2143,6 +2177,11 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
 
     WebEngine::instance().post([disp, self, surl, isHome, homeHtml, staticHtml, mySeq]() {
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
+        // Apotheosis (crash fix, 0.1.9.49): read the viewport ONCE, here, and use that one pair for
+        //   every engine call below and for the present. kW/kH move on the UI thread, so reading
+        //   them again further down could hand the engine one rectangle and the blit another.
+        const int ew = kW, eh = kH;
+        NoteEngineFrameSize(ew, eh);   // all three calls below set the engine's viewport to it
         int rc = -999;
         bool loadOk = false;   // 网络加载是否真成功(区别于错误页渲染成功),决定是否进历史
         bool sessionActive = false;   // 是否建立了引擎常驻会话(决定点击转发/翻页按钮)
@@ -2151,13 +2190,13 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         try {
             if (isHome) {
                 WebCoreCloseSession();   // 离开网络页:销毁会话,释放 Page + 取消在途加载
-                rc = WebCoreRenderHtml(homeHtml.c_str(), kW, kH, rgba->data());
+                rc = WebCoreRenderHtml(homeHtml.c_str(), ew, eh, rgba->data());
                 loadOk = (rc == 0);
                 title = W8(L"主页", L"Home");
             } else {
                 WriteStage(("before-load " + surl).c_str());
                 WriteMemLog("before-load url=" + surl + " " + MemSnapshot() + EngineMemStats());   // Apotheosis (M4)
-                int netRc = WebCoreSessionLoad(surl.c_str(), kW, kH, rgba->data());   // 常驻会话加载
+                int netRc = WebCoreSessionLoad(surl.c_str(), ew, eh, rgba->data());   // 常驻会话加载
                 // Apotheosis (M4): peak right after the load, still before title/diag/compositing
                 // queries — if the OS kills us in those, mem.txt already carries the number.
                 WriteMemLog("mem-loading url=" + surl + " " + MemSnapshot());
@@ -2179,9 +2218,9 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     title = ToWide(t);
                     if (title.empty()) title = Utf8ToWide(surl);
                 } else {
-                    std::string eh = MakeErrorHtml(surl, err);
-                    *staticHtml = eh;   // Apotheosis: re-renderable on a rotation, like the start page
-                    rc = WebCoreRenderHtml(eh.c_str(), kW, kH, rgba->data());   // 渲染错误页(会话已被引擎清理)
+                    std::string errHtml = MakeErrorHtml(surl, err);
+                    *staticHtml = errHtml;   // Apotheosis: re-renderable on a rotation, like the start page
+                    rc = WebCoreRenderHtml(errHtml.c_str(), ew, eh, rgba->data());   // 渲染错误页(会话已被引擎清理)
                     loadOk = false;
                     title = W8(L"加载失败", L"Load failed");
                 }
@@ -2205,7 +2244,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
         bool ok = (rc == 0);   // 渲染是否成功(决定是否贴图)
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, titleCopy, ok, loadOk, sessionActive, comp, links, staticHtml, mySeq]() {
+                ref new DispatchedHandler([self, rgba, ew, eh, titleCopy, ok, loadOk, sessionActive, comp, links, staticHtml, mySeq]() {
                     MainPage^ s = self.Get();
                     if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被更新操作/看门狗取代,丢弃此迟到回调
@@ -2233,7 +2272,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                             s->RenderImage->Visibility = present
                                 ? Windows::UI::Xaml::Visibility::Collapsed : Windows::UI::Xaml::Visibility::Visible;
                         }
-                        s->PresentSoftwareFrame(rgba);
+                        s->PresentSoftwareFrame(rgba, ew, eh);
                         s->m_pageLinks = *links;   // 存当前页链接表供点击命中
                     }
                     s->m_sessionActive = sessionActive;
@@ -2722,6 +2761,9 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
                 : (clickCount >= 2 ? WebCoreClickAtCount(px, py, clickCount, rgba->data())
                                    : WebCoreClickAt(px, py, rgba->data()));
         } catch (...) { rc = -1000; }
+        // Apotheosis (crash fix, 0.1.9.49): the viewport this frame was rendered at, read next to
+        //   the call that produced it - see PresentSoftwareFrame.
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         unsigned hashAfter = (rc == 0) ? WebCoreGetFrameHash() : hashBefore;
         bool changed = (hashAfter != hashBefore);   // 引擎点击是否改变了画面(区分模态关闭/按钮 vs 死链接)
         int editable = 0;
@@ -2751,7 +2793,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
         int ctxRcCopy = ctxRc;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, titleW, navW, links, rcCopy, changedCopy, editableCopy, linkHit, mySeq, ctxUrl, ctxRcCopy, longPress]() {
+                ref new DispatchedHandler([self, rgba, fw, fh, titleW, navW, links, rcCopy, changedCopy, editableCopy, linkHit, mySeq, ctxUrl, ctxRcCopy, longPress]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     if (s->m_opSeq != mySeq) {
                         // Apotheosis (review fix, 0.1.9.48): the hold this answer belongs to is over,
@@ -2791,7 +2833,7 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
                             s->SetLoading(false);
                             s->NavigateTo(ref new String(linkHit->c_str()), true);
                         } else {
-                            s->ApplyEngineFrame(rgba, title, navUrl, links);
+                            s->ApplyEngineFrame(rgba, fw, fh, title, navUrl, links);
                             s->SetLoading(false);
                             // 未导航(in-page):点中可编辑元素则唤起键盘,否则收起。导航了则收起。
                             if (navW->empty()) { if (editableCopy) s->OpenKeyboard(); else s->CloseKeyboard(); }
@@ -2817,26 +2859,50 @@ void MainPage::ForwardClickToEngine(int px, int py, bool longPress, int clickCou
 // 软件模式:把引擎 RGBA 帧贴上 RenderImage。WriteableBitmap 双缓冲复用 —— 原来每帧 ref new 一块
 // 3MB XAML 位图(实时 5fps + 拖拽滚动 + 逐键重绘)是 UI 线程分配大头;交替写 A/B 两块,避免 XAML
 // 还在上传上一帧纹理时就地改写同一块。直呈现模式(GpuPanel 已由引擎 swapBuffers)无事可做。
-void MainPage::PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba)
+// Apotheosis (crash fix, 0.1.9.49): w/h are THIS FRAME's viewport - the size the engine had when it
+//   filled the buffer, captured on the engine thread (EngineFrameSize) and carried here. Never
+//   kW/kH: those are what the harness wants NOW, and a frame that crossed a viewport change was
+//   written at the other size. Blitting w*h words out of a buffer allocated for fewer of them read
+//   past the end of the block into reserved address space and killed the app.
+//   Two guards, because a frame is allowed to be stale but a read never is: the buffer has to be
+//   big enough for the rectangle we are about to read (short = drop it, the size change that caused
+//   it has a fresh render on its way), and the bitmap has to be the frame's own size - the panel may
+//   already be somewhere else, and a bitmap of the wrong size would be the same overrun on the
+//   write side.
+void MainPage::PresentSoftwareFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba, int w, int h)
 {
     if (m_gpuPresent) return;
+    if (!rgba || w <= 0 || h <= 0) return;
+    const size_t need = (size_t)w * (size_t)h * 4;
+    if (rgba->size() < need) {
+        // One line per distinct mismatch, not per frame: a rotation can drop a handful in a row and
+        //   the interesting thing is which sizes disagreed, not how often.
+        static int s_lastW = 0, s_lastH = 0; static size_t s_lastHave = 0;
+        if (w != s_lastW || h != s_lastH || rgba->size() != s_lastHave) {
+            s_lastW = w; s_lastH = h; s_lastHave = rgba->size();
+            WriteStage((std::string("sw-present-drop eng=") + std::to_string(w) + "x" + std::to_string(h)
+                        + " need=" + std::to_string(need) + " have=" + std::to_string(rgba->size())
+                        + " want=" + std::to_string(kW) + "x" + std::to_string(kH)).c_str());
+        }
+        return;
+    }
     WriteableBitmap^ wb = m_frameBmpFlip ? m_frameBmpB : m_frameBmpA;
-    if (!wb) {
-        wb = ref new WriteableBitmap(kW, kH);
+    if (!wb || wb->PixelWidth != w || wb->PixelHeight != h) {
+        wb = ref new WriteableBitmap(w, h);
         if (m_frameBmpFlip) m_frameBmpB = wb; else m_frameBmpA = wb;
     }
     m_frameBmpFlip = !m_frameBmpFlip;
-    BlitToBitmap(wb, *rgba, kW, kH);
+    BlitToBitmap(wb, *rgba, w, h);
     wb->Invalidate();
     RenderImage->Source = wb;
 }
 
 // 把一帧引擎渲染结果贴到位图 + 同步标题/链接表;navUrl 非空 = 会话内发生导航(同步地址栏/栈/历史)。
-void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba,
+void MainPage::ApplyEngineFrame(const std::shared_ptr<std::vector<uint8_t>>& rgba, int w, int h,
                                Platform::String^ title, Platform::String^ navUrl,
                                const std::shared_ptr<std::vector<PageLink>>& links)
 {
-    PresentSoftwareFrame(rgba);   // present 模式内部自跳过(引擎已 swapBuffers 到 GpuPanel)
+    PresentSoftwareFrame(rgba, w, h);   // present 模式内部自跳过(引擎已 swapBuffers 到 GpuPanel)
     m_pageLinks = *links;
     m_lastFrameHash = 0;        // 强制下一实时帧重贴(交互改了画面)
     StartLiveMode();            // 交互后重启实时(可能触发了动画/SPA 更新)
@@ -2880,6 +2946,7 @@ void MainPage::EngineScroll(int dy)
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try { rc = WebCoreScrollBy(0, dy, rgba->data()); } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         if (rc == 0) {
             int lc = WebCoreGetLinkCount();
@@ -2894,14 +2961,14 @@ void MainPage::EngineScroll(int dy)
         int rcCopy = rc;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, links, rcCopy, mySeq]() {
+                ref new DispatchedHandler([self, rgba, fw, fh, links, rcCopy, mySeq]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 已被取代/看门狗复位,丢弃迟到回调
                     s->m_interacting = false;
                     if (s->m_loadWatchdog) s->m_loadWatchdog->Stop();
                     s->SetLoading(false);
                     if (rcCopy == 0) {
-                        s->PresentSoftwareFrame(rgba);
+                        s->PresentSoftwareFrame(rgba, fw, fh);
                         s->m_pageLinks = *links;
                         s->m_lastFrameHash = 0;
                         s->StartLiveMode();   // 滚动后重启实时(新视口的懒加载/动画)
@@ -2974,6 +3041,7 @@ void MainPage::PumpScroll()
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         // Apotheosis: read back where the engine ended up, in the same engine-thread hop that just
         // scrolled and presented. The engine clamps at the document edges, so what it actually
         // applied is generally NOT the delta we sent — only the position tells the truth, and the
@@ -2988,11 +3056,11 @@ void MainPage::PumpScroll()
         }
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, mySeq, present, dx, dy, sx, sy, cw, ch, vw, vh, haveState]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) { s->m_scrollBusy = false; s->m_scrollAccum = 0; s->m_scrollAccumX = 0; return; }   // 被导航/点击取代,丢弃迟到帧+全部残留位移
                 if (rcCopy == 0) {
-                    if (!present) s->PresentSoftwareFrame(rgba);
+                    if (!present) s->PresentSoftwareFrame(rgba, fw, fh);
                     s->m_lastFrameHash = 0;
                     if (haveState) { s->m_contentW = cw; s->m_contentH = ch; s->m_viewW = vw; s->m_viewH = vh; }
                     s->EngineScrollFrameApplied(sx, sy, haveState, dx, dy);
@@ -3057,13 +3125,14 @@ void MainPage::PumpNestedScroll()
         if (wrc != 1) {
             try { rc = WebCoreScrollBy(dx, dy, rgba->data()); } catch (...) { rc = -1000; }
         }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, wrc]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, mySeq, present, wrc]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) { s->m_nestedScrollBusy = false; s->m_nestedAccumX = 0; s->m_nestedAccumY = 0; return; }   // 被导航/点击取代
                 if (wrc == 1 || rcCopy == 0) {
-                    if (!present) s->PresentSoftwareFrame(rgba);   // present 模式:WebCoreWheelAt/ScrollBy 已经直呈现到 GpuPanel
+                    if (!present) s->PresentSoftwareFrame(rgba, fw, fh);   // present 模式:WebCoreWheelAt/ScrollBy 已经直呈现到 GpuPanel
                     s->m_lastFrameHash = 0;
                 }
                 s->m_nestedScrollBusy = false;
@@ -3161,9 +3230,10 @@ void MainPage::PumpDrag()
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try { rc = WebCoreDragAt(phase, px, py, rgba->data()); } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, phase, mySeq, myGen, present]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, phase, mySeq, myGen, present]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) { s->DragReset(); return; }   // 被导航/点击取代
                 if (s->m_dragGen != myGen) return;                     // answer belongs to a finished gesture
@@ -3190,7 +3260,7 @@ void MainPage::PumpDrag()
                 if (rcCopy == 1) {
                     // WebCoreDragAt already composited/presented this frame (direct swap in present
                     // mode), same contract as WebCoreWheelAt — only the software path needs the blit.
-                    if (!present) s->PresentSoftwareFrame(rgba);
+                    if (!present) s->PresentSoftwareFrame(rgba, fw, fh);
                     s->m_lastFrameHash = 0;
                 }
                 s->m_dragBusy = false;
@@ -3238,16 +3308,17 @@ void MainPage::PumpZoomWheel()
         auto rgba = AcquireEngineBuffer(present);
         int rc = -999;
         try { rc = WebCoreZoomWheelAt(px, py, notches, rgba->data()); } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, mySeq, present]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 s->m_zoomWheelBusy = false;
                 if (s->m_opSeq != mySeq) { s->m_zoomWheelNotches = 0; return; }   // navigation/click took over
                 if (rcCopy == 1) {
                     // WebCoreZoomWheelAt already composited/presented this frame in present mode,
                     // same contract as WebCoreWheelAt - only the software path needs the blit.
-                    if (!present) s->PresentSoftwareFrame(rgba);
+                    if (!present) s->PresentSoftwareFrame(rgba, fw, fh);
                     s->m_lastFrameHash = 0;
                 }
                 if (s->m_zoomWheelNotches) s->PumpZoomWheel();
@@ -4233,9 +4304,10 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try { rc = WebCoreSetPageScale(newScale, focalX, focalY, rgba->data()); } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, newScale, mySeq, present]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, newScale, mySeq, present]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 // Apotheosis (2837ce0 review item 2) — "the view jumps somewhere else a few seconds
                 //   after a pinch". Everything below used to sit BEHIND the m_opSeq guard, i.e. a
@@ -4278,7 +4350,7 @@ void MainPage::PinchCommit(float newScale, int focalX, int focalY)
                                 + " dropped pre-zoom scroll cache");
                 if (s->m_opSeq != mySeq) return;            // 被新操作取代,丢弃迟到帧
                 if (rcCopy == 0)
-                    s->PresentSoftwareFrame(rgba);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
+                    s->PresentSoftwareFrame(rgba, fw, fh);   // present 模式:引擎已 swapBuffers 到 GpuPanel,内部自跳过
                 // 复位实时变换(新帧已是按新尺度渲染的清晰图;变换归一,避免叠加二次缩放)。
                 s->m_zoomTransform = nullptr;
                 // Apotheosis (review 2026-09-04 item 1): drop the preview through the one place
@@ -4546,6 +4618,7 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
             else if (kind == 1) rc = WebCoreKeyAction(1, rgba->data());
             else rc = WebCoreKeyAction(0, rgba->data());
         } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         // 诊断(imedebug.txt 存在才记):rc=-6/kErrNoDocument → 打字时 canEdit 为 false=丢了可编辑焦点。
         if (ImeDebugEnabled()) {
             char edbg[256] = ""; try { WebCoreEditDebug(edbg, sizeof edbg); } catch (...) {}
@@ -4562,15 +4635,15 @@ void MainPage::SendKeyToEngine(int kind, Platform::String^ text)
         auto navW = std::make_shared<std::wstring>(navUrl); auto titleW = std::make_shared<std::wstring>(title);
         int rcCopy = rc; int kindCopy = kind;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, kindCopy, navW, titleW, links, mySeq]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, kindCopy, navW, titleW, links, mySeq]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) return;   // 被导航/点击/看门狗取代,丢弃迟到按键帧
                 if (rcCopy != 0) return;
                 if (kindCopy == 1 && !navW->empty() && std::wstring(navW->c_str()) != s->m_currentUrl) {
-                    s->ApplyEngineFrame(rgba, ref new String(titleW->c_str()), ref new String(navW->c_str()), links);   // 回车导航:同步地址栏/历史
+                    s->ApplyEngineFrame(rgba, fw, fh, ref new String(titleW->c_str()), ref new String(navW->c_str()), links);   // 回车导航:同步地址栏/历史
                     s->CloseKeyboard();
                 } else {
-                    s->PresentSoftwareFrame(rgba);
+                    s->PresentSoftwareFrame(rgba, fw, fh);
                     s->m_lastFrameHash = 0;
                     s->StartLiveMode();   // 打字后重启实时循环 → 后续帧把输入内容再合成/呈现一次(防单帧合成漏掉新文字)
                 }
@@ -4706,6 +4779,7 @@ void MainPage::DispatchLiveFrame()
         int rc = -999; unsigned hash = 0; int pending = 0;
         const ULONGLONG t0 = GetTickCount64();
         try { rc = WebCoreLiveTick(rgba->data()); if (rc == 0) { hash = WebCoreGetFrameHash(); pending = WebCoreGetPendingResourceCount(); } } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         const unsigned durMs = (unsigned)(GetTickCount64() - t0);   // 事件驱动的限流按它走
         // Apotheosis: sample here, on the engine thread, not in the UI
         // continuation below — WebCoreGetMemoryStats()/WebCoreSetMemoryPressure() must never be
@@ -4716,7 +4790,7 @@ void MainPage::DispatchLiveFrame()
         int rcCopy = rc; unsigned hashCopy = hash; int pendingCopy = pending;
         try {
             disp->RunAsync(CoreDispatcherPriority::Low,
-                ref new DispatchedHandler([self, rgba, rcCopy, hashCopy, pendingCopy, mySeq, present, durMs]() {
+                ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, hashCopy, pendingCopy, mySeq, present, durMs]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     s->m_liveBusy = false;
                     s->m_lastPresentMs = GetTickCount64();
@@ -4741,7 +4815,7 @@ void MainPage::DispatchLiveFrame()
                     } else {
                         s->m_fallbackStaticTicks = 0;
                         s->m_lastFrameHash = hashCopy;
-                        s->PresentSoftwareFrame(rgba);
+                        s->PresentSoftwareFrame(rgba, fw, fh);
                         // 永久动画防失控:连续动画超 ~150 帧无交互 → 降到 ~1fps(不硬停,免得动画卡死):
                         // ScheduleWakeComposite 的 minGap 读 m_liveTotalTicks 实现这条规则。
                         // 任何交互/导航/滚动都经 StartLiveMode 重置计数并恢复快帧率。
@@ -6217,10 +6291,11 @@ void MainPage::DoFind(int mode)
             else if (mode == 0) rc = WebCoreFindString(q.c_str(), /*matchCase*/ 0, /*wrap*/ 1, rgba->data());
             else rc = WebCoreFindNext(mode == 1 ? 1 : 0, rgba->data());
         } catch (...) { rc = -1000; }
+        int fw = 0, fh = 0; EngineFrameSize(fw, fh);
         int rcCopy = rc; int modeCopy = mode; bool clearCopy = clear;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal,
-                ref new DispatchedHandler([self, rgba, rcCopy, modeCopy, clearCopy, present, mySeq]() {
+                ref new DispatchedHandler([self, rgba, fw, fh, rcCopy, modeCopy, clearCopy, present, mySeq]() {
                     MainPage^ s = self.Get(); if (!s) return;
                     if (s->m_opSeq != mySeq) return;   // 被更新操作/看门狗取代
                     s->m_interacting = false;
@@ -6234,7 +6309,7 @@ void MainPage::DoFind(int mode)
                         s->FindCount->Text = ref new String(L"");
                         return;
                     }
-                    s->PresentSoftwareFrame(rgba);
+                    s->PresentSoftwareFrame(rgba, fw, fh);
                     s->m_lastFrameHash = 0;
                     if (clearCopy) s->FindCount->Text = ref new String(L"");
                     else if (modeCopy == 0) s->FindCount->Text = ref new String(rcCopy > 0 ? (std::to_wstring(rcCopy) + (g_lang == L"en" ? L" found" : L" 处")).c_str() : (g_lang == L"en" ? L"No results" : L"无结果"));
@@ -6281,7 +6356,9 @@ void MainPage::CaptureActiveTabSnapshot()
         // Apotheosis (landscape/rotation): the viewport the engine is about to paint at, read on
         //   the engine thread so it is the one the pixels really have (kW/kH move on the UI thread
         //   ahead of the WebCoreResize that follows this call in the same FIFO queue).
-        const int snapW = kW, snapH = kH;
+        // Apotheosis (crash fix, 0.1.9.49): and read from the ENGINE's own last viewport rather
+        //   than kW/kH, which is the harness' target and can already be one resize ahead of it.
+        int snapW = 0, snapH = 0; EngineFrameSize(snapW, snapH);
         int rc = -1;
         try {
             // ★ 直呈现模式下不能用 WebCoreSessionPaint:它会走 gpuPresent 再 swapBuffers 一次,
@@ -6807,6 +6884,7 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
         int rc = -999, surfW = 0, surfH = 0;
         try { WebCoreSetBottomOcclusion(occ); } catch (...) {}
         try { rc = WebCoreResize(ew, eh, &surfW, &surfH, rgba->data()); } catch (...) { rc = -1000; }
+        if (rc == 0) NoteEngineFrameSize(ew, eh);   // the engine is on this viewport from here on
         int rcCopy = rc;
         try {
             disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, rcCopy, mySeq, present, staticPage, ew, eh, oldW, oldH, surfW, surfH]() {
@@ -6949,7 +7027,7 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
                 //   no session), and RenderStaticPage's own frame is on its way - presenting this
                 //   one would be a black flash between the two. (rcCopy is 0 here: every failure
                 //   returned above.)
-                if (!present && !staticPage) s->PresentSoftwareFrame(rgba);
+                if (!present && !staticPage) s->PresentSoftwareFrame(rgba, ew, eh);
                 s->m_lastFrameHash = 0;              // force the next live frame to be re-shown
                 if (!staticPage) {
                     s->SyncLinksAfterScroll();       // the hit table was built for the old layout
@@ -6987,6 +7065,7 @@ void MainPage::RenderStaticPage(const char* why)
         auto rgba = std::make_shared<std::vector<uint8_t>>(EngineBufferBytes(), 0);
         int rc = -999;
         try { rc = WebCoreRenderHtml(html.c_str(), w, h, rgba->data()); } catch (...) { rc = -1000; }
+        if (rc == 0) NoteEngineFrameSize(w, h);
         auto links = std::make_shared<std::vector<Harness::PageLink>>();
         try {
             int lc = WebCoreGetLinkCount();
@@ -7000,11 +7079,11 @@ void MainPage::RenderStaticPage(const char* why)
         } catch (...) {}
         const int rcCopy = rc;
         try {
-            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, links, rcCopy, mySeq]() {
+            disp->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([self, rgba, w, h, links, rcCopy, mySeq]() {
                 MainPage^ s = self.Get(); if (!s) return;
                 if (s->m_opSeq != mySeq) return;
                 if (rcCopy != 0) return;
-                s->PresentSoftwareFrame(rgba);
+                s->PresentSoftwareFrame(rgba, w, h);
                 s->m_pageLinks = *links;
                 s->m_lastFrameHash = 0;
             }));
@@ -7119,6 +7198,7 @@ void MainPage::EnableGpu()
     WebEngine::instance().post([disp, self, win, engW, engH]() {
         int rc = -999;
         try { rc = WebCoreGpuInit(win, engW, engH); } catch (...) { rc = -1000; }
+        if (rc == 0) NoteEngineFrameSize(engW, engH);
         try {
             std::wstring d = LocalStateDir();
             if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }

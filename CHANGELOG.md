@@ -45,6 +45,11 @@ project's own version.
 - A failed asynchronous decode notifies its waiting clients instead of leaving
   a white box, and an already decoded image is drawn rather than decoded again
   at a new scale.
+- The software present blits each frame at the viewport the engine actually
+  rendered it at, not at the viewport the harness currently wants. A frame in
+  flight across a viewport change was read at the new, larger rectangle out of
+  a buffer allocated for the old one, which walked past the end of the block
+  into reserved address space and killed the app.
 - Text: glyphs no longer rasterise with subpixel antialiasing and the synthetic
   bold offset walks in device-pixel steps, which removes the doubled text after
   a pinch when only the regular font cuts are installed.
