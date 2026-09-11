@@ -6083,6 +6083,13 @@ void MainPage::SetLanguage(const std::wstring& lang) {
     //   silently leaves it in the old language until something else rebuilds the switcher. Do it here
     //   unconditionally (cheap, safe whether or not the switcher is currently open).
     RebuildTabSwitcher();
+    // Apotheosis (start page, 0.1.9.52): the start page is engine-rendered HTML, not part of the
+    //   XAML tree TranslateNode just walked, and nothing repaints a static page on its own. The
+    //   page that is on screen when the first-run language choice is made therefore stayed in the
+    //   language it was built with for the rest of its life, while every new tab got the chosen
+    //   one - the two pages differed, and with no CJK font in the package the Chinese strings on
+    //   the older one came out as empty boxes. RenderStaticPage rebuilds it from the builder.
+    if (m_currentUrl == L"about:home") RenderStaticPage("lang");
 }
 
 void MainPage::OnOobeLang(Platform::Object^ sender, RoutedEventArgs^) {
