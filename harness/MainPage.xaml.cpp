@@ -411,7 +411,8 @@ static std::string HostOfU8(const std::string& u)
 }
 
 // 动态新标签页:书签优先、历史补足的速拨磁贴(最多 8)。磁贴=<a>,经渲染时链接提取→点击导航。
-static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, const std::vector<Harness::Entry>& history)
+static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, const std::vector<Harness::Entry>& history,
+                                 bool landscape)
 {
     std::vector<Harness::Entry> tiles;
     std::vector<std::wstring> seen;
@@ -433,14 +434,23 @@ static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, c
     h += ".hero{background:linear-gradient(135deg,#00aa77,#0088cc);color:#fff;padding:46px 26px 38px}";
     h += ".hero h1{margin:0;font-size:46px;letter-spacing:-1px}.hero p{margin:10px 0 0;font-size:20px;opacity:.92}";
     h += ".wrap{padding:24px}.sec{font-size:17px;color:#5f6368;margin:0 0 14px}";
-    // Apotheosis (landscape, 0.1.9.43): auto-fill instead of a hard 2 columns, so the tiles use
-    //   the width they are given - two across in portrait (360 CSS px), more in landscape - and
-    //   the start page reflows on a rotation like any other page. Nothing here is fixed-width.
-    h += ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}";
+    // Apotheosis (start page columns, 0.1.9.52): exactly two columns in portrait and four in
+    //   landscape. The auto-fill rule this replaces assumed a 360 px CSS viewport; the engine
+    //   viewport is the panel in DEVICE pixels (720 portrait, ~1184 landscape), so auto-fill put
+    //   four postage stamps across a portrait screen and seven across a landscape one.
+    //   Stated twice on purpose, and the two always agree: the media query is what a rotation
+    //   needs if the page is ever re-laid-out without being rebuilt, and the class is what the
+    //   builder knows from the viewport it is building for - so the grid is right even where the
+    //   orientation feature is not evaluated. Tiles stay 1fr wide, i.e. the page still fills the
+    //   width at either count.
+    h += ".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}";
+    h += ".grid.cols4{grid-template-columns:repeat(4,1fr)}";
+    h += "@media (orientation:landscape){.grid{grid-template-columns:repeat(4,1fr)}}";
     h += "a.tile{display:block;text-decoration:none;background:#fff;border-radius:16px;padding:18px 18px 20px;box-shadow:0 2px 10px rgba(0,0,0,.08);color:#202124}";
     h += ".tile .t{font-size:20px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".tile .u{font-size:15px;color:#80868b;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += "</style></head><body>";
+    const char* gridClass = landscape ? "grid cols4" : "grid";
     h += "<div class='hero'><h1>EdgeHTML Reborn</h1><p>";
     h += U8("\xE7\x8E\xB0\xE4\xBB\xA3\xE6\xB5\x8F\xE8\xA7\x88\xE5\x99\xA8\xE5\xBC\x95\xE6\x93\x8E", "A modern browser engine");
     h += " &middot; Windows 10 Mobile &middot; ARM32</p></div>";
@@ -449,14 +459,14 @@ static std::string BuildHomeHtml(const std::vector<Harness::Entry>& bookmarks, c
         h += "<p class='sec'>";
         h += U8("\xE5\x9C\xA8\xE4\xB8\x8A\xE6\x96\xB9\xE5\x9C\xB0\xE5\x9D\x80\xE6\xA0\x8F\xE8\xBE\x93\xE5\x85\xA5\xE7\xBD\x91\xE5\x9D\x80\xE8\xAE\xBF\xE9\x97\xAE\xE7\xBD\x91\xE9\xA1\xB5\xE3\x80\x82",
                 "Type a URL in the address bar above to open a page.");
-        h += "</p><div class='grid'>";
+        h += "</p><div class='"; h += gridClass; h += "'>";
         const char* defs[][2] = { {"https://example.com","example.com"}, {"https://github.com","github.com"}, {"https://www.bing.com","bing.com"}, {"https://en.wikipedia.org","wikipedia.org"} };
         for (auto& d : defs) { h += "<a class='tile' href='"; h += d[0]; h += "'><div class='t'>"; h += d[1]; h += "</div><div class='u'>"; h += d[0]; h += "</div></a>"; }
         h += "</div>";
     } else {
         h += "<p class='sec'>";
         h += U8("\xE5\xB8\xB8\xE7\x94\xA8\xE7\xAB\x99\xE7\x82\xB9", "Frequently visited");
-        h += "</p><div class='grid'>";
+        h += "</p><div class='"; h += gridClass; h += "'>";
         for (const auto& e : tiles) {
             std::string href = HtmlEscape(WideToUtf8(e.url));
             std::string title = HtmlEscape(WideToUtf8(e.title.empty() ? e.url : e.title));
@@ -2167,7 +2177,7 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
     std::string surl = ToUtf8(url);
     unsigned long long mySeq = ++m_opSeq;
     // 主页:用当前书签/历史动态生成新标签页(速拨磁贴=<a>,渲染时提取进链接表→点击导航)。
-    std::string homeHtml = isHome ? BuildHomeHtml(m_bookmarks, m_historyList) : std::string();
+    std::string homeHtml = isHome ? BuildHomeHtml(m_bookmarks, m_historyList, kW > kH) : std::string();
     // Apotheosis (landscape, 0.1.9.43): the source of whatever STATIC page ends up on screen -
     //   the start page here, the error page from the engine thread below - kept so a later
     //   viewport change can re-render it. A static page has no session (NavigateTo closes it),
