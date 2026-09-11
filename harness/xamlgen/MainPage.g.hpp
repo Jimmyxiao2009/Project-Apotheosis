@@ -269,12 +269,23 @@ static ::Platform::String^ __MainPageXaml() {
                  margin down by the status-bar inset — the rendered page used to start at y=0 inside
                  this row (only the chrome above it, Progress/FindBar/overlays, got the inset), so
                  the content ran under the shell's clock. -->
-            <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10">
+            <Border x:Name="ContentBorder" Background="White" Margin="6,6,6,0" CornerRadius="10" IsDoubleTapEnabled="False">
                 <!-- 自由滚动:内容区直接接 ManipulationDelta(单指拖→引擎滚动+惯性,捏合→Scale)。
                      点击走 Tapped;坐标用 GetPosition(ContentArea) 映回引擎像素(MapTapToEngine)。 -->
-                <Grid x:Name="ContentArea" Background="White" ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale" IsTapEnabled="True" IsHoldingEnabled="True" Holding="OnPageHolding">
+                <!-- Apotheosis (double-tap route, 2026-09-10): IsDoubleTapEnabled MUST stay False on
+                     every element in this subtree. With it on (the XAML default) UWP raises the
+                     SECOND tap of a pair as DoubleTapped ONLY - Tapped comes for the first tap and
+                     never again - so the harness' own double-tap recogniser (OnPageTapped, which
+                     pairs taps by time and distance) never saw a second tap and every held first tap
+                     died in its timer with second=0. We deliberately do not handle DoubleTapped
+                     instead: the pair has to be judged against the engine's tap policy, i.e. exactly
+                     where OnPageTapped judges it. Gesture recognition is per-element and the
+                     ORIGINAL SOURCE of the tap owns it, so the child (RenderImage, hit-testable in
+                     software mode) and the Border around it need the flag as much as the Grid does -
+                     otherwise their recogniser swallows the second tap before it can bubble. -->
+                <Grid x:Name="ContentArea" Background="White" ManipulationMode="TranslateX,TranslateY,TranslateInertia,Scale" IsTapEnabled="True" IsDoubleTapEnabled="False" IsHoldingEnabled="True" Holding="OnPageHolding">
                     <!-- 固定 720x1080 的软件帧须随可用视口铺满；否则横屏时右侧会留下空白。 -->
-                    <Image x:Name="RenderImage" Stretch="Fill" />
+                    <Image x:Name="RenderImage" Stretch="Fill" IsDoubleTapEnabled="False" />
                 </Grid>
             </Border>
 
@@ -293,9 +304,34 @@ static ::Platform::String^ __MainPageXaml() {
                  size was right but the strip around them read as too thick at 8 DIP — trimmed to 5 (a
                  little separation around the dots, not much). Background is solid black (not
                  Transparent) so the strip stays OLED-friendly and the dots stay visible over any page
-                 colour. Visibility (SetLoading) drives both the animation and whether ApplyViewInsets
-                 gives content/GpuPanel the extra top inset for it — idle pages get the space back. -->
-            <ProgressBar x:Name="Progress" Height="5" VerticalAlignment="Top" Foreground="{StaticResource Accent}" Background="#000000" IsIndeterminate="False" Visibility="Collapsed" />
+                 colour.
+                 ★ Apotheosis (0.1.9.47): the strip is a pure OVERLAY. It always was in layout terms —
+                 a top-anchored sibling in this Grid cell costs the cell no )APO",
+        LR"APO(height — but
+                 ApplyViewInsets() used to hand its 5 DIP to the content as an extra top inset
+                 (ContentBorder's top margin and GpuPanel's translate), so the whole page slid down 5
+                 DIP the moment a load started and back up when it ended, and on the software path
+                 (start page, pre-GPU window) the margin change resized ContentArea and cost a
+                 WebCoreResize + relayout per load start/end. It draws OVER the page now and the
+                 engine viewport never moves for it; see ApplyViewInsets. Consequences that belong
+                 here: it must not eat taps meant for the page underneath (IsHitTestVisible), and it
+                 must be above the presenting elements (declaration order already does that in a
+                 Grid, but GpuPanel is a SwapChainPanel — say it explicitly rather than rely on how
+                 a composed swap-chain visual sorts against its XAML siblings). Left/right insets
+                 come from RootGrid's Padding, the status-bar inset from the Margin below. -->
+            <!-- Apotheosis (0.1.9.49): the black comes from THIS Border, not from the
+                 ProgressBar's own Background. The stock indeterminate template collapses the
+                 element that carries Background and animates the dots on a separate, fully
+                 transparent one, so the strip's black was never actually drawn. It went
+                 unnoticed while the strip pushed the page down (0.1.9.46 and earlier): the 5
+                 DIP it uncovered were the window's own dark chrome. As an overlay (0.1.9.47)
+                 it draws straight onto the page, and the dots were marching over white.
+                 The Border is the visible strip and therefore owns everything about it: the
+                 status-bar inset (ApplyViewInsets sets ITS margin), the height, the hit-test
+                 exemption, the z-order and the visibility SetLoading toggles. -->
+            <Border x:Name="ProgressStrip" Height="5" VerticalAlignment="Top" HorizontalAlignment="Stretch" Background="#000000" Visibility="Collapsed" IsHitTestVisible="False" Canvas.ZIndex="10">
+                <ProgressBar x:Name="Progress" Height="5" MinHeight="5" Foreground="{StaticResource Accent}" Background="Transparent" IsIndeterminate="False" Visibility="Collapsed" IsHitTestVisible="False" />
+            </Border>
 
             <!-- 悬浮翻页键(触发懒加载/看下方内容)。仅有会话时显示。 -->
             <StackPanel x:Name="ScrollFab" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,16,18" Visibility="Collapsed">
@@ -310,8 +346,7 @@ static ::Platform::String^ __MainPageXaml() {
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition)APO",
-        LR"APO( Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <Border Grid.Column="0" Background="{StaticResource Inset}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="18">
@@ -337,21 +372,28 @@ static ::Platform::String^ __MainPageXaml() {
                  behind the URL bar — see RevealTitleRow()/CollapseTitleRow() in MainPage.xaml.cpp.
                  TitleRowShift is the row's own TranslateTransform (Y: 0 = resting/visible, +Height =
                  fully tucked under the bottom chrome); the nav bar Grid (Grid.Row="1" below) is
-                 declared AFTER this content Grid as a RootGrid child, so it paints on top and covers
+                 declared AFTER this content Grid as a RootGrid child, so it paints o)APO",
+        LR"APO(n top and covers
                  the row the moment the slide carries it past the row/row boundary — no separate
                  z-index needed, just this declaration order.
                  ★ Overlay and not a chrome row ON PURPOSE: a bottom chrome that shrinks would grow
                  the content row, and growing the content row RESIZES GpuPanel — ANGLE then rebuilds
                  the swap chain from the engine thread's next eglSwapBuffers, which is the libGLESv2
                  AV class 26111c3 exists to avoid. As an overlay the row costs no layout at all; the
-                 strip it covers is handed back to the page exactly like the loading strip's at the
-                 top edge — ApplyViewInsets() gives ContentBorder a bottom margin for the software
-                 path, while the GPU panel keeps its size and simply has that strip covered. The inset
-                 (titleH in ApplyViewInsets) is keyed off TitleRow->Visibility only, not off the slide
-                 position, so it flips exactly when the row is fully shown/hidden — same as before,
-                 unaffected by swapping the fade for a slide.
+                 strip it covers is simply covered on BOTH paths.
+                 ☞ 0.1.9.48: the row no longer takes a bottom inset out of the content either — the
+                 same change the loading strip got in 0.1.9.47, and for the same reason. It used to
+                 hand its 24 DIP back to the page on the SOFTWARE path (ApplyViewInsets gave
+                 ContentBorder a bottom margin of titleH), which resized ContentArea and cost a
+                 WebCoreResize plus a full relayout — and a whole static-page re-render — every time
+                 the row was revealed or collapsed, i.e. on every toast, tab switch and link card.
+                 It draws over the bottom 24 DIP now, which is exactly what it has always done on
+                 the GPU path (GpuPanel is neither sized nor translated by titleH), so both paths
+                 behave the same and the page underneath stays put. titleH survives in
+                 ApplyViewInsets for one job only: lifting SuggestPanel so the dropdown stacks
+                 above this row.
                  Explicit Height so ApplyViewInsets' titleH is deterministic before the first
-                 arrange (same technique as Progress/stripH). -->
+                 arrange (ActualHeight is 0 until then). -->
             <Border x:Name="TitleRow" Height="24" VerticalAlignment="Bottom" HorizontalAlignment="Stretch" Background="{StaticResource Chrome}" BorderBrush="{StaticResource Sep}" BorderThickness="0,1,0,0">
                 <Border.RenderTransform>
                     <TranslateTransform x:Name="TitleRowShift" Y="0" />
@@ -377,8 +419,7 @@ static ::Platform::String^ __MainPageXaml() {
              ~24 DIP back — the bottom chrome is the nav row and nothing else again, no wrapper Grid.
              软键盘弹出时只上移这一行(不是整页,见 code-behind InputPane 处理)。
              Apotheosis (bar tightening, 0.1.9.21 feedback): bar 62 -> 48 DIP now that the address
-             pill itself only needs 36 (see below) — kNavBarHeightDip in MainPag)APO",
-        LR"APO(e.xaml.cpp (the
+             pill itself only needs 36 (see below) — kNavBarHeightDip in MainPage.xaml.cpp (the
              keyboard-shift safety clamp) MUST track this literal. -->
         <Grid Grid.Row="1" Height="48" Background="{StaticResource Chrome}">
             <Grid.RenderTransform>
@@ -406,7 +447,8 @@ static ::Platform::String^ __MainPageXaml() {
             <!-- 标签键:方框数字,点开标签切换器 -->
             <Button x:Name="TabsBtn" Grid.Column="0" Background="Transparent" BorderThickness="0" Width="44" Height="48" Padding="0" IsHoldingEnabled="False">
                 <Border BorderBrush="{StaticResource Accent}" Background="{StaticResource AccentDim}" BorderThickness="1.5" CornerRadius="7" Width="28" Height="28">
-                    <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource Accent}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
+      )APO",
+        LR"APO(              <TextBlock x:Name="TabCountText" Text="1" Foreground="{StaticResource Accent}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
                 </Border>
             </Button>
 
@@ -449,8 +491,7 @@ static ::Platform::String^ __MainPageXaml() {
                          Padding to 0 and re-anchored both button glyphs to the left edge of their
                          (unchanged, still 40x36 = full touch target) button via
                          HorizontalContentAlignment="Left" + a 4 DIP left Padding on the button
-                         itself, so the glyph sits ~4 DIP off the c)APO",
-        LR"APO(olumn boundary instead of ~12+.
+                         itself, so the glyph sits ~4 DIP off the column boundary instead of ~12+.
                          Button Width/Height untouched — this only moves the glyph, not the tap area. -->
                     <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 focused/select-all state,
                          wp_ss_20260907_0008.png, measured with a System.Drawing pixel scan, 1440x2560
@@ -470,7 +511,8 @@ static ::Platform::String^ __MainPageXaml() {
                          put the text past the boundary of the single grid cell UrlBox itself occupies.
                          Fix: give UrlBox Grid.ColumnSpan="2" so it also occupies the button's own
                          column (Button Background is Transparent and paints after UrlBox in z-order, so
-                         a scrolled-in tail of text is simply covered by the button's own 40x40 hit area,
+                         a scrolled-in tail of text is simply covere)APO",
+        LR"APO(d by the button's own 40x40 hit area,
                          not visible on top of it or stealing its taps), and grow its own right Padding
                          to 27 DIP so the ContentElement boundary this buys back lands just before the
                          glyph instead of at the pill's own outer edge: 415.2 (measured pill edge) - 27 =
@@ -505,8 +547,7 @@ static ::Platform::String^ __MainPageXaml() {
                     <!-- Apotheosis (2026-09-07, device feedback on 0.1.9.23 unfocused pill,
                          wp_ss_20260907_0007.png, measured with a System.Drawing pixel scan): the
                          c989fd6 column-centred glyph is NOT symmetric with LockIcon. Measured
-                         (1440x2560 device px, /3 for DIP): pill inner left edge px=19)APO",
-        LR"APO(1 (63.7 DIP),
+                         (1440x2560 device px, /3 for DIP): pill inner left edge px=191 (63.7 DIP),
                          pill inner right edge px=1247 (415.7 DIP); LockIcon glyph bbox x=[235,276]
                          -> centre px=255.5 (85.2 DIP) = 21.5 DIP right of the pill's left edge;
                          UrlActionGlyph bbox x=[1144,1184] -> centre px=1164 (388.0 DIP) = 27.7 DIP
@@ -525,7 +566,8 @@ static ::Platform::String^ __MainPageXaml() {
                     <Button x:Name="UrlActionBtn" Grid.Column="2" Background="Transparent" BorderThickness="0" Width="40" Height="40" Padding="0" VerticalAlignment="Center" HorizontalContentAlignment="Center" VerticalContentAlignment="Center">
                         <TextBlock x:Name="UrlActionGlyph" Text="↻" FontSize="17" TextLineBounds="Tight" Foreground="{StaticResource Accent}" Margin="12,-2,0,0" HorizontalAlignment="Center" VerticalAlignment="Center" />
                     </Button>
-                    <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLostFocus),
+                    <!-- 编辑地址时占用同一格:白色清除键顶掉刷新/停止键(见 OnUrlGotFocus/OnUrlLos)APO",
+        LR"APO(tFocus),
                          输入框因此拿到整条胶囊的宽度。IsTabStop=False → 点它不夺焦,软键盘不收。
                          2026-09-04 review item 5: glyph in its own TextBlock (TextLineBounds="Tight"),
                          same technique as UrlActionGlyph above — plain Button.Content centred on the
@@ -572,8 +614,7 @@ static ::Platform::String^ __MainPageXaml() {
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="*" /><ColumnDefinition Width="*" />
-                  )APO",
-        LR"APO(          </Grid.ColumnDefinitions>
+                            </Grid.ColumnDefinitions>
                             <Button x:Name="BackBtn" Grid.Column="0" Style="{StaticResource QuickBtn}" IsEnabled="False">
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
                                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" />
@@ -593,7 +634,8 @@ static ::Platform::String^ __MainPageXaml() {
                                 </StackPanel>
                             </Button>
                             <Button Grid.Column="3" Tag="bookmark" Style="{StaticResource QuickBtn}" x:Name="_ev5">
-                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+           )APO",
+        LR"APO(                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
                                     <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="22" VerticalAlignment="Center" Foreground="{StaticResource Warm}" />
                                     <TextBlock x:Name="ActFavLabel" Text="收藏" FontSize="12" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" Margin="6,1,0,0" />
                                 </StackPanel>
@@ -640,8 +682,7 @@ static ::Platform::String^ __MainPageXaml() {
                         </Button>
                         <Button Tag="download" Style="{StaticResource MenuRow}" x:Name="_ev12">
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="" FontFamily="Segoe M)APO",
-        LR"APO(DL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
+                                <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="下载此页" VerticalAlignment="Center" />
                             </StackPanel>
                         </Button>
@@ -669,7 +710,8 @@ static ::Platform::String^ __MainPageXaml() {
 
                         <Border Height="1" Background="{StaticResource Sep}" Margin="16,10,16,5" />
 
-                        <Button Tag="settings" Style="{StaticResource MenuRow}" x:Name="_ev16">
+                     )APO",
+        LR"APO(   <Button Tag="settings" Style="{StaticResource MenuRow}" x:Name="_ev16">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="17" Width="34" VerticalAlignment="Center" Foreground="{StaticResource TxtLo}" />
                                 <TextBlock Text="设置" VerticalAlignment="Center" />
@@ -731,8 +773,7 @@ static ::Platform::String^ __MainPageXaml() {
             <Grid Grid.Row="0" Background="{StaticResource Chrome}" Padding="8,8" BorderBrush="{StaticResource Sep}" BorderThickness="0,0,0,1">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
-                    <ColumnDefi)APO",
-        LR"APO(nition Width="*" />
+                    <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Button Grid.Column="0" Style="{StaticResource IconBtn}" FontFamily="Segoe MDL2 Assets" Content="" x:Name="_ev18" />
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="7,0">
@@ -760,7 +801,8 @@ static ::Platform::String^ __MainPageXaml() {
                         <ComboBoxItem Content="Qwant" />
                     </ComboBox>
 
-                    <TextBlock Text="主页(URL,留空用内置主页)" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,18,0,4" />
+                    <TextBlock Text="主页(URL,留空用内置主页)" Foreground="{StaticResource Tx)APO",
+        LR"APO(tLo}" FontSize="13" Margin="0,18,0,4" />
                     <TextBox x:Name="SetHomeBox" HorizontalAlignment="Stretch" InputScope="Url" PlaceholderText="about:home" />
 
                     <ToggleSwitch x:Name="SetUaSwitch" Header="启动请求桌面版网站" Foreground="{StaticResource TxtHi}" Margin="0,18,0,0" />
@@ -799,16 +841,32 @@ static ::Platform::String^ __MainPageXaml() {
                          normal INTERACTION section, not DEVELOPER. -->
                     <ToggleSwitch x:Name="SetDtapZoomSwitch" Header="双击缩放" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
 
+                    <!-- Apotheosis (page width, 0.1.9.58): the engine device scale factor. A page
+                         is laid out at (engine px / factor) CSS px, so a larger factor gives a
+                         narrower, phone-sized layout viewport while tiles still raster at the full
+                         engine resolution (text stays sharp). The five item labels are built in
+                         ShowSettings - they carry the resulting CSS width, which depends on the
+                         current engine viewport, and are language-neutral. -->
+                    <TextBlock Text="页面宽度" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,6,0,4" />
+                    <ComboBox x:Name="SetPageWidthCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem />
+                        <ComboBoxItem />
+                        <ComboBoxItem />
+                        <ComboBoxItem />
+                        <ComboBoxItem />
+                    </ComboBox>
+                    <TextBlock Text="倍数越大，页面按越窄的宽度排版（更像手机），文字更大" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,6" />
+
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
-                    <To)APO",
-        LR"APO(ggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
+                    <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6" />
                     <Button Tag="gpu" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)" x:Name="_ev19" />
 
                     <TextBlock Text="PRIVACY" Foreground="{StaticResource Warm}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7" />
                     <Button Tag="clearhist" Style="{StaticResource SetRow}" Content="清除历史记录" Margin="0,0,0,6" x:Name="_ev20" />
                     <Button Tag="clearfav" Style="{StaticResource SetRow}" Content="清除全部收藏" Margin="0,0,0,6" x:Name="_ev21" />
                     <Button Tag="cleardl" Style="{StaticResource SetRow}" Content="清除下载记录" Margin="0,0,0,6" x:Name="_ev22" />
-                    <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev23" />
+                    <Button Tag="clearcookies" Style="{StaticResource SetRow}" Foreground="{StaticResource )APO",
+        LR"APO(Danger}" Content="清除 Cookie(退出全部登录)" x:Name="_ev23" />
 
                     <!-- 自动检查更新：唯一一条非用户发起的外部请求（api.github.com），默认关。 -->
                     <ToggleSwitch x:Name="SetUpdateSwitch" Header="自动检查更新" Foreground="{StaticResource TxtHi}" Margin="0,12,0,2" />
@@ -868,11 +926,52 @@ static ::Platform::String^ __MainPageXaml() {
             </Button>
         </Grid>
 
+        <!-- ===== Apotheosis (link context menu, 0.1.9.42):长按链接弹出的小菜单 =====
+             Hand-built instead of a MenuFlyout on purpose. A flyout can only be placed at an
+             arbitrary point through ShowAt(UIElement, FlyoutShowOptions), which is 10.0.15063+,
+             and this package declares TargetDeviceFamily MinVersion 10.0.14393 - a menu that has
+             to appear AT THE FINGER cannot depend on an API the manifest says may not be there.
+             As an overlay it is also the same shape as every other panel in this file (Grid.Row=0
+             + RowSpan=2 over the whole RootGrid, Visibility toggled from code, Back handled in
+             OnHardwareBack), so light dismiss, keyboard handling and the Back key need no new
+             machinery.
+             Background="Transparent" and NOT a Scrim: this is a small menu next to a link, not a
+             modal sheet, so the page stays fully visible - but the grid must still be hit-testable
+             (Transparent is; a null Background is not) or a tap outside would fall through to the
+             page and scroll it instead of dismissing.
+             The card is Left/Top aligned and positioned by its Margin from code (ShowLinkMenu),
+             which is why it declares an explicit Width: the placement)APO",
+        LR"APO( math needs a width before
+             the first arrange.
+             IsHoldingEnabled/IsDoubleTapEnabled False throughout - a hold or a double tap on the
+             menu itself is not a gesture, and the double-tap flag has the same "the recogniser
+             belongs to the original source" trap as ContentArea's (see the comment there). -->
+        <Grid x:Name="LinkMenu" Grid.Row="0" Grid.RowSpan="2" Background="Transparent" Visibility="Collapsed" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+            <Border x:Name="LinkMenuCard" Width="268" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="8,8,0,0" Background="{StaticResource Surface}" BorderBrush="{StaticResource Sep}" BorderThickness="1" CornerRadius="12" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+                <StackPanel Margin="0,10,0,4">
+                    <!-- 目标链接:仅供辨认,不可点。0.1.9.44:长链接改为可横向拖动查看,不再省略号截断
+                         (一个被长按的目标必须能被完整读出),卡片宽度不变。ScrollViewer 不取 x:Name —
+                         代码侧无需访问,也就不必让 gen-xaml-codebehind.ps1 认识一个新类型。
+                         纵向滚动关闭:内容只有一行,SV 因此按内容高度参与 StackPanel 布局。 -->
+                    <ScrollViewer Margin="14,0,14,9" HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Auto" VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled" ZoomMode="Disabled" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+                        <TextBlock x:Name="LinkMenuTarget" Text="" Foreground="{StaticResource TxtLo}" FontSize="12" TextWrapping="NoWrap" />
+                    </ScrollViewer>
+                    <Border Height="1" Background="{StaticResource Sep}" />
+                    <Button x:Name="LinkMenuOpenBtn" Background="Transparent" BorderThickness="0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="14,13" IsHoldingEnabled="False" IsDoubleTapEnabled="False">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="" FontFamily="Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
+                            <!-- 文本每次弹出时由 ShowLinkMenu 按当前语言重写(L8),此处仅为设计期占位。 -->
+                            <TextBlock x:Name="LinkMenuOpenLabel" Text="在新标签页中打开" Margin="10,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource TxtHi}" FontSize="15" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </Border>
+        </Grid>
+
         <!-- ===== 首启 OOBE:欢迎 + 选语言(English / 中文)。仅全新安装(settings.ini 无 lang)弹出。 ===== -->
         <Grid x:Name="OobePanel" Grid.Row="0" Grid.RowSpan="2" Background="{StaticResource PageBg}" Visibility="Collapsed">
             <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="36,0" MaxWidth="380">
-                <Border Width="64" Height="64" CornerRadius="32" BorderBrush="{StaticResource Accent}" Border)APO",
-        LR"APO(Thickness="2" Background="{StaticResource AccentDim}" Margin="0,0,0,22">
+                <Border Width="64" Height="64" CornerRadius="32" BorderBrush="{StaticResource Accent}" BorderThickness="2" Background="{StaticResource AccentDim}" Margin="0,0,0,22">
                     <TextBlock Text="A" Foreground="{StaticResource Accent}" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center" />
                 </Border>
                 <TextBlock Text="APOTHEOSIS" Foreground="{StaticResource Accent}" FontSize="12" CharacterSpacing="220" HorizontalAlignment="Center" />
@@ -921,6 +1020,7 @@ void MainPage::InitializeComponent() {
     SetGpuSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetGpuSwitch"));
     SetUpdateSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetUpdateSwitch"));
     SetPrefetchCombo = safe_cast<::Windows::UI::Xaml::Controls::ComboBox^>(__root->FindName(L"SetPrefetchCombo"));
+    SetPageWidthCombo = safe_cast<::Windows::UI::Xaml::Controls::ComboBox^>(__root->FindName(L"SetPageWidthCombo"));
     SetScrollFabSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetScrollFabSwitch"));
     SetAxisLockSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetAxisLockSwitch"));
     SetDtapZoomSwitch = safe_cast<::Windows::UI::Xaml::Controls::ToggleSwitch^>(__root->FindName(L"SetDtapZoomSwitch"));
@@ -954,6 +1054,7 @@ void MainPage::InitializeComponent() {
     TitleRow = safe_cast<::Windows::UI::Xaml::Controls::Border^>(__root->FindName(L"TitleRow"));
     TitleRowShift = safe_cast<::Windows::UI::Xaml::Media::TranslateTransform^>(__root->FindName(L"TitleRowShift"));
     TitleText = safe_cast<::Windows::UI::Xaml::Controls::TextBlock^>(__root->FindName(L"TitleText"));
+    ProgressStrip = safe_cast<::Windows::UI::Xaml::Controls::Border^>(__root->FindName(L"ProgressStrip"));
     Progress = safe_cast<::Windows::UI::Xaml::Controls::ProgressBar^>(__root->FindName(L"Progress"));
     ScrollFab = safe_cast<::Windows::UI::Xaml::Controls::StackPanel^>(__root->FindName(L"ScrollFab"));
     FindBar = safe_cast<::Windows::UI::Xaml::Controls::Border^>(__root->FindName(L"FindBar"));
@@ -967,24 +1068,24 @@ void MainPage::InitializeComponent() {
     ContentArea = safe_cast<::Windows::UI::Xaml::Controls::Grid^>(__root->FindName(L"ContentArea"));
     RenderImage = safe_cast<::Windows::UI::Xaml::Controls::Image^>(__root->FindName(L"RenderImage"));
     // ---- 挂事件 ----
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnPageTapped);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationCompleted += ref new ::Windows::UI::Xaml::Input::ManipulationCompletedEventHandler(this, &MainPage::OnImageManipCompleted);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ContentArea"))->ManipulationDelta += ref new ::Windows::UI::Xaml::Input::ManipulationDeltaEventHandler(this, &MainPage::OnImageManipDelta);
     safe_cast<::Windows::UI::Xaml::FrameworkElement^>(__root->FindName(L"GpuPanel"))->Loaded += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnGpuPanelLoaded);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"ImeBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnImeKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"ImeBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnImeTextChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev1"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollUp);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev2"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnScrollDown);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"FindBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnFindKeyDown);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"FindBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnFindChanged);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindPrev"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindPrev);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindNext"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindNext);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"FindClose"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnFindClose);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"TabsBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabs);
-    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->KeyDown += ref new ::Windows::UI::Xaml::Input::KeyEventHandler(this, &MainPage::OnUrlKeyDown);
-    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
+    safe_cast<::Windows::UI::Xaml::Controls::TextBox^>(__root->FindName(L"UrlBox"))->TextChanged += ref new ::Windows::UI::Xaml::Controls::TextChangedEventHandler(this, &MainPage::OnUrlChanged);
     safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->GotFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlGotFocus);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"UrlBox"))->LostFocus += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlLostFocus);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlActionBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlAction);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"UrlClearBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnUrlClear);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"MenuBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnMenu);
@@ -1023,6 +1124,9 @@ void MainPage::InitializeComponent() {
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev25"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnSettingsBtn);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev26"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnTabSwitcherDone);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev27"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnNewTab);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"LinkMenu"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnLinkMenuScrimTap);
+    safe_cast<::Windows::UI::Xaml::UIElement^>(__root->FindName(L"LinkMenuCard"))->Tapped += ref new ::Windows::UI::Xaml::Input::TappedEventHandler(this, &MainPage::OnLinkMenuCardTap);
+    safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"LinkMenuOpenBtn"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnLinkMenuOpenNewTab);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev28"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnOobeLang);
     safe_cast<::Windows::UI::Xaml::Controls::Button^>(__root->FindName(L"_ev29"))->Click += ref new ::Windows::UI::Xaml::RoutedEventHandler(this, &MainPage::OnOobeLang);
 }

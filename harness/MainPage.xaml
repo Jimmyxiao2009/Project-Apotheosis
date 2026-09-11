@@ -909,6 +909,22 @@
                          normal INTERACTION section, not DEVELOPER. -->
                     <ToggleSwitch x:Name="SetDtapZoomSwitch" Header="双击缩放" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
 
+                    <!-- Apotheosis (page width, 0.1.9.58): the engine device scale factor. A page
+                         is laid out at (engine px / factor) CSS px, so a larger factor gives a
+                         narrower, phone-sized layout viewport while tiles still raster at the full
+                         engine resolution (text stays sharp). The five item labels are built in
+                         ShowSettings - they carry the resulting CSS width, which depends on the
+                         current engine viewport, and are language-neutral. -->
+                    <TextBlock Text="页面宽度" Foreground="{StaticResource TxtLo}" FontSize="13" Margin="0,6,0,4"/>
+                    <ComboBox x:Name="SetPageWidthCombo" HorizontalAlignment="Stretch">
+                        <ComboBoxItem/>
+                        <ComboBoxItem/>
+                        <ComboBoxItem/>
+                        <ComboBoxItem/>
+                        <ComboBoxItem/>
+                    </ComboBox>
+                    <TextBlock Text="倍数越大，页面按越窄的宽度排版（更像手机），文字更大" Foreground="{StaticResource TxtLo}" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,6"/>
+
                     <TextBlock Text="RENDERING" Foreground="{StaticResource Accent}" FontSize="10" CharacterSpacing="130" Margin="0,22,0,7"/>
                     <ToggleSwitch x:Name="SetGpuSwitch" Header="默认启用 GPU 渲染(加载首个网页后自动开)" Foreground="{StaticResource TxtHi}" Margin="0,0,0,6"/>
                     <Button Tag="gpu" Click="OnSettingsBtn" Style="{StaticResource SetRow}" Content="立即开启 GPU 合成(重启回软件)"/>

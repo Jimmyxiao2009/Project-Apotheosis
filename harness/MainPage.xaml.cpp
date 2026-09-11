@@ -3069,6 +3069,60 @@ void MainPage::ApplyPrefetchSetting()
     WebEngine::instance().post([en]() { try { WebCoreSetSpeculativePrefetch(en); } catch (...) {} });
 }
 
+// Apotheosis (page width, 0.1.9.58): the page-width factor behind Settings -> INTERACTION, which
+//   is the engine's device scale factor. The engine lays a page out at (engine px / factor) CSS px,
+//   so 1.5 turns the 720 engine px portrait panel into a 480 CSS px layout viewport - a phone-sized
+//   one instead of a tablet one - while tiles still raster at the full engine resolution, so text
+//   stays sharp. This table is the ONE place the index-to-factor mapping lives; the item labels,
+//   the setter and settings.ini all read it.
+static const float kPageWidthFactors[] = { 1.0f, 1.25f, 1.5f, 1.75f, 2.0f };
+static const int kPageWidthCount = (int)(sizeof(kPageWidthFactors) / sizeof(kPageWidthFactors[0]));
+static const int kPageWidthDefault = 2;   // 1.5x
+
+static float PageWidthFactorFor(int index)
+{
+    if (index < 0 || index >= kPageWidthCount) index = kPageWidthDefault;
+    return kPageWidthFactors[index];
+}
+
+// Two decimals for the diagnostics - Dip()'s single decimal would round 1.25 and 1.75 together.
+static std::string Dsf(float f)
+{
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.2f", (double)f);
+    return std::string(buf);
+}
+
+// One combo item label: the factor and the CSS width it produces, e.g. "1.5x . 480 px" (with a
+//   multiplication sign and a middle dot). Deliberately language-neutral - digits, two symbols and
+//   "px" - so it is NOT in kI18n and I18n() leaves it alone. The width comes from the PORTRAIT
+//   engine width (the short side of the current viewport), so rotating the device does not
+//   renumber the list.
+static std::wstring PageWidthLabel(int index)
+{
+    const float f = PageWidthFactorFor(index);
+    const int portraitW = (kW < kH) ? kW : kH;
+    const int cssW = (int)((double)portraitW / (double)f + 0.5);
+    char num[16];
+    std::snprintf(num, sizeof(num), "%.2f", (double)f);
+    std::string n(num);
+    // 1.00 -> 1.0, 1.50 -> 1.5, 2.00 -> 2.0; 1.25 and 1.75 keep both decimals.
+    if (n.size() > 3 && n[n.size() - 1] == '0' && n[n.size() - 2] != '.') n.erase(n.size() - 1);
+    std::wstring w(n.begin(), n.end());   // ASCII digits and '.' only
+    return w + L"\u00D7 \u00B7 " + std::to_wstring(cssW) + L" px";
+}
+
+// Apotheosis (page width, 0.1.9.58): hand the chosen factor to the engine. UI thread only; posts
+//   to the engine thread and never waits on it, exactly like ApplyPrefetchSetting above. The driver
+//   only STORES the value - it reaches a page that is already up through the WebCoreResize that
+//   HideSettings forces right after this, and a page loaded later picks it up on its own.
+void MainPage::ApplyPageWidthSetting()
+{
+    if (m_pageWidth < 0 || m_pageWidth >= kPageWidthCount) m_pageWidth = kPageWidthDefault;
+    const float f = PageWidthFactorFor(m_pageWidth);
+    WebEngine::instance().post([f]() { try { WebCoreSetPageWidthFactor(f); } catch (...) {} });
+}
+
 // Apotheosis: the floating page up/down buttons are a developer aid (they were there to trigger
 //   lazy loading before touch scrolling worked). Off unless Settings → DEVELOPER turns them on.
 void MainPage::UpdateScrollFab()
@@ -5897,6 +5951,7 @@ void MainPage::ApplySettings()
     });
     UpdateScrollFab();
     ApplyPrefetchSetting();
+    ApplyPageWidthSetting();                 // Apotheosis: INTERACTION page width, UI thread only
     ApplyEventPresentSetting();              // Apotheosis: registers the engine present wake-up
     ApplyHideNavBarSetting();                // Apotheosis: DISPLAY toggle, UI thread only
     ApplyHideStatusBarSetting();             // Apotheosis: DISPLAY toggle, UI thread only
@@ -5927,6 +5982,7 @@ void MainPage::LoadSettings()
             else if (k == "ua_custom") m_uaCustom = Utf8ToWide(v);
             else if (k == "updatecheck") m_updateAuto = (atoi(v.c_str()) != 0);
             else if (k == "prefetch") m_prefetch = atoi(v.c_str());
+            else if (k == "pagewidth") m_pageWidth = atoi(v.c_str());
             else if (k == "scrollfab") m_showScrollFab = (atoi(v.c_str()) != 0);
             else if (k == "hidenavbar") m_hideNavBar = (atoi(v.c_str()) != 0);
             else if (k == "hidestatusbar") m_hideStatusBar = (atoi(v.c_str()) != 0);
@@ -5936,6 +5992,7 @@ void MainPage::LoadSettings()
         }
     }
     if (m_setSearch < 0 || m_setSearch > 4) m_setSearch = 2;   // Apotheosis: unknown index -> the fresh-install default
+    if (m_pageWidth < 0 || m_pageWidth > 4) m_pageWidth = 2;   // Apotheosis (page width): same, 2 = factor 1.5
     if (g_lang != L"en" && g_lang != L"zh") g_lang = L"zh";
     ApplySettings();
 }
@@ -5953,6 +6010,7 @@ void MainPage::SaveSettings()
     s += "ua_custom=" + WideToUtf8(m_uaCustom) + "\n";
     s += "updatecheck=" + std::to_string(m_updateAuto ? 1 : 0) + "\n";
     s += "prefetch=" + std::to_string(m_prefetch) + "\n";
+    s += "pagewidth=" + std::to_string(m_pageWidth) + "\n";
     s += "scrollfab=" + std::to_string(m_showScrollFab ? 1 : 0) + "\n";
     s += "hidenavbar=" + std::to_string(m_hideNavBar ? 1 : 0) + "\n";
     s += "hidestatusbar=" + std::to_string(m_hideStatusBar ? 1 : 0) + "\n";
@@ -5976,6 +6034,18 @@ void MainPage::ShowSettings()
     if (SetGpuSwitch) SetGpuSwitch->IsOn = m_gpuDefault;
     if (SetUpdateSwitch) SetUpdateSwitch->IsOn = m_updateAuto;
     if (SetPrefetchCombo) SetPrefetchCombo->SelectedIndex = m_prefetch;
+    // Apotheosis (page width, 0.1.9.58): the five labels carry the CSS width the factor produces,
+    //   which depends on the current engine viewport - so they are built here, at every open,
+    //   instead of living as fixed strings in the XAML.
+    if (SetPageWidthCombo) {
+        auto pwItems = SetPageWidthCombo->Items;
+        const int pwN = pwItems ? (int)pwItems->Size : 0;
+        for (int i = 0; i < pwN && i < kPageWidthCount; ++i) {
+            auto pwItem = dynamic_cast<Windows::UI::Xaml::Controls::ComboBoxItem^>(pwItems->GetAt(i));
+            if (pwItem) pwItem->Content = ref new String(PageWidthLabel(i).c_str());
+        }
+        SetPageWidthCombo->SelectedIndex = (m_pageWidth >= 0 && m_pageWidth < pwN) ? m_pageWidth : kPageWidthDefault;
+    }
     if (SetScrollFabSwitch) SetScrollFabSwitch->IsOn = m_showScrollFab;
     if (SetHideNavBarSwitch) SetHideNavBarSwitch->IsOn = m_hideNavBar;
     if (SetHideStatusBarSwitch) SetHideStatusBarSwitch->IsOn = m_hideStatusBar;
@@ -5998,6 +6068,9 @@ void MainPage::ShowSettings()
 
 void MainPage::HideSettings()
 {
+    // Apotheosis (page width, 0.1.9.58): remembered before the harvest below - only a real
+    //   change may force a relayout of the page that is up.
+    const int prevPageWidth = m_pageWidth;
     // 语言先切:后面的 ApplySettings 才会用新语言刷运行期标签。
     if (SetLangCombo && SetLangCombo->SelectedIndex >= 0)
         SetLanguage(SetLangCombo->SelectedIndex == 1 ? L"en" : L"zh");
@@ -6014,6 +6087,7 @@ void MainPage::HideSettings()
     if (SetGpuSwitch) m_gpuDefault = SetGpuSwitch->IsOn;
     if (SetUpdateSwitch) m_updateAuto = SetUpdateSwitch->IsOn;
     if (SetPrefetchCombo && SetPrefetchCombo->SelectedIndex >= 0) m_prefetch = SetPrefetchCombo->SelectedIndex;
+    if (SetPageWidthCombo && SetPageWidthCombo->SelectedIndex >= 0) m_pageWidth = SetPageWidthCombo->SelectedIndex;
     if (SetScrollFabSwitch) m_showScrollFab = SetScrollFabSwitch->IsOn;
     if (SetHideNavBarSwitch) m_hideNavBar = SetHideNavBarSwitch->IsOn;
     if (SetHideStatusBarSwitch) m_hideStatusBar = SetHideStatusBarSwitch->IsOn;
@@ -6027,6 +6101,13 @@ void MainPage::HideSettings()
     }
     ApplySettings();
     SaveSettings();
+    // Apotheosis (page width, 0.1.9.58): the factor only reaches a page that is already up
+    //   through a relayout. ApplySettings() above has queued the setter on the engine thread,
+    //   and this queues the resize behind it on that same single queue, so the engine is on the
+    //   new factor before it re-lays the document out - keep that order. force=true because the
+    //   viewport size itself has not changed; UpdateEngineViewport also re-renders a static
+    //   page (start/error), which is the only way those reflow.
+    if (m_pageWidth != prevPageWidth) UpdateEngineViewport("pagewidth", /*force*/ true);
     SettingsPage->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
     StartLiveMode();
 }
@@ -6062,6 +6143,9 @@ static const wchar_t* const kI18n[][2] = {
     { L"交互", L"Interaction" },
     { L"轴锁定(单指滚动吸附方向)", L"Axis lock" },
     { L"双击缩放", L"Double-tap to zoom" },
+    { L"页面宽度", L"Page width" },
+    { L"倍数越大，页面按越窄的宽度排版（更像手机），文字更大",
+      L"A larger factor lays the page out at a narrower, phone-sized width, so text is bigger" },
     { L"隐藏系统导航栏", L"Hide navigation bar" },
     { L"从屏幕底部向上轻扫可临时唤回",
       L"Swipe up from the bottom edge to bring it back temporarily" },
@@ -6924,7 +7008,8 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
                 + " panel=" + Dip(panelW) + "x" + Dip(panelH)
                 + " scale=" + Dip(m_engineScale)
                 + " gpu=" + (m_gpuPresent ? "1" : "0")
-                + " occ=" + std::to_string(occ)).c_str());
+                + " occ=" + std::to_string(occ)
+                + " dsf=" + Dsf(PageWidthFactorFor(m_pageWidth))).c_str());
 
     // Apotheosis (landscape, 0.1.9.43): a static page (start page / error page) is a ONE-SHOT
     //   WebCoreRenderHtml with no session behind it, so WebCoreResize finds no LocalFrameView and
@@ -7276,13 +7361,16 @@ void MainPage::EnableGpu()
         std::wstring fd = LocalStateDir();
         if (!fd.empty()) { try { std::ofstream f(WideToUtf8(fd) + "\\gpu-crash.flag", std::ios::binary | std::ios::trunc); if (f) f << "1"; } catch (...) {} }
     }
-    WebEngine::instance().post([disp, self, win, engW, engH]() {
+    // Apotheosis (page width, 0.1.9.58): read on the UI thread and carried along, so gpuinit.txt
+    //   records which page-width factor this run started with.
+    const float pwDsf = PageWidthFactorFor(m_pageWidth);
+    WebEngine::instance().post([disp, self, win, engW, engH, pwDsf]() {
         int rc = -999;
         try { rc = WebCoreGpuInit(win, engW, engH); } catch (...) { rc = -1000; }
         if (rc == 0) NoteEngineFrameSize(engW, engH);
         try {
             std::wstring d = LocalStateDir();
-            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + "\n"; f.write(s.data(), s.size()); } }
+            if (!d.empty()) { std::ofstream f(WideToUtf8(d) + "\\gpuinit.txt", std::ios::binary | std::ios::trunc); if (f) { std::string s = "WebCoreGpuInit(window) rc=" + std::to_string(rc) + " dsf=" + Dsf(pwDsf) + "\n"; f.write(s.data(), s.size()); } }
         } catch (...) {}
         int rcCopy = rc;
         try {

@@ -255,6 +255,9 @@ namespace Harness {
         // Apotheosis: push the PRIVACY prefetch choice (m_prefetch + current connection cost) to the
         //   engine. UI thread only; posts to the engine thread, never waits on it.
         void ApplyPrefetchSetting();
+        // Apotheosis (page width, 0.1.9.58): push the INTERACTION page-width choice (m_pageWidth)
+        //   to the engine. UI thread only; posts to the engine thread, never waits on it.
+        void ApplyPageWidthSetting();
         void OnScrollUp(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         void OnScrollDown(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
         // 自由滚动:内容区 ManipulationDelta(单指拖拽 ΔY)→ 累积位移 → 合并成引擎滚动(无 spinner,带惯性)。
@@ -519,6 +522,10 @@ namespace Harness {
         std::wstring m_uaCustom;      // 自定义 UA(空=用 mobile/desktop 开关);settings.ini ua_custom
         bool m_updateAuto { false };  // 隐私：启动后自动查 GitHub 更新（默认关）；settings.ini updatecheck
         int  m_prefetch { 0 };        // 隐私：推测预取 0=关/1=仅 Wi-Fi(不计费连接)/2=始终；settings.ini prefetch
+        // Apotheosis (page width, 0.1.9.58): index into the factor table in MainPage.xaml.cpp
+        //   (0=1.0 / 1=1.25 / 2=1.5 / 3=1.75 / 4=2.0). The factor is the engine device scale
+        //   factor: the page lays out at (engine px / factor) CSS px. settings.ini pagewidth
+        int  m_pageWidth { 2 };
         bool m_showScrollFab { false };// 开发者选项:悬浮翻页按钮(默认关);settings.ini scrollfab
         // Apotheosis (review 2026-09-04 item 4): the suspend deferral in flight, and the timer that
         //   bounds how long the engine may keep the shell waiting for it. Both UI thread only.
