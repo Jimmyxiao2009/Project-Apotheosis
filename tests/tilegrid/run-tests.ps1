@@ -6,7 +6,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$WebKitSourceDir = 'C:/code/apotheosis/webkit',
+    [string]$WebKitSourceDir = '',
     [string]$BuildDir = '',
     [ValidateSet('Ninja', 'VS2022')]
     [string]$Generator = 'VS2022',
@@ -17,6 +17,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $BuildDir) { $BuildDir = Join-Path $here 'build' }
+
+if (-not $WebKitSourceDir) {
+    # Default: a WebKit checkout next to this repository. Pass
+    # -WebKitSourceDir if it lives somewhere else.
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $here)
+    foreach ($candidate in @('webkit', 'WebKit')) {
+        $try = Join-Path (Split-Path -Parent $repoRoot) $candidate
+        if (Test-Path (Join-Path $try 'Source\WebCore')) { $WebKitSourceDir = $try; break }
+    }
+    if (-not $WebKitSourceDir) {
+        throw 'No WebKit checkout found next to the repository. Pass -WebKitSourceDir <path to the patched webkitgtk-2.52.4 tree>.'
+    }
+}
 
 if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item -Recurse -Force $BuildDir

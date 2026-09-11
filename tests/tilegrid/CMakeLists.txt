@@ -12,7 +12,25 @@
 cmake_minimum_required(VERSION 3.20)
 project(tilegrid-tests CXX)
 
-set(WEBKIT_SOURCE_DIR "C:/code/apotheosis/webkit" CACHE PATH "Root of the patched WebKit tree (branch winuwp)")
+# Default: a WebKit checkout named "webkit" or "WebKit" next to this
+# repository. Pass -DWEBKIT_SOURCE_DIR=<path> if yours lives elsewhere.
+set(WEBKIT_SOURCE_DIR "" CACHE PATH "Root of the patched WebKit tree (branch winuwp)")
+if(NOT WEBKIT_SOURCE_DIR)
+    get_filename_component(_apo_repo_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+    get_filename_component(_apo_side_by_side "${_apo_repo_root}/.." ABSOLUTE)
+    foreach(_apo_candidate "webkit" "WebKit")
+        if(EXISTS "${_apo_side_by_side}/${_apo_candidate}/Source/WebCore")
+            set(WEBKIT_SOURCE_DIR "${_apo_side_by_side}/${_apo_candidate}")
+            break()
+        endif()
+    endforeach()
+    if(NOT WEBKIT_SOURCE_DIR)
+        message(FATAL_ERROR
+            "No WebKit checkout found next to ${_apo_repo_root}. "
+            "Pass -DWEBKIT_SOURCE_DIR=<path to the patched webkitgtk-2.52.4 tree>.")
+    endif()
+    message(STATUS "WEBKIT_SOURCE_DIR defaulted to ${WEBKIT_SOURCE_DIR}")
+endif()
 
 set(TEXMAP_DIR "${WEBKIT_SOURCE_DIR}/Source/WebCore/platform/graphics/texmap")
 set(SML_DIR "${WEBKIT_SOURCE_DIR}/Source/ThirdParty/sml")
