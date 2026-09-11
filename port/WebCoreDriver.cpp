@@ -5646,11 +5646,12 @@ int WebCoreGetPageScale()
 // call from the harness' tap-hold path before it has decided whether to click at all.
 // Apotheosis (0.1.9.40): outReason says which rule decided the answer, so a device trace can tell
 // "opted out" apart from "hit test missed" apart from "already zoomed" instead of everything
-// collapsing into zoomable=0. Values: 0 = zoomable (target computed), 1 = already zoomed
-// (curScale>1.05), 2 = no element under the point, 3 = viewport meta disables zoom, 4 = mobile-
-// optimised viewport, 5 = touch-action opt-out, 6 = target within 5% of curScale (not worth
-// animating). Left at -1 on every early/error return above (no session, busy, no document) — those
-// are not a rule decision, and the caller already has rc for that.
+// collapsing into zoomable=0. Values: 0 = zoomable (target computed), 1 = zoomed IN
+// (curScale > 1.05), 7 = zoomed OUT (curScale < 0.95 — 0.1.9.50, the other half of rule 1),
+// 2 = no element under the point, 3 = viewport meta disables zoom, 4 = mobile-optimised viewport,
+// 5 = touch-action opt-out, 6 = target within 5% of curScale (not worth animating). Left at -1 on
+// every early/error return above (no session, busy, no document) — those are not a rule decision,
+// and the caller already has rc for that.
 int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason)
 {
     using namespace WebCore;
@@ -5674,17 +5675,26 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
 
     // Apotheosis (0.1.9.40): "already zoomed" moved BEFORE the hit test (0.1.9.38 put it after
     // elementFromPoint(), which is why it never actually ran at scale — see below). The rule needs
-    // no element at all: the page scale above 1:1 is the harness' own pinch zoom, not something the
-    // page asked for, so a double tap must always be able to undo it — otherwise a page that opts
-    // out of double-tap-to-zoom (a map, a site with touch-action or user-scalable=no) traps the user
-    // at whatever scale the pinch left behind.
+    // no element at all: a page scale that is not 1:1 is the harness' own pinch zoom, not something
+    // the page asked for, so a double tap must always be able to undo it — otherwise a page that
+    // opts out of double-tap-to-zoom (a map, a site with touch-action or user-scalable=no) traps
+    // the user at whatever scale the pinch left behind.
+    //
+    // Apotheosis (0.1.9.50): the rule is SYMMETRIC. It used to read curScale > 1.05, so it only
+    // undid a pinch IN; a page the user had pinched OUT (this harness commits down to 0.5, the
+    // "survey a long page" overview) fell through to the viewport rules below and was refused —
+    // the device trace of 0.1.9.49 is exactly that, "zoomable=0 ... why=4 target=1.0 ... act=wait"
+    // at a scale below 1. Undoing a zoom must not depend on which way it went, so the test is now
+    // the distance from 1:1 in either direction, with its own reason code per direction so a trace
+    // still says which half fired.
     RefPtr<Page> page = g_session->page;
     float curScale = page ? page->pageScaleFactor() : 1.0f;
     if (!(curScale > 0.0f)) curScale = 1.0f;
-    if (curScale > 1.05f) {
+    const float offOneToOne = (curScale > 1.0f) ? (curScale - 1.0f) : (1.0f - curScale);
+    if (offOneToOne > 0.05f) {
         if (outZoomable) *outZoomable = 1;
         if (outTargetScale) *outTargetScale = 1.0f;
-        if (outReason) *outReason = 1;   // already zoomed
+        if (outReason) *outReason = (curScale > 1.0f) ? 1 : 7;   // zoomed in / zoomed out
         return kOK;
     }
 
@@ -5694,10 +5704,11 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     // wide, so a raw bitmap-px point like x=566 named a client coordinate far outside
     // visibleContentRect() and TreeScope::nodeFromPoint() returned null every time — which meant the
     // "already zoomed" rule above, that 0.1.9.38 had placed AFTER this call, never got a chance to
-    // run at any scale worth mentioning. curScale is <=1.05 here (the branch above already returned
-    // otherwise), so this conversion is a no-op in practice at this point in the function, but it
-    // keeps this call consistent with the other three hit-test sites that had the identical bug at
-    // higher scales (WebCoreClickAt's focus-on-editable, WebCoreIsScrollableAt, dragWidgetAtPoint).
+    // run at any scale worth mentioning. curScale is within 5 % of 1:1 here (the branch above
+    // already returned otherwise, in both directions since 0.1.9.50), so this conversion is a
+    // no-op in practice at this point in the function, but it keeps this call consistent with the
+    // other three hit-test sites that had the identical bug at higher scales (WebCoreClickAt's
+    // focus-on-editable, WebCoreIsScrollableAt, dragWidgetAtPoint).
     DoublePoint cp = clientPointForEnginePoint(page.get(), x, y);
     RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
     if (!hit) {
@@ -5773,9 +5784,9 @@ int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, in
     // hit element up towards <html> so the FIRST candidate found is the innermost/smallest one.
     // boundingClientRect() and (x,y) are read in the same viewport/bitmap px space this driver
     // already uses them in elsewhere with no extra scale conversion (extractLinks, dragWidgetAtPoint)
-    // — exact at scale 1.0 and close enough up to the 1.05 threshold checked above; a bigger
-    // current scale would need an extra factor of curScale (see WebCoreSetPageScale's own derivation
-    // of engine-px-vs-CSS-px), which this branch never runs at.
+    // — exact at scale 1.0 and close enough inside the ±5 % band around 1:1 checked above; any
+    // other current scale would need an extra factor of curScale (see WebCoreSetPageScale's own
+    // derivation of engine-px-vs-CSS-px), which this branch never runs at.
     //
     // Apotheosis (0.1.9.38): a block only counts as a "column" if it is meaningfully narrower than
     // the viewport. The old test was w < viewportW, and on a page whose content block fills the

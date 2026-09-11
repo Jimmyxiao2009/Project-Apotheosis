@@ -2548,8 +2548,9 @@ void MainPage::OnPageTapped(Platform::Object^, Windows::UI::Xaml::Input::TappedR
             // rc is carried into the trace: the driver answers kErrBusy/kErrNoSession with
             // zoomable=0, which looks exactly like "the page opted out" and must be tellable apart.
             // reason (0.1.9.40, WebCoreDriver.h WebCoreTapPolicyAt): which rule decided — see the
-            // header comment for the 0-6 table (1=already zoomed, 2=no element, 3=viewport disables
-            // zoom, 4=mobile-optimised viewport, 5=touch-action opt-out, 6=target within 5%).
+            // header comment for the 0-7 table (1=zoomed in, 7=zoomed out (0.1.9.50), 2=no element,
+            // 3=viewport disables zoom, 4=mobile-optimised viewport, 5=touch-action opt-out,
+            // 6=target within 5%).
             if (!drag) {
                 try { rc = WebCoreTapPolicyAt(px, py, &zoomable, &target, &anchorX, &anchorY, &reason); }
                 catch (...) { zoomable = 0; rc = -1000; anchorX = px; anchorY = py; }

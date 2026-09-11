@@ -251,10 +251,12 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 // Apotheosis(双击缩放,2026-09-09):命中测试 (x,y),回答这里的第二次点击是否应该缩放页面
 // (Safari/移动 Chrome 语义)而不是被当成普通的第二次点击转发。只读:不派发事件,不改会话/文档
 // 状态——可以在 harness 还没决定要不要真的点击之前,在"按住"路径里调用。
-// 判定顺序(0.1.9.39):
-//   1. 当前页面尺度 > 1.05(= harness 自己的捏合缩放)一律优先:zoomable=1、target=1.0,
-//      不管页面怎么说。双击必须永远能撤销一次捏合,否则关掉双击缩放的页面会把用户
-//      困在捏合留下的尺度上。
+// 判定顺序(0.1.9.39;规则 1 在 0.1.9.50 改为对称):
+//   1. 当前页面尺度与 1:1 相差超过 5%(两个方向都算,= harness 自己的捏合缩放)一律优先:
+//      zoomable=1、target=1.0,不管页面怎么说。双击必须永远能撤销一次捏合,否则关掉双击
+//      缩放的页面会把用户困在捏合留下的尺度上。两个方向都要,因为本 harness 也会提交小于
+//      1:1 的页面尺度(捏出去的"总览"视图,最低 0.5);0.1.9.50 之前这条只判 > 1.05,于是
+//      在用户捏小了的页面上双击会落到规则 2-5 被拒绝。
 //   2. 页面整体关闭缩放(viewport meta user-scalable=no,或 minimum-scale == maximum-scale):不缩放。
 //   3. 页面是移动端优化的(viewport meta 带 width=device-width,或未设 width 而 initial-scale=1)
 //      —— 即 Blink 的 WebViewImpl::ShouldDisableDesktopWorkarounds():不缩放。这条让所有规矩的
@@ -275,10 +277,10 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outBuf);
 //     是 x(点击 x),除非目标尺度来自上面的"缩放到栏"分支——此时是那一栏自己的水平中心
 //     (0.1.9.40):Safari 把窄栏居中显示,而不是锚定在点击点在栏内的任意位置,否则点在栏边缘
 //     会缩放到栏的大半截跑出屏幕外。两种情况下调用方都不必在按住间隔内自己记着点击点。
-//   *outReason (0.1.9.40):上面哪条规则决定了答案——0=可缩放(已算出 target),1=已处于缩放
-//     (规则 1),2=命中点下无元素,3=viewport 关闭缩放(规则 2),4=移动端优化 viewport(规则 3),
-//     5=touch-action opt-out(规则 4),6=目标与当前尺度相差不到 5%(不值得动画)。负数(错误)
-//     返回时留 -1——无会话/忙/无文档不是规则决定。
+//   *outReason (0.1.9.40):上面哪条规则决定了答案——0=可缩放(已算出 target),1=已放大
+//     (规则 1),7=已缩小(规则 1 的另一半,0.1.9.50),2=命中点下无元素,3=viewport 关闭缩放
+//     (规则 2),4=移动端优化 viewport(规则 3),5=touch-action opt-out(规则 4),6=目标与当前
+//     尺度相差不到 5%(不值得动画)。负数(错误)返回时留 -1——无会话/忙/无文档不是规则决定。
 // 任一输出指针可为 null。返回 kOK,或负数错误(无会话时也把 outZoomable 置 0,只查它的调用方
 // 照样安全降级)。
 int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);

@@ -267,10 +267,13 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 // should zoom the PAGE (Safari/mobile-Chrome semantics) instead of the harness treating it as two
 // ordinary clicks. Read-only: no event dispatched, no session/frame mutated, safe to call from the
 // tap-hold path before deciding whether to actually click.
-// The rules, in the order they are applied (0.1.9.39):
-//   1. Current page scale > 1.05 — the harness' own pinch zoom — always wins: zoomable=1,
-//      target 1.0, whatever the page says. A double tap must always be able to undo a pinch,
-//      or an opted-out page traps the user at the scale the pinch left behind.
+// The rules, in the order they are applied (0.1.9.39, rule 1 made symmetric in 0.1.9.50):
+//   1. Current page scale more than 5 % away from 1:1 IN EITHER DIRECTION — the harness' own
+//      pinch zoom — always wins: zoomable=1, target 1.0, whatever the page says. A double tap
+//      must always be able to undo a pinch, or an opted-out page traps the user at the scale the
+//      pinch left behind. Both directions, because this harness commits page scales below 1:1
+//      too (the pinch-out overview, down to 0.5); until 0.1.9.50 the test was scale > 1.05 and a
+//      double tap on a page the user had zoomed OUT fell through to rules 2-5 and was refused.
 //   2. Page opted out of zooming altogether (viewport meta user-scalable=no, or
 //      minimum-scale == maximum-scale): not zoomable.
 //   3. Page is mobile-optimised (viewport meta with width=device-width, or width unset with
@@ -301,10 +304,11 @@ int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
 //     the column off-screen. The caller does not have to remember the tap point across the hold
 //     interval either way.
 //   *outReason (0.1.9.40): which rule above decided the answer — 0 = zoomable (target computed),
-//     1 = already zoomed (rule 1), 2 = no element under the point, 3 = viewport disables zoom
-//     (rule 2), 4 = mobile-optimised viewport (rule 3), 5 = touch-action opt-out (rule 4),
-//     6 = target within 5% of the current scale (not worth animating). Left at -1 on a negative
-//     (error) return — no session/busy/no document, not a rule decision.
+//     1 = zoomed IN (rule 1), 7 = zoomed OUT (rule 1's other half, 0.1.9.50), 2 = no element under
+//     the point, 3 = viewport disables zoom (rule 2), 4 = mobile-optimised viewport (rule 3),
+//     5 = touch-action opt-out (rule 4), 6 = target within 5% of the current scale (not worth
+//     animating). Left at -1 on a negative (error) return — no session/busy/no document, not a
+//     rule decision.
 // Any output pointer may be null. Returns kOK, or a negative error (no session prints
 // outZoomable=0 as well, so a caller that only checks *outZoomable still degrades safely).
 int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
