@@ -2297,6 +2297,14 @@ void MainPage::NavigateTo(Platform::String^ url, bool pushHistory)
                     s->m_lastFrameHash = 0;
                     if (sessionActive) s->StartLiveMode(); else s->StopLiveMode();
                     s->OnNavDone(ref new String(titleCopy->c_str()), ok, loadOk);
+                    // Apotheosis (start page, 0.1.9.52): the viewport can move while this render is in
+                    //   flight, and at app start it always does - the first home render is posted from
+                    //   the constructor with the compile-time default viewport, and the panel is only
+                    //   arranged afterwards. Nothing else repaints a static page, so the app-start page
+                    //   kept a layout no other start page ever has unless a resize happened to arrive
+                    //   after m_staticHtml was set. Re-render whenever the two no longer match.
+                    if (!s->m_staticHtml.empty() && (ew != kW || eh != kH))
+                        s->RenderStaticPage("navdone");
                 }));
         } catch (...) {
             // RunAsync 抛了(dispatcher 断开/低内存):OnNavDone 不会跑,m_loading 靠 UI 看门狗复位。
@@ -7062,6 +7070,13 @@ void MainPage::UpdateEngineViewport(const char* why, bool force, int forceW, int
 // rectangles have moved. UI THREAD ONLY.
 void MainPage::RenderStaticPage(const char* why)
 {
+    // Apotheosis (start page, 0.1.9.52): the start page is BUILT here, not replayed, so that one
+    //   builder and one rendering path serve the page at app start, the page a new tab gets, and
+    //   every re-render after a rotation or a language change. Replaying the stored HTML froze
+    //   whatever language, tile set and column count the page had when it was navigated to - the
+    //   app-start page and a new tab's page could differ in all three within one session.
+    if (m_currentUrl == L"about:home")
+        m_staticHtml = BuildHomeHtml(m_bookmarks, m_historyList, kW > kH);
     if (m_staticHtml.empty()) return;
     const std::string html = m_staticHtml;
     const int w = kW, h = kH;
