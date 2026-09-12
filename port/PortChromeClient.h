@@ -25,6 +25,21 @@ struct FocusOptions;
 
 namespace WebCorePort {
 
+// Apotheosis: buffered append to LocalState\console.txt, defined in WebCoreDriver.cpp (the
+// path/ring/opt-in flag are statics of that TU — see the "JS console" block there). Called by
+// PortChromeClient::addMessageToConsole() below. Plain C strings on purpose: keeps this header
+// decoupled from the perf/crash-log internals. No-op when console logging is off.
+void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message);
+
+// Apotheosis (event-driven present): "something wants to be
+// presented". Defined in WebCoreDriver.cpp, where the harness callback registered through
+// WebCoreSetPresentRequestCallback() lives. Fires that callback at most once between two
+// composites (an atomic arms it; WebCoreLiveTick disarms it at the start of every tick), so a
+// burst of invalidations costs one wake-up, not one per invalidation. No-op until the harness
+// registers a callback — the old fixed-interval tick keeps working unchanged. Safe on any
+// thread: the callback contract is "post to a queue, do not call back into the engine".
+void presentRequested();
+
 class PortChromeClient final : public WebCore::ChromeClient {
     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(PortChromeClient);
 public:
@@ -34,6 +49,14 @@ public:
     // ---- driver-facing accessors (the whole point of this subclass) ----
     WebCore::GraphicsLayer* rootLayer() const { return m_rootLayer; }
     bool takeNeedsPresent() { bool v = m_needsPresent; m_needsPresent = false; return v; }
+    // Apotheosis (M4): non-consuming read, lets WebCoreLiveTick decide whether a tick may keep
+    // the already-uploaded tiles (nothing asked for a rendering update since the last present).
+    bool peekNeedsPresent() const { return m_needsPresent; }
+    // Apotheosis (threaded raster): arm a follow-up present from the driver itself.
+    // With threaded raster on, a tile replay that lands after the last composite of an operation
+    // would otherwise sit in its buffer until something else dirties the page; the driver sets this
+    // whenever replays are still in flight, so the next tick composites and uploads them.
+    void setNeedsPresent() { requestPresent(); }
 
     // ======================================================================
     // REAL accelerated-compositing behavior
@@ -42,8 +65,17 @@ public:
     // Pass nullptr as the GraphicsLayer to detach the root layer.
     void attachRootGraphicsLayer(WebCore::LocalFrame&, WebCore::GraphicsLayer* layer) final { m_rootLayer = layer; }
     void attachViewOverlayGraphicsLayer(WebCore::GraphicsLayer*) final { }
-    void setNeedsOneShotDrawingSynchronization() final { m_needsPresent = true; }
-    void triggerRenderingUpdate() final { m_needsPresent = true; }
+    void setNeedsOneShotDrawingSynchronization() final { requestPresent(); }
+    void triggerRenderingUpdate() final { requestPresent(); }
+    // Apotheosis (M4): Page::scheduleRenderingUpdateInternal() asks us first and only falls
+    // back to RenderingUpdateScheduler (display link / timer -> triggerRenderingUpdate) when
+    // we return false. Every repaint request goes through here - including the one an
+    // asynchronous image decode raises via CachedImage::imageFrameAvailable ->
+    // RenderImage::imageChanged -> GraphicsLayerTextureMapper::setNeedsDisplayInRect ->
+    // notifyFlushRequired. Flag the present right away so the very next harness tick shows the
+    // repaired tile instead of waiting for the scheduler's timer; keep returning false so the
+    // scheduler still runs exactly as before.
+    bool scheduleRenderingUpdate() final { requestPresent(); return false; }
 
     // Use the default GraphicsLayerTextureMapper factory.
     WebCore::GraphicsLayerFactory* graphicsLayerFactory() const final { return nullptr; }
@@ -91,7 +123,10 @@ public:
 
     void setResizable(bool) final { }
 
-    void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String&, unsigned, unsigned, const String&) final { }
+    // Apotheosis: mirrors JS console output to LocalState\console.txt (see the "JS console"
+    // block in WebCoreDriver.cpp, ahead of pumpLoop(), for the opt-in policy and ring buffer).
+    // Out-of-line (PortChromeClient.cpp) because it needs the MessageLevel -> string mapping.
+    void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String& message, unsigned lineNumber, unsigned columnNumber, const String& sourceID) final;
 
     bool canRunBeforeUnloadConfirmPanel() final { return false; }
     bool runBeforeUnloadConfirmPanel(String&&, WebCore::LocalFrame&) final { return true; }
@@ -129,7 +164,7 @@ public:
     WebCore::IntPoint accessibilityScreenToRootView(const WebCore::IntPoint& p) const final { return p; }
     WebCore::IntRect rootViewToAccessibilityScreen(const WebCore::IntRect& r) const final { return r; }
 
-    void didFinishLoadingImageForElement(WebCore::HTMLImageElement&) final { m_needsPresent = true; }
+    void didFinishLoadingImageForElement(WebCore::HTMLImageElement&) final { requestPresent(); }
 
     PlatformPageClient platformPageClient() const final { return 0; }
     void contentsSizeChanged(WebCore::LocalFrame&, const WebCore::IntSize&) const final { }
@@ -181,6 +216,16 @@ public:
     void requestCookieConsent(CompletionHandler<void(WebCore::CookieConsentDecisionResult)>&&) final;
 
 private:
+    // Apotheosis (event-driven present): the single place that raises the flag. Every hook above
+    // goes through here so the harness wake-up can never drift out of sync with m_needsPresent.
+    // Engine thread in practice (WebCore calls all of these on it); presentRequested() itself is
+    // thread-safe. Costs one atomic exchange on the first request after a composite, nothing after.
+    void requestPresent()
+    {
+        m_needsPresent = true;
+        presentRequested();
+    }
+
     WebCore::GraphicsLayer* m_rootLayer { nullptr };
     bool m_needsPresent { false };
 };

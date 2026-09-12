@@ -40,6 +40,15 @@ void WebCoreSetCACertPath(const char* path);
 // the one that works. `data` = raw cacert.pem bytes; call before the first load.
 void WebCoreSetCACertBlob(const uint8_t* data, int len);
 
+// The Public Suffix List, as the bytes of the publicsuffix.org data file. Same
+// reason as the CA blob: the engine cannot reach the install directory, so the
+// harness reads the packaged file and passes it in. Without it the engine has
+// no way to tell a registry apart from a site, and treats every host as its own
+// registrable domain - which silently breaks every cookie a site sets on one
+// subdomain and reads on another. Call before the first load; returns the
+// number of rules parsed (0 = no list, old behaviour).
+int WebCoreSetPublicSuffixListBlob(const uint8_t* data, int len);
+
 // Explicit cookie-jar SQLite path. UNSAFE on device as of 2026-07-03 (crashes —
 // SQLite's Win32 VFS null-derefs opening a real file in this ARM32 UWP App
 // Container build; see project memory cookie-persistence). Do not call; kept
@@ -57,6 +66,49 @@ void WebCoreSetCookieJsonPath(const char* path);
 // Lines path. Call when the app is about to background/suspend (UWP can kill
 // a suspended app without notice). Engine-thread call.
 void WebCoreFlushCookiesToDisk();
+
+// ---- M4 step 1: per-phase timing (opt-in) ----
+// Switch per-phase timing on and point it at a CSV file (one row per completed
+// nav/scroll/tick/click operation). The App Container only lets us write inside
+// LocalState and the engine cannot discover that path itself, so the harness
+// passes it in — and only when LocalState\perf.txt exists, mirroring the
+// imedebug.txt opt-in. Unset/"" = off (shipping default, one branch per probe).
+// Engine-thread call; call before the first navigation.
+void WebCoreSetPerfLogPath(const char* path);
+
+// Drain the in-memory perf ring to that CSV. Rows otherwise reach disk only on
+// navigation completion or when the ring fills, so call this before suspend
+// (UWP can terminate a suspended app without notice). No-op when off.
+void WebCorePerfFlush(void);
+
+// ---- crash reporting (always on) ----
+// Point the engine at a crash log file (LocalState\crash.txt) and arm all three
+// crash legs: the WTF crash hook (fires before the trap, carries the failing
+// assertion's file/line), a vectored exception handler for the fatal SEH codes,
+// and signal(SIGABRT) for abort(). Each crash appends a timestamped entry with
+// the reason, the host module base/size and up to 48 stack frames as
+// "module +0xRVA". Needed because Windows 10 Mobile's WER writes no dump for
+// fast-fail / breakpoint-trap terminations. Not opt-in. Engine-thread call;
+// call it as early as possible (SetupRuntimeEnv).
+void WebCoreSetCrashLogPath(const char* path);
+
+// Append one "reason:" line plus the current stack to that crash log from outside the
+// engine. The harness runs on its own CRT instance (C++/CX, MSVC v143, exceptions on),
+// so the engine's terminate/new/invalid-parameter/purecall handlers never see the
+// harness' own fatal paths — Application::UnhandledException and its std::terminate use
+// this instead, so those aborts stop looking like a silent OS memory kill. No-op until
+// WebCoreSetCrashLogPath() has run. Callable from any thread, including a dying one.
+void WebCoreCrashNote(const char* reason);
+
+// ---- network resolve mode ----
+// Force the curl backend to resolve names to IPv4 only (1) or let it use whatever
+// the resolver returns (0, the default). The phone has global IPv6 addresses and on
+// some links the v6 path is a black hole: first contact with a host then stalls for
+// 14-22 s before the main resource commits, while an immediate reload takes 0.4 s.
+// Takes effect for the next request, so call it before starting a navigation.
+// Measure the effect with the net_dns/net_connect/net_tls/net_ttfb columns of the
+// perf CSV. Engine-thread call.
+void WebCoreSetIPv4Only(int enable);
 
 // ---- diagnostics / page metadata (written by the render/load paths) ----
 // Each copies a NUL-terminated UTF-8 string into buf (<= len bytes) and returns
@@ -78,6 +130,52 @@ int WebCoreGetLink(int i, int* x, int* y, int* w, int* h, char* url, int len);
 // critical: 1=严重,0=温和。一把清资源/后退页面缓存 + JSC GC + 字体缓存。
 void WebCoreReleaseMemory(int critical);
 
+// Apotheosis: engine-side memory accounting, so the harness'
+// mem.txt carries more than the OS view of our working set. All sizes are bytes.
+// Usage: zero the struct, set structSize = sizeof(WebCoreMemoryStats), call. The driver
+// writes at most structSize bytes, so the two copies of this header may drift by a trailing
+// field without breaking the ABI. Engine thread only (walks the MemoryCache and the JSC heap).
+typedef struct WebCoreMemoryStats {
+    int      structSize;      // in: sizeof(WebCoreMemoryStats); out: bytes actually written
+    // JavaScriptCore, common VM (all zero while no VM exists yet)
+    uint64_t jscHeapSize;     // Heap::size()
+    uint64_t jscHeapCapacity; // Heap::capacity()
+    uint64_t jscExtraMemory;  // Heap::extraMemorySize() - non-GC memory owned by GC objects
+    uint64_t jscObjectCount;  // Heap::objectCount() (blockBytesAllocated needs ENABLE(RESOURCE_USAGE))
+    // WebCore MemoryCache
+    uint64_t cacheTotal;      // MemoryCache::size() = live + dead encoded data
+    uint64_t cacheLive;       // of that, resources that still have clients
+    uint64_t cacheDecoded;    // decoded (bitmap/parsed) data, all types
+    uint64_t cacheCapacity;   // total budget the driver currently configured
+    uint64_t imagesSize;
+    uint64_t imagesDecoded;   // the big unknown: decoded image bitmaps
+    uint64_t cssSize;
+    uint64_t scriptsSize;
+    uint64_t fontsSize;
+    uint32_t imagesCount;
+    uint32_t cssCount;
+    uint32_t scriptsCount;
+    uint32_t fontsCount;
+    // TextureMapper GL textures - graphics commits are charged to AppMemoryUsage too
+    uint64_t texBytes;        // every live BitmapTexture (tiles + pool + filter surfaces)
+    uint32_t texCount;
+    uint64_t poolBytes;       // of that, parked in BitmapTexturePool (recoverable)
+    uint32_t poolCount;
+    int32_t  pressureLevel;   // last level pushed via WebCoreSetMemoryPressure()
+} WebCoreMemoryStats;
+
+// Fill *out. 0 on success, negative on bad args / uninitialised engine.
+int WebCoreGetMemoryStats(WebCoreMemoryStats* out);
+
+// Apotheosis: push the harness' MemoryManager view into WebCore. level: 0 = normal,
+// 1 = medium (>= 65 % of AppMemoryUsageLimit), 2 = high/critical (>= 80 %, or a High/
+// OverLimit MemoryManager event). Sets WTF::MemoryPressureHandler's status - the only way
+// isUnderMemoryPressure() can ever become true on this port, since the Windows poll is a
+// no-op in an App Container - shrinks the MemoryCache budget and, when the level rises,
+// releases memory (level 2 = synchronous full GC + drop the resource cache). Idempotent:
+// calling it with the level already in effect does nothing. Engine thread only.
+void WebCoreSetMemoryPressure(int level);
+
 // 清除全部 cookie(含持久 SQLite 库里的)。设置页"清除数据"用;引擎线程调。
 void WebCoreClearCookies();
 
@@ -88,24 +186,278 @@ void WebCoreClearCookies();
 int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA);
 void WebCoreCloseSession();
 int WebCoreClickAt(int x, int y, uint8_t* outRGBA);   // (x,y) = bitmap/viewport px
+// Apotheosis (double-tap zoom, 2026-09-09): like WebCoreClickAt, but the dispatched mousedown/
+// mouseup carry clickCount instead of an implicit 1 — WebCore's EventHandler dispatches 'dblclick'
+// after 'click' when the release's clickCount is >= 2 (PlatformMouseEvent::clickCount()). Used for
+// the second tap of a double tap the harness decided is NOT a zoom (WebCoreTapPolicyAt said
+// not-zoomable), so the page still gets the real dblclick a two-click page expects.
+// WebCoreClickAt above is unchanged (equivalent to clickCount=1).
+int WebCoreClickAtCount(int x, int y, int clickCount, uint8_t* outRGBA);
 int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA); // dx>0 right, dy>0 down
+
+// Apotheosis (instant pan): where the main frame actually is. The harness applies a touch pan to
+// the presenting XAML element immediately and only needs the engine to tell it how far it has
+// really got, so the preview can be reduced to the not-yet-applied remainder and clamped to the
+// document instead of sliding the page off its own content.
+// All values are in the units WebCoreScrollBy's dx/dy use (engine viewport px at the current page
+// scale). viewW/viewH are the visible size the engine clamps against, i.e. the maximum scroll
+// position is exactly (contentW-viewW, contentH-viewH), floored at 0. Any pointer may be null.
+// Cheap: reads the existing layout, no relayout and no paint. Returns 0, or a negative error when
+// there is no session/view. Engine thread only.
+int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* viewW, int* viewH);
+
+// Nested-scroll support (cookie-consent overlays, modals, iframes): unlike WebCoreScrollBy, which
+// only ever moves the main frame, these route through WebCore's real wheel-event scroll targeting
+// so an overflow:auto container/modal/iframe under the point scrolls instead of the page behind it.
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt/WebCoreScrollBy.
+//
+// WebCoreIsScrollableAt: hit test only, no event dispatched. Returns 1 if a scrollable ancestor
+// (or an iframe) is under the point, else 0. Call at gesture start to pick the fast path.
+int WebCoreIsScrollableAt(int x, int y);
+// WebCoreWheelAt: dispatches one synthetic wheel event (delta in px, granularity
+// ScrollByPixelWheelEvent). phase: 0 none / 1 began / 2 changed / 3 ended (currently inert on this
+// port, see WebCoreDriver.cpp). Returns 1 if a nested scroller consumed it (call again with the
+// next delta), 0 if it did not (main-frame scroll position is left unchanged either way — on a 0
+// return the harness must call WebCoreScrollBy itself for this delta). On a 1 return this already
+// composited/presented the frame into outRGBA (same paintToRGBA call WebCoreScrollBy makes) — the
+// harness does not need a follow-up call to see the nested scroller move.
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA);
+
+// Apotheosis (drag as pointer events): map widgets (Leaflet, MapLibre, canvas
+// apps) pan by handling pointerdown/mousedown themselves and moving their own content — they
+// scroll no scrollable box, so neither WebCoreScrollBy nor WebCoreWheelAt does anything useful
+// over them. These two let the harness hand such a gesture to the page as a real mouse drag.
+//
+// WebCoreWantsDragAt: hit test only, no event dispatched, cheap enough for gesture start (run it
+// next to WebCoreIsScrollableAt). 1 = the element under (x,y) or an ancestor below <body> has a
+// pointerdown/mousedown/touchstart/pointermove/touchmove listener, is a <canvas>, or sets CSS
+// touch-action to something other than auto/manipulation.
+int WebCoreWantsDragAt(int x, int y);
+// WebCoreDragAt: dispatch the gesture as a left-button mouse drag (which the engine also turns
+// into pointerdown/pointermove/pointerup). phase: 0 = press, 1 = move, 2 = release, 3 = cancel;
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt/WebCoreScrollBy. Returns 1 while
+// the page owns the gesture, 0 when it does not (the harness then routes the rest of the gesture
+// down its normal scroll path). Only the press decides: phases 1-3 are inert — and answer 0 —
+// unless the press was consumed, so an individual mousemove that the page ignores never yanks the
+// gesture away mid-pan. Apotheosis (2026-09-04): the press is owned when EITHER the engine reported
+// it handled OR the point is still a drag widget (the WebCoreWantsDragAt walk, re-run here). A map
+// that listens for pointerdown without calling preventDefault - a map site does exactly that -
+// answers "not handled" and would otherwise lose the whole gesture on its first event. On a 1
+// return the frame is already composited/presented into outRGBA the
+// way WebCoreWheelAt does it; outRGBA may be null (no present attempted).
+int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA);
+// Apotheosis (map-site pin, 2026-09-06): LONG PRESS on a drag widget. ENABLE_TOUCH_EVENTS is 0
+// on this port and nothing synthesises Touch/Pointer input, so a touch long press cannot be
+// delivered as one; what this does deliver is everything a page can key a long press off with a
+// mouse: mousedown, the button STAYS DOWN while the engine turns its run loop for holdMs (so a
+// press-and-hold timer inside the page - a map site drops its pin from exactly such a timer - gets
+// the time it waits for), then mouseup + DOM click, and optionally a 'contextmenu' event at the
+// same point (on desktop Maps the right-click menu is the usable "drop a pin / What's here?" path,
+// and a long press is what a browser turns into a contextmenu).
+// holdMs: 0 = default 600, capped at 2000. flags: see WEBCORE_LONGPRESS_* below.
+// (x,y) = viewport/bitmap px, same convention as WebCoreClickAt. Returns 0 (kOK) once delivered -
+// and also on the DRAG_WIDGET_ONLY skip, with the current frame painted into outRGBA, so the caller
+// never has to tell a skip from a failure. Negative = the usual driver error codes.
+#define WEBCORE_LONGPRESS_CONTEXTMENU      1   // also send a 'contextmenu' event after the release
+#define WEBCORE_LONGPRESS_NO_CLICK         2   // suppress the DOM 'click' the release would fire
+#define WEBCORE_LONGPRESS_DRAG_WIDGET_ONLY 4   // do nothing unless (x,y) is a canvas / touch-action:none
+int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA);
+
+// Apotheosis (pinch on map widgets, 2026-09-06): `notches` ctrl+wheel clicks at (x,y), positive =
+// wheel up = zoom in, one notch = 120 px of delta and one wheel tick (what a real mouse wheel
+// sends). A pinch that starts over a map must become this instead of WebCoreSetPageScale: page zoom
+// scales a picture of the map (old tiles, blurry labels), while the wheel asks the map itself for
+// the next zoom level around the point. Returns 1 if the page took the wheel, 0 if nothing did (the
+// caller can then fall back to page zoom). The document never scrolls on this path; on a 1 the
+// frame is already composited/presented into outRGBA the way WebCoreWheelAt does it.
+int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA);
+
+// Apotheosis (double-tap zoom, 2026-09-09): hit-test (x,y) and answer whether a double tap there
+// should zoom the PAGE (Safari/mobile-Chrome semantics) instead of the harness treating it as two
+// ordinary clicks. Read-only: no event dispatched, no session/frame mutated, safe to call from the
+// tap-hold path before deciding whether to actually click.
+// The rules, in the order they are applied (0.1.9.39, rule 1 made symmetric in 0.1.9.50):
+//   1. Current page scale more than 5 % away from 1:1 IN EITHER DIRECTION — the harness' own
+//      pinch zoom — always wins: zoomable=1, target 1.0, whatever the page says. A double tap
+//      must always be able to undo a pinch, or an opted-out page traps the user at the scale the
+//      pinch left behind. Both directions, because this harness commits page scales below 1:1
+//      too (the pinch-out overview, down to 0.5); until 0.1.9.50 the test was scale > 1.05 and a
+//      double tap on a page the user had zoomed OUT fell through to rules 2-5 and was refused.
+//   2. Page opted out of zooming altogether (viewport meta user-scalable=no, or
+//      minimum-scale == maximum-scale): not zoomable.
+//   3. Page is mobile-optimised (viewport meta with width=device-width, or width unset with
+//      initial-scale=1) — Blink's WebViewImpl::ShouldDisableDesktopWorkarounds(): not zoomable.
+//      This is what makes taps immediate on every well-behaved mobile site, because the harness
+//      only pays the double-tap hold interval where a zoom could actually happen.
+//   4. CSS touch-action other than auto on the hit element or an ancestor: not zoomable
+//      (mirrors WebKit's own Element::allowsDoubleTapGesture(), compiled out on this port
+//      since ENABLE_TOUCH_EVENTS=0).
+//   5. Otherwise zoomable, at the target below.
+//   *outZoomable: 1 if double-tap-to-zoom applies here, 0 otherwise (including no session and
+//     no hit, and including a target that would not move the page, see below).
+//   *outTargetScale: the scale a double tap here should animate to, clamped to the driver's own
+//     [1.25, 3.0] double-tap range (a subrange of WebCoreSetPageScale's [0.5, 6.0]): 1.0 in
+//     case 1 above; otherwise viewport-width / (width of the innermost block-level ancestor of
+//     the hit point narrower than 90 % of the layout viewport — Safari's "zoom to column"
+//     heuristic), or 2.0 when no such ancestor exists. A block from 90 % of the viewport upwards
+//     is the page's own full-width layout, not a column: zooming to it is a no-op.
+//     A target within ±5 % of the current scale is never returned - it is reported as
+//     zoomable=0 instead, so the caller forwards a clickCount=2 click rather than animating
+//     to where it already is.
+//   *outAnchorX/*outAnchorY: the anchor for that zoom, in the same viewport/bitmap px
+//     WebCoreSetPageScale takes as focalX/focalY. *outAnchorY is always y (the tap y): vertically
+//     the tapped point stays under the finger. *outAnchorX is x (the tap x) UNLESS the target
+//     scale came from the "zoom to column" case above, in which case it is the column's own
+//     horizontal centre (0.1.9.40) — Safari centres a narrower column instead of anchoring on
+//     wherever inside it was tapped, so a tap near a column's edge does not zoom in with most of
+//     the column off-screen. The caller does not have to remember the tap point across the hold
+//     interval either way.
+//     In the zoomed-OUT half of rule 1 (0.1.9.51) *outAnchorX is instead the anchor that makes the
+//     zoom back to 1:1 END on the scroll position the commit will settle on — the document's own
+//     left edge (0) at the usual overview position, so the content simply grows to the right until
+//     it fills the screen instead of growing around the tap point and then sliding sideways once
+//     WebCoreSetPageScale clamps the position it was asked for. A tap that needs no clamping (a
+//     page still wider than the viewport at 1:1) keeps the tap x. *outAnchorY is the tap y here
+//     too: zooming back UP can never need a vertical correction.
+//   *outReason (0.1.9.40): which rule above decided the answer — 0 = zoomable (target computed),
+//     1 = zoomed IN (rule 1), 7 = zoomed OUT (rule 1's other half, 0.1.9.50), 2 = no element under
+//     the point, 3 = viewport disables zoom (rule 2), 4 = mobile-optimised viewport (rule 3),
+//     5 = touch-action opt-out (rule 4), 6 = target within 5% of the current scale (not worth
+//     animating). Left at -1 on a negative (error) return — no session/busy/no document, not a
+//     rule decision.
+// Any output pointer may be null. Returns kOK, or a negative error (no session prints
+// outZoomable=0 as well, so a caller that only checks *outZoomable still degrades safely).
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason);
+
+// Apotheosis (link context menu, 0.1.9.42): the absolute http(s) href of the innermost <a> under
+// (x,y) (viewport/BITMAP px, WebCoreClickAt's convention), written UTF-8/NUL-terminated into
+// outUrl. Read-only: no event dispatched, no session or frame mutated, safe to call from the
+// long-press route before deciding whether the hold opens a menu or goes to the page.
+//   * The hit test goes through the same client-px conversion as WebCoreTapPolicyAt, so it is
+//     correct at any page scale, and it respects z-order - unlike the WebCoreGetLink rectangle
+//     table, which is a post-layout harvest that cannot see what covers a link.
+//   * A drag widget wins: over a canvas / touch-action:none element (dragWidgetAtPoint, the probe
+//     the pinch/drag/tap routes share) this reports no link, so a hold there keeps behaving as it
+//     always did - the widget owns that gesture.
+//   * Only http(s) is reported; javascript:, mailto: and fragment-only anchors are not openable.
+// Returns 1 = link written, 0 = no link here (outUrl emptied), negative = the usual driver errors
+// (kErrNoSession / kErrBusy / kErrNoDocument, or kErrBadArgs when cap is too small for the URL).
+int WebCoreLinkAt(int x, int y, char* outUrl, int cap);
+
 int WebCoreSyncLinks();                // refresh link hit-table after scroll settles (layout+extract, no paint)
 int WebCoreEditDebug(char* out, int cap); // diag: last WebCoreTypeText canEdit/focus/insert state
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA); // M4 pinch zoom: set pageScaleFactor anchored at focal
 int WebCoreGetPageScale();             // M4: current pageScaleFactor ×1000
 int WebCoreSessionPaint(uint8_t* outRGBA);
+
+// Apotheosis (landscape/rotation, 0.1.9.41): re-establish the engine viewport at w*h. Call it
+// whenever the presenting panel changes size - a device rotation is the case that matters, but a
+// window resize on any host is the same event. Engine thread only, like every other session call.
+//
+// Until this existed the viewport was written exactly twice, by WebCoreGpuInit (the GL viewport)
+// and by WebCoreSessionLoad (the LocalFrameView), and never again: after a rotation the engine
+// kept laying out and compositing at the old size while the window surface under it had the new
+// shape, so the previous picture was simply stretched over it. This does the full job - GL
+// viewport, LocalFrameView, a real relayout at the new width (media queries, percentage widths and
+// the layout viewport all move), the scroll position re-clamped against the document the relayout
+// produced, the link table re-extracted, and one composite so the caller has a correct frame - and
+// forces the next composite to re-raster the whole tree, because every tile was painted for the
+// old viewport.
+//
+// A focused editable element is scrolled back into view after the relayout: the keyboard survives a
+//   rotation, so the field being typed into has to survive it too. No-op when the field already
+//   sits comfortably inside the visible area. "Visible" here means the viewport MINUS the strip
+//   WebCoreSetBottomOcclusion() reported, plus a comfort gap, so the field ends up above the
+//   keyboard rather than one sliver inside the viewport's bottom edge.
+//
+// outRGBA: as everywhere else, the software path fills it with w*h*4 bytes and the GPU
+//   direct-present path does not touch it (the frame goes to the swap chain). It may be null ONLY
+//   when there is no live session, which is also the case where this call does nothing but record
+//   the size for the next WebCoreSessionLoad.
+// outSurfaceW/outSurfaceH (either may be null): DIAGNOSTIC. The size of the EGL window surface
+//   after the composite, i.e. what ANGLE actually resized the swap chain to for the panel, or 0x0
+//   when there is no window surface. The caller asks for w*h; ANGLE derives its own size from the
+//   panel and the resolution scale the caller set at WebCoreGpuInit time, and these two numbers
+//   are how a device log shows whether the two agree. Nothing in the engine acts on them.
+// Returns kOK, or one of five negative errors. With a live session the call is ALL-OR-NOTHING: on
+//   every one of them the GL viewport and the LocalFrameView are still the pair the previous call
+//   left, so the caller must keep the size it had rather than the size it asked for.
+//     kErrBadArgs     w/h outside the surface limits, or outRGBA null while a session is live.
+//     kErrBusy        a pump is already running (re-entrancy guard) - retry after it.
+//     kErrNoView      the main frame has no LocalFrameView.
+//     kErrNoDocument  the main frame has no Document.
+//     kErrFrameGone   the main frame is gone. THE ONE EXCEPTION to the sentence above: the session
+//                     has been torn down before returning, so treat it as a lost session exactly as
+//                     for the interaction entry points, not as a resize to retry.
+int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA);
+
+// How many engine px at the BOTTOM of the viewport are covered by something the engine cannot see -
+// the on-screen keyboard, which is an OS overlay over the window and does not change the viewport
+// the harness hands us. Sticky; 0 (the default) means the whole viewport is visible. Read wherever
+// the engine has to reveal something to the USER (currently WebCoreResize's focused-field reveal).
+void WebCoreSetBottomOcclusion(int enginePx);
+
+// Apotheosis (0.1.9.46): run WebCoreResize's focused-field reveal on its own, without a resize.
+// The occlusion above is only correct a few dispatcher hops AFTER a rotation - the shell answers
+// with the previous orientation's keyboard rectangle first, and a rectangle that cannot belong to
+// the current window must not be believed - so the reveal that ran inside the resize ran without a
+// margin and left the field at the bottom edge, behind the keyboard. Call this once the real
+// rectangle is in, right after WebCoreSetBottomOcclusion(), on the engine thread. Cheap: layout
+// only if the document is dirty, no composite of its own (the scroll arms the next tick's).
+// Returns kOK - also when nothing editable is focused - or kErrNoSession / kErrBusy.
+int WebCoreRevealFocusedElement(void);
+
 int WebCoreGetUrl(char* buf, int len);
 int WebCoreFocusedEditable();                         // 1 if an editable element is focused
 int WebCoreTypeText(const char* utf8, uint8_t* outRGBA);   // insert text into focused editable
 int WebCoreKeyAction(int action, uint8_t* outRGBA);   // 0=Backspace, 1=Enter
 void WebCoreSetUserAgentMobile(int mobile);           // 1=mobile iPhone UA (default), 0=desktop Edge UA
 void WebCoreSetUserAgentString(const char* ua);       // custom UA override (non-empty wins over mobile/desktop; empty clears)
+void WebCoreSetSpeculativePrefetch(int enabled);      // <script type="speculationrules"> prefetch, default off; sticky (live page + new sessions)
+
+// Apotheosis (page width, 0.1.9.58): the page-width factor, which is the engine's DEVICE SCALE
+// FACTOR. The engine lays a page out at (engine px / factor) CSS px, so on a 720 engine px wide
+// portrait panel a factor of 1.5 gives a 480 CSS px layout viewport - phone-sized, where 1.0 gave a
+// 720 px one every site answers with its tablet layout and half-height text. Raster resolution is
+// unchanged: a composited layer's contentsScale is pageScaleFactor * deviceScaleFactor, so tiles
+// are still painted at the full engine resolution and text stays as sharp as it was. This is not
+// page zoom and not text autosizing, both of which only enlarge a layout that is still a wide one.
+// window.devicePixelRatio becomes the factor.
+//
+// Nothing else in this ABI changes: every coordinate in and out of the driver is still viewport/
+// BITMAP px, and the driver converts at the boundary.
+//
+// Range [1.0, 2.0], default 1.5; anything outside falls back to the default. Stores the value only
+// - it reaches a live document through the next WebCoreResize() (which relays the page out at the
+// new CSS viewport, re-clamps the scroll position and forces a full repaint) and a new one through
+// WebCoreSessionLoad()/WebCoreRenderHtml(). Engine thread, like every other setter here.
+void WebCoreSetPageWidthFactor(float factor);
+// Apotheosis (M4): warm up an origin before the user navigates to it — call it while a URL is being
+// typed (debounced) so the DNS lookup is done when Enter arrives. Full URL or bare host ("example.com");
+// anything else ignored. DNS only: libcurl cannot open a reusable connection ahead of time (see
+// WebCoreDriver.cpp). Non-blocking (work queue), idempotent per host, engine thread.
+void WebCorePreconnect(const char* url);
 int WebCoreEnableCompositing();                       // M1: 1 if GPU compositing is live (root GraphicsLayer attached)
 int WebCoreGpuInit(void* nativeWindow, int w, int h); // M2: init GPU present (engine thread). nativeWindow=SwapChainPanel PropertySet IInspectable*; nullptr=offscreen(readback)
 int WebCoreComposite();                               // M2: composite current session layer tree to the window surface (swapBuffers)
 int WebCoreCompositeReadback(uint8_t* outRGBA);       // M2: offscreen composite + readback RGBA (verify), shown via existing WriteableBitmap path
 void WebCoreGpuSetFlip(int flipH, int flipV);         // M2 debug: set readback flip (find correct orientation); repaint to apply
 int WebCoreGpuLayerInfo(char* outBuf, int len);       // M2 debug: FrameView scroll/contents + layerTreeAsText dump
+
+// Apotheosis: event-driven present. Register a wake-up the
+// engine calls whenever something wants to be presented (rendering update scheduled, image
+// loaded, off-thread raster tile finished, a tick that ended still dirty) instead of having the
+// harness poll on a fixed timer. Fired at most once per composite; disarmed at the top of every
+// WebCoreLiveTick. THE CALLBACK MAY RUN ON THE ENGINE THREAD OR ON A RASTER WORKER: it must not
+// block and must not call back into the engine - post to a queue and return. nullptr unregisters
+// (back to pure polling). Register from the engine thread, once, before the first navigation.
+void WebCoreSetPresentRequestCallback(void (*cb)(void* ctx), void* ctx);
+// Apotheosis (package 5): the pan present handshake is gone - WebCoreSetPanGesture /
+// WebCorePresent / WebCoreGetOwedSwapScroll / WebCorePresentFrame. It let a gesture take the
+// presents away from the engine so its own composites could not race the XAML TranslateTransform
+// the harness drew a pan with; that preview is deleted, and it was the only caller the mode ever
+// had. The engine presents every composite as it makes it.
+
 int WebCoreEvalJS(const char* script, char* out, int len);  // run JS in the session, result as string
 int WebCoreLiveTick(uint8_t* outRGBA);                // advance + repaint one animation/SPA frame
 int WebCoreGetPendingResourceCount();                 // pending cached resources in the current document

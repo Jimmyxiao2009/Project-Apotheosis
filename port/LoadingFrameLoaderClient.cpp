@@ -19,9 +19,11 @@
 #include <WebCore/FrameLoaderTypes.h>             // PolicyAction enum
 #include <WebCore/FrameNetworkingContext.h>
 #include <WebCore/HistoryItem.h>
+#include <WebCore/LayoutMilestone.h>          // Apotheosis (M4): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/LocalFrame.h>
 #include <WebCore/NetworkStorageSession.h>
 #include "PortNetworkStorageSession.h"   // cookie 持久化:真 storageSession
+#include "PortPerf.h"                    // Apotheosis: M4 per-phase timing (navigation marks)
 #include <WebCore/ResourceError.h>
 #include <WebCore/ResourceRequest.h>
 #include <WebCore/ResourceResponse.h>
@@ -30,8 +32,26 @@
 #include <wtf/text/CString.h>
 
 // Apotheosis: 诊断通道,定义在 WebCoreDriver.cpp。把失败的 ResourceError 细节
-// (curl 错误码 + 域 + 描述 + 失败 URL)送给驱动,供真机网络失败定位。
-extern "C" void WebCorePortRecordNetError(int code, const char* domain, const char* desc, const char* url);
+// (curl 错误码 + type + 域 + 描述 + 失败 URL)送给驱动,供真机网络失败定位。type 是
+// ResourceError::Type(见下方 recordNetError)——投递重定向 bug 时加的,好在下一次真机
+// 测试里不用猜就能看出卡住的加载到底是不是撞见了 dispatchDidFailProvisionalLoad 里那条
+// Cancellation 一律吞掉的分支。
+extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain, const char* desc, const char* url);
+
+// Apotheosis (2026-09-11): the narrow sibling of the channel above, also defined in
+// WebCoreDriver.cpp. It is told only about a main-frame PROVISIONAL load that has failed for
+// good - the navigation never committed a byte - because that is the single case the driver is
+// allowed to retry. The wide channel cannot serve that purpose: recordNetError() below also runs
+// for every failed subresource, so whatever it holds when a navigation returns is usually some
+// image's error, and retrying a page because a tracking pixel failed would be a bug.
+extern "C" void WebCorePortRecordMainLoadFailure(int code, int type, const char* url);
+
+// Apotheosis: DNS prefetch for <link rel="dns-prefetch">. Implemented in
+// WebKit\Source\WebKitLegacy\WebCoreSupport\WebResourceLoadScheduler.cpp, which is
+// compiled straight into the driver alongside this file, so this is a plain
+// cross-TU call. WebCore::prefetchDNS() itself is a no-op in the curl port - see the
+// comment on apotheosisPrefetchDNS() there.
+extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 
 namespace WebCorePort {
 
@@ -43,7 +63,7 @@ static void recordNetError(const ResourceError& error)
     auto domain = error.domain().utf8();
     auto desc = error.localizedDescription().utf8();
     auto url = error.failingURL().string().utf8();
-    WebCorePortRecordNetError(error.errorCode(), domain.data(), desc.data(), url.data());
+    WebCorePortRecordNetError(error.errorCode(), static_cast<int>(error.type()), domain.data(), desc.data(), url.data());
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +156,7 @@ void LoadingFrameLoaderClient::signalLoadComplete(bool failed)
 
 void LoadingFrameLoaderClient::dispatchDidFinishLoad()
 {
+    perfNavLoadEvent();   // Apotheosis (M4): ms_net_load — before the completion handler stops the pump
     signalLoadComplete(false);
 }
 
@@ -155,6 +176,14 @@ void LoadingFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceErro
     //   (curl 非取消错误仍立即终结显示错误页);真卡住由 pumpLoop 的看门狗兜底。
     if (willContinue == WillContinueLoading::Yes || error.isCancellation())
         return;
+    // Apotheosis (2026-09-11): past this point the navigation is over and nothing was committed -
+    // the harness will show its error page. Report it on the narrow channel so the driver can
+    // decide whether the transport merely never came up (then it retries once); see
+    // isRetriableTransportError() in WebCoreDriver.cpp.
+    {
+        auto url = error.failingURL().string().utf8();
+        WebCorePortRecordMainLoadFailure(error.errorCode(), static_cast<int>(error.type()), url.data());
+    }
     signalLoadComplete(true);
 }
 
@@ -319,6 +348,10 @@ void LoadingFrameLoaderClient::dispatchWillClose()
 
 void LoadingFrameLoaderClient::dispatchDidStartProvisionalLoad()
 {
+    // Apotheosis (M4): start of the network clock — the driver measures the
+    // net_commit / net_load columns from here, so page setup before the load
+    // does not leak into them. No-op unless perf logging is on.
+    perfNavStart();
 }
 
 void LoadingFrameLoaderClient::dispatchDidReceiveTitle(const StringWithDirection&)
@@ -327,14 +360,24 @@ void LoadingFrameLoaderClient::dispatchDidReceiveTitle(const StringWithDirection
 
 void LoadingFrameLoaderClient::dispatchDidCommitLoad(std::optional<HasInsecureContent>, std::optional<UsedLegacyTLS>, std::optional<WasPrivateRelayed>)
 {
+    perfNavCommit();          // Apotheosis (M4): ms_net_commit
 }
 
 void LoadingFrameLoaderClient::dispatchDidFinishDocumentLoad()
 {
+    perfNavDocumentReady();   // Apotheosis (M4): DOM ready (ms_net_load fallback)
 }
 
-void LoadingFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone>)
+// Apotheosis (M4 load timeline): t_firstpaint. Only the milestones a client requested via
+// Page::addLayoutMilestones ever reach here - WebCoreDriver::buildSession asks for
+// DidFirstVisuallyNonEmptyLayout, which LocalFrameView fires the first time the laid-out
+// content qualifies as visually non-empty. That is the engine-side "something readable is on
+// screen" mark, and it costs nothing when perf logging is off (perfNavVisuallyNonEmpty
+// returns on the g_perfOn branch).
+void LoadingFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone> milestones)
 {
+    if (milestones.contains(LayoutMilestone::DidFirstVisuallyNonEmptyLayout))
+        perfNavVisuallyNonEmpty();
 }
 
 void LoadingFrameLoaderClient::dispatchDidReachVisuallyNonEmptyState()
@@ -527,9 +570,11 @@ bool LoadingFrameLoaderClient::supportsAsyncShouldGoToHistoryItem() const
     return false;
 }
 
-void LoadingFrameLoaderClient::shouldGoToHistoryItemAsync(HistoryItem&, CompletionHandler<void(ShouldGoToHistoryItem)>&&) const
+void LoadingFrameLoaderClient::shouldGoToHistoryItemAsync(HistoryItem&, CompletionHandler<void(ShouldGoToHistoryItem)>&& completionHandler) const
 {
-    RELEASE_ASSERT_NOT_REACHED();
+    // Apotheosis (M4): was RELEASE_ASSERT_NOT_REACHED() - i.e. std::abort() without a dump the
+    // moment a page triggers a history navigation (history.go/back, some SPA routers). Allow it.
+    completionHandler(ShouldGoToHistoryItem::Yes);
 }
 
 void LoadingFrameLoaderClient::saveViewStateToItem(HistoryItem&)
@@ -589,8 +634,12 @@ void LoadingFrameLoaderClient::willCacheResponse(DocumentLoader*, ResourceLoader
 
 #endif
 
-void LoadingFrameLoaderClient::prefetchDNS(const String&)
+void LoadingFrameLoaderClient::prefetchDNS(const String& hostname)
 {
+    // Apotheosis: real DNS prefetch (background getaddrinfo, warms the OS resolver
+    // cache that libcurl hits next). Preconnect beyond DNS is not possible with libcurl
+    // - see WebResourceLoadScheduler::preconnectTo().
+    ::apotheosisPrefetchDNS(hostname);
 }
 
 RefPtr<HistoryItem> LoadingFrameLoaderClient::createHistoryItemTree(bool, BackForwardItemIdentifier) const

@@ -1,0 +1,40 @@
+sample stage.txt for tests/tilegrid/replay.cpp
+Synthetic until the first TileGrid v2 device round; the shape is exactly what
+wkWinUWPTakeTexmapZoomTrace writes (docs/TILEGRID-DESIGN.md 5.3). Lines that are
+not `tg S<id> pass` are ignored by the parser, so a real stage.txt can be
+dropped in unchanged.
+stage load begin url=https://example.com/news/
+tg S1 pass  s=1 B=720x8000 V=0,0,720,1280 d=0,0,720,8000 pan=0 budget=24
+tg S1 out   miss=2 rast=0 land=0 ready=0 jobs=0/2 cancel=0 rm=0 holes=2 bd=-
+tg S1 comp  V=0,0,720,1280 holes=0 bdclips=0
+tg S1 pass  s=1 B=720x8000 V=0,240,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=1 B=720x8000 V=0,700,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=1 B=720x8000 V=0,1180,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S2 pass  s=1 B=720x96 V=0,0,720,96 d=0,0,720,96 pan=0 budget=24
+tg S2 pass  s=1 B=720x112 V=0,0,720,112 d=0,80,720,32 pan=0 budget=24
+tg S1 pass  s=1 B=720x8000 V=0,1660,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=1 B=720x8000 V=0,2000,720,1280 d=0,0,0,0 pan=0 budget=24
+stage pinch begin anchor=360,540
+tg S1 pass  s=2.85 B=2052x22800 V=666,5799,720,1280 d=0,0,2052,22800 pan=0 budget=24
+tg S1 out   miss=4 rast=0 land=0 ready=0 jobs=4/2 cancel=0 rm=0 holes=0 bd=p0
+tg S1 pass  s=2.85 B=2052x22800 V=666,5799,720,1280 d=0,0,0,0 pan=0 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=666,6119,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=666,6439,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=666,7079,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=666,7719,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=1332,8359,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=1332,9000,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=2.85 B=2052x22800 V=1332,9000,720,1280 d=120,9100,50,50 pan=0 budget=24
+stage pinch begin anchor=360,640
+tg S1 pass  s=6 B=4320x48000 V=2805,18947,720,1280 d=0,0,4320,48000 pan=0 budget=24
+tg S1 pass  s=6 B=4320x48000 V=2805,19587,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=6 B=4320x48000 V=2805,20227,720,1280 d=0,0,0,0 pan=1 budget=24
+stage doubletap reset
+tg S1 pass  s=1 B=720x8000 V=0,3160,720,1280 d=0,0,0,0 pan=0 budget=24
+tg S1 pass  s=1 B=720x8000 V=0,3160,720,1280 d=0,0,0,0 pan=0 budget=24
+tg S1 pass  s=1 B=720x8400 V=0,3160,720,1280 d=0,3000,720,600 pan=0 budget=24
+tg S3 pass  s=1 B=3000x2000 V=- d=0,0,3000,2000 pan=0 budget=24
+tg S3 pass  s=1 B=3000x2000 V=- d=0,0,0,0 pan=0 budget=24
+tg S1 pass  s=1 B=720x8400 V=0,3400,720,1280 d=0,0,0,0 pan=1 budget=24
+tg S1 pass  s=1 B=720x8400 V=0,3640,720,1280 d=0,0,0,0 pan=1 budget=24
+stage load end

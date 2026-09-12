@@ -41,10 +41,17 @@
 #include "config.h"
 
 #include "WebCoreDriver.h"
+#include "PortPerf.h"    // Apotheosis: M4 perf probes called from the port-layer clients
 
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <csignal>
+#include <cstdlib>     // Apotheosis: std::abort / _set_purecall_handler (crash.txt legs)
+#include <atomic>      // Apotheosis: try-flag guarding perfFlush() from the crash legs
+#include <exception>   // Apotheosis: std::set_terminate (crash.txt leg (d))
+#include <new.h>       // Apotheosis: _set_new_handler — CRT form, gets the requested size
+#include <JavaScriptCore/ExecutableAllocator.h>   // Apotheosis: JIT pool range / isJITPC for crash.txt       // Apotheosis: signal(SIGABRT) leg of the crash.txt logger
 #include <vector>
 #include <curl/curl.h>   // 下载用独立 curl_easy 句柄(WebCoreDownload)
 
@@ -84,18 +91,84 @@
 #include <WebCore/MemoryCache.h>         // Apotheosis: 资源缓存上限
 #include <WebCore/MemoryRelease.h>       // Apotheosis: WebCore::releaseMemory(内存压力时一把清)
 #include <wtf/MemoryPressureHandler.h>   // Apotheosis: WTF::Critical / Synchronous
+#include <WebCore/CommonVM.h>            // Apotheosis: g_commonVMOrNull(WebCoreGetMemoryStats 的 JSC 堆数)
+#include <JavaScriptCore/VM.h>           // Apotheosis: JSC::VM::heap
+#include <JavaScriptCore/HeapInlines.h>  // Apotheosis: Heap::size()/capacity()/extraMemorySize()
+#include <JavaScriptCore/JSLock.h>       // Apotheosis: JSLockHolder(读堆前取 VM 锁)
+#include <wtf/FastMalloc.h>              // Apotheosis: WTF::releaseFastMallocFreeMemory
+// Apotheosis: texmap memory counters (WebKit winuwp 0c78243bf5). Declared by hand rather than
+// included: BitmapTexture.h pulls in TextureMapperGLHeaders.h, whose GL prototypes collide with
+// the ANGLE headers this file already uses (glFinish/glReadPixels/glViewport go missing).
+namespace WebCore {
+void wkWinUWPTexmapTextureStats(uint64_t& bytes, unsigned& count);   // BitmapTexture.h
+void wkWinUWPTexmapPoolStats(uint64_t& bytes, unsigned& count);      // BitmapTexturePool.h
+// Apotheosis (threaded raster): the in-flight counter of the off-thread tile
+// rasterisation (TextureMapperTiledStore.h). Declared here for the same reason as the two above —
+// including the texmap header would drag in TextureMapperGLHeaders.h. The runtime switch that used
+// to sit beside it is gone with package 5: a layer pass is always rastered on the worker pool.
+unsigned wkWinUWPTexmapPendingRasterTiles();
+// Apotheosis (threaded raster, WebKit winuwp 099064a24d..c0608a6353): first paints became
+// asynchronous too, so a tile whose replay has not landed draws NOTHING. Missing the
+// follow-up composite is now an empty tile, not a stale one — hence the edge-triggered counter and
+// the worker-side wake-up below, which cover the two cases polling alone cannot.
+unsigned wkWinUWPTexmapTakeFinishedRasterTiles();          // engine thread; reading resets
+void wkWinUWPSetRasterCompletionHandler(void (*)());       // called ON A WORKER thread
+void wkWinUWPTexmapRasterStats(unsigned& posted, unsigned& cancelled, unsigned& blockingWaits);
+// Apotheosis (2026-09-06, WebKit winuwp): per-frame tile-upload budget. A finished replay costs a
+// ~4 MB glTexSubImage2D on the engine thread (~8-10 ms on the Adreno 430), and draining seven to
+// nine of them in one pass is what turns a 2.9 ms scroll tick into an 80 ms one. The engine now
+// uploads at most a few per composite - visible tiles that would otherwise be a hole are exempt -
+// and reports how many it pushed to a later frame. Non-zero means "the pixels exist, nothing has
+// shown them yet", so it owes a present exactly like wkWinUWPTexmapTakeFinishedRasterTiles();
+// reading resets it. Declared by hand for the same reason as everything above.
+unsigned wkWinUWPTexmapTakeDeferredUploads();
+// Apotheosis (docs/TILEGRID-DESIGN.md 5.3): the engine's TileGrid input trace - one `tg` line per
+// pass and per composite of every tiled layer store, a pass line being the complete PassInput, so
+// a device session replays on the PC (tests/tilegrid). This hands over the lines that have not been
+// read yet (oldest first, whole lines, NUL-terminated, 0 = nothing pending). Engine thread,
+// allocation-free. The name predates the rewrite (it used to drain a zoom trace as well) and is
+// kept so this file needs no change. Declared by hand for the same reason as everything above.
+size_t wkWinUWPTakeTexmapZoomTrace(char* buffer, size_t length);
+// Apotheosis (2026-09-07): one header line plus one line per live tiled backing store - size,
+// contents scale, page scale, visible rect, the tile counts, and for a TileGrid v2 store the state
+// of its grid. This is the dump a device session takes *while* an artefact is on screen, so
+// WebCoreGpuLayerInfo() writes it before the layer tree rather than after it. Declared by hand for
+// the same reason as everything above.
+size_t wkWinUWPDumpTexmap(char* buffer, size_t length);
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3, GraphicsLayerTextureMapper.cpp):
+// per-cause breakdown of the wkTexmapDirtyFull count above - which of updateBackingStoreIfNeeded's
+// full-repaint conditions fired (a layer that hits more than one adds to more than one counter),
+// plus how many GraphicsLayerTextureMapper::setNeedsDisplay() calls actually flipped m_needsDisplay
+// false->true. Both reset on read. Declared by hand for the same reason as everything above.
+void wkWinUWPTexmapDirtySrcStats(unsigned& needsDisplay, unsigned& storeCreated, unsigned& sizeChange, unsigned& scaleChange, unsigned& setNeedsDisplayCalls);
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md sections 3 and 5.2): the one number
+// the driver reads from the TileGrid (TextureMapperTiledStore.h). Declared by hand for the same
+// reason as everything above - that header pulls in the texmap GL headers. The v1/v2 switch that
+// used to sit here is gone with package 5; the TileGrid is the only store there is.
+//   wkWinUWPTexmapVisibleHoles                   the sum of visibleHoles() over every store that
+//     has composited since the last call - visible cells drawing nothing with no backdrop behind
+//     them. Reading resets it. This is the ONLY number the repair reacts to (gpuPresent).
+// (wkWinUWPSetTileGridPanGesture, the level that mirrored a pan gesture into every live store, went
+// with the pan present handshake in package 5 - see the block at g_dragActive. The engine-side
+// setter is still there and simply never called; it comes out with the next engine rebuild.)
+unsigned wkWinUWPTexmapVisibleHoles();
+}
 #include <WebCore/CookieJar.h>           // WebCore::CookieJar(cookie 持久化)
 #include <WebCore/NetworkStorageSession.h>   // deleteAllCookies(WebCoreClearCookies)
 #include <WebCore/StorageSessionProvider.h>  // 完整类型(Ref<StorageSessionProvider> 析构需要)
 #include "PortNetworkStorageSession.h"   // WebCorePort::makeStorageSessionProvider / ensureDefaultPortStorageSession
 #include "PortChromeClient.h"            // WebCorePort::PortChromeClient(开合成,捕获根图层)
+#include "PortWebSocket.h"              // WebCorePort::PortSocketProvider(WebSocket,见该头文件)
+#include <WebCore/LayoutMilestone.h>     // Apotheosis (M4 load timeline): DidFirstVisuallyNonEmptyLayout
 #include <WebCore/Page.h>                // WebCore::Page
 #include <WebCore/Settings.h>            // Page::settings()
+#include <WebCore/FontLoadTimingOverride.h>  // Apotheosis (M4): FontLoadTimingOverride::Swap
 #include <WebCore/LocalFrame.h>          // WebCore::LocalFrame
 #include <WebCore/LocalFrameInlines.h>   // inline LocalFrame::document()/protectedDocument()
 #include <WebCore/LocalFrameView.h>      // WebCore::LocalFrameView
 #include <WebCore/DocumentView.h>        // inline LocalFrame::view()/protectedView()
 #include <WebCore/FrameLoader.h>         // FrameLoader::activeDocumentLoader
+#include <WebCore/FrameLoaderStateMachine.h> // Apotheosis (M4 settle): committedFirstRealDocumentLoad()
 #include <WebCore/DocumentLoader.h>      // DocumentLoader::writer()
 #include <WebCore/DocumentWriter.h>      // DocumentWriter setMIMEType/begin/addData/end
 #include <WebCore/Document.h>            // Document::updateLayout / updateLayoutIgnorePendingStylesheets
@@ -140,6 +213,9 @@
 #include <WebCore/HTMLTextAreaElement.h>     // 同上,textarea
 #include <WebCore/HTMLElement.h>             // isContentEditable()(contenteditable 检测)
 #include <WebCore/Document.h>                // elementFromPoint / focusedElement(命中点显式聚焦可编辑元素)
+#include <WebCore/DocumentPage.h>            // Apotheosis (0.1.9.40): Document::page()/Frame::page() are declared
+                                              // inline in Document.h/LocalFrame.h but DEFINED here only -
+                                              // clientPointForEnginePoint()'s callers need doc->page().
 #include <WebCore/PlatformKeyboardEvent.h>   // Enter/退格 真键盘事件
 #include <WebCore/ScriptController.h>        // frame->script().canExecuteScripts / executeScript(诊断 SPA)
 #include <WebCore/DOMWrapperWorld.h>         // mainThreadNormalWorldSingleton()(WebCoreEvalJS)
@@ -148,7 +224,29 @@
 #include <WebCore/ScrollView.h>              // setScrollPosition/maximumScrollPosition(LocalFrameView 基类)
 #include <WebCore/DoublePoint.h>             // PlatformMouseEvent 的坐标类型
 #include <wtf/MonotonicTime.h>               // PlatformMouseEvent 时间戳
+#include <wtf/WallTime.h>                    // Apotheosis (M4 settle): CachedResource::apoRequestTimestamp()
+#include <wtf/ApoLoadPhase.h>                // Apotheosis (M4 load): engine-thread phase buckets
+#include <wtf/ApoLoadThrottle.h>             // Apotheosis (M4 load): DOM timer alignment while the pump runs
 #include <wtf/OptionSet.h>                   // OptionSet<PlatformEvent::Modifier>
+#include <WebCore/PlatformWheelEvent.h>      // PlatformWheelEvent(WebCoreWheelAt)
+#include <WebCore/ScrollingCoordinatorTypes.h> // WheelEventProcessingSteps(full definition; EventHandler.h only forward-declares it)
+#include <WebCore/RenderBox.h>               // RenderBox::canBeScrolledAndHasScrollableArea()(WebCoreIsScrollableAt)
+#include <WebCore/RenderElement.h>           // RenderObject::parent(), absoluteAnchorRectWithScrollMargin()
+#include <WebCore/RenderLayer.h>             // ScrollRectToVisibleOptions / ShouldAllowCrossOriginScrolling
+#include <WebCore/ScrollAlignment.h>         // ScrollAlignment::alignCenterIfNeeded(WebCoreResize 聚焦回滚)
+#include <WebCore/ContainerNodeInlines.h>    // inline ContainerNode::renderer()(hit->renderer() in WebCoreIsScrollableAt)
+#include <WebCore/HTMLIFrameElement.h>       // is<HTMLIFrameElement>(WebCoreIsScrollableAt)
+#include <WebCore/ShadowRoot.h>              // ShadowRoot::mode()/elementFromPoint(WebCoreIsScrollableAt)
+#include <WebCore/ShadowRootMode.h>          // ShadowRootMode::Open(同上)
+#include <WebCore/EventTargetInlines.h>   // Node::hasEventListeners()(WebCoreWantsDragAt)
+#include <WebCore/EventNames.h>           // eventNames().pointerdownEvent/... (WebCoreWantsDragAt)
+#include <WebCore/HTMLCanvasElement.h>    // is<HTMLCanvasElement>(WebCoreWantsDragAt)
+#include <WebCore/HTMLBodyElement.h>      // is<HTMLBodyElement>: stop the ancestor walk before <body>
+#include <WebCore/StyleTouchAction.h>     // Style::TouchAction::isAuto/isManipulation
+#include <WebCore/RenderObjectStyle.h>        // inline RenderObject::style()
+#include <WebCore/RenderStyle+GettersInlines.h>  // RenderStyle::touchAction()(the umbrella header; the
+                                              // RenderStyleProperties/ComputedStyleProperties inline files
+                                              // it pulls in #error out if included directly)
 #include <optional>
 #include <algorithm>
 
@@ -171,6 +269,12 @@
 #define GL_GLEXT_PROTOTYPES 1               // 这版 ms-master ANGLE 的 gl2.h 把核心 GL 原型放此宏下(否则 glReadPixels/glViewport C3861)
 #include <WebCore/PlatformDisplay.h>        // PlatformDisplay::sharedDisplay()(WIN→PlatformDisplayWin,起 ANGLE EGLDisplay)
 #include <WebCore/GLContext.h>              // GLContext::create/createOffscreen + makeContextCurrent + swapBuffers
+// Apotheosis (landscape/rotation, 0.1.9.41): raw EGL for ONE read-only question - how big is the
+// window surface ANGLE is actually handing us right now (querySurfaceSize, used by WebCoreResize's
+// diagnostic out-params). GLContext exposes no accessor for it, and the answer settles whether the
+// harness' idea of the panel-to-surface scale matches ANGLE's. Nothing here creates or resizes an
+// EGL object - that stays GLContext's job, see the note above.
+#include <EGL/egl.h>
 #include "texmap/TextureMapper.h"           // TextureMapper::create/beginPainting/endPainting(platform/graphics 已在 -I 上)
 #include "texmap/TextureMapperLayer.h"      // TextureMapperLayer::paint/applyAnimationsRecursively
 #include "texmap/GraphicsLayerTextureMapper.h" // 根 GraphicsLayer 实为它;.layer()/updateBackingStoreIncludingSubLayers
@@ -221,12 +325,189 @@ static bool isValidSurfaceSize(int w, int h)
     return static_cast<uint64_t>(w) * static_cast<uint64_t>(h) <= kMaxSurfacePixels;
 }
 
+// ---------------------------------------------------------------------------
+// Apotheosis (page width, 0.1.9.58): the page-width factor - which is WebKit's DEVICE SCALE FACTOR.
+//
+// Why it exists: the panel is 360 DIP wide and the harness runs the engine at two engine px per
+// DIP, so the engine was handed a 720 px wide LocalFrameView at device scale factor 1, i.e. a
+// 720 CSS px layout viewport. Every site read that as a small tablet, served its wide layout, and
+// 16 px text came out 8 DIP tall - half the size of the same page in any phone browser. A real
+// phone reports 360-430 CSS px at a device pixel ratio of 2-3, and the mechanism WebKit has for
+// exactly that is the device scale factor: Page::setDeviceScaleFactor(f) leaves the raster
+// resolution alone (a composited layer's contentsScale is pageScaleFactor * deviceScaleFactor, so
+// a tile is still rastered at the full engine resolution and text stays as sharp as it was) while
+// the LocalFrameView is sized in CSS px, i.e. engine px / f. At the default 1.5 the layout viewport
+// is 480 CSS px and window.devicePixelRatio is 1.5. This is not page zoom and not text autosizing:
+// both of those enlarge a layout that is still a tablet layout.
+//
+// The C ABI does NOT change: every coordinate in and out of this driver is still viewport/BITMAP px
+// (see WebCoreDriver.h), and the conversion happens here, at the boundary. Three coordinate spaces
+// meet in this file and the factor is the difference between the first and the other two:
+//
+//   engine px   what the harness talks in; the GL viewport, the RGBA buffer, g_gpuW/H, g_session->w/h.
+//   event px    what WebCore's mouse/wheel events and ScrollView scroll positions use. That space
+//               is CSS px * pageScaleFactor (WebCoreSetPageScale derives the page-scale half in
+//               detail), so engine = event * f.
+//   client px   what elementFromPoint() and boundingClientRect() use: plain CSS px, so
+//               engine = client * pageScaleFactor * f (see clientPointForEnginePoint()).
+//
+// Engine thread only, like every other piece of state in this file.
+// ---------------------------------------------------------------------------
+static constexpr float kPageWidthFactorMin = 1.0f;
+static constexpr float kPageWidthFactorMax = 2.0f;
+static constexpr float kPageWidthFactorDefault = 1.5f;
+static float g_pageWidthFactor = kPageWidthFactorDefault;
+
+static inline float wkPageWidthFactor()
+{
+    return (g_pageWidthFactor >= kPageWidthFactorMin && g_pageWidthFactor <= kPageWidthFactorMax)
+        ? g_pageWidthFactor : 1.0f;
+}
+
+static inline int wkRoundToInt(double v)
+{
+    return static_cast<int>(v < 0.0 ? v - 0.5 : v + 0.5);
+}
+
+// A viewport size in engine px -> the LocalFrameView's size, in CSS px. Never zero: a degenerate
+// view size is a layout with no viewport at all, which is not a state any caller can mean.
+static WebCore::IntSize wkViewSizeFromEngine(int w, int h)
+{
+    const double f = static_cast<double>(wkPageWidthFactor());
+    const int cw = wkRoundToInt(static_cast<double>(w) / f);
+    const int ch = wkRoundToInt(static_cast<double>(h) / f);
+    return WebCore::IntSize(cw > 0 ? cw : 1, ch > 0 ? ch : 1);
+}
+
+// engine px <-> event px (mouse/wheel positions, scroll positions, scroll deltas).
+static inline double wkEventFromEngine(double v) { return v / static_cast<double>(wkPageWidthFactor()); }
+static inline int wkEngineFromEvent(double v) { return wkRoundToInt(v * static_cast<double>(wkPageWidthFactor())); }
+static inline WebCore::DoublePoint wkEventPointFromEngine(int x, int y)
+{
+    return WebCore::DoublePoint(wkEventFromEngine(static_cast<double>(x)),
+        wkEventFromEngine(static_cast<double>(y)));
+}
+
+// Apotheosis (page width, 0.1.9.58): put the factor on the Page. Called wherever this driver
+// creates one and again from WebCoreResize(), which is the path a factor CHANGE takes to a live
+// document (the harness re-runs the viewport after writing the setting). Page::setDeviceScaleFactor
+// is a no-op when the value is unchanged, so calling it on every resize costs nothing.
+static void wkApplyPageWidthFactor(WebCore::Page& page)
+{
+    page.setDeviceScaleFactor(wkPageWidthFactor());
+}
+
+// engine px <-> CSS client px. One engine px is one CSS px times the page scale times the
+// page-width factor; clientPointForEnginePoint() below is the point-shaped form of the same thing.
+static double wkClientToEngineScale(WebCore::Page* page)
+{
+    float scale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(scale > 0.0f)) scale = 1.0f;
+    return static_cast<double>(scale) * static_cast<double>(wkPageWidthFactor());
+}
+static inline double wkEngineLengthFromClient(WebCore::Page* page, double v) { return v * wkClientToEngineScale(page); }
+static inline double wkClientLengthFromEngine(WebCore::Page* page, double v) { return v / wkClientToEngineScale(page); }
+
+// ---------------------------------------------------------------------------
+// Apotheosis: memory-pressure state.
+// The App Container cap is 1536 MB and the OS kills us at it with no exception and no dump,
+// so the only defence is to shrink before we get there. The numbers come from the harness
+// (MemoryManager.AppMemoryUsage / AppMemoryUsageLimit) and arrive through
+// WebCoreSetMemoryPressure(); everything below runs on the single engine thread.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMB = 1024u * 1024u;
+// MemoryCache budgets per level: (minDeadBytes, maxDeadBytes, totalBytes).
+// Apotheosis: the unpressured budget was 0/16/32 MB, which is smaller than a single image-heavy
+// viewport once the frames are decoded. On an image-heavy social timeline (200+ images) mem.txt showed dec=32 MB
+// against cap=32 MB while the process sat at 35 % of the App Container limit: every insert pruned
+// what the previous decode had just produced, so large images ping-ponged between the async decode
+// queue (11b3bbd2b9) and the pruner and some never reached a paint at all. 32/64/128 MB is still a
+// twelfth of the cap and leaves the decoded-bitmap ceiling where it belongs - with the texture pool
+// and the tile budget (0c78243bf5, 8585f00e3f), not with a cache that was starving the decoder.
+// minDeadBytes is what survives a prune, so it is non-zero only in the unpressured state; under
+// pressure we still want every dead resource gone, and the two smaller budgets are unchanged.
+static constexpr unsigned kMemCacheMinDeadNormal =  32u * kMB;
+static constexpr unsigned kMemCacheDeadNormal   =  64u * kMB;
+static constexpr unsigned kMemCacheTotalNormal  = 128u * kMB;
+static constexpr unsigned kMemCacheDeadMedium   =  4u * kMB;
+static constexpr unsigned kMemCacheTotalMedium  =  8u * kMB;
+static constexpr unsigned kMemCacheDeadHigh     =  1u * kMB;
+static constexpr unsigned kMemCacheTotalHigh    =  2u * kMB;
+
+static int g_memPressureLevel = 0;              // last level pushed by the harness (0..2)
+static unsigned g_memCacheCapacity = 0;         // total budget currently configured (for the stats log)
+
+// setCapacities(minDeadBytes, maxDeadBytes, totalBytes) - see MemoryCache.h:124.
+static void wkSetMemoryCacheCapacities(unsigned minDead, unsigned maxDead, unsigned total)
+{
+    WebCore::MemoryCache::singleton().setCapacities(minDead, maxDead, total);
+    g_memCacheCapacity = total;
+}
+
+// The one place that actually gives memory back. level: 0 = nothing but a prune, 1 = the
+// non-critical trim, 2 = the critical one (drops decoded data of *live* resources → visible
+// images go white until they are re-decoded, and runs a synchronous full GC).
+// keepResourceCache: keep the encoded resource cache. Yes on a navigation/tab switch, where
+// the next page usually wants the same CSS/JS; No when the user closes the page for good.
+// Engine thread only — releaseMemory() walks every Document and collects the JSC heap.
+static void wkReleaseMemoryLevel(int level, bool keepResourceCache)
+{
+    using namespace WebCore;
+    const auto maintainCache = keepResourceCache ? MaintainMemoryCache::Yes : MaintainMemoryCache::No;
+    if (level <= 0) {
+        // prune() is otherwise only ever reached from pruneSoon() on an insert, so a page that
+        // just sits there never trims at all (MemoryCache.cpp:793).
+        MemoryCache::singleton().prune();
+        return;
+    }
+    // Critical::Yes also does WTF::releaseFastMallocFreeMemory() + GarbageCollectionController::
+    // garbageCollectNow() (a synchronous full collection) inside releaseCriticalMemory();
+    // Synchronous::Yes adds the per-thread fastMalloc cache flush. No need to duplicate either.
+    releaseMemory(level >= 2 ? WTF::Critical::Yes : WTF::Critical::No,
+                  WTF::Synchronous::Yes,
+                  MaintainBackForwardCache::No,
+                  maintainCache);
+    if (level < 2)
+        WTF::releaseFastMallocFreeMemory();   // Critical::No skips it; it is cheap and USE_SYSTEM_MALLOC fragments
+}
+
+// A synchronous full collection of the common VM, without releaseCriticalMemory()'s
+// deleteAllCode(PreventCollectionAndDeleteAllCode). Used where we want the dead page's JS heap
+// back but not to throw away every piece of JIT code the next page will have to compile again.
+// No-op while no VM exists (commonVM() would create one just to collect it).
+static void wkCollectJSCHeapNow()
+{
+    JSC::VM* vm = WebCore::g_commonVMOrNull;
+    if (!vm)
+        return;
+    JSC::JSLockHolder locker(vm);
+    vm->heap.collectNow(JSC::Synchronousness::Sync, JSC::CollectionScope::Full);
+}
+
 // Run the WebCore one-time process initialization exactly once.
 // Sequence taken from Source/WebKit/Shared/WebKit2Initialize.cpp
 // (the !PLATFORM(COCOA) branch — our case).
 bool ensureWebCoreInitialized()
 {
     static bool initialized = [] {
+        // Apotheosis (M4): JSC reads JSC_* options from the environment during initialize().
+        // Set them here (same CRT as the engine) rather than in the harness;
+        // _putenv_s does not overwrite a value the tester set.
+        //
+        // JSC sizes its whole GC heuristic from Heap::m_ramSize, which on Windows is
+        // GlobalMemoryStatusEx().ullTotalPhys (WTF/wtf/RAMSize.cpp) = the phone's ~3 GB of
+        // *physical* RAM — not the ~1.5 GB our App Container may actually use. forceRAMSize
+        // overrides that one input (Heap.cpp:330) and correctly scales everything derived
+        // from it: minBytesPerCycle/minHeapSize, the growth mode, proportionalHeapSize
+        // (Heap.cpp:2545) and m_maxEdenSizeWhenCritical, which is 25 % of the RAM above
+        // criticalGCMemoryThreshold (Heap.cpp:462) — 25 MB at 512 MB instead of 153 MB at 3 GB.
+        if (!std::getenv("JSC_forceRAMSize"))
+            _putenv_s("JSC_forceRAMSize", "536870912");   // 512 MB
+        // NOTE: do NOT set JSC_gcMaxHeapSize here. It is not a heap *cap*: when non-zero it
+        // short-circuits Heap::collectIfNecessaryOrDefer's shouldRequestGC (Heap.cpp:2901-2906)
+        // to "collect only once more than N bytes were allocated *this cycle*", bypassing the
+        // proportional heuristic entirely. The 384 MB we used to set therefore made GC happen
+        // *later*, not earlier — the opposite of what it was added for.
         JSC::initialize();                       // JSC heap/threading/options
         WTF::initializeMainThread();             // pins this thread as the WebKit main thread + RunLoop::main
         WebCore::initializeCommonAtomStrings();  // interns "auto", "all", content types, etc.
@@ -241,7 +522,27 @@ bool ensureWebCoreInitialized()
         // 是 32 位地址空间最大的隐性占用),资源缓存收紧上限。系统内存压力来时由 harness 经
         // WebCoreReleaseMemory() 主动放(WebCore::releaseMemory 一把清缓存 + JSC GC + 字体缓存)。
         WebCore::BackForwardCache::singleton().setMaxSize(0);
-        WebCore::MemoryCache::singleton().setCapacities(0, 8u * 1024 * 1024, 16u * 1024 * 1024);
+        // Apotheosis: sized for the 1536 MB App Container cap.
+        // 8/16 MB was too tight for repeat visits and bought nothing - encoded resources are a
+        // rounding error next to the decoded bitmaps. What actually bounds us is the
+        // *decoded* data, and that needs the deletion interval below - and enough headroom that
+        // the pruner does not eat the frames the decode queue has just produced (see the constants).
+        wkSetMemoryCacheCapacities(kMemCacheMinDeadNormal, kMemCacheDeadNormal, kMemCacheTotalNormal);
+        // Apotheosis: without this the interval is 0 and CachedResource::destroyDecodedDataIfNeeded()
+        // returns immediately, so a client-less resource keeps its decoded bitmap until some
+        // *insert* happens to trigger a prune - i.e. never, on a page that just sits there.
+        // 5 s after the last client goes away is safe: nothing on screen references it.
+        WebCore::MemoryCache::singleton().setDeadDecodedDataDeletionInterval(WTF::Seconds(5));
+        // Apotheosis: MemoryPressureHandler is never install()ed on
+        // this port on purpose - its Windows poll (windowsMeasurementTimerFired) would reset the
+        // status to Normal every 60 s, and the App Container has no CreateMemoryResourceNotification
+        // anyway. We only push the status in from the harness (WebCoreSetMemoryPressure). Giving it
+        // a low-memory handler makes the few in-engine paths that call releaseMemory() work.
+        WTF::MemoryPressureHandler::singleton().setLowMemoryHandler([](WTF::Critical critical, WTF::Synchronous synchronous) {
+            WebCore::releaseMemory(critical, synchronous,
+                                   WebCore::MaintainBackForwardCache::No,
+                                   WebCore::MaintainMemoryCache::No);
+        });
         return true;
     }();
     return initialized;
@@ -254,6 +555,18 @@ bool ensureWebCoreInitialized()
 // WebCoreLoadUrl 返回负值时取走写进 LocalFolder,便于真机失败定位(App Container 无
 // 控制台/调试器输出通道)。单线程(WebKit 主线程)写,无需加锁。
 static char g_lastNetError[512] = "";
+// Apotheosis (2026-09-11): the same channel, but narrowed to the ONE failure a retry may act on -
+// the main frame's provisional load, i.e. a navigation that never got a byte of its document.
+// g_lastNetError above cannot be used for that decision: LoadingFrameLoaderClient also records
+// every failed SUBRESOURCE through it (dispatchDidFailLoading), so by the time a navigation
+// returns, the code stored there is usually some image's, not the document's.
+// Written only by WebCorePortRecordMainLoadFailure(), on the engine thread, and cleared before
+// each attempt. The host is stored without the path or query - a retry decision never needs, and
+// a log line must never carry, what the user searched for.
+static int  g_mainFailCode = 0;        // curl error code of that failure (0 = none recorded)
+static int  g_mainFailType = 0;        // WebCore::ResourceError::Type as an int (see recordNetError)
+static char g_mainFailHost[160] = "";  // host of the failing URL, no scheme/path/query
+static int  g_ipv4Only = 0;            // mirror of the last WebCoreSetIPv4Only(); for the netretry line
 static char g_lastDiag[4096] = "";   // 渲染诊断(URL/标题/内容尺寸/非白像素数 + 已缓存资源清单)
 static char g_lastTitle[512] = "";   // 最近加载页面的标题(供历史/书签用)
 static char g_lastUrl[1024] = "";    // 最近渲染文档的最终 URL(会话点击/导航后检测 URL 变化用)
@@ -261,7 +574,26 @@ static uint32_t g_lastFrameHash = 0; // 最近一帧像素哈希(实时模式判
 static int g_lastPendingResources = 0; // 最近文档仍在加载/未知状态的缓存资源数(防实时循环过早停)
 extern "C" bool g_apoUaMobile = true;  // UA 开关:true=移动 iPhone(默认),false=桌面(LoadingFrameLoaderClient::userAgent 用)。extern "C" 跨命名空间一个符号
 extern "C" char g_apoCustomUA[2048] = {0};  // 自定义 UA:非空则覆盖 mobile/desktop。WebCoreSetUserAgentString 设。
+// Apotheosis (M4 load waterfall, 2026-09-07): "perf logging is armed", read by WebKit's
+// CurlRequest::didReceiveHeader (WK_WINUWP) on the curl worker thread. Set together with
+// g_perfOn in WebCoreSetPerfLogPath; off in the shipping default, so the per-response URL copy
+// and main-thread hop that feed the waterfall cost nothing on a normal run.
+extern "C" bool g_apoNetTimingOn = false;
+// Apotheosis (privacy review): speculation-rules prefetch.
+//   WebCore defaults speculationRulesPrefetchEnabled to true, so a page's
+//   <script type="speculationrules"> may issue full requests for URLs the user never clicked.
+//   Off unless the harness turns it on (Settings -> PRIVACY: Off / Wi-Fi only / Always).
+//   WebCoreSetSpeculativePrefetch() sets it; every Page created afterwards reads it.
+static bool g_apoSpecPrefetch = false;
+// Apotheosis (M4): DNS warm-up, implemented in WebKit\Source\WebKitLegacy\WebCoreSupport\
+// WebResourceLoadScheduler.cpp, which is compiled straight into the driver
+// alongside this file - a plain cross-TU call, like the one in
+// LoadingFrameLoaderClient::prefetchDNS(). Used by WebCorePreconnect().
+extern void apotheosisPrefetchDNS(const WTF::String& hostname);
 static char g_spaProbe[512] = "";     // SPA 模块求值探针结果(诊断 <script type=module> 是否求值/抛错)
+static char g_pageProbe[384] = "";    // Apotheosis: per-document content summary (counts/lengths only, see writeDiag)
+static int g_paintProbeNonWhite = 0;  // Apotheosis: non-white pixels of the downscaled probe paint (the GPU present has no readback)
+static int g_paintProbeSampled = 0;   // Apotheosis: pixels that probe paint sampled (0 = it did not run)
 static std::vector<uint8_t> g_caBytes;  // CA 根证书字节副本,供 WebCoreDownload 的独立 curl 句柄用
 
 // GPU 合成是否就绪:仅当 WebCoreGpuInit 成功建好 GL 上下文 + TextureMapper 后才置 true。
@@ -279,12 +611,177 @@ static bool g_gpuFlipH = false;   // 反转列;真机实测无翻转(GPU·-)即�
 static bool g_gpuFlipV = false;   // 反转行;同上(仍可经 WebCoreGpuSetFlip 调,harness GPU 按钮循环)
 static int g_lastContentPx = 0;   // 最近一次 GPU readback 中"与背景色不同"的像素数(诊断:内容是否真合成进来)
 static bool g_gpuScrollFast = false;  // 置位时本次合成跳过 forceDirtyTree(滚动快路径,见 gpuPrepare)
+// Apotheosis: the pan present handshake is gone. It let a gesture take
+// the presents away from the engine (defer eglSwapBuffers, release each frame by hand) so that the
+// engine's own composites could not race the XAML TranslateTransform the harness drew the pan with.
+// That preview is deleted, and with it the only caller WebCoreSetPanGesture(1) ever had: on the
+// shipping default (instantpanxaml OFF since package 13) the harness never armed the mode, so every
+// flag, the owed-swap ledger and the scroll generation that dated it were provably unreachable.
+// Presents are unconditional again. If a future gesture path wants the engine to hold frames back,
+// take the mechanism from the history of this file rather than from a flag nothing sets.
+// Apotheosis (drag as pointer events): a mousedown WebCoreDragAt() dispatched and the page
+// consumed is still in flight — moves/releases only reach the page while this is set, and
+// teardownSession() clears it. Engine thread only, like every other flag here.
+static bool g_dragActive = false;
+// Apotheosis (map tap, 2026-09-06): where that press landed, and whether the finger has since
+// travelled far enough that the gesture stopped being a tap. A touch pan must NOT end in a click:
+// on the map site every pan ended with a click on the map canvas, which is the site's own
+// "toggle the full-screen map view" action - the reported "a tap/drag flips the map view".
+// (A mouse drag inside one element does fire a click in a desktop browser; a touch pan never does,
+// and every gesture that reaches WebCoreDragAt came from a finger.) Engine thread only.
+static int g_dragPressX = 0;
+static int g_dragPressY = 0;
+static bool g_dragMoved = false;
+static const int kDragTapSlopPx = 8;   // engine px (~4 DIP at 720 over a 360 DIP wide content area)
 static bool g_gpuPresentMode = false; // WebCoreGpuInit 收到窗口表面=true → 各帧直呈现到 SwapChainPanel(省 readback)
 static bool g_gpuAnimating = false;   // 最近一次合成时图层树仍有动画在跑(applyAnimationsRecursively 返回值),直呈现模式的帧变化信号之一
+
+// Apotheosis (WHITE-AT-SCROLL-END, 2026-09-04; docs/TILEGRID-DESIGN.md section 3): a
+// composite can come up with no content at all.
+//
+// Who produces such a composite: every live tick takes the scroll fast path (WebCoreLiveTick sets
+// g_gpuScrollFast unconditionally), so gpuPrepare skips forceDirtyTree and the composite is drawn
+// entirely from the tiles the backing stores still hold. When those tiles are gone - dropped
+// outside the cover rect while the gesture moved the visible rect, recycled on a scale change, or
+// still owed by a raster worker - the tree paints nothing at all and the whole screen is the clear
+// colour.
+//
+// The repair ledger that used to live here - gpuArmRepair(), gpuNoteRepairResult(),
+// g_gpuRepairMisses, the escalation cooldown and the `repairloop` stage line - is gone with the v1
+// mechanics it read. The TileGrid model answers one question
+// after a composite instead: how many VISIBLE cells drew nothing and had no backdrop behind them
+// (wkWinUWPTexmapVisibleHoles). A cell can only be in that state while work the model has already
+// scheduled is running, and R5/R12 guarantee that work converges, so the only thing missing is a
+// frame to show the result in - exactly one more composite, no dirtying. See gpuPresent().
+static bool g_gpuLastCompositeFull = false;   // gpuPrepare force-dirtied the tree this composite
+static bool g_gpuForceFullNext = false;       // next composite must force-dirty whatever the caller asks
+static bool g_gpuTargetedNext = false;        // next composite must NOT force-dirty: per-layer detection decides
+
+// Apotheosis (0.1.9.45): how many engine px at the BOTTOM of the viewport are covered by something
+// the engine cannot see - in practice the on-screen keyboard, which is an OS overlay on top of the
+// window and therefore changes nothing about the viewport the harness hands us. Set by
+// WebCoreSetBottomOcclusion(), read where the engine has to put something WHERE THE USER CAN SEE IT
+// (WebCoreResize's focused-field reveal). 0 = the whole viewport is visible.
+static int g_bottomOcclusionPx = 0;
+
+// ---------------------------------------------------------------------------
+// Apotheosis: event-driven present.
+//
+// The harness used to poll us with a fixed 200 ms DispatcherTimer because the C ABI had no way
+// of saying "something changed". It now registers a wake callback here; every invalidation
+// (PortChromeClient::scheduleRenderingUpdate / triggerRenderingUpdate / setNeedsOneShotDrawing-
+// Synchronization / didFinishLoadingImageForElement, the raster-completion hook, and the tick's
+// own "still dirty when it finished" state) funnels into presentRequested().
+//
+// Contract with the harness: the callback may run on ANY thread (engine thread for the WebCore
+// hooks, a raster worker for the completion hook), must not block and must not call back into
+// the engine - all it may do is post to a queue. See MainPage::PresentWakeThunk.
+//
+// Rate control lives on both sides: here an atomic arms the callback so a burst of invalidations
+// produces exactly one wake-up (disarmed again at the top of WebCoreLiveTick, i.e. once a
+// composite is actually under way, so anything raised during that composite arms the next one);
+// in the harness a >= ~16 ms gap between presents. g_presentWakes counts the wake-ups fired
+// since the last tick and becomes the perf row's wake_count column.
+// ---------------------------------------------------------------------------
+static std::atomic<void (*)(void*)> g_presentCb { nullptr };
+static std::atomic<void*> g_presentCbCtx { nullptr };
+static std::atomic<int> g_presentWakeArmed { 0 };
+static std::atomic<unsigned> g_presentWakes { 0 };
+
+// Apotheosis (M4 load throttle): while the main document is loading, every arriving stylesheet,
+// script and image invalidates layout, and each invalidation used to become its own wake-up and
+// therefore a full composite on the engine thread - the same thread the parser, the scripts and
+// the image decodes run on. During a load those composites show a half-built page nobody is
+// looking at yet, and they cost more than the work they display. So between
+// dispatchDidStartProvisionalLoad and the load event, engine-initiated presents are limited to
+// one per 250 ms. Exempt: the first visually-non-empty layout (the frame the user is waiting
+// for) goes out immediately. Untouched: scroll, pinch and pan presents, which do not travel
+// through presentRequested() at all, and a suppressed wake is never lost - the next allowed one
+// (or navLoadEnd(), at the load event) delivers it.
+static std::atomic<int> g_navLoading { 0 };             // provisional start .. load event
+static std::atomic<int> g_navWakeSuppressed { 0 };      // a wake was dropped by the throttle
+static std::atomic<int> g_navFirstPaintPending { 0 };   // DidFirstVisuallyNonEmptyLayout, not yet shown
+static std::atomic<double> g_navWakeLastSec { 0 };      // MonotonicTime of the last wake let through
+static std::atomic<double> g_navLoadStartSec { 0 };
+static double g_navTickCompositeSec = 0;                // engine thread only (WebCoreLiveTick)
+static constexpr double kNavWakeIntervalSec = 0.25;
+// Safety valve: a provisional load that never reaches a load event and never reaches a pump
+// (an SPA navigation started from a timer, say) must not throttle presents forever.
+static constexpr double kNavThrottleMaxSec = 20.0;
+
+static double monotonicSeconds()
+{
+    return MonotonicTime::now().secondsSinceEpoch().value();
+}
+
+static bool navLoadThrottleActive()
+{
+    if (!g_navLoading.load(std::memory_order_acquire))
+        return false;
+    if (g_navFirstPaintPending.load(std::memory_order_acquire))
+        return false;   // the first readable frame is never held back
+    return monotonicSeconds() - g_navLoadStartSec.load(std::memory_order_relaxed) < kNavThrottleMaxSec;
+}
+
+namespace WebCorePort {
+
+void presentRequested()
+{
+    void (*cb)(void*) = g_presentCb.load(std::memory_order_acquire);
+    if (!cb)
+        return;   // fixed-tick mode: nobody registered, the flag alone does the work
+    if (navLoadThrottleActive()) {
+        const double now = monotonicSeconds();
+        if (now - g_navWakeLastSec.load(std::memory_order_relaxed) < kNavWakeIntervalSec) {
+            g_navWakeSuppressed.store(1, std::memory_order_release);
+            return;   // covered by the next allowed wake, or by navLoadEnd()
+        }
+        g_navWakeLastSec.store(now, std::memory_order_relaxed);
+    }
+    int expected = 0;
+    if (!g_presentWakeArmed.compare_exchange_strong(expected, 1, std::memory_order_acq_rel))
+        return;   // a wake is already on its way; it will cover this request too
+    g_navWakeSuppressed.store(0, std::memory_order_release);
+    g_presentWakes.fetch_add(1, std::memory_order_relaxed);
+    cb(g_presentCbCtx.load(std::memory_order_acquire));
+}
+
+} // namespace WebCorePort
+
+// Apotheosis (M4 load throttle): the main document started / finished loading. navLoadEnd() also
+// hands over a wake the throttle swallowed, so the finished page is presented even if nothing
+// else invalidates afterwards. Both are engine-thread only.
+static void navLoadBegin()
+{
+    g_navLoadStartSec.store(monotonicSeconds(), std::memory_order_relaxed);
+    g_navFirstPaintPending.store(0, std::memory_order_release);
+    g_navLoading.store(1, std::memory_order_release);
+}
+
+static void navLoadEnd()
+{
+    if (!g_navLoading.exchange(0, std::memory_order_acq_rel))
+        return;
+    g_navFirstPaintPending.store(0, std::memory_order_release);
+    if (g_navWakeSuppressed.exchange(0, std::memory_order_acq_rel))
+        WebCorePort::presentRequested();
+}
+
+// Called at the top of every WebCoreLiveTick: the composite the last wake asked for is happening
+// now, so the next invalidation must be able to arm a new one.
+static void presentWakeDisarm()
+{
+    g_presentWakeArmed.store(0, std::memory_order_release);
+}
+
 
 // 子资源加载诊断计数(主文档 + CSS/JS/图片全经 ResourceHandle 桥)。由 ResourceHandle.cpp
 // 的 WebCorePortBumpLoad 累加;在 WebCoreLoadUrl 开头清零,结束并入 g_lastDiag,真机定位"子资源不加载"。
 static int g_loadStarted = 0, g_loadResponse = 0, g_loadComplete = 0, g_loadFail = 0;
+// Apotheosis (M4 load timeline): <script> elements in the document at the last writeDiag()
+// - the cheapest proxy for "how much script did this page bring" (this tree has no counter of
+// executed scripts, and adding one would mean a hook in JSC). Read by perfEnd() into n_scripts.
+static int g_lastScriptCount = -1;
 extern "C" void WebCorePortBumpLoad(int kind)
 {
     switch (kind) {
@@ -325,6 +822,13 @@ static void extractLinks(WebCore::Document* document, int renderH)
     g_links.clear();
     if (!document)
         return;
+    // Apotheosis (page width, 0.1.9.58): boundingClientRect() answers in CSS client px while
+    // renderH arrives in engine px and the harness reads these rectangles as engine px
+    // (WebCoreGetLink), so both ends of this loop convert. The factor the conversion carries is
+    // pageScaleFactor * page-width factor - the page scale was missing here before, which is the
+    // same mismatch WebCoreLinkAt's header describes; at 1:1 with a factor of 1 nothing changes.
+    WebCore::Page* page = document->page();
+    const double cssRenderH = wkClientLengthFromEngine(page, static_cast<double>(renderH));
     Ref<WebCore::HTMLCollection> links = document->links();
     unsigned n = links->length();
     for (unsigned i = 0; i < n && g_links.size() < 4000; ++i) {
@@ -338,13 +842,13 @@ static void extractLinks(WebCore::Document* document, int renderH)
         WebCore::FloatRect r = el->boundingClientRect();
         if (r.width() <= 0 || r.height() <= 0)
             continue;
-        if (r.maxY() < 0 || r.y() > static_cast<float>(renderH))
+        if (r.maxY() < 0 || r.y() > static_cast<float>(cssRenderH))
             continue;   // 只收落在已渲染视口内的链接(屏外的点不到)
         LinkRect lr;
-        lr.x = static_cast<int>(r.x());
-        lr.y = static_cast<int>(r.y());
-        lr.w = static_cast<int>(r.width());
-        lr.h = static_cast<int>(r.height());
+        lr.x = wkRoundToInt(wkEngineLengthFromClient(page, r.x()));
+        lr.y = wkRoundToInt(wkEngineLengthFromClient(page, r.y()));
+        lr.w = wkRoundToInt(wkEngineLengthFromClient(page, r.width()));
+        lr.h = wkRoundToInt(wkEngineLengthFromClient(page, r.height()));
         lr.url = href.string().utf8().data();
         g_links.push_back(std::move(lr));
     }
@@ -366,6 +870,12 @@ static size_t webcoreDownloadWrite(void* ptr, size_t size, size_t nmemb, void* s
 struct DriverLoadState {
     bool mainDone = false;   // 主文档完成(成功或失败),由完成回调置位
     bool failed   = false;
+    // Apotheosis (M3): the main document reached dispatchDidCommitLoad (set from
+    // perfNavCommit, the driver's only commit observer — LoadingFrameLoaderClient
+    // exists for the main frame only, createFrame() returns nullptr). Lets the load
+    // path tell "committed but no load event" (ImageDocument / deferred-load bug →
+    // render what we have) from "nothing ever arrived" (a real timeout).
+    bool committed = false;
 };
 
 struct Session {
@@ -382,36 +892,1614 @@ static bool g_inPump = false;              // settle 轮询 / 事件派发的重
 // 复位 g_inPump 的作用域守卫(无异常环境下,析构在正常返回路径也会执行)。
 struct PumpGuard { ~PumpGuard() { g_inPump = false; } };
 
+// ==================== crash.txt: last-resort crash reporting =================
+// Apotheosis: on Windows 10 Mobile WER writes no dump for the way this engine
+// dies (WTF's CRASH() is std::abort(), whose UWP CRT tail is __fastfail, and
+// WTFBreakpointTrap() is a `bkpt #0` trap) — the app just vanishes, which is
+// exactly what a news site does on a Lumia 950. So the driver writes the crashing
+// stack itself, appended to LocalState\crash.txt, from three independent
+// sources that all funnel into crashLogWrite():
+//   (a) the WTF crash hook (Source/WTF/wtf/Assertions.cpp, WK_WINUWP) — fires
+//       *before* the trap, so the captured stack is the crashing stack and the
+//       reason carries file/line/assertion;
+//   (b) a vectored exception handler (first in the chain) for the fatal codes —
+//       catches AVs and traps that never reach WTF at all;
+//   (c) signal(SIGABRT) — the tail of abort() before the CRT fast-fails.
+// Constraints on the crash path: no heap allocation beyond fopen's, no C++
+// exceptions (_HAS_EXCEPTIONS=0), no DbgHelp and no SetUnhandledExceptionFilter
+// (neither exists in the App Container partition), re-entrancy guarded, and a
+// hard cap on entries so a repeating first-chance AV cannot fill LocalState.
+// The engine and driver are statically linked into Harness.exe, so nearly every
+// frame is an RVA into Harness.exe — resolve them offline against its map/pdb.
+
+// AddVectoredExceptionHandler is declared DESKTOP-only in the 10.0.22621 SDK
+// headers, but the import is present in WindowsApp.lib and the API works inside
+// the App Container, so declare it here instead of widening WINAPI_FAMILY.
+extern "C" WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
+
+// Installed into WTF by WebCoreSetCrashLogPath(). Defined in
+// Source/WTF/wtf/Assertions.cpp under WK_WINUWP; declared here on purpose so no
+// WTF header changes (a header edit would rebuild the whole engine). Plain C++
+// linkage at global scope — the definition must match this exactly.
+extern void WTFWinUWPSetCrashHook(void (*hook)(const char* reason));
+
+static char g_crashLogPath[512] = { 0 };
+static bool g_crashLogInstalled = false;
+static bool g_crashLogInProgress = false;   // re-entrancy guard (crash while logging)
+static int  g_crashLogEntries = 0;          // hard cap, see kMaxCrashLogEntries
+static const int kMaxCrashLogEntries = 16;
+
+// Apotheosis (2026-09-03): a device abort left only "signal 22 (SIGABRT)" and the
+// handler frame — abort() reached us without going through WTFCrash, so the reason
+// was invisible. Everything that can abort *behind* WTF's back now gets its own
+// leg, each writing a distinct `reason:` line before falling through:
+//   (d) std::terminate      — uncaught exception, or ANGLE's RunOnUIThread timeout
+//                             (the port's single-engine-thread rule) reaching our CRT;
+//   (e) _set_new_handler    — operator new failed: address-space/commit exhaustion,
+//                             which with _HAS_EXCEPTIONS=0 aborts with no message;
+//   (f) invalid parameter   — CRT contract violation (bad handle, bad printf, ...);
+//   (g) purecall            — call through a partially destroyed object's vtable.
+// All four are CRT-level, so they see aborts the WTF hook and the VEH never do.
+static void perfFlush();   // fwd decl: drain the perf ring before we die (see (3) below)
+static void consoleFlush(); // fwd decl: drain the console.txt ring before we die, same reason
+
+// Memory numbers for the OOM-shaped legs. GlobalMemoryStatusEx is APP-partition and
+// comes from WindowsApp.lib; K32GetProcessMemoryInfo is APP-partition too but lives in
+// a psapi apiset we do not otherwise link, so resolve it once at install time and keep
+// the pointer — never call GetProcAddress from inside a crash handler.
+struct CrashProcessMemoryCounters {   // layout of PROCESS_MEMORY_COUNTERS (psapi.h)
+    DWORD cb;
+    DWORD pageFaultCount;
+    SIZE_T peakWorkingSetSize;
+    SIZE_T workingSetSize;
+    SIZE_T quotaPeakPagedPoolUsage;
+    SIZE_T quotaPagedPoolUsage;
+    SIZE_T quotaPeakNonPagedPoolUsage;
+    SIZE_T quotaNonPagedPoolUsage;
+    SIZE_T pagefileUsage;
+    SIZE_T peakPagefileUsage;
+};
+using CrashGetProcessMemoryInfoFn = BOOL (WINAPI*)(HANDLE, CrashProcessMemoryCounters*, DWORD);
+static CrashGetProcessMemoryInfoFn g_crashGetProcessMemoryInfo = nullptr;
+
+// Driver and harness are both /MD, so they share one vcruntime and one set of CRT
+// handler slots: whoever installs last wins. The harness installs its own terminate
+// handler in App() (it has exceptions and can describe the exception object; we cannot),
+// and SetupRuntimeEnv arms us afterwards — so keep the previous handlers and call them
+// once we have logged. Both reasons then appear in crash.txt, ours with the stack.
+static std::terminate_handler g_crashPrevTerminate = nullptr;
+static _invalid_parameter_handler g_crashPrevInvalidParameter = nullptr;
+static _purecall_handler g_crashPrevPureCall = nullptr;
+
+// "ws=..M priv=..M availVirt=..M load=..%" — appended to the reason of the OOM-shaped
+// legs so an abort can be told apart from a genuine logic failure at a glance. Never
+// allocates; every value that cannot be had is simply left out.
+static void crashLogMemorySuffix(char* out, size_t outSize)
+{
+    out[0] = 0;
+    int off = 0;
+    if (g_crashGetProcessMemoryInfo) {
+        CrashProcessMemoryCounters pmc = { };
+        pmc.cb = sizeof(pmc);
+        if (g_crashGetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+            off += std::snprintf(out + off, outSize - off, " ws=%lluM commit=%lluM",
+                static_cast<unsigned long long>(pmc.workingSetSize >> 20),
+                static_cast<unsigned long long>(pmc.pagefileUsage >> 20));
+    }
+    if (off >= static_cast<int>(outSize) - 1)
+        return;
+    MEMORYSTATUSEX ms = { };
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms))
+        std::snprintf(out + off, outSize - off, " availPhys=%lluM availVirt=%lluM load=%lu%%",
+            static_cast<unsigned long long>(ms.ullAvailPhys >> 20),
+            static_cast<unsigned long long>(ms.ullAvailVirtual >> 20),
+            static_cast<unsigned long>(ms.dwMemoryLoad));
+}
+
+// Basename of a module path, ASCII-folded into `out` (module names are ASCII).
+static void crashLogModuleName(HMODULE module, char* out, size_t outSize)
+{
+    out[0] = 0;
+    if (!module || outSize < 2)
+        return;
+    wchar_t wide[MAX_PATH];
+    DWORD n = GetModuleFileNameW(module, wide, MAX_PATH);
+    if (!n)
+        return;
+    wide[MAX_PATH - 1] = 0;
+    const wchar_t* base = wide;
+    for (const wchar_t* p = wide; *p; ++p) {
+        if (*p == L'\\' || *p == L'/')
+            base = p + 1;
+    }
+    size_t i = 0;
+    for (; base[i] && i + 1 < outSize; ++i)
+        out[i] = (base[i] < 128) ? static_cast<char>(base[i]) : '?';
+    out[i] = 0;
+}
+
+// SizeOfImage straight out of the mapped PE headers (no DbgHelp in App Container).
+static DWORD crashLogModuleSize(HMODULE module)
+{
+    if (!module)
+        return 0;
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(module) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+// The one writer. `ctxOrNull` is the vectored handler's CONTEXT when we have one.
+static void crashLogWrite(const char* reason, const CONTEXT* ctxOrNull)
+{
+    if (!g_crashLogPath[0] || g_crashLogInProgress || g_crashLogEntries >= kMaxCrashLogEntries)
+        return;
+    g_crashLogInProgress = true;
+    ++g_crashLogEntries;
+
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp) {
+        g_crashLogInProgress = false;
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "\n==== crash %04u-%02u-%02u %02u:%02u:%02u.%03u tid=%lu ====\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    std::fprintf(fp, "reason: %s\n", reason ? reason : "(none)");
+
+    // Image base/size of the host exe first, so every RVA below can be matched
+    // offline against the exact Harness.exe that produced this file.
+    HMODULE exe = GetModuleHandleW(nullptr);
+    char exeName[64];
+    crashLogModuleName(exe, exeName, sizeof(exeName));
+    std::fprintf(fp, "module %s base=0x%08llx size=0x%08lx\n",
+        exeName[0] ? exeName : "?",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(exe)),
+        static_cast<unsigned long>(crashLogModuleSize(exe)));
+
+#if defined(_M_ARM) || defined(_ARM_)
+    if (ctxOrNull) {
+        std::fprintf(fp, "context: pc=0x%08lx lr=0x%08lx sp=0x%08lx r0=0x%08lx r1=0x%08lx\n",
+            static_cast<unsigned long>(ctxOrNull->Pc), static_cast<unsigned long>(ctxOrNull->Lr),
+            static_cast<unsigned long>(ctxOrNull->Sp), static_cast<unsigned long>(ctxOrNull->R0),
+            static_cast<unsigned long>(ctxOrNull->R1));
+    }
+#else
+    (void)ctxOrNull;
+#endif
+
+    void* frames[48] = { nullptr };
+    USHORT captured = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    // Apotheosis: say how many frames the unwinder actually produced. On ARM32 Thumb
+    // it regularly returns 1 (no unwind data for the CRT's abort tail), and a file
+    // with a single frame must be readable as "the unwinder failed", not "shallow stack".
+    std::fprintf(fp, "stack: captured=%u\n", static_cast<unsigned>(captured));
+    for (USHORT i = 0; i < captured; ++i) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(frames[i]);
+        HMODULE mod = nullptr;
+        char name[64] = { 0 };
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(frames[i]), &mod) && mod) {
+            crashLogModuleName(mod, name, sizeof(name));
+            std::fprintf(fp, "frame %2u: %s +0x%08llx\n", static_cast<unsigned>(i),
+                name[0] ? name : "?",
+                static_cast<unsigned long long>(addr - reinterpret_cast<uintptr_t>(mod)));
+        } else
+            std::fprintf(fp, "frame %2u: ? 0x%08llx\n", static_cast<unsigned>(i),
+                static_cast<unsigned long long>(addr));
+    }
+
+    // Apotheosis: unwinder fallback. When RtlCaptureStackBackTrace gives us almost
+    // nothing (the ARM32 abort tail), raw-scan this thread's stack for words that look
+    // like Thumb return addresses inside the host image and log them as candidates.
+    // Noisy by construction — stale frames survive on the stack — but "cand" lines feed
+    // an offline symbolizer exactly like "frame" lines and usually contain the real
+    // caller. Bounded scan, no allocation, VirtualQuery for the stack extent.
+    if (captured < 4 && exe) {
+        const uintptr_t exeBase = reinterpret_cast<uintptr_t>(exe);
+        const uintptr_t exeEnd = exeBase + crashLogModuleSize(exe);
+        volatile uintptr_t probe = 0;
+        const uintptr_t here = reinterpret_cast<uintptr_t>(const_cast<uintptr_t*>(&probe));
+        MEMORY_BASIC_INFORMATION mbi = { };
+        if (crashLogModuleSize(exe) && VirtualQuery(reinterpret_cast<const void*>(here), &mbi, sizeof(mbi))) {
+            uintptr_t top = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (top > here + 16384)
+                top = here + 16384;          // 4k words is plenty and keeps the file small
+            int found = 0;
+            for (uintptr_t p = here; p + sizeof(uintptr_t) <= top && found < 24; p += sizeof(uintptr_t)) {
+                const uintptr_t v = *reinterpret_cast<const uintptr_t*>(p);
+                if (v <= exeBase || v >= exeEnd || !(v & 1))
+                    continue;                // Thumb return addresses have bit 0 set
+                std::fprintf(fp, "cand %2d: %s +0x%08llx\n", found, exeName[0] ? exeName : "?",
+                    static_cast<unsigned long long>((v & ~static_cast<uintptr_t>(1)) - exeBase));
+                ++found;
+            }
+        }
+    }
+
+    std::fflush(fp);
+    std::fclose(fp);
+    g_crashLogInProgress = false;
+}
+
+// (a) WTF hook: reason already carries file/line/assertion or reason/misc values.
+static void crashLogWtfHook(const char* reason)
+{
+    char buffer[832];
+    std::snprintf(buffer, sizeof(buffer), "WTF %s", reason ? reason : "(none)");
+    crashLogWrite(buffer, nullptr);
+}
+
+// (b) Vectored handler, first in the chain. Logs only the terminal codes and
+// always returns EXCEPTION_CONTINUE_SEARCH — we observe, we never swallow.
+static LONG NTAPI crashLogVectoredHandler(EXCEPTION_POINTERS* info)
+{
+    if (!info || !info->ExceptionRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_BREAKPOINT:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case 0xC00000FDu:   // STATUS_STACK_OVERFLOW
+    case 0xC0000409u:   // STATUS_STACK_BUFFER_OVERRUN — what __fastfail raises
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char reason[200];
+    // For access violations ExceptionInformation[0] is 0 = read, 1 = write, 8 = execute
+    // (DEP/no-execute page) and [1] the faulting address - tells a non-executable JIT
+    // pool apart from a bad pointer inside JIT code.
+    const auto* rec = info->ExceptionRecord;
+    std::snprintf(reason, sizeof(reason), "SEH code=0x%08lx address=0x%08llx access=%lu fault=0x%08llx",
+        static_cast<unsigned long>(code),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rec->ExceptionAddress)),
+        rec->NumberParameters > 0 ? static_cast<unsigned long>(rec->ExceptionInformation[0]) : 99ul,
+        rec->NumberParameters > 1 ? static_cast<unsigned long long>(rec->ExceptionInformation[1]) : 0ull);
+    crashLogWrite(reason, info->ContextRecord);
+    // For an execute fault (access=8) the decisive question is what protection the page
+    // at the faulting address actually has: VirtualQuery is App-Container-safe and the
+    // JIT pool is the prime suspect (W^X commit path in OSAllocatorWin.cpp).
+    if (rec->NumberParameters > 1) {
+        MEMORY_BASIC_INFORMATION mbi = { };
+        if (VirtualQuery(reinterpret_cast<const void*>(rec->ExceptionInformation[1]), &mbi, sizeof(mbi))) {
+            char extra[200];
+            std::snprintf(extra, sizeof(extra), "fault page: base=0x%08llx size=0x%08llx state=0x%lx protect=0x%lx allocProtect=0x%lx type=0x%lx",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+                static_cast<unsigned long long>(mbi.RegionSize),
+                static_cast<unsigned long>(mbi.State), static_cast<unsigned long>(mbi.Protect),
+                static_cast<unsigned long>(mbi.AllocationProtect), static_cast<unsigned long>(mbi.Type));
+            crashLogWrite(extra, nullptr);
+        }
+        // Which modules do pc and lr point into? (a pc outside Harness.exe with a DLL name
+        // beats a bare address - the ANGLE DLLs are the usual suspects for present/resize races)
+        {
+            const uintptr_t regs[2] = { static_cast<uintptr_t>(info->ContextRecord->Pc), static_cast<uintptr_t>(info->ContextRecord->Lr) };
+            char where[200]; int off = 0;
+            for (int k = 0; k < 2; ++k) {
+                HMODULE mod = nullptr; char name[64] = { 0 };
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(regs[k]), &mod) && mod) {
+                    crashLogModuleName(mod, name, sizeof(name));
+                    off += std::snprintf(where + off, sizeof(where) - off, "%s in %s +0x%08llx  ", k ? "lr" : "pc", name[0] ? name : "?", static_cast<unsigned long long>(regs[k] - reinterpret_cast<uintptr_t>(mod)));
+                } else
+                    off += std::snprintf(where + off, sizeof(where) - off, "%s in no module  ", k ? "lr" : "pc");
+                if (off >= static_cast<int>(sizeof(where)) - 1) break;
+            }
+            crashLogWrite(where, nullptr);
+        }
+        // Is the fault inside JSC's fixed executable pool? (W^X commit gap vs. stray jump)
+        char pool[120];
+        std::snprintf(pool, sizeof(pool), "jit pool: [0x%08llx, 0x%08llx) isJITPC(fault)=%d",
+            static_cast<unsigned long long>(JSC::startOfFixedExecutableMemoryPool<uintptr_t>()),
+            static_cast<unsigned long long>(JSC::endOfFixedExecutableMemoryPool<uintptr_t>()),
+            JSC::isJITPC(reinterpret_cast<void*>(rec->ExceptionInformation[1])) ? 1 : 0);
+        crashLogWrite(pool, nullptr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// (c) abort() tail. Returns; the CRT then fast-fails as usual.
+// The perf ring is drained first: abort() is the one exit where the rows leading up to
+// the crash (the `scale` rows of a pinch, say) would otherwise be lost with the process.
+static void __cdecl crashLogSignalHandler(int sig)
+{
+    char reason[128];
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    std::snprintf(reason, sizeof(reason), "signal %d (SIGABRT)%s", sig, mem);
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    consoleFlush();
+}
+
+// (d) std::terminate. Reached by an uncaught exception, a noexcept violation, or a
+// terminate() call — on this port most plausibly ANGLE's RunOnUIThread timeout (the
+// port's single-engine-thread rule) unwinding into our CRT. The driver is built with
+// _HAS_EXCEPTIONS=0, so there is no exception object to describe: say so explicitly
+// rather than leaving the reader guessing. Must not return — the CRT would abort
+// anyway; we abort ourselves so leg (c) also runs and the RVAs land in the file.
+static void __cdecl crashLogTerminateHandler()
+{
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    char reason[256];
+#if defined(_HAS_EXCEPTIONS) && !_HAS_EXCEPTIONS
+    std::snprintf(reason, sizeof(reason),
+        "terminate (driver _HAS_EXCEPTIONS=0: no exception object; uncaught throw came from another module)%s", mem);
+#else
+    std::snprintf(reason, sizeof(reason), "terminate (pending exception=%d)%s",
+        std::current_exception() ? 1 : 0, mem);
+#endif
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    consoleFlush();
+    if (g_crashPrevTerminate && g_crashPrevTerminate != &crashLogTerminateHandler)
+        g_crashPrevTerminate();   // harness leg: names the exception; aborts itself
+    std::abort();
+}
+
+// (e) operator new failure. Uses the CRT hook rather than std::set_new_handler because
+// this one is handed the requested size — the number that tells an ordinary large
+// allocation apart from 32-bit address-space exhaustion, which is what a 770 MB working
+// set on a Lumia produces. Returning 0 means "do not retry", so the CRT proceeds to its
+// usual bad_alloc/terminate path; returning non-zero here would spin operator new forever.
+static int __cdecl crashLogNewHandler(size_t size)
+{
+    char mem[160];
+    crashLogMemorySuffix(mem, sizeof mem);
+    char reason[256];
+    std::snprintf(reason, sizeof(reason), "operation new failed size=%llu%s",
+        static_cast<unsigned long long>(size), mem);
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    consoleFlush();
+    return 0;
+}
+
+// (f) CRT contract violation (bad handle, malformed printf spec, out-of-range index in a
+// checked call). In a release CRT every string argument is null — that is expected; the
+// stack in the same entry is what identifies the call site.
+static void __cdecl crashLogInvalidParameterHandler(const wchar_t* expression, const wchar_t* function,
+    const wchar_t* file, unsigned int line, uintptr_t /*reserved*/)
+{
+    auto narrow = [](const wchar_t* w, char* out, size_t outSize) {
+        size_t i = 0;
+        if (!w) {
+            std::snprintf(out, outSize, "(null)");
+            return;
+        }
+        for (; w[i] && i + 1 < outSize; ++i)
+            out[i] = (w[i] < 128) ? static_cast<char>(w[i]) : '?';
+        out[i] = 0;
+    };
+    char e[96], f[96], fl[128];
+    narrow(expression, e, sizeof e);
+    narrow(function, f, sizeof f);
+    narrow(file, fl, sizeof fl);
+    char reason[400];
+    std::snprintf(reason, sizeof(reason), "invalid parameter expr=%s func=%s file=%s line=%u", e, f, fl, line);
+    crashLogWrite(reason, nullptr);
+    perfFlush();
+    consoleFlush();
+    if (g_crashPrevInvalidParameter && g_crashPrevInvalidParameter != &crashLogInvalidParameterHandler)
+        g_crashPrevInvalidParameter(expression, function, file, line, 0);
+    // Return: the CRT then fast-fails exactly as it would have without us.
+}
+
+// (g) pure virtual call — a virtual dispatched on a half-constructed/half-destroyed
+// object. On this port the prime suspects are the teardown paths (session/tab destruction
+// racing a queued engine call), which look identical to an OOM kill from outside.
+static void __cdecl crashLogPureCallHandler()
+{
+    crashLogWrite("pure virtual call", nullptr);
+    perfFlush();
+    consoleFlush();
+    if (g_crashPrevPureCall && g_crashPrevPureCall != &crashLogPureCallHandler)
+        g_crashPrevPureCall();
+    // Return: the CRT fast-fails as before.
+}
+
+// ==================== M4 step 1: per-phase timing (PerfLog) ==================
+// Apotheosis: opt-in per-phase timing for the performance milestone. Off unless
+// the harness calls WebCoreSetPerfLogPath() — which it only does when the tester
+// dropped LocalState\perf.txt (same device-side opt-in as imedebug.txt) — so a
+// shipping build pays one predictable branch per probe and nothing else.
+// One CSV row per completed top-level operation (nav/scroll/tick/click); rows
+// buffer in a fixed ring and reach disk with a single fopen_s("ab")+fprintf+
+// fclose at nav completion / ring-full / explicit flush. Never one file open per
+// frame — that would dominate the numbers on a Lumia 950. Timestamps are taken
+// only at phase boundaries, never inside the per-pixel loops.
+// Engine thread only, like the g_last* diagnostics above (deliberately lock-free).
+static std::string g_perfPath;
+// Apotheosis (M4 load timeline): LocalState\stage.txt, derived from crash.txt's directory in
+// WebCoreSetCrashLogPath (the same trick console.txt uses below). One human-readable
+// "timeline ..." line per navigation, so the load breakdown is legible without perf.csv.
+static std::string g_stagePath;
+static bool g_perfOn = false;
+static bool g_perfHeaderDone = false;
+
+// One physical line; the column order must stay in sync with perfFlush()'s fprintf.
+static const char* const kPerfHeader =
+    "seq,kind,url,ms_total,ms_net_commit,ms_net_load,ms_settle,ms_style_layout,ms_render_update,"
+    "ms_flush,ms_backing,ms_paint,ms_readback,ms_swap,ms_blit,frames,subres_started,subres_ok,"
+    "subres_fail,gpu,dfg,w,h,dirty_full,dirty_partial,net_dns,net_connect,net_tls,net_ttfb,http_ver,"
+    "raster_pending,raster_done,raster_posted,raster_cancelled,raster_blocked,wake_count,"
+    // Apotheosis (M4 load timeline): ms since dispatchDidStartProvisionalLoad, empty = never
+    // reached; the n_* pair is cumulative at t_load. ms_style_layout / ms_paint above already
+    // are the per-navigation sums, so the timeline does not duplicate them.
+    "t_firstbyte,t_commit,t_dcl,t_firstpaint,t_load,t_settle,n_scripts,n_subres,"
+    // Apotheosis (2026-09-06): finished tile replays the engine's upload budget pushed to a later
+    // frame. Appended at the END rather than next to the other raster_ columns on purpose - the
+    // analysis notes and scripts address the existing columns by index (the raster_ block starts at
+    // column 31 counting from one), and shifting eight of them to group one new one with them would
+    // break every one of those.
+    "raster_deferred,"
+    // Apotheosis (M4 load waterfall, 2026-09-07): the subresource side of the network, which
+    // the four net_* columns above never covered (they are the main document only). Filled on
+    // "nav" rows from WebCorePortNetTiming, empty everywhere else.
+    //   net_sub_n        subresource responses whose headers arrived during this navigation
+    //   net_sub_conn     of those, how many had to open a TCP connection. With HTTP/2 and a
+    //                    working connection cache this is ~ the number of distinct hosts; if
+    //                    it tracks net_sub_n instead, connection reuse/multiplexing is broken
+    //   net_sub_h1       how many came back over HTTP/1.x (h2 negotiation failed for that host)
+    //   net_sub_ttfb     sum of the per-transfer waits. Divided by the wall time between commit
+    //                    and load it gives the effective parallelism: ~1 means the loader is
+    //                    serialised, ~6-8 means the connection limits are actually being used
+    //   net_sub_last     ms since nav start of the LAST subresource header. Close to t_load =
+    //                    the load event waited for the network; far below it = it waited for us
+    //   settle_why       which pumpLoop rule ended the navigation (quiet / cap-load / cap-dcl /
+    //                    watchdog / frame-gone) - the difference between "the page was done" and
+    //                    "we gave up on it"
+    "net_sub_n,net_sub_conn,net_sub_h1,net_sub_ttfb,net_sub_last,settle_why,"
+    // Apotheosis (M4 load, 2026-09-07): where the *engine thread* was during a navigation. The
+    // pump's settle timer repeats every 50 ms, and RunLoopGeneric schedules the next fire from
+    // the moment the callback starts - so the spacing between two callbacks is 50 ms plus
+    // whatever else ran on the run loop in between (WebCore's own timers: the HTML parser's
+    // yield timer, DOM timers, ScriptRunner, plus every callOnMainThread hop the loader makes
+    // per response). That is the one large bucket nothing measured:
+    //   ms_tick_cb   sum of the settle callbacks themselves (ms_render_update is inside this)
+    //   ms_offpump   sum of max(0, period - max(50 ms, callback)) = main-thread work that was
+    //                NOT ours. On the 2026-09-07 log this is the biggest single bucket of a
+    //                cold news-site load, and it is invisible in every other column
+    //   pump_ticks   settle callbacks (same number as `frames`, kept next to the two above so
+    //                the row is readable on its own)
+    "ms_tick_cb,ms_offpump,pump_ticks,"
+    // Apotheosis (M4 load): the split of ms_offpump, from the scoped
+    // accounting in wtf/ApoLoadPhase.h (armed by pumpLoop, only with perf logging on). Each
+    // bucket holds the *self* time of its scopes, so they never overlap and an inner scope
+    // always beats the generic run-loop one around it:
+    //   off_js       DOMTimer::fired + ScriptController::evaluateInWorld - third-party script
+    //   off_parse    HTMLDocumentParser::pumpTokenizer, including the yield timer's slices
+    //   off_style    Document::resolveStyle + LocalFrameViewLayoutContext::layout that no
+    //                script or parser scope was already paying for
+    //   off_decode   synchronous image decode on the engine thread
+    //   off_timer    a RunLoop timer none of the above named (WebCore has many small ones)
+    //   off_dispatch RunLoop::dispatch / callOnMainThread functions - the loader makes one
+    //                hop per response and per body chunk; off_disp_n is how many ran
+    //   off_other    ms_offpump minus the six, i.e. the run loop's own overhead and whatever
+    //                still has no scope. A large off_other means this list is incomplete
+    "off_js,off_parse,off_style,off_decode,off_timer,off_dispatch,off_disp_n,off_other,"
+    // Apotheosis (M4 load, 2026-09-07): how often, not how long. off_style
+    // is one number for two very different things, and 1.4 s of it on a tech-news site reads the same
+    // whether one style resolution was expensive or the pump forced twenty. Counted in
+    // wtf/ApoLoadPhase.h at the same scopes, over the same window as the buckets:
+    //   style_n   Document::resolveStyle entries          (> ~10 per navigation = the driver is
+    //   layout_n  LocalFrameViewLayoutContext::layout      forcing passes, not the page)
+    //   timer_n   DOMTimer::fired entries                 (drops when the C2.9 alignment works)
+    "style_n,layout_n,timer_n,"
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): why the layers dirty_full
+    // counts were repainted in full, one string cell instead of six more columns so existing
+    // scripts that address raster_deferred and everything before it by index (see the raster_
+    // comment above) keep working - appended at the very END for the same reason. Format
+    // "a/b/c/d/e/f", each a running sum over this operation except f (0 or 1):
+    //   a  layers where m_needsDisplay was set (GraphicsLayerTextureMapper::wkTexmapDirtySrcStats)
+    //   b  layers whose backing store was just created (m_wkNeedsFullRepaint)
+    //   c  layers whose backing store size changed (m_wkBackingStoreSize != m_size)
+    //   d  layers whose contents scale changed (m_wkBackingStoreScale != wkContentsScale)
+    //   e  GraphicsLayerTextureMapper::setNeedsDisplay() calls that flipped m_needsDisplay
+    //      false->true (a superset of forceDirtyTree()'s own calls - see f)
+    //   f  1 if any composite in this operation was one forceDirtyTree() had just walked
+    //      (g_gpuLastCompositeFull), else 0 - the only field NOT counted inside WebCore, so a
+    //      row with e > 0 and f = 0 means WebCore itself asked for the repaint, not the driver
+    "dirty_src,"
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.5/3): the TileGrid's only output
+    // the driver reacts to - the sum over this operation's composites of visible cells that drew
+    // NOTHING and had no backdrop behind them (wkWinUWPTexmapVisibleHoles, read once per composite
+    // in gpuPresent). Empty when the operation never composited. 0 = every visible cell had pixels; a small
+    // number for a frame or two after a pinch or a fast pan is the model working (each of those
+    // composites also asks for one more present); a row that stays non-zero with the finger off the
+    // glass is the thing to chase. Appended at the very END for the same reason as dirty_src.
+    "tg_holes\n";
+
+struct PerfRow {
+    unsigned seq = 0;
+    char kind[12] = { 0 };    // nav | scroll | tick | click
+    char url[192] = { 0 };
+    // Phase durations in ms; < 0 means "phase does not apply" → empty CSV cell.
+    double total = -1, netCommit = -1, netLoad = -1, settle = -1, styleLayout = -1,
+           renderUpdate = -1, flush = -1, backing = -1, paint = -1, readback = -1,
+           swap = -1, blit = -1;
+    double domReady = -1;     // no column of its own; ms_net_load falls back to it
+    int frames = -1, subStarted = -1, subOk = -1, subFail = -1;
+    int gpu = 0, dfg = 0, w = 0, h = 0;
+    // Apotheosis (M4): TextureMapper layers repainted in full vs. by dirty rect in this operation
+    // (wkWinUWPTexmapDirtyStats, WebKit winuwp f14d05ff1f); -1 = no composite happened.
+    int dirtyFull = -1, dirtyPartial = -1;
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): per-cause breakdown of
+    // dirtyFull above (wkWinUWPTexmapDirtySrcStats — see dirty_src in kPerfHeader),
+    // accumulated across this operation the same way dirtyFull/dirtyPartial are. -1 = no
+    // composite happened. dirtySrcForceDirty is not a sum: it is 1 if ANY composite in this
+    // operation was one forceDirtyTree() had just walked (g_gpuLastCompositeFull).
+    int dirtySrcNeedsDisplay = -1, dirtySrcStoreCreated = -1, dirtySrcSizeChange = -1,
+        dirtySrcScaleChange = -1, dirtySrcSetNeedsDisplay = -1, dirtySrcForceDirty = -1;
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes - the sum of
+    // wkWinUWPTexmapVisibleHoles() over this operation's composites (see the column in
+    // kPerfHeader). -1 = this operation never composited, i.e. nobody could have reported a hole,
+    // which is a different statement from "no hole was reported" and therefore a different cell.
+    int tgHoles = -1;
+    // Apotheosis (M4): curl's breakdown of the main resource of this navigation
+    // (WebCorePortNetTiming, WebKit CurlRequest::didReceiveHeader). Milliseconds since
+    // the transfer started; net_connect is the TCP handshake only, net_tls the TLS one,
+    // net_ttfb the whole wait until the first response byte. -1 = never reported.
+    // Chasing the sporadic 14-22 s "first contact" stalls seen on the Lumia over Wi-Fi.
+    double netDns = -1, netConnect = -1, netTls = -1, netTtfb = -1;
+    int httpVer = -1;         // 10 / 11 / 20 / 30; 0 = curl could not tell
+    // Apotheosis (threaded raster): tile replays still running on the worker pool when
+    // this operation's last composite finished. 0 with threaded raster on = the pool kept up;
+    // -1 = no composite happened (or the feature is off), i.e. an empty CSV cell.
+    int rasterPending = -1;
+    // Apotheosis (threaded raster): raster_done = replays that finished since the last
+    // composite and are therefore owed a present (edge-triggered, wkWinUWPTexmapTakeFinishedRasterTiles).
+    // The other three are running totals since process start: replays posted, replays cancelled
+    // before a worker picked them up, and times the engine thread had to BLOCK on a replay. The
+    // last one is the one to watch: it must stay near zero, otherwise off-thread raster is worse
+    // than synchronous raster.
+    int rasterDone = -1, rasterPosted = -1, rasterCancelled = -1, rasterBlocked = -1;
+    // Apotheosis (2026-09-06): raster_deferred = finished replays the engine's per-pass upload
+    // budget moved to a later frame (edge-triggered, wkWinUWPTexmapTakeDeferredUploads). It is the
+    // price side of the ms_backing improvement: a row with a low ms_backing and a high
+    // raster_deferred means the burst was spread, a row where it never falls back to zero means
+    // the budget is too small for what the page produces.
+    int rasterDeferred = -1;
+    // Apotheosis (event-driven present): wake-ups fired to the harness since the previous tick.
+    // 0 on an idle page (the loop is asleep, only the 1 s fallback tick runs), ~1 per frame on an
+    // animating one; a number much larger than 1 means the arming atomic stopped collapsing bursts.
+    // -1 = the operation was not a tick (only WebCoreLiveTick reads and resets the counter).
+    int wakes = -1;
+    // Apotheosis (M4 load timeline): milestones of one navigation, in ms since the provisional
+    // load started (perfSinceNavStart); -1 = never reached -> empty CSV cell. t_commit and t_dcl
+    // get no fields of their own: the CSV prints netCommit and domReady in those columns.
+    //   t_firstbyte  main-resource response headers (WebCorePortNetTiming, curl didReceiveHeader)
+    //   t_firstpaint DidFirstVisuallyNonEmptyLayout  (dispatchDidReachLayoutMilestone)
+    //   t_load       load event                      (dispatchDidFinishLoad)
+    //   t_settle     pumpLoop returned               (buildSession: the driver calls it done)
+    double tFirstByte = -1, tFirstPaint = -1, tLoad = -1, tSettle = -1;
+    // Cumulative at t_load: <script> elements in the document, subresources completed.
+    int nScripts = -1, nSubres = -1;
+    // Apotheosis (M4 load waterfall): subresource network aggregate of this navigation; see the
+    // net_sub_* block in kPerfHeader. -1 = not a nav row / nothing reported.
+    int netSubN = -1, netSubConn = -1, netSubH1 = -1;
+    double netSubTtfb = -1, netSubLast = -1;
+    char settleWhy[16] = { 0 };   // pumpLoop's stop reason, "" on non-nav rows
+    // Apotheosis (M4 load): engine-thread accounting of the pump; see kPerfHeader.
+    double msTickCb = -1, msOffPump = -1;
+    int pumpTicks = -1;
+    // Apotheosis (M4 load, 2026-09-07): the ms_offpump split; see kPerfHeader and
+    // wtf/ApoLoadPhase.h. -1 = not a nav row.
+    double offJs = -1, offParse = -1, offStyle = -1, offDecode = -1, offTimer = -1,
+           offDispatch = -1, offOther = -1;
+    int offDispatchN = -1;
+    // Apotheosis (M4 load, 2026-09-07): pass counts over the same window as the buckets above;
+    // see kPerfHeader and wtf/ApoLoadPhase.h. -1 = not a nav row.
+    int styleN = -1, layoutN = -1, timerN = -1;
+};
+
+static constexpr int kPerfRingSize = 256;
+static PerfRow g_perfRing[kPerfRingSize];
+static int g_perfRows = 0;
+static unsigned g_perfSeq = 0;
+
+static PerfRow g_perfCur;                 // operation currently being measured
+static bool g_perfInOp = false;
+static bool g_perfOpIsNav = false;
+static MonotonicTime g_perfOpStart;       // C ABI entry of the current operation
+static MonotonicTime g_perfNavT0;         // first provisional load start of the operation
+static bool g_perfNavT0Set = false;
+static int g_perfPumpTicks = 0;           // pumpLoop settle ticks of the current operation
+// Apotheosis (M4 load, 2026-09-07): which pumpLoop rule ended the navigation - see the
+// settle_why column in kPerfHeader. Written by pumpLoop (perf-independent, it is also the
+// cheapest breadcrumb when a load feels stuck), read by perfEnd.
+static char g_settleWhy[16] = { 0 };
+// Perf-independent "this navigation has painted something readable" flag, set from
+// perfNavVisuallyNonEmpty and cleared at navLoadBegin. pumpLoop's wall-clock cap on the
+// pre-load phase only fires once the user actually has a page to look at.
+static std::atomic<int> g_navSawFirstPaint { 0 };
+// Apotheosis (M4 load, 2026-09-07): the wall clock of the two events pumpLoop's caps are counted
+// from, taken *at the event* instead of at the settle tick that happens to notice it. Both are
+// perf-independent (the caps run with logging off) and 0 = "not reached in this navigation".
+//
+// This is a real bug, not tidiness. The settle timer ticks every 50 ms plus its callback plus
+// whatever the run loop does in between, which on a news site is 160 ms on average and over a second
+// when an ad timer chain runs; anchoring a 1 s deadline on the first tick that observed the event
+// therefore pushed the deadline out by a whole gap. Measured (log 20260907-100044): the news site warm
+// fired its load event at 1820 ms and cap-load ended the pump at 4124 ms - 2.3 s for a 1 s cap.
+static std::atomic<double> g_navLoadEventSec { 0 };   // dispatchDidFinishLoad
+static std::atomic<double> g_navDomReadySec { 0 };    // dispatchDidFinishDocumentLoad
+// Apotheosis (M4 load): the DOM timer alignment the load window asks for.
+// Declared here because the stage.txt timeline line prints it; used by loadTimerThrottleSet().
+static constexpr unsigned kLoadTimerAlignMs = 250;
+static constexpr unsigned kLoadTimerNestedAlignMs = 1000;
+
+// Scoped phase timer: adds its own lifetime to one PerfRow field (accumulating,
+// so repeated phases inside one operation sum up). Reads no clock at all when
+// logging is off. Never place one inside a pixel loop.
+struct PerfPhase {
+    double* slot;
+    MonotonicTime t;
+    explicit PerfPhase(double* s)
+        : slot(g_perfOn ? s : nullptr)
+        , t(g_perfOn ? MonotonicTime::now() : MonotonicTime())
+    {
+    }
+    ~PerfPhase()
+    {
+        if (!slot)
+            return;
+        const double ms = (MonotonicTime::now() - t).milliseconds();
+        *slot = (*slot < 0) ? ms : (*slot + ms);
+    }
+};
+
+// CSV-safe copy: URLs carry commas/quotes and a row must stay one physical line.
+static void perfSetUrl(const char* url)
+{
+    g_perfCur.url[0] = '\0';
+    if (!url)
+        return;
+    size_t n = 0;
+    for (; url[n] && n + 1 < sizeof g_perfCur.url; ++n) {
+        const char c = url[n];
+        g_perfCur.url[n] = (c == ',' || c == '"' || c == '\r' || c == '\n') ? '_' : c;
+    }
+    g_perfCur.url[n] = '\0';
+}
+
+static void perfFmtD(char* buf, size_t cap, double v)
+{
+    if (v < 0) {
+        buf[0] = '\0';
+        return;
+    }
+    std::snprintf(buf, cap, "%.2f", v);
+}
+
+static void perfFmtI(char* buf, size_t cap, int v)
+{
+    if (v < 0) {
+        buf[0] = '\0';
+        return;
+    }
+    std::snprintf(buf, cap, "%d", v);
+}
+
+// Drain the ring to disk. Single open/append/close (App-Container-safe, the same
+// shape PortNetworkStorageSession uses for its cookie diag).
+// Apotheosis: the crash legs above call this so the rows leading up to an abort are not
+// lost with the process. There is no lock to deadlock on, but the crash may well *be*
+// inside this function (a fopen/fprintf on an exhausted heap), so entry is gated by an
+// atomic try-flag: a flush already in flight is never re-entered, we simply skip it.
+static std::atomic<int> g_perfFlushBusy { 0 };
+
+static void perfFlushLocked()
+{
+    if (!g_perfOn || g_perfPath.empty() || !g_perfRows)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_perfPath.c_str(), "ab") != 0 || !fp) {
+        g_perfRows = 0;   // an unwritable path must not make the ring grow forever
+        return;
+    }
+    if (!g_perfHeaderDone) {
+        std::fputs(kPerfHeader, fp);
+        g_perfHeaderDone = true;
+    }
+    for (int i = 0; i < g_perfRows; ++i) {
+        const PerfRow& r = g_perfRing[i];
+        const double vals[12] = { r.total, r.netCommit, r.netLoad, r.settle, r.styleLayout,
+                                  r.renderUpdate, r.flush, r.backing, r.paint, r.readback,
+                                  r.swap, r.blit };
+        char d[12][16];
+        for (int k = 0; k < 12; ++k)
+            perfFmtD(d[k], sizeof d[k], vals[k]);
+        const int ints[4] = { r.frames, r.subStarted, r.subOk, r.subFail };
+        char n[4][12];
+        for (int k = 0; k < 4; ++k)
+            perfFmtI(n[k], sizeof n[k], ints[k]);
+        char df[12], dp[12];
+        perfFmtI(df, sizeof df, r.dirtyFull);
+        perfFmtI(dp, sizeof dp, r.dirtyPartial);
+        // M4: network breakdown of the main resource (empty cells when never reported).
+        const double netVals[4] = { r.netDns, r.netConnect, r.netTls, r.netTtfb };
+        char nt[4][16];
+        for (int k = 0; k < 4; ++k)
+            perfFmtD(nt[k], sizeof nt[k], netVals[k]);
+        char hv[12];
+        perfFmtI(hv, sizeof hv, r.httpVer);
+        const int rasterVals[5] = { r.rasterPending, r.rasterDone, r.rasterPosted,
+                                    r.rasterCancelled, r.rasterBlocked };
+        char rs[5][12];
+        for (int k = 0; k < 5; ++k)
+            perfFmtI(rs[k], sizeof rs[k], rasterVals[k]);
+        char wk[12];
+        perfFmtI(wk, sizeof wk, r.wakes);
+        // M4 load timeline (t_commit = netCommit, t_dcl = domReady - no second copy is kept).
+        const double tlVals[6] = { r.tFirstByte, r.netCommit, r.domReady, r.tFirstPaint,
+                                   r.tLoad, r.tSettle };
+        char tl[6][16];
+        for (int k = 0; k < 6; ++k)
+            perfFmtD(tl[k], sizeof tl[k], tlVals[k]);
+        char nsc[12], nsr[12];
+        perfFmtI(nsc, sizeof nsc, r.nScripts);
+        perfFmtI(nsr, sizeof nsr, r.nSubres);
+        char rdf[12];
+        perfFmtI(rdf, sizeof rdf, r.rasterDeferred);
+        // M4 load waterfall: subresource network aggregate (nav rows only).
+        const int subInts[3] = { r.netSubN, r.netSubConn, r.netSubH1 };
+        char sb[3][12];
+        for (int k = 0; k < 3; ++k)
+            perfFmtI(sb[k], sizeof sb[k], subInts[k]);
+        char sbt[16], sbl[16];
+        perfFmtD(sbt, sizeof sbt, r.netSubTtfb);
+        perfFmtD(sbl, sizeof sbl, r.netSubLast);
+        // M4 load: engine-thread accounting of the pump.
+        char tcb[16], offp[16], pt[12];
+        perfFmtD(tcb, sizeof tcb, r.msTickCb);
+        perfFmtD(offp, sizeof offp, r.msOffPump);
+        perfFmtI(pt, sizeof pt, r.pumpTicks);
+        // M4 load C2.1: the ms_offpump split (empty cells on non-nav rows).
+        const double offVals[7] = { r.offJs, r.offParse, r.offStyle, r.offDecode, r.offTimer,
+                                    r.offDispatch, r.offOther };
+        char of[7][16];
+        for (int k = 0; k < 7; ++k)
+            perfFmtD(of[k], sizeof of[k], offVals[k]);
+        char ofn[12];
+        perfFmtI(ofn, sizeof ofn, r.offDispatchN);
+        // M4 load C2.10: style / layout / DOM timer pass counts.
+        const int passInts[3] = { r.styleN, r.layoutN, r.timerN };
+        char pc[3][12];
+        for (int k = 0; k < 3; ++k)
+            perfFmtI(pc[k], sizeof pc[k], passInts[k]);
+        // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): dirty_src, appended at the
+        // very end - see the comment on the column in kPerfHeader. -1 on dirtySrcNeedsDisplay means
+        // no composite happened this operation, same convention as dirtyFull/dirtyPartial -> empty
+        // cell rather than "0/0/0/0/0/0", which would misleadingly claim a composite ran clean.
+        char ds[48];
+        if (r.dirtySrcNeedsDisplay < 0)
+            ds[0] = '\0';
+        else
+            std::snprintf(ds, sizeof ds, "%d/%d/%d/%d/%d/%d",
+                r.dirtySrcNeedsDisplay, r.dirtySrcStoreCreated, r.dirtySrcSizeChange,
+                r.dirtySrcScaleChange, r.dirtySrcSetNeedsDisplay,
+                r.dirtySrcForceDirty > 0 ? 1 : 0);
+        // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): tg_holes, after it. Same
+        // convention: -1 (this operation never composited) -> empty
+        // cell, so a 0 always means "the grid ran and saw no hole".
+        char tgh[12];
+        perfFmtI(tgh, sizeof tgh, r.tgHoles);
+        std::fprintf(fp, "%u,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                         "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+            r.seq, r.kind, r.url,
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
+            n[0], n[1], n[2], n[3], r.gpu, r.dfg, r.w, r.h, df, dp,
+            nt[0], nt[1], nt[2], nt[3], hv,
+            rs[0], rs[1], rs[2], rs[3], rs[4], wk,
+            tl[0], tl[1], tl[2], tl[3], tl[4], tl[5], nsc, nsr, rdf,
+            sb[0], sb[1], sb[2], sbt, sbl, r.settleWhy,
+            tcb, offp, pt,
+            of[0], of[1], of[2], of[3], of[4], of[5], ofn, of[6],
+            pc[0], pc[1], pc[2], ds, tgh);
+    }
+    std::fclose(fp);
+    g_perfRows = 0;
+}
+
+static void perfFlush()
+{
+    int expected = 0;
+    if (!g_perfFlushBusy.compare_exchange_strong(expected, 1))
+        return;
+    perfFlushLocked();
+    g_perfFlushBusy.store(0);
+}
+
+// ---- Apotheosis (M4 load waterfall, 2026-09-07) ------------------------------------------
+// The slowest subresource transfers of the current navigation, kept as a tiny insertion-sorted
+// table (no allocation, no lock - every entry arrives on the engine thread from
+// WebCorePortNetTiming). Sorted by TTFB, which on this port is the interesting number: a
+// resource whose own transfer was fast but whose headers arrived late was queued, and the pair
+// (t, b) below shows exactly that. Printed once per navigation as a "loadwaterfall" line.
+struct NetSubEntry {
+    char name[40];    // last path segment, truncated - enough to recognise the resource
+    double tHeader;   // ms since nav start when the response headers landed
+    double dns, connect, tls, ttfb;
+    int ver;
+};
+static constexpr int kNetTopN = 8;
+static NetSubEntry g_netTop[kNetTopN];
+static int g_netTopUsed = 0;
+static double perfSinceNavStart();   // defined below, next to the navigation phase marks
+
+static void netSubReset()
+{
+    g_netTopUsed = 0;
+}
+
+// Copy the last path segment of a URL (query stripped) into a fixed buffer.
+static void netSubShortName(char* out, size_t cap, const char* url)
+{
+    out[0] = '\0';
+    if (!url || !*url)
+        return;
+    const char* end = std::strpbrk(url, "?#");
+    const char* stop = end ? end : url + std::strlen(url);
+    const char* begin = stop;
+    while (begin > url && begin[-1] != '/')
+        --begin;
+    size_t n = static_cast<size_t>(stop - begin);
+    if (!n) {                       // directory URL ("https://host/") - fall back to the host
+        begin = url;
+        n = static_cast<size_t>(stop - url);
+    }
+    if (n > cap - 1)
+        n = cap - 1;
+    std::memcpy(out, begin, n);
+    out[n] = '\0';
+}
+
+static void netSubAdd(double dnsMs, double connectMs, double tlsMs, double ttfbMs,
+                      int httpVersion, const char* url)
+{
+    const double now = perfSinceNavStart();
+    // Aggregate first - it counts every response, not just the slow ones.
+    if (g_perfCur.netSubN < 0) {
+        g_perfCur.netSubN = 0;
+        g_perfCur.netSubConn = 0;
+        g_perfCur.netSubH1 = 0;
+        g_perfCur.netSubTtfb = 0;
+    }
+    ++g_perfCur.netSubN;
+    if (connectMs > 0 || tlsMs > 0)          // a new TCP/TLS connection had to be opened
+        ++g_perfCur.netSubConn;
+    if (httpVersion && httpVersion < 20)     // 0 = curl could not tell; do not blame it on h1
+        ++g_perfCur.netSubH1;
+    g_perfCur.netSubTtfb += ttfbMs;
+    if (now > g_perfCur.netSubLast)
+        g_perfCur.netSubLast = now;
+
+    // Then the top-N by TTFB.
+    if (g_netTopUsed == kNetTopN && ttfbMs <= g_netTop[kNetTopN - 1].ttfb)
+        return;
+    int at = g_netTopUsed < kNetTopN ? g_netTopUsed : kNetTopN - 1;
+    while (at > 0 && g_netTop[at - 1].ttfb < ttfbMs) {
+        g_netTop[at] = g_netTop[at - 1];
+        --at;
+    }
+    NetSubEntry& e = g_netTop[at];
+    netSubShortName(e.name, sizeof e.name, url);
+    e.tHeader = now;
+    e.dns = dnsMs;
+    e.connect = connectMs;
+    e.tls = tlsMs;
+    e.ttfb = ttfbMs;
+    e.ver = httpVersion;
+    if (g_netTopUsed < kNetTopN)
+        ++g_netTopUsed;
+}
+
+// One "loadwaterfall" line per navigation, next to the "timeline" line. Read it as: n/conn/h1
+// say whether the connection cache and HTTP/2 are doing their job, ttfbsum/(load-commit) is the
+// effective parallelism, last is when the network actually went quiet, and the entries are the
+// eight transfers that waited longest - "name t=<header arrived> b=<ttfb> d/c/s=<dns/tcp/tls> v=<http>".
+static void perfWriteStageWaterfall(const PerfRow& r)
+{
+    if (g_stagePath.empty() || r.netSubN < 0)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "loadwaterfall url=%s n=%d conn=%d h1=%d ttfbsum=%.0f last=%.0f slowest=[",
+        r.url, r.netSubN, r.netSubConn, r.netSubH1,
+        r.netSubTtfb < 0 ? 0.0 : r.netSubTtfb, r.netSubLast < 0 ? 0.0 : r.netSubLast);
+    for (int i = 0; i < g_netTopUsed; ++i) {
+        const NetSubEntry& e = g_netTop[i];
+        std::fprintf(fp, "%s%s t=%.0f b=%.0f d=%.0f c=%.0f s=%.0f v=%d",
+            i ? " | " : "", e.name, e.tHeader, e.ttfb, e.dns, e.connect, e.tls, e.ver);
+    }
+    std::fputs("]\n", fp);
+    std::fclose(fp);
+}
+
+// Apotheosis (M4 load timeline): the same navigation timeline as one readable line in
+// LocalState\stage.txt - the file the device scripts already pull and a human can read on the
+// phone. One open/append/close per navigation (never per frame), so the cost is irrelevant.
+// "-" means the milestone was never reached, which is itself the interesting case: a load that
+// never paints has fp=-, one that never fires a load event has load=-.
+static void perfWriteStageTimeline(const PerfRow& r)
+{
+    if (g_stagePath.empty())
+        return;
+    const double vals[6] = { r.tFirstByte, r.netCommit, r.domReady, r.tFirstPaint, r.tLoad, r.tSettle };
+    char t[6][16];
+    for (int k = 0; k < 6; ++k) {
+        if (vals[k] < 0)
+            std::snprintf(t[k], sizeof t[k], "-");
+        else
+            std::snprintf(t[k], sizeof t[k], "%.0f", vals[k]);
+    }
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    // Apotheosis (M4 load, 2026-09-07): why= is pumpLoop's stop reason. Without it a long
+    // settle and a settle that hit a cap look identical in this line, and they call for
+    // opposite fixes (wait longer vs. stop waiting).
+    std::fprintf(fp, "timeline url=%s firstbyte=%s commit=%s dcl=%s fp=%s load=%s settle=%s"
+                     " why=%s total=%.0f subres=%d/%d scripts=%d ticks=%d cb=%.0f offpump=%.0f\n",
+        r.url, t[0], t[1], t[2], t[3], t[4], t[5],
+        r.settleWhy[0] ? r.settleWhy : "-",
+        r.total < 0 ? 0.0 : r.total, r.subOk, r.subStarted, r.nScripts,
+        r.pumpTicks, r.msTickCb < 0 ? 0.0 : r.msTickCb, r.msOffPump < 0 ? 0.0 : r.msOffPump);
+    // Apotheosis (M4 load): the same split as the off_* columns, on a line
+    // of its own so the timeline line above keeps the shape the existing notes quote.
+    // Apotheosis (M4 load, 2026-09-07): style_n/layout_n/timer_n are pass *counts* over the
+    // same window (wtf/ApoLoadPhase.h). A style time that is large because one resolution is
+    // expensive and one that is large because the pump forces twenty need opposite fixes, and
+    // timer_n is how the C2.9 timer alignment shows up: the same work in fewer, larger runs.
+    // tthr= is the alignment the load window asked for, so a log says which build it is.
+    std::fprintf(fp, "offpump url=%s total=%.0f js=%.0f parse=%.0f style=%.0f decode=%.0f"
+                     " timers=%.0f dispatch=%.0f/%d other=%.0f"
+                     " style_n=%d layout_n=%d timer_n=%d tthr=%u\n",
+        r.url, r.msOffPump < 0 ? 0.0 : r.msOffPump,
+        r.offJs < 0 ? 0.0 : r.offJs, r.offParse < 0 ? 0.0 : r.offParse,
+        r.offStyle < 0 ? 0.0 : r.offStyle, r.offDecode < 0 ? 0.0 : r.offDecode,
+        r.offTimer < 0 ? 0.0 : r.offTimer, r.offDispatch < 0 ? 0.0 : r.offDispatch,
+        r.offDispatchN < 0 ? 0 : r.offDispatchN, r.offOther < 0 ? 0.0 : r.offOther,
+        r.styleN, r.layoutN, r.timerN, kLoadTimerAlignMs);
+    std::fclose(fp);
+}
+
+// Apotheosis (2026-09-07, ghost after a pinch): the engine's zoom trace into stage.txt. WebCore
+// writes one "zoom ..." line per composite for the few composites that follow a contents-scale
+// change (TextureMapperTiledBackingStore::wkTraceZoomComposite) and this drains whatever is
+// pending. Called at the end of every operation, not only of a navigation: the composites the
+// trace describes happen on the ticks *after* the pinch, never on the pinch's own row. Between
+// two zooms the take returns 0 and the file is not opened at all.
+// Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 5.3): the same take now also drains the
+// TileGrid v2 input trace ("tg ..."), whose ring is 256 lines of up to 320 characters - up to ~82 kB
+// against the 2 kB buffer this used to pass, i.e. one call could carry seven lines and the model's
+// replay input (§5.4) would be full of gaps. The take copies WHOLE lines and leaves the rest in the
+// ring for the next call, so draining is a loop: keep an 8 kB buffer off the stack pressure of a
+// single 82 kB one and go round until the ring is empty. The cap only exists so a bug in the engine
+// ring cannot spin here; 16 rounds is twice the worst case (three full rings).
+static void perfWriteStageZoomTrace()
+{
+    if (g_stagePath.empty())
+        return;
+    char buf[8192];
+    size_t used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
+    if (!used)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    for (int round = 0; used && round < 16; ++round) {
+        std::fwrite(buf, 1, used, fp);
+        used = WebCore::wkWinUWPTakeTexmapZoomTrace(buf, sizeof buf);
+    }
+    std::fclose(fp);
+}
+
+static void perfBegin(const char* kind, const char* url, int w, int h)
+{
+    if (!g_perfOn)
+        return;
+    g_perfCur = PerfRow{};
+    std::snprintf(g_perfCur.kind, sizeof g_perfCur.kind, "%s", kind ? kind : "?");
+    perfSetUrl(url);
+    g_perfCur.w = w;
+    g_perfCur.h = h;
+    g_perfOpIsNav = kind && !std::strcmp(kind, "nav");
+    g_perfPumpTicks = 0;
+    g_perfNavT0Set = false;
+    netSubReset();          // M4 load waterfall: the slow-transfer table is per navigation
+    WTF::apoPhaseReset();   // M4 load C2.1: the ms_offpump split is per operation too
+    g_settleWhy[0] = '\0';
+    g_perfInOp = true;
+    g_perfOpStart = MonotonicTime::now();
+}
+
+static void perfEnd()
+{
+    if (!g_perfOn || !g_perfInOp)
+        return;
+    g_perfInOp = false;
+    g_perfCur.total = (MonotonicTime::now() - g_perfOpStart).milliseconds();
+    g_perfCur.seq = ++g_perfSeq;
+    if (!g_perfCur.url[0])
+        perfSetUrl(g_lastUrl);
+    // ms_net_load: the load event when it fired, else DOM ready — redirect chains
+    // and in-page (SPA) navigations may never reach a second load event.
+    if (g_perfCur.netLoad < 0)
+        g_perfCur.netLoad = g_perfCur.domReady;
+    if (g_perfOpIsNav) {
+        g_perfCur.frames = g_perfPumpTicks;         // rendering updates driven while settling
+        g_perfCur.subStarted = g_loadStarted;
+        g_perfCur.subOk = g_loadComplete;
+        g_perfCur.subFail = g_loadFail;
+        // M4 load timeline: n_subres is the count at t_load (set in perfNavLoadEvent); a
+        // navigation that never fired a load event falls back to the final count so the column
+        // is not blank for a page that did render. n_scripts comes from the last writeDiag().
+        if (g_perfCur.nSubres < 0)
+            g_perfCur.nSubres = g_loadComplete;
+        g_perfCur.nScripts = g_lastScriptCount;
+        std::snprintf(g_perfCur.settleWhy, sizeof g_perfCur.settleWhy, "%s",
+                      g_settleWhy[0] ? g_settleWhy : "-");
+        g_perfCur.pumpTicks = g_perfPumpTicks;
+        // M4 load C2.1: the ms_offpump split. The buckets are self times and therefore disjoint;
+        // off_other is what ms_offpump has left over - run-loop overhead plus anything that still
+        // has no scope. It is the number that says whether the attribution can be trusted: a load
+        // whose off_other dominates has not been explained.
+        g_perfCur.offJs = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Js);
+        g_perfCur.offParse = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Parse);
+        g_perfCur.offStyle = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Style);
+        g_perfCur.offDecode = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Decode);
+        g_perfCur.offTimer = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Timer);
+        g_perfCur.offDispatch = WTF::apoPhaseMilliseconds(WTF::ApoPhaseBucket::Dispatch);
+        g_perfCur.offDispatchN = static_cast<int>(WTF::apoPhaseEntries(WTF::ApoPhaseBucket::Dispatch));
+        const double offSum = g_perfCur.offJs + g_perfCur.offParse + g_perfCur.offStyle
+            + g_perfCur.offDecode + g_perfCur.offTimer + g_perfCur.offDispatch;
+        const double offTotal = g_perfCur.msOffPump < 0 ? 0.0 : g_perfCur.msOffPump;
+        g_perfCur.offOther = offTotal > offSum ? offTotal - offSum : 0.0;
+        // Apotheosis (M4 load C2.10): pass counts over the same window.
+        g_perfCur.styleN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::StyleRecalc));
+        g_perfCur.layoutN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::Layout));
+        g_perfCur.timerN = static_cast<int>(WTF::apoPhaseEvents(WTF::ApoPhaseCounter::DomTimer));
+    } else
+        g_perfCur.frames = 1;
+    g_perfCur.gpu = g_gpuActive ? 1 : 0;
+    g_perfCur.dfg = 0;   // hardcoded: becomes a build flag once ENABLE_DFG_JIT=ON is measured (M4 §4)
+    if (g_perfCur.w <= 0 && g_session) {            // viewport of the live session
+        g_perfCur.w = g_session->w;
+        g_perfCur.h = g_session->h;
+    }
+    if (g_perfOpIsNav) {
+        perfWriteStageTimeline(g_perfCur);
+        perfWriteStageWaterfall(g_perfCur);
+    }
+    // Apotheosis (2026-09-07): ... and the engine's zoom trace on any operation - see
+    // perfWriteStageZoomTrace(); it is a no-op unless a pinch happened a few frames ago.
+    perfWriteStageZoomTrace();
+    if (g_perfRows < kPerfRingSize)
+        g_perfRing[g_perfRows++] = g_perfCur;
+    // Flush on nav completion, and every 32 rows so a crash mid-session (seen
+    // on a news site) does not take the whole ring with it - still one file open per
+    // ~6 s of ticks, not per frame.
+    if (g_perfOpIsNav || g_perfRows >= 32)
+        perfFlush();
+}
+
+// Scope guard so every early return of an entry point still emits its row.
+struct PerfOpGuard {
+    PerfOpGuard(const char* kind, const char* url, int w, int h) { perfBegin(kind, url, w, h); }
+    ~PerfOpGuard() { perfEnd(); }
+};
+
+// Network phases are measured from the first provisional load start, so page
+// setup/teardown before the load does not leak into the network columns.
+static double perfSinceNavStart()
+{
+    return (MonotonicTime::now() - (g_perfNavT0Set ? g_perfNavT0 : g_perfOpStart)).milliseconds();
+}
+
+// Apotheosis (M4 load timeline): t_settle - the moment the driver itself calls the navigation
+// done, i.e. pumpLoop returned in buildSession (load event, settle cap or watchdog). Whatever
+// is left between it and ms_total is the final layout, link extraction and first paint.
+static void perfMarkNavSettled()
+{
+    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav || g_perfCur.tSettle >= 0)
+        return;
+    g_perfCur.tSettle = perfSinceNavStart();
+}
+
+// Navigation phase marks — LoadingFrameLoaderClient is the only observer of these
+// boundaries. Declared in PortPerf.h; first mark of an operation wins (a redirect
+// chain keeps the timestamps of the load the user actually asked for).
+namespace WebCorePort {
+
+void perfNavStart()
+{
+    // Apotheosis (M4 load throttle): runs with perf logging off too — this is the
+    // "main document is loading" edge the present throttle above is keyed on.
+    navLoadBegin();
+    g_navSawFirstPaint.store(0, std::memory_order_release);   // M4 load: per navigation
+    g_navLoadEventSec.store(0, std::memory_order_relaxed);    // M4 load: pumpLoop's cap anchors
+    g_navDomReadySec.store(0, std::memory_order_relaxed);
+    if (!g_perfOn || !g_perfInOp || g_perfNavT0Set)
+        return;
+    g_perfNavT0 = MonotonicTime::now();
+    g_perfNavT0Set = true;
+}
+
+void perfNavCommit()
+{
+    // Apotheosis (M3): commit bookkeeping runs even with perf logging off — the load
+    // path needs it to decide timeout vs. "committed, just no load event".
+    if (g_session)
+        g_session->load.committed = true;
+    if (!g_perfOn || !g_perfInOp || g_perfCur.netCommit >= 0)
+        return;
+    g_perfCur.netCommit = perfSinceNavStart();
+}
+
+void perfNavDocumentReady()
+{
+    // Apotheosis (M4 load): perf-independent - pumpLoop's cap-dcl deadline is counted from here.
+    if (!g_navDomReadySec.load(std::memory_order_relaxed))
+        g_navDomReadySec.store(monotonicSeconds(), std::memory_order_relaxed);
+    if (!g_perfOn || !g_perfInOp || g_perfCur.domReady >= 0)
+        return;
+    g_perfCur.domReady = perfSinceNavStart();
+}
+
+void perfNavLoadEvent()
+{
+    navLoadEnd();   // Apotheosis (M4 load throttle): full present rate from here on (perf-independent)
+    // Apotheosis (M4 load): perf-independent - pumpLoop's cap-load deadline is counted from here.
+    if (!g_navLoadEventSec.load(std::memory_order_relaxed))
+        g_navLoadEventSec.store(monotonicSeconds(), std::memory_order_relaxed);
+    if (!g_perfOn || !g_perfInOp || g_perfCur.netLoad >= 0)
+        return;
+    g_perfCur.netLoad = perfSinceNavStart();
+    // M4 load timeline: t_load, plus the subresource count reached by the load event.
+    g_perfCur.tLoad = g_perfCur.netLoad;
+    g_perfCur.nSubres = g_loadComplete;
+}
+
+// t_firstpaint. WebCore fires DidFirstVisuallyNonEmptyLayout from
+// LocalFrameView::fireLayoutRelatedMilestonesIfNeeded as soon as the content qualifies as
+// visually non-empty - the engine-side answer to "when did something readable appear", and far
+// cheaper than scanning pixels. buildSession asks for it via Page::addLayoutMilestones (WebCore
+// only tracks milestones a client requested).
+void perfNavVisuallyNonEmpty()
+{
+    // Apotheosis (M4 load throttle): the frame the user is waiting for. Exempt it from the
+    // throttle (navLoadThrottleActive) and ask for it right away; the flag is consumed by the
+    // composite in WebCoreLiveTick. Perf-independent, like the marks above.
+    if (g_navLoading.load(std::memory_order_acquire)) {
+        g_navFirstPaintPending.store(1, std::memory_order_release);
+        presentRequested();
+    }
+    // Apotheosis (M4 load): perf-independent, pumpLoop's pre-load cap is keyed on it.
+    g_navSawFirstPaint.store(1, std::memory_order_release);
+    if (!g_perfOn || !g_perfInOp || g_perfCur.tFirstPaint >= 0)
+        return;
+    g_perfCur.tFirstPaint = perfSinceNavStart();
+}
+
+} // namespace WebCorePort
+
+// Apotheosis (M4): curl's DNS/TCP/TLS/TTFB breakdown for the main resource of the
+// current navigation. Called from WebKit's CurlRequest::didReceiveHeader (WK_WINUWP)
+// on the main thread, once per response, for VeryHigh-priority requests only — that
+// is WebKit's priority for the main document, but subresources can be raised to it
+// too, so the FIRST report inside a nav operation wins (that is the main resource:
+// nothing else can have finished its headers before it). Only recorded for "nav"
+// rows; scroll/tick/click operations have no main resource of their own.
+//
+// Apotheosis (M4 load waterfall, 2026-09-07): every other response lands here too and feeds
+// two things - the net_sub_* aggregate of the perf row, and a small "slowest transfers" table
+// that perfWriteStageWaterfall() prints into stage.txt. Both exist to answer the one question
+// the old main-resource-only columns could not: on a news front page, whose load event is 6.6 s
+// after DOMContentLoaded and whose engine-thread work in that window is ~1.1 s, are the 261
+// subresources waiting on the network or on us?
+extern "C" void WebCorePortNetTiming(int isMainResource, double dnsMs, double connectMs,
+    double tlsMs, double ttfbMs, int httpVersion, const char* url)
+{
+    if (!g_perfOn || !g_perfInOp || !g_perfOpIsNav)
+        return;
+    if (!isMainResource) {
+        netSubAdd(dnsMs, connectMs, tlsMs, ttfbMs, httpVersion, url);
+        return;
+    }
+    if (g_perfCur.netTtfb >= 0)   // first main-resource report of this navigation wins
+        return;
+    // M4 load timeline: t_firstbyte. The response headers of the main resource are in hand
+    // right now, so the wall clock since the provisional load started IS time-to-first-byte as
+    // the navigation experienced it - net_ttfb below is curl's own per-transfer number and
+    // excludes everything WebKit did before the request reached curl.
+    g_perfCur.tFirstByte = perfSinceNavStart();
+    g_perfCur.netDns = dnsMs;
+    g_perfCur.netConnect = connectMs;
+    g_perfCur.netTls = tlsMs;
+    g_perfCur.netTtfb = ttfbMs;
+    g_perfCur.httpVer = httpVersion;
+}
+
+// ==================== JS console -> LocalState\console.txt =================
+// Apotheosis: buffered mirror of PortChromeClient::addMessageToConsole() to disk — the JS-console
+// analogue of the perf/crash logs above, reachable without a debugger attached to a headless
+// ARM32 App Container. Same opt-in family as perf.txt/imedebug.txt (see WebCoreSetPerfLogPath):
+// on when perf logging is on (g_perfOn, reused rather than adding a second harness->driver
+// setter) OR when LocalState\console.txt already exists, so a tester who wants console output
+// without perf can just drop an empty file. The path is derived once, in WebCoreSetCrashLogPath,
+// from the crash log's own directory — crash logging is always armed (not opt-in), so its path is
+// the one thing guaranteed known by the time any JS can run, and deriving from it means no third
+// harness->driver path setter is needed for this feature.
+// One physical line per message: "HH:MM:SS.mmm level source:line message\n", message truncated to
+// 512 chars. Buffers in a small ring, same shape as the perf ring; flushes every ~16 lines, on
+// session teardown (teardownSession above), and from the crash legs / WebCoreCrashNote /
+// WebCorePerfFlush (suspend path) so a dying or backgrounded process does not take the trailing
+// console output with it. Engine thread only (PortChromeClient callbacks run on it).
+static std::string g_consolePath;
+static bool g_consolePathReady = false;
+static bool g_consoleFileExisted = false;   // opt-in probe result, computed once when the path becomes known
+
+static bool consoleLoggingEnabled()
+{
+    return g_consolePathReady && (g_perfOn || g_consoleFileExisted);
+}
+
+static constexpr int kConsoleRingSize = 16;
+static constexpr int kConsoleRowSize = 600;
+// Apotheosis: POD rows, exactly like PerfRow — NOT std::string. Rows are written on the engine
+// thread (PortChromeClient::addMessageToConsole) while consoleFlush() can run from the UI thread
+// (WebCorePerfFlush on suspend) and from the crash legs (VEH / SIGABRT / terminate, on whatever
+// thread died). std::string assignment there means malloc/free on a heap another thread may be
+// inside → heap corruption in exactly the situation the log exists to explain. A fixed char array
+// only ever races on bytes: a torn row, never a crash.
+static char g_consoleRing[kConsoleRingSize][kConsoleRowSize];
+static int g_consoleRows = 0;
+static std::atomic<int> g_consoleFlushBusy { 0 };   // same re-entrancy guard shape as g_perfFlushBusy
+
+static void consoleFlushLocked()
+{
+    if (g_consolePath.empty() || !g_consoleRows)
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_consolePath.c_str(), "ab") != 0 || !fp) {
+        g_consoleRows = 0;   // an unwritable path must not make the ring grow forever
+        return;
+    }
+    for (int i = 0; i < g_consoleRows; ++i) {
+        g_consoleRing[i][kConsoleRowSize - 1] = '\0';   // paranoia: never fwrite past the row
+        std::fwrite(g_consoleRing[i], 1, std::strlen(g_consoleRing[i]), fp);
+    }
+    std::fclose(fp);
+    g_consoleRows = 0;
+}
+
+static void consoleFlush()
+{
+    int expected = 0;
+    if (!g_consoleFlushBusy.compare_exchange_strong(expected, 1))
+        return;
+    consoleFlushLocked();
+    g_consoleFlushBusy.store(0);
+}
+
+// Called by WebCorePort::consoleLogAppend() below. Plain C strings so PortChromeClient.cpp (which
+// calls that bridge) does not need to know about the ring/path statics living in this TU.
+static void consoleAppendLine(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message)
+{
+    if (!consoleLoggingEnabled())
+        return;
+    if (g_consoleRows >= kConsoleRingSize)
+        return;   // full and the flush below could not drain it: drop rather than overrun the ring
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char* line = g_consoleRing[g_consoleRows];
+    // %.128s / %.512s: printf precision truncates for us, no separate strncpy needed. sourceID is
+    // a page-controlled URL and used to be unbounded — a long data:/blob: script URL alone could
+    // fill the row and push the terminating newline out of it, gluing two console lines together.
+    // Cap it, and then append the newline by hand from the *clamped* length so every row ends in
+    // exactly one '\n' no matter how snprintf truncated.
+    int n = std::snprintf(line, kConsoleRowSize - 1, "%02u:%02u:%02u.%03u %s %.128s:%u %.512s",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        levelStr ? levelStr : "?", sourceID ? sourceID : "", lineNumber, utf8Message ? utf8Message : "");
+    if (n < 0)
+        return;                                  // encoding error: leave the slot unused
+    if (n > kConsoleRowSize - 2)
+        n = kConsoleRowSize - 2;                 // truncated: snprintf returns what it *wanted* to write
+    line[n] = '\n';
+    line[n + 1] = '\0';
+    ++g_consoleRows;
+    if (g_consoleRows >= kConsoleRingSize)
+        consoleFlush();
+}
+
+namespace WebCorePort {
+
+// Bridge for PortChromeClient::addMessageToConsole() (PortChromeClient.cpp) — kept as plain C
+// strings/ints rather than exposing JSC::MessageSource/MessageLevel or WTF::String here.
+void consoleLogAppend(const char* levelStr, const char* sourceID, unsigned lineNumber, const char* utf8Message)
+{
+    consoleAppendLine(levelStr, sourceID, lineNumber, utf8Message);
+}
+
+} // namespace WebCorePort
+
+// ---- Apotheosis (M4 load, 2026-09-07) ------------------------
+// Can a pending load still change what the user is looking at?
+//
+// pumpLoop's "quiet" rule used to be DocumentLoader::isLoadingInAPISense(), i.e. "the frame tree
+// has any load in flight at all". On a news site that is never satisfied: the consent and
+// analytics stack keeps firing beacons and XHRs for as long as the page is open, so every
+// navigation ran to a cap instead. Measured on a device session, the news site warm:
+// the load event fired at 1645 ms, the pump held the engine thread until 3501 ms, and the six
+// transfers still open at that moment were draws / count / raw / get_site_data - trackers, none
+// of which paints a pixel.
+//
+// So judge the loads by type instead. Render-affecting = the main resource, stylesheets, scripts,
+// fonts, SVG documents and images; ignored = RawResource (XHR/fetch), Beacon, Ping, LinkPrefetch,
+// Icon, media and the rest. Nothing is cancelled either way - what is still running keeps
+// streaming into the live tick and repaints there, exactly as after the post-load cap.
+//
+// Two deliberate simplifications. (1) Only the main frame is inspected: a subframe that is still
+// loading is an ad or a social embed far more often than it is the article, and letting one hold
+// the pump is the behaviour being removed. (2) "images intersecting the viewport" is approximated
+// by "images", because a pending CachedResource cannot be walked back to a renderer cheaply -
+// CachedResourceClient carries no geometry. Lazy image loading (C1.1) is what keeps that honest:
+// on a page that marks its images the off-screen ones are never requested in the first place, and
+// The news site went from 261 subresources to 88 because of it.
+//
+// Apotheosis (2026-09-07, second pass): images stop blocking once the load event has fired.
+// The load event is by definition "every subresource the document declared is done", so an image
+// that is still pending after it is a lazy one, a JS-inserted one or a late `srcset` pick - all
+// of them below the fold or invisible, none of them worth holding the engine thread for. Before
+// the load event images still block: that is the article's own imagery and the first screen.
+// Measured motivation: the news site warm fired `load` at 1820 ms and settled at 4124 ms on the cap,
+// with only image and beacon traffic left (the new settle-pending line below names it).
+static bool apoIsRenderAffecting(WebCore::CachedResource::Type type, bool afterLoadEvent)
+{
+    switch (type) {
+    case WebCore::CachedResource::Type::ImageResource:
+        return !afterLoadEvent;
+    case WebCore::CachedResource::Type::MainResource:
+    case WebCore::CachedResource::Type::CSSStyleSheet:
+    case WebCore::CachedResource::Type::Script:
+    case WebCore::CachedResource::Type::FontResource:
+    case WebCore::CachedResource::Type::SVGFontResource:
+    case WebCore::CachedResource::Type::SVGDocumentResource:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static const char* apoResourceTypeName(WebCore::CachedResource::Type type)
+{
+    switch (type) {
+    case WebCore::CachedResource::Type::MainResource:        return "main";
+    case WebCore::CachedResource::Type::ImageResource:       return "img";
+    case WebCore::CachedResource::Type::CSSStyleSheet:       return "css";
+    case WebCore::CachedResource::Type::Script:              return "js";
+    case WebCore::CachedResource::Type::FontResource:        return "font";
+    case WebCore::CachedResource::Type::SVGFontResource:     return "svgfont";
+    case WebCore::CachedResource::Type::SVGDocumentResource: return "svgdoc";
+    default:                                                 return "other";
+    }
+}
+
+static bool apoHasRenderAffectingLoads(WebCore::LocalFrame& frame, bool afterLoadEvent)
+{
+    RefPtr<WebCore::Document> doc = frame.document();
+    if (!doc)
+        return false;
+    if (doc->parsing())
+        return true;
+    RefPtr<WebCore::DocumentLoader> dl = frame.loader().documentLoader();
+    if (dl && dl->isLoadingMainResource())
+        return true;
+    // Same walk as countPendingResources() above: Unknown = not started, Pending = in flight.
+    // A few hundred entries once per 50 ms tick, no allocation.
+    for (auto& kv : doc->cachedResourceLoader().allCachedResources()) {
+        WebCore::CachedResource* res = kv.value.get();
+        if (!res)
+            continue;
+        auto status = res->status();
+        if (status != WebCore::CachedResource::Unknown && status != WebCore::CachedResource::Pending)
+            continue;
+        if (apoIsRenderAffecting(res->type(), afterLoadEvent))
+            return true;
+    }
+    return false;
+}
+
+// Apotheosis (M4 load, 2026-09-07): "settle-pending" - what was still open when a settle cap
+// fired. The caps exist because the viewport-quiet rule did not trip, and until now nothing said
+// what kept it from tripping: on a news site and a tech-news site every navigation of log 20260907-100044
+// ended on cap-load / cap-dcl, never on quiet-vp. One line per capped navigation, listing up to
+// eight pending render-affecting loads with type, age and the tail of the URL, plus the count of
+// the pending loads the rule already ignores. Read it as: many old `img` entries mean the page
+// does not mark its images lazy (C1.1 cannot help it, and the after-load rule above should);
+// an old `js` entry is a long-poll or a stalled tracker script; an old `css`/`font` entry is a
+// genuine reason to keep waiting and would argue for raising the cap instead of lowering it.
+static void perfWriteStagePending(WebCore::LocalFrame& frame, const char* why, bool afterLoadEvent)
+{
+    if (!g_perfOn || g_stagePath.empty())
+        return;
+    RefPtr<WebCore::Document> doc = frame.document();
+    if (!doc)
+        return;
+    struct Entry { char name[40]; const char* type; double ageMs; };
+    Entry entries[8];
+    int used = 0, blocking = 0, ignored = 0;
+    const WallTime now = WallTime::now();
+    for (auto& kv : doc->cachedResourceLoader().allCachedResources()) {
+        WebCore::CachedResource* res = kv.value.get();
+        if (!res)
+            continue;
+        auto status = res->status();
+        if (status != WebCore::CachedResource::Unknown && status != WebCore::CachedResource::Pending)
+            continue;
+        if (!apoIsRenderAffecting(res->type(), afterLoadEvent)) {
+            ++ignored;
+            continue;
+        }
+        ++blocking;
+        const double ageMs = (now - res->apoRequestTimestamp()).milliseconds();
+        // Keep the eight oldest: those are the ones that made the cap fire.
+        int at = used < 8 ? used : 7;
+        if (used == 8 && ageMs <= entries[7].ageMs)
+            continue;
+        while (at > 0 && entries[at - 1].ageMs < ageMs) {
+            entries[at] = entries[at - 1];
+            --at;
+        }
+        netSubShortName(entries[at].name, sizeof entries[at].name, res->url().string().utf8().data());
+        entries[at].type = apoResourceTypeName(res->type());
+        entries[at].ageMs = ageMs;
+        if (used < 8)
+            ++used;
+    }
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "settle-pending why=%s parsing=%d blocking=%d ignored=%d oldest=[",
+        why ? why : "-", doc->parsing() ? 1 : 0, blocking, ignored);
+    for (int i = 0; i < used; ++i)
+        std::fprintf(fp, "%s%s age=%.0f %s", i ? " | " : "",
+            entries[i].type, entries[i].ageMs, entries[i].name);
+    std::fputs("]\n", fp);
+    std::fclose(fp);
+}
+
+// ---- Apotheosis (M4 load, 2026-09-07): DOM timer throttle -------------
+// Between the commit of a real document and t_settle, align every DOM timer of every document
+// onto a 250 ms grid (1 s for the maximally nested ones WebCore already treats as pollers). The
+// engine thread is the only thread there is here, and during a load it has to serve the parser,
+// the first style resolution and the first paint *and* the ad/consent stack's setTimeout chains:
+// the ms_offpump split of a warm news-site load is timers=1030 js=867 style=911 of 2508 ms.
+// Alignment does not drop a timer and delays none by more than one grid step; it makes a burst
+// of unrelated timers land in one wake-up, so the page pays one script entry and one style
+// resolution for the lot. See wtf/ApoLoadThrottle.h for the engine half.
+//
+// The window is opened and closed by pumpLoop alone, so it cannot outlive the navigation. User
+// input cannot be starved by it either: while the pump owns the engine thread no C ABI call is
+// serviced at all, so by the time input is processed the window is already closed.
+static void loadTimerThrottleSet(WebCore::Page* page, bool on)
+{
+    const unsigned align = on ? kLoadTimerAlignMs : 0;
+    if (WTF::g_apoLoadTimerAlignMs.load(std::memory_order_relaxed) == align)
+        return;
+    WTF::g_apoLoadTimerAlignMs.store(align, std::memory_order_relaxed);
+    WTF::g_apoLoadTimerNestedAlignMs.store(on ? kLoadTimerNestedAlignMs : 0, std::memory_order_relaxed);
+    // Re-align what is already scheduled - without this the new grid would only apply to timers
+    // installed after the edge, which on the closing edge means the throttle lingers.
+    if (page)
+        page->forEachDocument([](WebCore::Document& document) {
+            document.didChangeTimerAlignmentInterval();
+        });
+}
+
 // 轮询 RunLoop 直到活动文档空闲(涵盖图片/脚本/XHR)或封顶。timers 为调用局部量,返回前销毁。
 //  mainDone: 指向"主文档已完成"标志的指针(可空 → 无导航语义,只看加载活动)。
 //  allowEarlyStopWithoutNav: 若未发生导航完成,连续 ~0.5s 无加载活动即停(点击/滚动用)。
-//  settleCapTicks: 导航完成后的最大额外轮询数(×50ms)。
+//  settleCapTicks: 导航完成后的最大额外轮询数(×50ms)。Apotheosis (M4 settle): 一旦 load 事件到达,
+//    内部再收紧到 20 tick(1s)并只要 300ms 静默即停 —— 见下方 quietNeeded/capTicks。
 //  pageForRendering: 非空则每 tick 调 isolatedUpdateRendering 驱动 rAF/IntersectionObserver(懒加载/SPA 必需)。
 static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allowEarlyStopWithoutNav,
                      int settleCapTicks, double watchdogSeconds, WebCore::Page* pageForRendering)
 {
     using namespace WebCore;
+    // Apotheosis (M4 load): the ms_offpump split is accounted only while a
+    // pump is running - that is exactly the window ms_offpump measures. Saved and restored rather
+    // than cleared, because isolatedUpdateRendering() can reach a nested pump. See
+    // wtf/ApoLoadPhase.h; with perf logging off this stays false and every scope is a branch.
+    const bool apoPhaseWasOn = WTF::g_apoPhaseEnabled;
+    WTF::g_apoPhaseEnabled = g_perfOn;
     bool stopped = false;
-    auto stopLoop = [&stopped] {
+    // Apotheosis (M4 load, 2026-09-07): every stop takes a reason, recorded in g_settleWhy and
+    // printed as why= in the stage.txt timeline / settle_why in perf.csv. A stop on one of the
+    // caps also dumps what was still pending (settle-pending), because a cap is by definition
+    // "the quiet rule never tripped" and that is the thing to fix next.
+    RefPtr<LocalFrame> frameForStop = &frame;
+    auto stopLoop = [&stopped, frameForStop](const char* why) {
         if (stopped)
             return;
         stopped = true;
+        std::snprintf(g_settleWhy, sizeof g_settleWhy, "%s", why);
+        if (frameForStop && why && (!std::strncmp(why, "cap", 3) || !std::strcmp(why, "watchdog")))
+            perfWriteStagePending(*frameForStop, why,
+                g_navLoadEventSec.load(std::memory_order_relaxed) != 0);
         RunLoop::currentSingleton().stop();
     };
     int settleTicks = 0;
     int quietTicks = 0;
+    // Apotheosis (M4 load, 2026-09-07): the tick counters below were written as time budgets
+    // ("20 ticks = 1 s") but a tick is 50 ms *plus* whatever isolatedUpdateRendering costs, and
+    // on a heavy page that is 100-200 ms. Measured on the Lumia (logs 20260907-023940): a news site
+    // warm fired its load event at 1716 ms and the pump did not return until 4849 ms - 3.1 s of
+    // "1 s hard cap"; a map site 2034 -> 3427 ms. Deadlines are therefore wall clock now,
+    // and the tick counts stay only as the secondary guard they always were.
+    MonotonicTime navDoneAt;      // the load event (fallback: first tick that saw it)
+    MonotonicTime domReadyAt;     // DOMContentLoaded (fallback: first tick that saw it)
+    // Apotheosis (M4 load, 2026-09-07): ms_tick_cb / ms_offpump accounting - see kPerfHeader.
+    MonotonicTime lastTickStart;
+    double cbTotalAtLastTick = 0;
+    bool timerThrottleArmed = false;   // Apotheosis (M4 load C2.9): see loadTimerThrottleSet()
     RefPtr<LocalFrame> frameRef = &frame;
     RunLoop::Timer settle(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.settle"_s,
-        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+        WTF::Function<void()> { [&stopLoop, &settleTicks, &quietTicks, &navDoneAt, &domReadyAt, &lastTickStart, &cbTotalAtLastTick, &timerThrottleArmed, frameRef, mainDone, allowEarlyStopWithoutNav, settleCapTicks, pageForRendering] {
+            // Apotheosis (M4 load C2.1): this callback is already measured as ms_tick_cb.
+            // Opening the Pump scope keeps the RunLoop Timer scope that contains it from
+            // charging itself our work, so the buckets describe the *other* run-loop work only.
+            WTF::ApoPhase apoPumpPhase(WTF::ApoPhaseBucket::Pump);
+            // Apotheosis (M4 load): PerfPhase accumulates this callback's own duration into
+            // ms_tick_cb on every exit path; the block below turns the spacing between two
+            // callbacks into ms_offpump = run-loop work that was not ours.
+            PerfPhase perfTickCb(&g_perfCur.msTickCb);
+            if (g_perfOn) {
+                const MonotonicTime tickStart = MonotonicTime::now();
+                const double cbTotal = g_perfCur.msTickCb < 0 ? 0.0 : g_perfCur.msTickCb;
+                if (lastTickStart) {
+                    const double period = (tickStart - lastTickStart).milliseconds();
+                    const double prevCb = cbTotal - cbTotalAtLastTick;
+                    // The timer re-arms from the START of the previous callback (RunLoopGeneric
+                    // ScheduledTask::fired -> updateReadyTime), so an idle loop gives a period of
+                    // max(50 ms, previous callback). Anything beyond that ran on the run loop
+                    // between the two ticks: WebCore timers, the parser, loader dispatches.
+                    const double expected = prevCb > 50.0 ? prevCb : 50.0;
+                    const double off = period - expected;
+                    if (off > 0)
+                        g_perfCur.msOffPump = (g_perfCur.msOffPump < 0 ? off : g_perfCur.msOffPump + off);
+                }
+                lastTickStart = tickStart;
+                cbTotalAtLastTick = cbTotal;
+                ++g_perfPumpTicks;   // Apotheosis: settle ticks of the current operation (M4)
+            }
             // EmptyChromeClient 下自动 RenderingUpdateScheduler 是 no-op;不显式调它则 rAF /
             // IntersectionObserver / 懒加载图片永不触发(滚动加载与 SPA 渲染必需)。
             if (pageForRendering) {
-                pageForRendering->isolatedUpdateRendering();   // 跑 rAF/IntersectionObserver(可能跑 JS 改 DOM 甚至导航)
+                {
+                    PerfPhase perfRender(&g_perfCur.renderUpdate);
+                    pageForRendering->isolatedUpdateRendering();   // 跑 rAF/IntersectionObserver(可能跑 JS 改 DOM 甚至导航)
+                }
                 // isolatedUpdateRendering 可能因导航替换主帧;若已不是当初那帧,本轮停止(调用方随后重取帧),
                 // 避免在同一 tick 里对脱离的 frameRef->loader() 解引用半毁状态。
                 RefPtr<LocalFrame> mf = pageForRendering->localMainFrame();
                 if (mf.get() != frameRef.get()) {
-                    stopLoop();
+                    stopLoop("frame-gone");
                     return;
                 }
             }
@@ -423,32 +2511,161 @@ static void pumpLoop(WebCore::LocalFrame& frame, const bool* mainDone, bool allo
             RefPtr<DocumentLoader> dl = frameRef->loader().activeDocumentLoader();
             bool loading = dl && dl->isLoadingInAPISense();
             bool navDone = mainDone && *mainDone;
-            bool ready = navDone || allowEarlyStopWithoutNav;
+            // Apotheosis (M3): some main-frame loads commit and go idle without ever
+            // dispatching a load event — ImageDocument (image URL in the main frame),
+            // and occasionally an HTML page hit by the defer/cancel bug. *mainDone then
+            // stays false forever and only the watchdog ends the pump (30 s of dead UI,
+            // then kErrLoadTimeout). Accept "committed document loader, no longer
+            // loading, parser finished" as a second readiness signal. It only opens the
+            // *gate*: the quiet-tick hysteresis below still has to be satisfied, so a
+            // live load (which keeps the loader busy) cannot be cut short by this.
+            RefPtr<DocumentLoader> committedLoader = frameRef->loader().documentLoader();
+            RefPtr<Document> frameDoc = frameRef->document();
+            // Apotheosis (M4 settle): "parser finished on a committed document" = DOMContentLoaded.
+            // The loader may still be pulling subresources; the quiet-tick hysteresis below decides.
+            //
+            // Apotheosis (2026-09-07): committedFirstRealDocumentLoad() is not decoration. Until
+            // the navigation commits, loader().documentLoader() is still the *initial empty
+            // document* that LocalFrame::init() created - committed, parsed, and holding no
+            // resources - so this expression was true on the very first tick of every load. That
+            // anchored cap-dcl at the start of the pump instead of at DOMContentLoaded (a tech-news site
+            // in log 20260907-100044: dcl at 2390 ms, cap-dcl at 3184 ms, i.e. 0.8 s after a
+            // "3 s" cap), and with the viewport-quiet rule of 831097a it could also let a
+            // navigation settle on the empty document's zero pending resources after 500 ms.
+            bool realDocCommitted = committedLoader && committedLoader->isCommitted()
+                && frameRef->loader().stateMachine().committedFirstRealDocumentLoad();
+            bool domReady = realDocCommitted && frameDoc && !frameDoc->parsing();
+            // Apotheosis (M4 load): the DOM timer window opens at the
+            // commit of the real document - the parse is exactly where the ad timers hurt most -
+            // and closes when this pump returns. Navigation pumps only.
+            // The apoLoadTimerThrottleActive() term keeps a nested pump (isolatedUpdateRendering
+            // can reach one) from taking ownership of a window the outer pump opened and then
+            // closing it early - same reasoning as the g_apoPhaseEnabled save/restore above.
+            if (!timerThrottleArmed && realDocCommitted && !allowEarlyStopWithoutNav
+                && !WTF::apoLoadTimerThrottleActive()) {
+                timerThrottleArmed = true;
+                loadTimerThrottleSet(pageForRendering, true);
+            }
+            bool ready = navDone || allowEarlyStopWithoutNav || domReady;
+
+            // Apotheosis (M4 settle): how long the pump keeps the UI hostage after the page is
+            // usable. It used to be one rule for everything - "the loader has been quiet for 16
+            // ticks (0.8 s)", capped at settleCapTicks (160 = 8 s) after the load event. A page
+            // with hundreds of subresources never gives us 0.8 s of quiet in a row (a news site: 255
+            // subresources), so every navigation ran to the cap: stage.txt showed load at 1.4 s
+            // and settle at 4.8-6.0 s, i.e. ~4 s of spinner after the page was done. The load
+            // event is the point at which the *page* calls itself loaded, so make it ours too:
+            //   load event fired  -> 300 ms of idle, hard cap 1 s after the event
+            //   no load event yet -> DOMContentLoaded + 500 ms without any loading activity
+            //   neither (click/type pumps with allowEarlyStopWithoutNav) -> unchanged 0.8 s
+            // Everything still in flight keeps streaming into the live tick and repaints there.
+            int quietNeeded = 16;                                    // 0.8 s (unchanged default)
+            int capTicks = settleCapTicks;
+            if (navDone) {
+                quietNeeded = 6;                                     // 300 ms of idle after load
+                capTicks = settleCapTicks < 20 ? settleCapTicks : 20; // and 1 s hard cap
+            } else if (domReady)
+                quietNeeded = 10;                                    // 500 ms after DOMContentLoaded
+
+            // Apotheosis (M4 load, 2026-09-07): wall-clock deadlines. Two of them.
+            //
+            // (1) after the load event: the "1 s hard cap" above is 20 ticks, and a tick on a
+            //     heavy page is 150-200 ms, so it was really 3 s. Make it 1 s of real time.
+            //
+            // (2) before the load event: nothing bounded this phase at all except the 30 s
+            //     watchdog, and on a page whose load event waits for hundreds of images it is
+            //     the whole problem. The news site cold (same log): DOMContentLoaded 2349 ms, first
+            //     paint 1311 ms, load event 8961 ms - 6.6 s in which the page was already on
+            //     screen but every C ABI call (scroll, tap, the next navigation) queued behind
+            //     this pump on the engine thread. That is the "initial page load is still quite
+            //     slow" the user reports; the pixels were there at 1.3 s.
+            //     So: once the document has parsed AND something readable has been painted,
+            //     give the rest of the subresource cascade 3 s and then hand the page over.
+            //     Nothing is cancelled - the loads keep running and keep repainting through
+            //     WebCoreLiveTick, exactly as they already do after the post-load cap fires.
+            //     3 s (not 1) because a page that is merely slow to finish should still finish
+            //     inside the pump; this is meant to catch the pathological tail, and settle_why
+            //     = cap-dcl in the next log says how often it does.
+            //
+            // Apotheosis (2026-09-07, second pass): and anchor them on the *events*, not on the
+            // tick that noticed them. A tick is 50 ms plus the callback plus whatever the run
+            // loop did in between, which on a news site averages 160 ms and exceeds a second when an
+            // ad timer chain runs, so "first tick that saw the load event" was up to a full gap
+            // late and the 1 s cap measured 2.3 s (log 20260907-100044: load 1820, cap-load
+            // 4124). perfNavLoadEvent / perfNavDocumentReady now stamp the wall clock at the
+            // event itself; the tick time stays as the fallback for a pump that has no
+            // navigation of its own (click/type). The deadline is still only *checked* on a tick,
+            // so a run loop blocked inside one long script still overshoots by that script - that
+            // is C2.1's problem, not this one's.
+            const MonotonicTime nowT = MonotonicTime::now();
+            const double navEventSec = g_navLoadEventSec.load(std::memory_order_relaxed);
+            const double domEventSec = g_navDomReadySec.load(std::memory_order_relaxed);
+            if (navDone && !navDoneAt) {
+                navDoneAt = navEventSec ? MonotonicTime::fromRawSeconds(navEventSec) : nowT;
+                if (navDoneAt > nowT)
+                    navDoneAt = nowT;
+            }
+            if (domReady && !domReadyAt) {
+                domReadyAt = domEventSec ? MonotonicTime::fromRawSeconds(domEventSec) : nowT;
+                if (domReadyAt > nowT)
+                    domReadyAt = nowT;
+            }
+            if (navDone && navDoneAt && (nowT - navDoneAt) > 1_s) {
+                stopLoop("cap-load");
+                return;
+            }
+            if (!navDone && domReadyAt && (nowT - domReadyAt) > 3_s
+                && g_navSawFirstPaint.load(std::memory_order_acquire)) {
+                stopLoop("cap-dcl");
+                return;
+            }
 
             // ★ 关键:绝不在 isLoadingInAPISense 一转 false 就停。模块求值(<script type=module>)和
             //   重定向后最终文档的样式表应用都发生在"加载器空闲之后",经 ScriptRunner/WindowEventLoop 的
             //   0_s 定时器 + 微任务级联触发——这要求 RunLoop 继续转若干 tick。改为"加载器持续静默 ~0.8s
             //   才停":期间求值/挂载会引发新活动(渲染/拉字体),重置静默计数,自然等到真稳定。
-            if (loading)
+            // Apotheosis (M4 load, 2026-09-07): once the document has parsed, "quiet" means the
+            // viewport is quiet - see apoHasRenderAffectingLoads() above. Before that, and for the
+            // click/type pumps that have no navigation semantics, the old all-loads rule stands.
+            // Apotheosis (2026-09-07, second pass): after the load event images no longer count -
+            // everything the document declared is done by then, so what is left is lazy or
+            // script-inserted and belongs to the live tick. See apoIsRenderAffecting().
+            bool loadingForQuiet = loading;
+            if (loading && !allowEarlyStopWithoutNav && (navDone || domReady))
+                loadingForQuiet = apoHasRenderAffectingLoads(*frameRef, navDone);
+            if (loadingForQuiet)
                 quietTicks = 0;
             else
                 ++quietTicks;
             if (navDone)
                 ++settleTicks;
-            if (ready && quietTicks >= 16) {            // 加载器静默 ~0.8s → 异步级联已跑完,停
-                stopLoop();
+            if (ready && quietTicks >= quietNeeded) {    // 加载器静默 → 异步级联已跑完,停
+                // "quiet-vp": the loader is still busy, but only with things that cannot change
+                // the viewport. Distinguished from "quiet" so the device log says how often the
+                // new rule is what ended the navigation.
+                stopLoop(loading ? "quiet-vp" : "quiet");
                 return;
             }
-            if (navDone && settleTicks > settleCapTicks)  // 硬封顶(8s),防长连接/永久活动拖到看门狗
-                stopLoop();
+            if (navDone && settleTicks > capTicks)        // 硬封顶,防长连接/永久活动拖到看门狗
+                stopLoop("cap-ticks");
         } });
     settle.startRepeating(0.05_s);
     RunLoop::Timer watchdog(Ref { RunLoop::currentSingleton() }, "WebCorePort.pump.watchdog"_s,
-        WTF::Function<void()> { [&stopLoop] { stopLoop(); } });
+        WTF::Function<void()> { [&stopLoop] { stopLoop("watchdog"); } });
     watchdog.startOneShot(WTF::Seconds(watchdogSeconds));
     RunLoop::run();
     settle.stop();
     watchdog.stop();
+    // Apotheosis (M4 load C2.9): t_settle closes the DOM timer window. Unconditional, so the
+    // alignment cannot survive a pump that ended on the watchdog or on frame-gone.
+    if (timerThrottleArmed)
+        loadTimerThrottleSet(pageForRendering, false);
+    WTF::g_apoPhaseEnabled = apoPhaseWasOn;   // M4 load C2.1: see the top of this function
+    // Apotheosis (M4 load throttle): catch-all end of the loading window. The load event
+    // normally ends it (perfNavLoadEvent); this covers the pump that stopped on the settle
+    // cap, the watchdog or "committed but no load event", so a page can never leave the
+    // driver with presents still throttled.
+    navLoadEnd();
 }
 
 // ★ 打字/退格专用轻量 settle:pumpLoop 的"加载器连续静默 16 tick(≈0.8s)才停"是为导航场景设计
@@ -489,8 +2706,43 @@ static void forceDirtyTree(WebCore::GraphicsLayer& l)
 static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerTextureMapper& glRoot)
 {
     using namespace WebCore;
+    // Apotheosis (page width, 0.1.9.58): the device scale factor does NOT reach the layer tree.
+    // WebCore keeps every GraphicsLayer's position and size in CSS px and expresses the device
+    // scale only as the backing store's contentsScale (pageScaleFactor * deviceScaleFactor, see
+    // GraphicsLayerTextureMapper::updateBackingStoreIfNeeded), so a tree laid out at 480 CSS px
+    // would be composited into the top-left 480 px of a 720 px framebuffer. Every port that
+    // composites through TextureMapper therefore applies the factor as a transform on the ROOT at
+    // composite time, and this is that transform. The root layer here is the compositor's host
+    // layer: it is 0x0 and paints nothing of its own, so a transform on it is a plain scale of the
+    // whole subtree about the origin (TextureMapperLayer::computeTransformsRecursive composes it as
+    // translate(anchor + pos) * transform, and both are zero).
+    //
+    // Deliberately NOT setChildrenTransform(): wkVisibleRectForChildren() refuses to map a visible
+    // rect through a non-identity children transform and falls back to tiling the whole subtree,
+    // which on a long page is hundreds of MB. The rect the compositor flushes down is the
+    // LocalFrameView's own visible content rect, i.e. already in the layer tree's CSS px, so
+    // nothing else in the tiling machinery needs to know this factor exists.
+    //
+    // Set before the flush so flushCompositingStateForThisLayerOnly() pushes it in the same pass;
+    // GraphicsLayer::setTransform() is a no-op when the value is unchanged, so a steady factor
+    // costs one matrix compare per composite. Nothing in RenderLayerCompositor ever writes a
+    // transform on a root layer, so ours is not fighting anyone for it.
+    {
+        TransformationMatrix wantedRootTransform;
+        wantedRootTransform.scale(static_cast<double>(wkPageWidthFactor()));
+        if (glRoot.transform() != wantedRootTransform)
+            glRoot.setTransform(wantedRootTransform);
+    }
+
     // flushCompositingStateForThisFrame 在 needsLayout() 时直接返回不 flush → 先确保布局就绪。
-    view.updateLayoutAndStyleIfNeededRecursive();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        // Apotheosis (M4): run the pending compositing-geometry update in the same layout
+        // (as Page::updateRendering does). Without the option it is deferred to the next
+        // tick, whose RenderLayerBacking::updateGeometry then dirties whole layers ->
+        // heavy/light ping-pong between consecutive ticks on animated pages.
+        view.updateLayoutAndStyleIfNeededRecursive({ WebCore::LayoutOptions::UpdateCompositingLayers });
+    }
     // 文档/base 背景:合成路径下不会自动进图层(无 embedder 给根层设背景色)→ 离屏 FBO 透出底白,
     // 任何页面背景都丢。显式把文档背景色设到根层(TextureMapperLayer::paintSelf 会以纯色渲染有效
     // backgroundColor)。只解决纯色/base 背景;body 背景图仍靠各自元素图层的 backing(若仍缺另议)。
@@ -498,20 +2750,91 @@ static void gpuPrepare(WebCore::LocalFrameView& view, WebCore::GraphicsLayerText
         Color docBg = view.documentBackgroundColor();
         glRoot.setBackgroundColor(docBg.isValid() ? docBg : Color::white);
     }
-    view.flushCompositingStateIncludingSubframes();        // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
-    // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
-    // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
-    // 当时状态重置滚动层位置,放在 flush 前会被它覆盖 → 画面不滚。这里在 flush 后、paint 前显式定位一次,
-    // 让 -scrollPosition 成为合成前对 scrolled-contents 层的最后一次定位。无滚动层时为 no-op。
-    if (auto* renderView = view.renderView())
-        renderView->compositor().frameViewDidScroll();
-    // 滚动帧跳过强制全树重绘:滚动不改内容,tile 早已画好,只需移动滚动层重新合成 → 避免每帧重画所有 tile
-    //   (长页尤其卡)。加载/点击/输入/动画帧仍全量重绘保正确。g_gpuScrollFast 由 WebCoreScrollBy 置位、此处消费。
-    if (!g_gpuScrollFast)
-        forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
-    g_gpuScrollFast = false;
-    glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
-    g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
+    {
+        PerfPhase perfFlushPhase(&g_perfCur.flush);        // M4: compositing flush (+ scroll-layer positioning)
+        // Apotheosis (C2): position the scrolled-contents layer *before* the flush as well.
+        // GraphicsLayerTextureMapper::flushCompositingState() now derives every layer's visible
+        // rect from the layer positions it walks over, so with -scrollPosition applied only
+        // after the flush each visible rect would lag one tick behind and tiles would be created
+        // for the previous viewport (blank strips while scrolling). The call after the flush
+        // stays the authoritative one for compositing.
+        if (auto* renderViewBeforeFlush = view.renderView())
+            renderViewBeforeFlush->compositor().frameViewDidScroll();
+        view.flushCompositingStateIncludingSubframes();    // GraphicsLayer 变更 → TextureMapperLayer 树(递归全帧)
+        // 同步 TextureMapper 路径(无 async scrolling):主帧滚动靠 compositor 把 -scrollPosition 设到
+        // scrolled-contents 层(updateScrollLayerPosition)。★ 必须在 flush 之后:flush 内的合成几何更新会按
+        // 当时状态重置滚动层位置,放在 flush 前会被它覆盖 → 画面不滚。这里在 flush 后、paint 前显式定位一次,
+        // 让 -scrollPosition 成为合成前对 scrolled-contents 层的最后一次定位。无滚动层时为 no-op。
+        if (auto* renderView = view.renderView())
+            renderView->compositor().frameViewDidScroll();
+    }
+    {
+        PerfPhase perfBacking(&g_perfCur.backing);         // M4: dirty-tree + tile upload + animations
+        // 滚动帧跳过强制全树重绘:滚动不改内容,tile 早已画好,只需移动滚动层重新合成 → 避免每帧重画所有 tile
+        //   (长页尤其卡)。加载/点击/输入/动画帧仍全量重绘保正确。g_gpuScrollFast 由 WebCoreScrollBy 置位、此处消费。
+        // Apotheosis (WHITE-AT-SCROLL-END): g_gpuForceFullNext is the recovery lever - a composite
+        // that published nothing because it drew nothing asks the next one to force-dirty, whatever
+        // the caller wanted. g_gpuLastCompositeFull tells gpuPresent whether this frame is allowed
+        // to be trusted when it comes out empty (a force-dirtied tree that paints background IS
+        // background; a fast-path tree that paints background has probably lost its tiles).
+        // Apotheosis (2026-09-06): g_gpuTargetedNext is the same "do not force-dirty" statement as
+        // g_gpuScrollFast, made by a caller that is not riding a scroll job - the end of a pan
+        // gesture and the unpainted-tile repair below. Both want the composite that follows to
+        // repaint the stores that have actually lost pixels and nothing else; the per-layer
+        // detection in GraphicsLayerTextureMapper::updateBackingStoreIfNeeded() is what decides,
+        // and updateBackingStoreIncludingSubLayers() runs for a targeted composite just as it does
+        // for a forced one, so a real invalidation (m_needsDisplay/m_needsDisplayRect) is repainted
+        // either way.
+        const bool wkTargeted = g_gpuScrollFast || g_gpuTargetedNext;
+        const bool wkFullDirty = !wkTargeted || g_gpuForceFullNext;
+        if (wkFullDirty)
+            forceDirtyTree(glRoot);                                     // 强制全树标脏,否则脏区已被消费 → 内容 tile 空
+        g_gpuScrollFast = false;
+        g_gpuTargetedNext = false;
+        g_gpuForceFullNext = false;
+        g_gpuLastCompositeFull = wkFullDirty;
+        glRoot.updateBackingStoreIncludingSubLayers(*g_textureMapper);  // 上传脏 tile 内容到 GL 纹理(递归)
+        {
+            // Apotheosis (M4): how many layers were repainted in full vs. by dirty rect (accumulates per op).
+            unsigned full = 0, partial = 0;
+            WebCore::wkWinUWPTexmapDirtyStats(full, partial);
+            if (g_perfOn) {
+                if (g_perfCur.dirtyFull < 0) { g_perfCur.dirtyFull = 0; g_perfCur.dirtyPartial = 0; }
+                g_perfCur.dirtyFull += static_cast<int>(full);
+                g_perfCur.dirtyPartial += static_cast<int>(partial);
+            }
+        }
+        {
+            // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): per-cause breakdown of
+            // the full-repaint count above, plus whether THIS composite is the one forceDirtyTree()
+            // just walked (g_gpuLastCompositeFull, set two lines above from wkFullDirty) - together
+            // they tell "WebCore dirtied it" apart from "forceDirtyTree ran", which is what the
+            // a code-hosting site's dirty_full=54 rows need (the repair-escalation cap, 9df4438, never fired for
+            // them, so something else is force-dirtying the tree). Accumulated across this
+            // operation like dirtyFull/dirtyPartial above; dirtySrcForceDirty is an OR, not a sum -
+            // one force-dirtied composite in the operation is enough to answer "did it happen".
+            unsigned nd = 0, sc = 0, sz = 0, scl = 0, snd = 0;
+            WebCore::wkWinUWPTexmapDirtySrcStats(nd, sc, sz, scl, snd);
+            if (g_perfOn) {
+                if (g_perfCur.dirtySrcNeedsDisplay < 0) {
+                    g_perfCur.dirtySrcNeedsDisplay = 0;
+                    g_perfCur.dirtySrcStoreCreated = 0;
+                    g_perfCur.dirtySrcSizeChange = 0;
+                    g_perfCur.dirtySrcScaleChange = 0;
+                    g_perfCur.dirtySrcSetNeedsDisplay = 0;
+                    g_perfCur.dirtySrcForceDirty = 0;
+                }
+                g_perfCur.dirtySrcNeedsDisplay += static_cast<int>(nd);
+                g_perfCur.dirtySrcStoreCreated += static_cast<int>(sc);
+                g_perfCur.dirtySrcSizeChange += static_cast<int>(sz);
+                g_perfCur.dirtySrcScaleChange += static_cast<int>(scl);
+                g_perfCur.dirtySrcSetNeedsDisplay += static_cast<int>(snd);
+                if (g_gpuLastCompositeFull)
+                    g_perfCur.dirtySrcForceDirty = 1;
+            }
+        }
+        g_gpuAnimating = glRoot.layer().applyAnimationsRecursively(MonotonicTime::now()); // 推进动画到当前时刻;返回值=仍有动画在跑
+    }
 }
 
 // 离屏合成 + 读回:把图层树合成进 w*h 的 BitmapTexture(FBO),glReadPixels 出 RGBA 到 outRGBA。
@@ -537,11 +2860,21 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     // 已是全表面)。documentBackgroundColor 已混合 base+html+body 纯色;背景图无法纳入(见 LocalFrameView
     // 注释),故纯色页背景就此修复,背景图仍待其元素图层自身绘制。
     g_textureMapper->clearColor(docBg);
-    glRoot.layer().paint(*g_textureMapper);
+    {
+        PerfPhase perfPaint(&g_perfCur.paint);   // M4: TextureMapper composite of the layer tree
+        glRoot.layer().paint(*g_textureMapper);
+    }
+    // Apotheosis (docs/TILEGRID-DESIGN.md section 3): this composite added to the engine's
+    // visible-hole accumulator like any other, and nothing here would ever read it - so gpuPresent()
+    // would find this readback's holes on top of its own and owe a present for a frame the user is
+    // not looking at. Drain and discard: the readback is a snapshot (a tab thumbnail, the offscreen
+    // validation path), not the screen, and a hole in it is not a reason to composite again.
+    wkWinUWPTexmapVisibleHoles();
     // texture 的 FBO 此刻仍绑定 → 直接读回(endPainting 会还原帧缓冲绑定,故必须读在前)。
     // 读回缓冲静态复用:仅引擎线程用,免每帧 3MB 分配+释放(readback 模式滚动/实时 tick 是热路径)。
     static std::vector<uint8_t> tmp;
     tmp.resize(static_cast<size_t>(w) * h * 4);
+    PerfPhase perfReadback(&g_perfCur.readback);   // M4: glFinish + glReadPixels + the copy/hash pass below
     glFinish();
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp.data());
     g_textureMapper->endPainting();
@@ -575,6 +2908,12 @@ static int gpuCompositeReadback(WebCore::LocalFrameView& view, int w, int h,
     return kOK;
 }
 
+// Apotheosis: paint the layer tree into whatever framebuffer is bound.
+static void gpuPaintTree(WebCore::GraphicsLayerTextureMapper& glRoot)
+{
+    glRoot.layer().paint(*g_textureMapper);
+}
+
 // 直呈现:把图层树合成进默认帧缓冲(GpuInit 绑的窗口表面)并 eglSwapBuffers。返回 kOK / 负错误码。
 static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::GraphicsLayer& root)
 {
@@ -584,16 +2923,158 @@ static int gpuPresent(WebCore::LocalFrameView& view, int w, int h, WebCore::Grap
     g_glContext->makeContextCurrent();
     auto& glRoot = static_cast<GraphicsLayerTextureMapper&>(root);
     gpuPrepare(view, glRoot);
+
     glViewport(0, 0, w, h);
     g_textureMapper->beginPainting(TextureMapper::FlipY::No, nullptr);   // nullptr → 默认帧缓冲
     {
         Color docBg = view.documentBackgroundColor();
         g_textureMapper->clearColor(docBg.isValid() ? docBg : Color::white);   // 文档 base 背景(同 readback,见上)
     }
-    glRoot.layer().paint(*g_textureMapper);
-    g_textureMapper->endPainting();
-    g_glContext->swapBuffers();
+    {
+        PerfPhase perfPaint(&g_perfCur.paint);      // M4: TextureMapper composite into the default framebuffer
+        gpuPaintTree(glRoot);
+        g_textureMapper->endPainting();
+    }
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md 2.2b "driver repair machine" and 3): the
+    // present-only repair. The TileGrid model answers one question after a composite - how many
+    // VISIBLE cells drew nothing and had no backdrop behind them - and a cell can only be in that
+    // state while its replay is in flight or its texture is waiting for the upload budget, i.e.
+    // while work the model has already scheduled is running. R5 and R12 guarantee that work
+    // converges, so the only thing missing is a frame to show the result in: exactly one more
+    // composite. No dirtying (dirtying is what made the v1 repair loop feed itself, 9df4438), no
+    // second paint in this call, no cooldown, no escalation ledger - two states, Settled and
+    // PresentOwed.
+    //
+    // The reading also drains the engine-side accumulator, so it happens on every composite. A v1
+    // store never adds to it, so with the switch off this is a read of a zero.
+    {
+        const unsigned holes = wkWinUWPTexmapVisibleHoles();
+        if (g_perfOn) {
+            if (g_perfCur.tgHoles < 0)
+                g_perfCur.tgHoles = 0;
+            g_perfCur.tgHoles += static_cast<int>(holes);
+        }
+        // Apotheosis (device round 1, 0.1.9.29): PresentOwed has a bound. R12 promises that a
+        // constant input converges, and the guard above is written as if it always does - but a
+        // store whose hole count is *stuck* (in 0.1.9.29: a store with an unknown visible rect
+        // reporting holes over cells beyond its own budget) turned "holes > 0 => one more
+        // composite" into a busy loop on a page at rest: 2749 perf rows with tg_holes=3 and
+        // nothing on screen changing. So the composite is owed only while the number is still
+        // moving, or for kTgMaxOwedComposites in a row after it stopped moving; after that the
+        // driver goes quiet until something actually changes. Anything that closes a hole changes
+        // the count, so a converging store is never cut short - the bound only ends a loop that is
+        // not converging, and it is released again the moment the count moves.
+        static unsigned tgHolesPrevious = 0;
+        static unsigned tgOwedRun = 0;
+        static bool tgLoopNoted = false;
+        const unsigned kTgMaxOwedComposites = 8;
+        if (holes != tgHolesPrevious) {
+            tgOwedRun = 0;
+            tgLoopNoted = false;
+        }
+        tgHolesPrevious = holes;
+        if (!holes) {
+            tgOwedRun = 0;
+            tgLoopNoted = false;
+        } else if (tgOwedRun < kTgMaxOwedComposites) {
+            ++tgOwedRun;
+            if (g_session && g_session->chrome) {
+                g_session->chrome->setNeedsPresent();
+                WebCorePort::presentRequested();
+            }
+        } else if (!tgLoopNoted) {
+            // Grep for "tgloop": the hole count did not move for kTgMaxOwedComposites composites,
+            // so the extra present is not helping and is not asked for again until it does.
+            tgLoopNoted = true;
+            if (!g_stagePath.empty()) {
+                FILE* fp = nullptr;
+                if (fopen_s(&fp, g_stagePath.c_str(), "ab") == 0 && fp) {
+                    const float ps = g_session && g_session->page ? g_session->page->pageScaleFactor() : -1.f;
+                    std::fprintf(fp, "tgloop holes=%u owed=%u ps=%.3f\n",
+                        holes, tgOwedRun, ps);
+                    std::fclose(fp);
+                }
+            }
+        }
+    }
+    {
+        PerfPhase perfSwap(&g_perfCur.swap);        // M4: eglSwapBuffers → SwapChainPanel
+        g_glContext->swapBuffers();
+    }
     return kOK;
+}
+
+// Apotheosis (threaded raster): call right after a composite. A replay that
+// finishes after this composite has no one to upload it — the tile would keep its old pixels until
+// the page happens to be dirtied again. Arming m_needsPresent makes the harness' next live tick
+// composite (and the tick's own peekNeedsPresent() fast-path check take the heavy branch), where
+// wkFinishPendingPaints() picks the finished buffers up. Bumping the frame hash keeps the live loop
+// from judging the frame static and stopping before that tick happens. The count also becomes the
+// perf row's raster_pending column, which is the only way to see whether the worker pool kept up.
+static void notePendingRasterTiles()
+{
+    // Apotheosis (2026-09-08, docs/TILEGRID-DESIGN.md section 3): the TileGrid needs this even for
+    // the passes it replays inline (an image store never goes to a worker), where nothing is
+    // pending and nothing finishes on a worker - the tile still has to be UPLOADED, and the
+    // per-composite upload budget applies to the inline path too. A pass that rasterises more cells
+    // than the budget uploads leaves the rest Landed: pixels that exist and that only the next
+    // composite's drain can put on screen. On a page that has stopped dirtying itself nobody would
+    // ask for that composite (the visible-holes present in gpuPresent covers a hole, not a Landed
+    // tile behind an already drawn one), so the last tiles of every burst would sit in memory, off
+    // the screen.
+    // Both are needed. `pending` covers "a replay is still running" — one more composite will be
+    // owed. `finished` (edge-triggered, reading resets) covers the replay that started AND ended
+    // between two composites, which leaves `pending` at zero although nothing has uploaded the new
+    // pixels yet. With threaded raster's asynchronous first paints that case
+    // is an *empty* tile on screen, not a stale one, so it is the more important of the two.
+    // Apotheosis (2026-09-06): and `deferred` covers the third case, which the tile-upload budget
+    // introduced — a replay that finished long ago and whose pixels the last pass chose not to
+    // upload because it had already spent its budget on nearer tiles. Nothing is running for it
+    // (so `pending` is zero), its completion edge was consumed frames ago (so `finished` is zero),
+    // and no worker will ever wake anybody for it again: only the next composite's drain can put
+    // it on screen. Without this a page that stops dirtying itself the moment a burst is deferred
+    // would keep the last one or two tiles of that burst in memory and off the screen.
+    const unsigned pending = WebCore::wkWinUWPTexmapPendingRasterTiles();
+    const unsigned finished = WebCore::wkWinUWPTexmapTakeFinishedRasterTiles();
+    const unsigned deferred = WebCore::wkWinUWPTexmapTakeDeferredUploads();
+    if (g_perfOn) {
+        g_perfCur.rasterPending = static_cast<int>(pending);
+        g_perfCur.rasterDone = static_cast<int>(finished);
+        g_perfCur.rasterDeferred = static_cast<int>(deferred);
+        unsigned posted = 0, cancelled = 0, blocking = 0;
+        WebCore::wkWinUWPTexmapRasterStats(posted, cancelled, blocking);
+        g_perfCur.rasterPosted = static_cast<int>(posted);
+        g_perfCur.rasterCancelled = static_cast<int>(cancelled);
+        g_perfCur.rasterBlocked = static_cast<int>(blocking);
+    }
+    if (!pending && !finished && !deferred)
+        return;
+    if (g_session && g_session->chrome)
+        g_session->chrome->setNeedsPresent();
+    ++g_lastFrameHash;
+}
+
+// Apotheosis (threaded raster): the case polling cannot cover — a replay lands while
+// the harness' tick loop has already gone idle, so no composite is coming and the tile stays empty.
+// wkWinUWPSetRasterCompletionHandler() calls this ON A WORKER THREAD, so the contract is strict:
+// non-blocking, thread-safe, must not touch WebCore. All it does is hop to the engine thread
+// through WTF's main-thread function queue — the same queue the finished image decodes arrive on,
+// drained by the RunLoop::cycle() at the top of WebCoreScrollBy / WebCoreLiveTick — and set
+// m_needsPresent there, on the thread that owns it. The atomic collapses a burst of completions
+// into one hop: several tiles finishing together only need one composite.
+static std::atomic<int> g_rasterWakeQueued { 0 };
+
+static void rasterCompletedOnWorker()
+{
+    int expected = 0;
+    if (!g_rasterWakeQueued.compare_exchange_strong(expected, 1))
+        return;   // a hop is already queued; it will pick this completion up too
+    WTF::callOnMainThread([] {
+        g_rasterWakeQueued.store(0);
+        if (g_session && g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+        ++g_lastFrameHash;   // so the harness' live loop does not judge the frame static and stop
+    });
 }
 
 // view->paint → Cairo ARGB32 → 调用方 RGBA8888 缓冲(B<->R 交换 + 去预乘)。统计非白像素数。
@@ -619,10 +3100,13 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
                     // 链接表兜底误导航)。takeNeedsPresent 此前无人消费,在此消费正好。
                     if (g_session->chrome->takeNeedsPresent() || g_gpuAnimating)
                         ++g_lastFrameHash;
+                    notePendingRasterTiles();   // after takeNeedsPresent(), so it is not consumed again
                     return kOK;
                 }
-            } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK)
+            } else if (gpuCompositeReadback(view, w, h, *root, outRGBA, nonWhiteOut) == kOK) {
+                notePendingRasterTiles();
                 return kOK;
+            }
         }
     }
 
@@ -630,7 +3114,6 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     // 有意义,这里必须清掉,否则残留到下一次真 GPU 合成(如点击后)会错误跳过 forceDirtyTree → 停留旧内容。
     g_gpuScrollFast = false;
 
-    const IntSize size(w, h);
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
         if (surface) cairo_surface_destroy(surface);
@@ -643,6 +3126,12 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
         return kErrCairoContext;
     }
     {
+        // Apotheosis (page width, 0.1.9.58): the software path is the embedder's own paint, so the
+        // device scale factor is ours to apply - WebCore paints the view in CSS px and expects the
+        // context to carry the factor (the GPU path does the same thing as a root layer transform,
+        // see gpuPrepare). Without it a 480 CSS px layout would be blitted into the top-left corner
+        // of the 720 px buffer.
+        cairo_scale(cr, wkPageWidthFactor(), wkPageWidthFactor());
         GraphicsContextCairo context(adoptRef(cr));
         // ScrollView::paint 内部已按 -scrollPosition 平移,始终从原点绘制,绝不另加 scrollY。
         // ★ M1:开合成后页面内容进 GraphicsLayer,普通 paint 会漏合成层 → 软件渲染变空。
@@ -650,7 +3139,10 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
         //   非合成路径(RenderHtml/LoadUrl)无合成层,此标志无害。
         auto oldBehavior = view.paintBehavior();
         view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
-        view.paint(context, IntRect(IntPoint(), size));
+        {
+            PerfPhase perfPaint(&g_perfCur.paint);   // M4: software raster (Cairo)
+            view.paint(context, IntRect(IntPoint(), wkViewSizeFromEngine(w, h)));
+        }
         view.setPaintBehavior(oldBehavior);
     }
     cairo_surface_flush(surface);
@@ -659,6 +3151,8 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
     const int stride = cairo_image_surface_get_stride(surface);
     int nonWhite = 0;
     uint32_t hash = 2166136261u;   // FNV-ish 滚动哈希,实时模式判断画面是否变化(顺带在同一遍像素循环里算)
+    {
+    PerfPhase perfBlit(&g_perfCur.blit);   // M4: ARGB32 → RGBA8888 convert/unpremultiply pass (one probe, not per pixel)
     for (int y = 0; y < h; ++y) {
         const unsigned char* srow = src + static_cast<size_t>(y) * stride;
         uint8_t* drow = outRGBA + static_cast<size_t>(y) * w * 4;
@@ -680,7 +3174,7 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
             }
             if (drow[x * 4 + 0] != 255 || drow[x * 4 + 1] != 255 || drow[x * 4 + 2] != 255)
                 ++nonWhite;
-            // 每 4 像素采样进哈希(原 16px 网格太疏,漏掉 Bing 小加载圈等小动画 → 误判静止停帧;
+            // 每 4 像素采样进哈希(原 16px 网格太疏,漏掉搜索页小加载圈等小动画 → 误判静止停帧;
             // 4px 网格密 16 倍,能侦测到小圈圈的变化,让实时循环对动画持续重绘;真静止页仍会停帧省电)。
             if (((x | y) & 3) == 0) {
                 hash = (hash ^ drow[x * 4 + 0]) * 16777619u;
@@ -689,11 +3183,127 @@ static int paintToRGBA(WebCore::LocalFrameView& view, int w, int h, uint8_t* out
             }
         }
     }
+    }
     cairo_surface_destroy(surface);
     nonWhiteOut = nonWhite;
     g_lastFrameHash = hash;
     return kOK;
 }
+
+static int evalJS(WebCore::LocalFrame& frame, const char* script, char* out, int len);   // defined below; the diag probes use it
+
+// Apotheosis: "is the page blank?" used to be answered by paintToRGBA()'s nonWhite counter.
+// The direct GPU present has no readback, so that counter stays 0 for every page and the
+// signal has been dead since the GPU path became the default. Take it here instead, from a
+// software paint of the visible rect at a quarter of the size in each axis (1/16 of the
+// pixels, compositing layers flattened in exactly as on the software path). It cannot say
+// which pixels are wrong, but it separates the two cases that matter when a page comes up
+// white: the engine painted nothing, or it painted and the composite/upload lost the result.
+// Runs once per document (see writeDiag), never per frame.
+static int probePaintNonWhite(WebCore::LocalFrameView& view, int w, int h, int& sampledOut)
+{
+    using namespace WebCore;
+    sampledOut = 0;
+    const int kProbeShrink = 4;
+    const int pw = w / kProbeShrink;
+    const int ph = h / kProbeShrink;
+    if (pw <= 0 || ph <= 0)
+        return 0;
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+    if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        if (surface) cairo_surface_destroy(surface);
+        return 0;
+    }
+    cairo_t* cr = cairo_create(surface);
+    if (!cr || cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+        if (cr) cairo_destroy(cr);
+        cairo_surface_destroy(surface);
+        return 0;
+    }
+    // Start from opaque white, so "nothing was painted" really counts as zero non-white
+    // pixels (a fresh ARGB32 surface is transparent black, which would count as non-white).
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_paint(cr);
+    // Apotheosis (page width, 0.1.9.58): the device scale factor belongs in the embedder's
+    // context here too, exactly as in paintToRGBA - the view is painted in CSS px.
+    cairo_scale(cr, wkPageWidthFactor() / kProbeShrink, wkPageWidthFactor() / kProbeShrink);
+    {
+        GraphicsContextCairo context(adoptRef(cr));   // takes the reference; cr must not be destroyed below
+        auto oldBehavior = view.paintBehavior();
+        view.setPaintBehavior(oldBehavior | PaintBehavior::FlattenCompositingLayers | PaintBehavior::Snapshotting);
+        view.paint(context, IntRect(IntPoint(), wkViewSizeFromEngine(w, h)));
+        view.setPaintBehavior(oldBehavior);
+    }
+    cairo_surface_flush(surface);
+    const unsigned char* src = cairo_image_surface_get_data(surface);
+    const int stride = cairo_image_surface_get_stride(surface);
+    int nonWhite = 0;
+    if (src) {
+        for (int y = 0; y < ph; ++y) {
+            const unsigned char* row = src + static_cast<size_t>(y) * stride;
+            for (int x = 0; x < pw; ++x) {
+                // Comparing all three colour bytes to 255 is byte-order independent and
+                // true only for opaque white in this premultiplied format.
+                if (row[x * 4 + 0] != 255 || row[x * 4 + 1] != 255 || row[x * 4 + 2] != 255)
+                    ++nonWhite;
+            }
+        }
+        sampledOut = pw * ph;
+    }
+    cairo_surface_destroy(surface);
+    return nonWhite;
+}
+
+// Apotheosis: one compact summary of what the finished document actually contains, so that a
+// "the page shows up white" report can be answered from a device log instead of a guess: how
+// many elements and links there are, how much text the document renders, how tall it lays
+// out, how many boxes have a non-empty rect and how many of those reach the viewport, plus
+// the body's own colours and whether the page sees a dark colour scheme. Counts and lengths
+// only - never page text, a query or a URL - so it stays safe to read off a shared log.
+static const char* const kPageProbeScript =
+    "(function(){try{var d=document,b=d.body;if(!b)return 'nobody';"
+    "var all=d.getElementsByTagName('*'),n=all.length;"
+    "var a=d.querySelectorAll('a[href]'),ext=0,hs=location.hostname;"
+    "for(var i=0;i<a.length;i++){var hh=a[i].hostname;if(hh&&hh!==hs)ext++;}"
+    "var vh=innerHeight||1,box=0,inview=0,hid=0,lim=n<400?n:400;"
+    "for(var j=0;j<lim;j++){var el=all[j],r=el.getBoundingClientRect();"
+    "if(r.width>0&&r.height>0){box++;if(r.bottom>0&&r.top<vh){inview++;"
+    // An element that has a box in the viewport and still paints nothing is the
+    // difference between "the page rendered and we lost it" and "the page chose
+    // to show nothing" - a shell waiting on data usually hides itself this way.
+    "var cs=getComputedStyle(el);"
+    "if(+cs.opacity===0||cs.visibility==='hidden')hid++;}}}"
+    // The mount point's own first three levels, as flags: opacity, then v/h for
+    // visibility and d/n for display. A React tree that mounted but rendered an
+    // empty or faded-out route shows up here and nowhere else.
+    "var rt=d.getElementById('root')||b,ch=[],e=rt;"
+    "for(var k=0;k<3&&e;k++){var s2=getComputedStyle(e);"
+    "ch.push((+s2.opacity).toFixed(2)+(s2.visibility==='hidden'?'h':'v')+(s2.display==='none'?'n':'d'));"
+    "e=e.firstElementChild;}"
+    // A full-viewport, opaque element parked directly under <body> - outside the
+    // app's own mount point - is how a third-party interstitial covers a page
+    // that rendered perfectly well underneath it. Count them, with the highest
+    // z-index seen, so a white screen can be told apart from an empty one.
+    "var cov=0,zmax=0,vw=innerWidth||1;"
+    "for(var m=0;m<b.children.length;m++){var c2=b.children[m];if(c2===rt)continue;"
+    "var cr=c2.getBoundingClientRect();if(cr.width<vw*0.9||cr.height<vh*0.9)continue;"
+    "var cst=getComputedStyle(c2);"
+    "if(cst.position!=='fixed'&&cst.position!=='absolute')continue;"
+    "if(+cst.opacity===0||cst.visibility==='hidden'||cst.display==='none')continue;"
+    "cov++;var z=parseInt(cst.zIndex,10);if(z>zmax)zmax=z;}"
+    // How many cookies this document can see, and how long they are in total.
+    // Counts and lengths only - never a name and never a value. A site that
+    // depends on a cookie it set from a sibling host shows up as a zero here.
+    "var ckRaw=(d.cookie||''),ck=ckRaw?ckRaw.split(';').length:0;"
+    "var st=getComputedStyle(b);"
+    "return 'els='+n+' a='+a.length+'/'+ext+' txt='+((b.innerText||'').length)"
+    "+' docH='+d.documentElement.scrollHeight+' box='+box+'/'+lim+' inview='+inview"
+    "+' hid='+hid+' root='+ch.join('/')+' cover='+cov+'/'+zmax+' ck='+ck+'/'+ckRaw.length"
+    "+' fg='+st.color.replace(/ /g,'')+' bg='+st.backgroundColor.replace(/ /g,'')"
+    "+' vw='+vw+'x'+vh"
+    "+' dpr='+(devicePixelRatio||1)"
+    "+' dark='+(matchMedia('(prefers-color-scheme:dark)').matches?1:0);"
+    "}catch(e){return 'ERR:'+(e&&(e.message||e.name)||'?');}})()";
 
 // 渲染诊断写入 g_lastTitle/g_lastDiag(白屏定性 + 子资源计数),供 WebCoreGetDiag/GetTitle 取走。
 static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view, int w, int h, int nonWhite)
@@ -707,6 +3317,7 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     int jsEnabled = document.settings().isScriptEnabled() ? 1 : 0;
     int canExec = view.frame().script().canExecuteScripts(ReasonForCallingCanExecuteScripts::NotAboutToExecuteScript) ? 1 : 0;
     unsigned scriptCount = document.scripts()->length();
+    g_lastScriptCount = static_cast<int>(scriptCount);   // Apotheosis (M4): n_scripts column
     // SPA 挂载判据(纯 DOM 读,不依赖 JS eval):#root 子元素数>0 = React/Vue 挂载了;=0 = 没挂(白屏);
     // bodyKids = body 子元素数。配合 loads=/js= 分清:模块没下来(loads.F 高)vs 下来没执行(rootKids=0)vs 挂了。
     int rootKids = -1;
@@ -715,14 +3326,25 @@ static void writeDiag(WebCore::Document& document, WebCore::LocalFrameView& view
     int bodyKids = document.body() ? static_cast<int>(document.body()->childElementCount()) : -1;
     int pendingResources = countPendingResources(document);
     g_lastPendingResources = pendingResources;
+    // Apotheosis: both probes cost a paint and a script evaluation, so they run once per
+    // document instead of on every interactive writeDiag(). The document URL is the identity
+    // here, which also re-probes after an in-page route change; g_lastUrl still holds the
+    // previous diag's URL at this point.
+    if (std::strcmp(g_lastUrl, urlStr.data() ? urlStr.data() : "")) {
+        // Only the direct GPU present needs the probe paint; on the software path the nonwhite=
+        // field above is already the real count and paint= stays 0/0 ("probe did not run").
+        if (g_gpuPresentMode)
+            g_paintProbeNonWhite = probePaintNonWhite(view, w, h, g_paintProbeSampled);
+        evalJS(view.frame(), kPageProbeScript, g_pageProbe, sizeof g_pageProbe);
+    }
     std::snprintf(g_lastTitle, sizeof g_lastTitle, "%s", titleStr.data());
     std::snprintf(g_lastUrl, sizeof g_lastUrl, "%s", urlStr.data());
     int mainLen = std::snprintf(g_lastDiag, sizeof g_lastDiag,
-        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d spa=[%.220s] lasterr=[%.150s]",
+        "url=%s title=%s contents=%dx%d body=%d nonwhite=%d/%d paint=%d/%d loads=S%d/R%d/C%d/F%d pending=%d js=%d/%d scripts=%u rootKids=%d bodyKids=%d page=[%.300s] spa=[%.220s] lasterr=[%.150s]",
         urlStr.data(), titleStr.data(), cs.width(), cs.height(),
-        document.body() ? 1 : 0, nonWhite, w * h,
+        document.body() ? 1 : 0, nonWhite, w * h, g_paintProbeNonWhite, g_paintProbeSampled,
         g_loadStarted, g_loadResponse, g_loadComplete, g_loadFail, pendingResources,
-        jsEnabled, canExec, scriptCount, rootKids, bodyKids, g_spaProbe, g_lastNetError);
+        jsEnabled, canExec, scriptCount, rootKids, bodyKids, g_pageProbe, g_spaProbe, g_lastNetError);
     // 已请求资源清单(诊断 SPA 模块图):每项 文件名(s状态)。status: 0未知 1加载中 2成功 3加载失败 4解码失败。
     // 若 pigai.shop 的 5 个 chunk(react-core/semi-ui/...)根本不在表里 = import 没去拉(模块图没解析);
     // 在表里但 s3 = 拉了但失败(网络/CORS)。
@@ -804,6 +3426,34 @@ static void teardownSession()
     using namespace WebCore;
     if (!g_session)
         return;
+    consoleFlush();   // Apotheosis: this session's console.txt lines otherwise wait for the next ~16-line batch
+    // Apotheosis: (a) GPU sessions must be torn down with the ANGLE context current.
+    // ~Page destroys the GraphicsLayerTextureMapper tree, and with it the BitmapTextures /
+    // FBOs it owns — those destructors call into GL. Outside gpuPresent nothing makes the
+    // context current, so on the second tab the GL deletes ran against no current context
+    // (suspected device crash). Make it current first. Also drop the per-frame flags, which
+    // describe the session that is going away; g_gpuActive / g_gpuPresentMode / g_glContext /
+    // g_textureMapper are deliberately process-lifetime and stay untouched.
+    if (g_gpuActive && g_glContext)
+        g_glContext->makeContextCurrent();
+    g_gpuAnimating = false;
+    g_gpuScrollFast = false;
+    // Apotheosis (WHITE-AT-SCROLL-END): the tile bookkeeping describes the page that is going away.
+    // The new session's first composite must force-dirty.
+    g_gpuForceFullNext = true;
+    g_gpuTargetedNext = false;
+    g_gpuLastCompositeFull = false;
+    navLoadEnd();   // Apotheosis (M4 load throttle): the load this belonged to is gone
+    // Apotheosis (drag as pointer events): the page that owned an in-flight drag is going
+    // away — drop the flag, or the first phase-1/2 call of the next session would dispatch a
+    // mousemove/mouseup into a document that never saw the press.
+    g_dragActive = false;
+    // Apotheosis (review fix, 0.1.9.48): the bottom occlusion was measured for the viewport of the
+    // page that is going away. It is sticky ON PURPOSE within one page, but carrying it into the
+    // next session made the first focused-field reveal there reserve a band nothing covers - in
+    // landscape more than half the panel, so a tapped field was scrolled far past where it belongs.
+    // The harness re-sends the real number with the next resize and from its own keyboard events.
+    g_bottomOcclusionPx = 0;
     if (g_session->client)
         g_session->client->setLoadCompletionHandler({});       // (b)
     if (g_session->mainFrame)
@@ -817,6 +3467,20 @@ static void teardownSession()
     g_session.reset();                                          // (f) 此时 Session.page 已空,~Session 不再触发回调
     for (int i = 0; i < 4; ++i)                                  // (g) 排空延迟清理 / curl 取消
         RunLoop::cycle();
+    // Apotheosis (memory pressure): (h) ~Page freed the layer tree and its textures,
+    // but the JSC heap and the MemoryCache survive a tab switch untouched — that is why the
+    // second tab measured 951 MB while the same page alone costs 620 MB. Give it back here,
+    // after the Page is gone (nothing can re-populate the caches at this point) and after the
+    // RunLoop drain (so the deferred deletions above are already counted as garbage).
+    // keepResourceCache: this path also runs at the start of every WebCoreSessionLoad, and the
+    // next page usually wants the same CSS/JS — dropping the encoded cache here would cost a
+    // full re-download on every navigation. WebCoreCloseSession() clears it as well.
+    // Deliberately *not* wkReleaseMemoryLevel(2): the critical path's
+    // deleteAllCode(PreventCollectionAndDeleteAllCode) would discard every piece of JIT code on
+    // every navigation, which is exactly what we bought the JIT tree for. The explicit full
+    // collection below reclaims the dead page's heap without that.
+    wkReleaseMemoryLevel(1, /*keepResourceCache*/ true);
+    wkCollectJSCHeapNow();
 }
 
 // 在已 emplace 的 g_session 上建立 Page、发起网络加载、settle、布局、提链接、绘制。
@@ -835,6 +3499,15 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     // cookie 持久化:DOM(document.cookie)路换成真 jar(默认是 EmptyStorageSessionProvider→nullptr→cookie 被丢)。
     // HTTP(Cookie/Set-Cookie 头)路由 LoadingFrameLoaderClient::createNetworkingContext 提供,二者共用同一 jar。
     pageConfiguration.cookieJar = WebCore::CookieJar::create(WebCorePort::makeStorageSessionProvider());
+
+    // Apotheosis (2026-09-07): WebSocket. pageConfigurationWithEmptyClients installs
+    // EmptyClients.cpp's EmptySocketProvider, whose createWebSocketChannel() returns nullptr -
+    // and WebSocket.cpp:288 answers that with RELEASE_ASSERT(m_channel) ("Every
+    // ScriptExecutionContext should have a SocketProvider"). So the first `new WebSocket(...)`
+    // on a page killed the app: a map site every time, and any SPA with a live connection.
+    // PortSocketProvider hands out a real channel that speaks the protocol over curl streams;
+    // see PortWebSocket.h.
+    pageConfiguration.socketProvider = WebCorePort::PortSocketProvider::create();
 
     // GPU 合成:仅当 GPU(GL 上下文 + TextureMapper)已初始化才用真 ChromeClient(PortChromeClient,
     // 它在 attachRootGraphicsLayer 捕获根 GraphicsLayer)+ 下面开合成。GPU 未起时保持
@@ -875,12 +3548,52 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
 
     Ref<Page> page = Page::create(WTF::move(pageConfiguration));
     g_session->page = page.ptr();   // 立即存活到会话:后续失败路径 teardown 才能安全访问 client/frame
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
 
     page->settings().setScriptEnabled(true);
     page->settings().setLoadsImagesAutomatically(true);
     page->settings().setAcceleratedCompositingEnabled(g_gpuActive);   // 仅 GPU 就绪才开合成 → 建 GraphicsLayer 树(PortChromeClient 捕获根层),经 TextureMapper GPU 呈现
     page->settings().setForceCompositingMode(g_gpuActive);            // 同上;GPU 未起时关闭 → 纯软件 cairo,零回归
+    // Apotheosis (fixed/sticky at scroll, 2026-09-07): WebCore's own default for this preference is
+    // false off iOS, and we build the Page directly - so position:fixed and position:sticky elements
+    // never got a composited layer of their own. They are painted into the scrolled-contents tile
+    // grid instead, and because the grid is translated by -scrollPosition on every scroll frame,
+    // WebCore has to REPAINT them into it at their new place every single frame
+    // (LocalFrameView::scrollContentsFastPath -> setBackingNeedsRepaintInRect of the old-plus-new
+    // band). With off-thread raster and the per-composite tile-upload budget that repaint lands one
+    // or more composites late, so a fixed/sticky header is drawn where it was, rides the page down
+    // (or up) and snaps back when the replay arrives - the "header comes down piecewise and jumps
+    // back" of 0.1.9.21/22, worst exactly where the raster workers are busy with something else
+    // (a news site's lazy images in the lower page, a chat/AI site's polling bot check, a map site's tiles).
+    // With the preference on, RenderLayerCompositor::updateCompositingLayers(OnScroll) - which
+    // WebCore runs for us because there is no ScrollingCoordinator - re-positions those layers
+    // instead: a layer move per scroll frame, no raster and no upload. Sticky needs the WK_WINUWP
+    // branch in RenderLayerCompositor::isAsyncScrollableStickyLayer() as well. Gated on g_gpuActive
+    // like the two above: without compositing there is nothing to promote.
+    page->settings().setAcceleratedCompositingForFixedPositionEnabled(g_gpuActive);
     page->settings().setShouldAllowUserInstalledFonts(false);
+    // Apotheosis (M4): never let a web font hold text back. CSSFontFace::fontLoadTiming() maps the
+    // default (FontLoadTimingOverride::None with font-display:auto/block, which is what most sites
+    // end up with) to a 3 s block period: for those three seconds the text is laid out but painted
+    // with nothing - on a phone whose first visually-non-empty layout we measure at 0.4 s. Swap
+    // overrides every face to { block 0 s, swap infinite }: the fallback font is painted
+    // immediately and replaced when the web font arrives. The trade-off is icon fonts - their code
+    // points have no fallback glyph, so a Font-Awesome-style icon is a blank box until it loads,
+    // and it cannot be exempted (the timing is per-face and nothing tells us a face is an icon
+    // font). Readable text at first paint is worth more here than icons arriving at the same time.
+    page->settings().setFontLoadTimingOverride(FontLoadTimingOverride::Swap);
+    // Apotheosis (M4 load, 2026-09-07): honour loading="lazy". WebCore's own default for this
+    // preference is false (UnifiedWebPreferences.yaml: WebKit true, WebCore false) and we build
+    // the Page directly, so we inherited the off state and fetched every image of a document up
+    // front. On a news front page that is 261 subresources for a 42424 px tall page whose viewport is 1080
+    // px - the load event waits 6.6 s past DOMContentLoaded for images ~39 screens down. The
+    // implementation is complete in this tree (html/LazyLoadImageObserver.cpp): a deferred image
+    // is observed by an IntersectionObserver with a 100 % root margin, i.e. it loads one screen
+    // before it is reached, and the observer is driven by the isolatedUpdateRendering that
+    // pumpLoop and WebCoreLiveTick already call every tick. Sites that do not use the attribute
+    // are unaffected.
+    page->settings().setLazyImageLoadingEnabled(true);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
     // ★ DOM Storage:Window.localStorage/sessionStorage 默认被 LocalStorageEnabled/SessionStorageEnabled
     //   两个 setting 门控,默认关 → 这两个全局根本没挂上 window → 现代 SPA 启动时访问 localStorage 直接
     //   ReferenceError("Can't find variable: localStorage")崩溃,React 永不挂载(白屏)。开了它们才行。
@@ -890,6 +3603,10 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setMediaEnabled(false);
 #endif
     page->setIsVisible(true);
+    // Apotheosis (M4 load timeline): opt in to the visually-non-empty milestone. WebCore only
+    // computes and dispatches the milestones a client asked for (Page::requestedLayoutMilestones),
+    // and this is the mark behind the t_firstpaint column and the stage.txt timeline line.
+    page->addLayoutMilestones({ LayoutMilestone::DidFirstVisuallyNonEmptyLayout });
 
     RefPtr<LocalFrame> localMainFrame = page->localMainFrame();
     if (!localMainFrame)
@@ -904,7 +3621,7 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
     view->setCanHaveScrollbars(true);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     // headless 页面标记为 active + focused,否则 EventHandler 命中/默认动作、:focus、表单交互、依赖
     // document.hasFocus()/可见性的脚本会被当后台页抑制 → 点击像没反应。
@@ -918,14 +3635,29 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     Ref<FrameLoader> loader = localMainFrame->loader();
     loader->load(WTF::move(frameLoadRequest));
 
-    // 初次加载:等主文档完成 + 空闲;每 tick isolatedUpdateRendering 让 SPA(claude.ai 等)的
+    // 初次加载:等主文档完成 + 空闲;每 tick isolatedUpdateRendering 让 SPA(聊天/AI 站等)的
     // rAF 驱动渲染推进(否则 JS 站点 settle 后仍空白)。
-    pumpLoop(*localMainFrame, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ false,
-             /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
+    {
+        PerfPhase perfSettle(&g_perfCur.settle);   // M4: network + settle wall time (tick count → `frames`)
+        pumpLoop(*localMainFrame, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ false,
+                 /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ page.ptr());
+    }
+    perfMarkNavSettled();   // Apotheosis (M4 load timeline): t_settle
 
-    if (!g_session->load.mainDone)
-        return kErrLoadTimeout;
-    if (g_session->load.failed)
+    // Apotheosis (M3): "no load event" is not "nothing loaded". An ImageDocument (main
+    // frame navigated to an image URL) and, occasionally, an HTML page hit by the
+    // defer/cancel bug commit, parse and paint but never dispatch a load event, so
+    // mainDone stays false and pumpLoop only ends via its watchdog. If the main document
+    // did commit, render what we have and report success (the diag is tagged below);
+    // only a load that never committed anything is a genuine timeout.
+    bool noLoadEvent = false;
+    if (!g_session->load.mainDone) {
+        RefPtr<DocumentLoader> committedLoader = localMainFrame->loader().documentLoader();
+        bool committed = g_session->load.committed || (committedLoader && committedLoader->isCommitted());
+        if (!committed || !localMainFrame->document())
+            return kErrLoadTimeout;
+        noLoadEvent = true;
+    } else if (g_session->load.failed)
         return kErrLoadFailed;
 
     // 提交后 WebKit 给新文档新建了 LocalFrameView,加载前的 view 已失效 → 重取 + 重设背景/尺寸。
@@ -934,12 +3666,15 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     RefPtr<Document> document = localMainFrame->protectedDocument();
     if (!document)
         return kErrNoDocument;
-    document->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4: forced style + layout
+        document->updateLayoutIgnorePendingStylesheets();
+    }
 
     // SPA 模块求值探针:动态 import 入口模块,触发/复用其求值(可能挂载 React)。之后重取帧/view/document,
     // 因挂载可能改了 DOM/布局。非模块站点(probeSpaModule 内判 no-mod)不跑、零开销。
@@ -953,11 +3688,14 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
     document = localMainFrame->protectedDocument();
     if (!document)
         return kErrNoDocument;
-    document->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4: forced style + layout
+        document->updateLayoutIgnorePendingStylesheets();
+    }
     extractLinks(document.get(), h);
 
     int nonWhite = 0;
@@ -965,6 +3703,11 @@ static int buildSession(const char* url, int w, int h, uint8_t* outRGBA)
     if (prc != kOK)
         return prc;
     writeDiag(*document, *view, w, h, nonWhite);
+    if (noLoadEvent) {   // Apotheosis (M3): keep the device log honest about why we returned early
+        const size_t used = std::strlen(g_lastDiag);
+        if (used + 1 < sizeof g_lastDiag)
+            std::snprintf(g_lastDiag + used, sizeof g_lastDiag - used, " (no load event)");
+    }
     return kOK;
 }
 
@@ -985,7 +3728,7 @@ static int finishInteractionPaint(uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(g_session->w, g_session->h));
+    view->resize(wkViewSizeFromEngine(g_session->w, g_session->h));
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
@@ -999,11 +3742,112 @@ static int finishInteractionPaint(uint8_t* outRGBA)
     return kOK;
 }
 
-extern "C" void WebCorePortRecordNetError(int code, const char* domain, const char* desc, const char* url)
+// Apotheosis: `type` is WebCore::ResourceError::Type (0=Null 1=General 2=AccessControl
+// 3=Cancellation 4=Timeout — see ResourceErrorBase.h) as an int, so the driver
+// need not include WebCore headers here. Added while chasing the "every redirect ends in
+// the harness' error page" regression that surfaced once da68fe9fdd stopped the redirect
+// completion lambda from running on a cancelled ResourceHandle: our own
+// dispatchDidFailProvisionalLoad (LoadingFrameLoaderClient.cpp) swallows any
+// Type::Cancellation failure unconditionally, on the (previously accurate — pre-fix — but
+// now stale) assumption that WebKit always restarts the load itself. Logging the type
+// alongside domain/desc/url lets the next device run show, without guessing, whether the
+// stuck load is really hitting that Cancellation branch (in which case the swallow is the
+// bug) or failing immediately with a different type (AccessControl/General), which points
+// at a specific WebCore-side redirect check instead.
+extern "C" void WebCorePortRecordNetError(int code, int type, const char* domain, const char* desc, const char* url)
 {
     std::snprintf(g_lastNetError, sizeof g_lastNetError,
-        "curlcode=%d domain=%s desc=%s url=%s",
-        code, domain ? domain : "", desc ? desc : "", url ? url : "");
+        "curlcode=%d type=%d domain=%s desc=%s url=%s",
+        code, type, domain ? domain : "", desc ? desc : "", url ? url : "");
+}
+
+// Apotheosis (2026-09-11): copy the host out of an absolute URL - "https://example.com/a?b" ->
+// "example.com". Deliberately string-level and not URL{}: this runs on a failure path where the
+// only thing wanted is a label for a log line, and the label must never be able to carry a query.
+static void copyUrlHost(char* out, size_t outLen, const char* url)
+{
+    if (!out || !outLen)
+        return;
+    out[0] = '\0';
+    if (!url || !*url)
+        return;
+    const char* p = std::strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char* at = nullptr;
+    size_t n = 0;
+    for (const char* q = p; *q && *q != '/' && *q != '?' && *q != '#'; ++q) {
+        if (*q == '@')
+            at = q + 1;         // strip any userinfo
+        ++n;
+    }
+    if (at) {
+        n -= static_cast<size_t>(at - p);
+        p = at;
+    }
+    if (n > outLen - 1)
+        n = outLen - 1;
+    std::memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+// Apotheosis (2026-09-11): the main frame's provisional load failed for good - no document byte
+// ever arrived, so the harness is about to show its error page. Recorded separately from
+// g_lastNetError (see there) because this is the only failure WebCoreSessionLoad may retry.
+extern "C" void WebCorePortRecordMainLoadFailure(int code, int type, const char* url)
+{
+    g_mainFailCode = code;
+    g_mainFailType = type;
+    copyUrlHost(g_mainFailHost, sizeof g_mainFailHost, url);
+}
+
+// Apotheosis (2026-09-11): curl codes that mean "the transport never came up", as opposed to
+// "the server answered something we do not like". Every one of these can and does happen once on
+// a phone Wi-Fi link and succeed on the very next attempt - the device logs of 2026-09-03 to
+// 2026-09-11 show six of them, all on the first contact with a host in an app session, all
+// failing in under a second, and the one that was retried by hand loaded normally 13 s later.
+// A browser is expected to absorb that; this port had no retry at all and turned each one into
+// an error page.
+//   6  CURLE_COULDNT_RESOLVE_HOST   28  CURLE_OPERATION_TIMEDOUT
+//   7  CURLE_COULDNT_CONNECT        35  CURLE_SSL_CONNECT_ERROR
+//   56 CURLE_RECV_ERROR
+// 6 is included on purpose: curl caches no negative DNS answer, so a genuinely dead name costs
+// one extra lookup (~0.4 s in the logs) while a resolver that was not ready yet - the single
+// most common first-navigation failure here - is repaired.
+// Codes deliberately NOT retried: 60/58/77 (certificate problems - a retry cannot change the
+// verdict and re-trying a rejected certificate is exactly the wrong instinct), 16 (HTTP/2 framing,
+// which needs a protocol downgrade rather than a repeat), and everything >= 400 HTTP, which never
+// reaches here at all.
+// Upper bound on how long the FIRST attempt may have taken for a retry to still make sense. The
+// failures this repairs gave up in 0.4-1.0 s; a load that burned longer than this has a link that
+// answers too slowly, and a second full attempt (up to the 30 s pump watchdog) would only double
+// the spinner the user is already staring at.
+static constexpr double kNetRetryMaxFirstAttemptSeconds = 8.0;
+
+static bool isRetriableTransportError(int curlCode)
+{
+    switch (curlCode) {
+    case 6: case 7: case 28: case 35: case 56:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Apotheosis (2026-09-11): one line per retry, next to the timeline/tgloop lines. Host only -
+// never the path and never the query, so a search a user typed can never end up in a log that
+// leaves the phone. ipv4= is the current resolve mode (WebCoreSetIPv4Only), which the retry does
+// not change: it is a process-wide switch, not a per-host one, and IPv6 works on this link for
+// every other load in the same session.
+static void writeNetRetryStage(const char* host, int code, int attempt)
+{
+    if (g_stagePath.empty())
+        return;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_stagePath.c_str(), "ab") != 0 || !fp)
+        return;
+    std::fprintf(fp, "netretry url-host=%s code=%d attempt=%d ipv4=%d\n",
+        host && *host ? host : "-", code, attempt, g_ipv4Only ? 1 : 0);
+    std::fclose(fp);
 }
 
 // Apotheosis: 内存压力释放。harness 监听 UWP MemoryManager.AppMemoryUsageIncreased,
@@ -1012,10 +3856,123 @@ extern "C" void WebCorePortRecordNetError(int code, const char* domain, const ch
 extern "C" void WebCoreReleaseMemory(int critical)
 {
     if (!ensureWebCoreInitialized()) return;
-    WebCore::releaseMemory(critical ? WTF::Critical::Yes : WTF::Critical::No,
-                           WTF::Synchronous::Yes,
-                           WebCore::MaintainBackForwardCache::No,
-                           WebCore::MaintainMemoryCache::No);
+    wkReleaseMemoryLevel(critical ? 2 : 1, /*keepResourceCache*/ false);
+}
+
+// Apotheosis: push the harness' MemoryManager numbers into WebCore.
+// Two effects, both of which the port was missing entirely:
+//  (1) MemoryPressureHandler's status. It is never install()ed here (the Windows 60 s poll would
+//      just reset it to Normal — MemoryPressureHandlerWin.cpp is a stub in an App Container), so
+//      isUnderMemoryPressure() was permanently false at all ~22 WebCore call sites: FontCache,
+//      WidthCache, GlyphDisplayListCache, RenderLayerCompositor's cover-area multiplier, the
+//      pruning reason in MemoryRelease. Setting it is what makes those react.
+//  (2) our own MemoryCache budget, plus a release when the level rises.
+// Level transitions only — the harness applies hysteresis and calls on change; re-calling with
+// the level already in effect is a no-op, so this is safe to call from a tick.
+// Engine thread only.
+extern "C" void WebCoreSetMemoryPressure(int level)
+{
+    if (!ensureWebCoreInitialized()) return;
+    if (level < 0) level = 0;
+    if (level > 2) level = 2;
+    const int previous = g_memPressureLevel;
+    if (level == previous)
+        return;
+    g_memPressureLevel = level;
+
+    using SysStatus = WTF::SystemMemoryPressureStatus;
+    WTF::MemoryPressureHandler::singleton().setMemoryPressureStatus(
+        level >= 2 ? SysStatus::Critical : (level == 1 ? SysStatus::Warning : SysStatus::Normal));
+
+    switch (level) {
+    case 0:
+        wkSetMemoryCacheCapacities(kMemCacheMinDeadNormal, kMemCacheDeadNormal, kMemCacheTotalNormal);
+        break;
+    case 1:
+        wkSetMemoryCacheCapacities(0, kMemCacheDeadMedium, kMemCacheTotalMedium);
+        break;
+    default:
+        wkSetMemoryCacheCapacities(0, kMemCacheDeadHigh, kMemCacheTotalHigh);
+        break;
+    }
+
+    // Only release when the pressure *rises*. Falling back to 0 just restores the budget —
+    // running a full GC on the way down would be pure cost.
+    if (level > previous) {
+        // Keep the encoded resource cache at level 1; at level 2 we are close enough to the
+        // kill threshold that a white image is better than a dead app.
+        wkReleaseMemoryLevel(level, /*keepResourceCache*/ level < 2);
+    }
+}
+
+// Apotheosis: engine-side memory numbers for the harness' mem.txt.
+// Without these, mem.txt only carries the OS view (AppMemoryUsage) and every one of the eight
+// buckets below is a guess. Engine thread only: getStatistics() walks the whole resource map
+// and the JSC accessors touch the heap.
+extern "C" int WebCoreGetMemoryStats(WebCoreMemoryStats* out)
+{
+    if (!out)
+        return kErrBadArgs;
+    int cap = out->structSize;
+    if (cap < (int)sizeof(int) || cap > (int)sizeof(WebCoreMemoryStats))
+        cap = (int)sizeof(WebCoreMemoryStats);
+    WebCoreMemoryStats s;
+    std::memset(&s, 0, sizeof s);
+    s.structSize = cap;
+    s.pressureLevel = g_memPressureLevel;
+
+    if (!ensureWebCoreInitialized()) {
+        std::memcpy(out, &s, cap);
+        return kErrBadArgs;
+    }
+
+    // JSC — commonVM() would *create* a VM, so go through the raw pointer: a page that never
+    // ran script leaves these zero instead of allocating a heap just to measure it.
+    if (JSC::VM* vm = WebCore::g_commonVMOrNull) {
+        JSC::JSLockHolder locker(vm);
+        s.jscHeapSize     = vm->heap.size();
+        s.jscHeapCapacity = vm->heap.capacity();
+        s.jscExtraMemory  = vm->heap.extraMemorySize();
+        s.jscObjectCount  = vm->heap.objectCount();
+    }
+
+    auto& cache = WebCore::MemoryCache::singleton();
+    auto stats = cache.getStatistics();
+    s.cacheTotal    = cache.size();
+    s.cacheCapacity = g_memCacheCapacity;
+    const WebCore::MemoryCache::TypeStatistic* types[] = {
+        &stats.images, &stats.cssStyleSheets, &stats.scripts, &stats.fonts, &stats.xslStyleSheets };
+    for (auto* t : types) {
+        s.cacheLive    += (uint64_t)(t->liveSize    > 0 ? t->liveSize    : 0);
+        s.cacheDecoded += (uint64_t)(t->decodedSize > 0 ? t->decodedSize : 0);
+    }
+    s.imagesSize    = (uint64_t)(stats.images.size > 0 ? stats.images.size : 0);
+    s.imagesDecoded = (uint64_t)(stats.images.decodedSize > 0 ? stats.images.decodedSize : 0);
+    s.cssSize       = (uint64_t)(stats.cssStyleSheets.size > 0 ? stats.cssStyleSheets.size : 0);
+    s.scriptsSize   = (uint64_t)(stats.scripts.size > 0 ? stats.scripts.size : 0);
+    s.fontsSize     = (uint64_t)(stats.fonts.size > 0 ? stats.fonts.size : 0);
+    s.imagesCount   = (uint32_t)(stats.images.count > 0 ? stats.images.count : 0);
+    s.cssCount      = (uint32_t)(stats.cssStyleSheets.count > 0 ? stats.cssStyleSheets.count : 0);
+    s.scriptsCount  = (uint32_t)(stats.scripts.count > 0 ? stats.scripts.count : 0);
+    s.fontsCount    = (uint32_t)(stats.fonts.count > 0 ? stats.fonts.count : 0);
+
+    // TextureMapper. The counters are process-wide levels maintained in BitmapTexture's
+    // ctor/reset/dtor (WebKit 0c78243bf5) — no GL calls, no context needed. Only ask the pool
+    // once GPU compositing is actually up: BitmapTexturePool::singleton() would otherwise
+    // construct the pool (and its RunLoop timer) just to report zero.
+    uint64_t texBytes = 0; unsigned texCount = 0;
+    WebCore::wkWinUWPTexmapTextureStats(texBytes, texCount);
+    s.texBytes = texBytes;
+    s.texCount = texCount;
+    if (g_gpuActive) {
+        uint64_t poolBytes = 0; unsigned poolCount = 0;
+        WebCore::wkWinUWPTexmapPoolStats(poolBytes, poolCount);
+        s.poolBytes = poolBytes;
+        s.poolCount = poolCount;
+    }
+
+    std::memcpy(out, &s, cap);
+    return kOK;
 }
 
 // Apotheosis: 清除全部 cookie。设置页"清除数据"用。引擎线程调。清完立即落盘(空文件),否则
@@ -1063,6 +4020,130 @@ void WebCoreSetCookieJsonPath(const char* path)
     if (!path || !*path)
         return;
     WebCorePort::setPortCookieJsonPath(String::fromUTF8(path));
+}
+
+// Apotheosis: arm crash.txt logging and point it at a file inside LocalState
+// (the App Container's only writable place, and the driver cannot discover it —
+// the harness passes it in from SetupRuntimeEnv on the engine thread). Unlike
+// the perf log this is NOT opt-in: a crash with no dump is exactly the case we
+// can never reproduce on the build machine. Installs all three legs once; later
+// calls only update the path. See the block near the top of this file.
+void WebCoreSetCrashLogPath(const char* path)
+{
+    if (!path || !*path)
+        return;
+    // Copy into a fixed buffer — the crash path must not touch the heap and the
+    // caller's string may be gone by the time we crash.
+    size_t i = 0;
+    for (; path[i] && i + 1 < sizeof(g_crashLogPath); ++i)
+        g_crashLogPath[i] = path[i];
+    g_crashLogPath[i] = 0;
+
+    // Apotheosis: derive console.txt's path from crash.txt's directory — see the "JS console"
+    // block above consoleAppendLine() for why crash.txt's path is the one this rides on. Ordinary
+    // heap/file use, fine here (unlike the crash legs): this runs once from SetupRuntimeEnv, never
+    // from a dying process.
+    {
+        std::string crashPath(g_crashLogPath);
+        const size_t slash = crashPath.find_last_of("\\/");
+        g_consolePath = (slash == std::string::npos) ? std::string("console.txt")
+            : crashPath.substr(0, slash + 1) + "console.txt";
+        g_consolePathReady = true;
+        // Apotheosis (M4 load timeline): stage.txt lives in the same LocalState directory.
+        g_stagePath = (slash == std::string::npos) ? std::string("stage.txt")
+            : crashPath.substr(0, slash + 1) + "stage.txt";
+        FILE* probe = nullptr;
+        if (fopen_s(&probe, g_consolePath.c_str(), "rb") == 0 && probe) {
+            g_consoleFileExisted = true;   // opt-in: console.txt already exists on disk
+            std::fclose(probe);
+        }
+    }
+
+    if (g_crashLogInstalled)
+        return;
+    g_crashLogInstalled = true;
+    // Resolve the memory probe once, here — never from inside a crash handler.
+    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+        g_crashGetProcessMemoryInfo = reinterpret_cast<CrashGetProcessMemoryInfoFn>(
+            reinterpret_cast<void*>(GetProcAddress(k32, "K32GetProcessMemoryInfo")));
+    WTFWinUWPSetCrashHook(&crashLogWtfHook);
+    AddVectoredExceptionHandler(1, &crashLogVectoredHandler);
+    std::signal(SIGABRT, &crashLogSignalHandler);
+    // The four CRT legs (see the block comment above crashLogMemorySuffix): every path
+    // that aborts without ever reaching WTFCrash now names itself in crash.txt.
+    g_crashPrevTerminate = std::set_terminate(&crashLogTerminateHandler);
+    _set_new_handler(&crashLogNewHandler);
+    g_crashPrevInvalidParameter = _set_invalid_parameter_handler(&crashLogInvalidParameterHandler);
+    g_crashPrevPureCall = _set_purecall_handler(&crashLogPureCallHandler);
+}
+
+// Apotheosis: append one reason line (plus the current stack) to crash.txt from outside
+// the engine. The harness owns the terminate/UnhandledException paths of its own CRT —
+// C++/CX, exceptions enabled, a different CRT instance from this DLL's — so it cannot
+// reuse the handlers above and needs a way to record *why* it is about to die. No-op
+// until WebCoreSetCrashLogPath() has run. Safe from any thread and from a dying one.
+void WebCoreCrashNote(const char* reason)
+{
+    crashLogWrite(reason && *reason ? reason : "(note)", nullptr);
+    perfFlush();
+    consoleFlush();
+}
+
+// Apotheosis (M4): resolve-mode switch for the curl backend. The phone has global
+// IPv6 addresses; on some links the v6 path is a black hole and the first contact
+// with a host stalls 14-22 s before the main resource commits, while an immediate
+// reload takes 0.4 s. Rather than hardcoding IPv4 we let the harness flip it at
+// runtime so it can be A/B-measured against the net_dns/net_connect/net_ttfb columns.
+// Takes effect for handles created after the call (i.e. the next request), so call
+// it before starting a navigation. Implemented in WebKit's CurlContext.cpp.
+extern "C" void WebCorePortSetIPv4Only(int on);
+
+void WebCoreSetIPv4Only(int enable)
+{
+    g_ipv4Only = enable ? 1 : 0;   // Apotheosis: mirrored so the netretry stage line can report it
+    WebCorePortSetIPv4Only(enable);
+}
+
+// Apotheosis (M4 step 1): switch per-phase timing on and point it at a CSV file.
+// The App Container only lets us write inside LocalState and the driver cannot
+// discover that path itself, so the harness passes it in — and only when the
+// tester dropped LocalState\perf.txt, mirroring the imedebug.txt opt-in. Unset or
+// "" = off, which is the shipping default and costs one branch per probe.
+// Engine-thread call; call it before the first navigation.
+void WebCoreSetPerfLogPath(const char* path)
+{
+    if (!path || !*path) {
+        g_perfOn = false;
+        g_apoNetTimingOn = false;
+        g_perfPath.clear();
+        return;
+    }
+    g_perfPath = path;
+    g_perfOn = true;
+    // Apotheosis (M4 load waterfall): WebKit's CurlRequest reads this flag on the curl worker
+    // thread to decide whether a response is worth a URL copy + a main-thread hop. It is a
+    // plain bool written once here, before any load; a torn read would only cost one missing
+    // or one extra waterfall entry, so no atomic.
+    g_apoNetTimingOn = true;
+    // Write the CSV header only into a fresh file (the log is appended across runs).
+    g_perfHeaderDone = false;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_perfPath.c_str(), "rb") == 0 && fp) {
+        std::fseek(fp, 0, SEEK_END);
+        if (std::ftell(fp) > 0)
+            g_perfHeaderDone = true;
+        std::fclose(fp);
+    }
+}
+
+// Apotheosis (M4 step 1): drain the in-memory perf ring to disk. Rows otherwise
+// reach the file only when a navigation completes or the ring fills, so an app
+// that UWP terminates while suspended would lose them — the harness calls this
+// from the suspend path and at the end of the autodiag loop. No-op when off.
+void WebCorePerfFlush()
+{
+    perfFlush();
+    consoleFlush();
 }
 
 // 把当前 jar 里的持久(有过期时间、非会话)cookie 写回 JSON Lines 文件。harness 在应用切后台
@@ -1245,9 +4326,12 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     page->settings().setScriptEnabled(false);
     page->settings().setAcceleratedCompositingEnabled(false);
     page->settings().setShouldAllowUserInstalledFonts(false);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
 #if ENABLE(VIDEO)
     page->settings().setMediaEnabled(false);
 #endif
+
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
 
     // ---- 4. Main frame + view ----
     RefPtr<LocalFrame> localMainFrame = page->localMainFrame();
@@ -1285,8 +4369,8 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     writer.end();   // finishes parsing synchronously for this in-memory document
 
     // ---- 6. Size + layout ----
-    const IntSize size(w, h);
-    view->resize(size);   // Widget::resize -> setFrameRect; establishes layout viewport
+    const IntSize size = wkViewSizeFromEngine(w, h);   // CSS px, see wkViewSizeFromEngine
+    view->resize(size);   // Widget::resize -> setFrameRect; establishes the layout viewport
 
     RefPtr<Document> document = localMainFrame->protectedDocument();
     if (!document)
@@ -1310,6 +4394,10 @@ int WebCoreRenderHtml(const char* utf8Html, int w, int h, uint8_t* outRGBA)
     }
 
     {
+        // Apotheosis (page width, 0.1.9.58): this path has its own cairo context (it predates
+        // paintToRGBA) and needs the same device scale factor - the view is laid out and painted in
+        // CSS px, the surface is engine px. The built-in start and error pages come through here.
+        cairo_scale(cr, wkPageWidthFactor(), wkPageWidthFactor());
         // GraphicsContextCairo adopts a RefPtr<cairo_t>. We created cr with a
         // refcount of 1, so hand ownership over via adoptRef (no extra ref).
         GraphicsContextCairo context(adoptRef(cr));   // RefPtr<cairo_t>&& ctor
@@ -1372,6 +4460,8 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrBadArgs;
 
     g_lastNetError[0] = '\0';   // clear any stale diagnostic from a prior call
+    g_pageProbe[0] = '\0';
+    g_paintProbeNonWhite = g_paintProbeSampled = 0;
     g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;   // 重置子资源计数
 
     // process init (JSC/MainThread/AtomStrings) + installPortPlatformStrategies()
@@ -1431,9 +4521,11 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
     page->settings().setLoadsImagesAutomatically(true);   // 确保 <img>/CSS 背景图自动加载
     page->settings().setAcceleratedCompositingEnabled(false);
     page->settings().setShouldAllowUserInstalledFonts(false);
+    page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);   // Apotheosis: privacy, see g_apoSpecPrefetch
 #if ENABLE(VIDEO)
     page->settings().setMediaEnabled(false);
 #endif
+    wkApplyPageWidthFactor(page.get());   // Apotheosis: device scale factor, before the first layout
     // 标记页面可见,否则后台节流会推迟图片/定时器/资源加载(headless 默认可能非可见)。
     page->setIsVisible(true);
 
@@ -1452,7 +4544,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
     view->setCanHaveScrollbars(true);
-    view->resize(IntSize(w, h));   // establish viewport BEFORE load
+    view->resize(wkViewSizeFromEngine(w, h));   // establish viewport BEFORE load
 
     // ---- Issue the network load ----
     ResourceRequest request { WTF::move(parsedURL) };
@@ -1515,7 +4607,7 @@ int WebCoreLoadUrl(const char* url, int w, int h, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(w, h));
+    view->resize(wkViewSizeFromEngine(w, h));
 
     document->updateLayoutIgnorePendingStylesheets();
     extractLinks(document.get(), h);                    // 提取链接命中表(点击交互)
@@ -1543,16 +4635,47 @@ int WebCoreSessionLoad(const char* url, int w, int h, uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
     teardownSession();
-    g_lastNetError[0] = '\0';
-    g_spaProbe[0] = '\0';
-    g_lastPendingResources = 0;
-    g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
-    g_session.emplace();
-    g_session->w = w;
-    g_session->h = h;
-    int rc = buildSession(url, w, h, outRGBA);
-    if (rc != kOK)
-        teardownSession();   // 失败不留半截会话
+    PerfOpGuard perfOp("nav", url, w, h);   // M4: one CSV row for this navigation (flushed on completion)
+
+    // One attempt at the navigation, from a clean slate. Everything a previous attempt could have
+    // left behind is reset here rather than above, so a retry starts exactly where the first one did.
+    auto attemptLoad = [&]() -> int {
+        g_lastNetError[0] = '\0';
+        g_spaProbe[0] = '\0';
+        g_pageProbe[0] = '\0';
+        g_paintProbeNonWhite = g_paintProbeSampled = 0;
+        g_lastPendingResources = 0;
+        g_loadStarted = g_loadResponse = g_loadComplete = g_loadFail = 0;
+        g_mainFailCode = 0;
+        g_mainFailType = 0;
+        g_mainFailHost[0] = '\0';
+        g_session.emplace();
+        g_session->w = w;
+        g_session->h = h;
+        int r = buildSession(url, w, h, outRGBA);
+        if (r != kOK)
+            teardownSession();   // 失败不留半截会话
+        return r;
+    };
+
+    // Apotheosis (2026-09-11): retry the MAIN RESOURCE once when the transport never came up.
+    // Why this exists: every curl failure in the device logs so far (codes 6 and 35, six of them
+    // across nine days) was the first contact with that host in the app session, failed in well
+    // under a second, and went straight to the harness' error page - while the very same URL
+    // typed again loaded normally. WebKit's curl backend has no retry of its own and neither had
+    // this driver, so a single dropped handshake on the phone's Wi-Fi was a dead page.
+    // Three guards keep this from becoming a way to wait twice as long for a site that is simply
+    // down: only a main-frame PROVISIONAL failure counts (g_mainFailCode - a failed subresource
+    // must never restart the page), only the transport codes in isRetriableTransportError(), and
+    // only when the first attempt gave up quickly. A slow failure (connect timeout, the 30 s
+    // watchdog) is a link that is answering too slowly for a second helping to help.
+    const MonotonicTime attemptStart = MonotonicTime::now();
+    int rc = attemptLoad();
+    if (rc != kOK && g_mainFailCode && isRetriableTransportError(g_mainFailCode)
+        && (MonotonicTime::now() - attemptStart).seconds() < kNetRetryMaxFirstAttemptSeconds) {
+        writeNetRetryStage(g_mainFailHost, g_mainFailCode, 1);
+        rc = attemptLoad();
+    }
     return rc;
 }
 
@@ -1561,13 +4684,173 @@ void WebCoreCloseSession()
 {
     if (g_inPump)
         return;
+    const bool hadSession = g_session.has_value();
     teardownSession();
+    // Apotheosis (memory pressure): the user left the page for good (home screen,
+    // suspend, tab closed) — unlike the navigation path there is no next page that would reuse
+    // the encoded resources or the compiled code, so take the critical route as well.
+    if (hadSession)
+        wkReleaseMemoryLevel(2, /*keepResourceCache*/ false);
+}
+
+// ===========================================================================
+// Apotheosis (synthetic mouse input, 2026-09-04): PlatformMouseEvent carries TWO button fields.
+// `button` says which button this event is about; `buttons` is the W3C uievents bitmask of what is
+// held down right now (1 = primary). The public constructor takes only the first and leaves
+// m_buttons at 0, and nothing derives it later: MouseEvent::create() copies event.buttons()
+// straight through (MouseEvent.cpp:70), and PointerEvent takes both the DOM `buttons` and - for
+// the mouse pointer type - `pressure` from it (PointerEvent.cpp:202/207,
+// pressureForPressureInsensitiveInputDevices(buttons())). So every mouse event this driver
+// synthesised reached the page as `buttons: 0, pressure: 0`, i.e. a pointermove with nothing
+// pressed. Widgets that pan on pointer events (Leaflet, MapLibre, canvas apps) test exactly
+// that field to tell a drag from a hover, which is why the one-finger drag did nothing on Maps.
+// PlatformMouseEventWin.cpp is the reference for the real values: a WM_MOUSEMOVE during a left
+// drag carries button=Left AND buttons=1 (buttonsForEvent(), GDIUtilities.h:44), WM_LBUTTONDOWN
+// carries 1, and WM_LBUTTONUP carries 0 because the button being released is no longer down.
+// m_buttons is protected with no setter, so this three-line subclass is how it gets set.
+// ===========================================================================
+namespace {
+class DriverMouseEvent final : public WebCore::PlatformMouseEvent {
+public:
+    DriverMouseEvent(const WebCore::DoublePoint& position, WebCore::MouseButton button,
+                     WebCore::PlatformEvent::Type type, int clickCount,
+                     OptionSet<WebCore::PlatformEvent::Modifier> modifiers, MonotonicTime timestamp,
+                     unsigned short buttons)
+        : WebCore::PlatformMouseEvent(position, position, button, type, clickCount, modifiers, timestamp,
+                                      /*force*/ 0.0, WebCore::SyntheticClickType::NoTap)
+    {
+        m_buttons = buttons;
+    }
+};
+}
+static const unsigned short kButtonsLeftDown = 1;   // MouseEvent.buttons bit for the primary button
+static const unsigned short kButtonsRightDown = 2;  // ...and for the secondary one (contextmenu, WebCoreLongPressAt)
+
+// Apotheosis (2026-09-04): unwind a mousedown the page never got a mouseup for.
+// EventHandler::handleMousePressEvent() sets m_mousePressed (EventHandler.cpp:2030) before it even
+// hit-tests, and PointerCaptureController marks the pointer pressed when it dispatches the
+// pointerdown - both regardless of whether anything consumed the event. A press left dangling
+// therefore poisons the rest of the page's life: every later hover is treated as a drag move, and
+// the next mousedown is turned into a pointermove instead of a pointerdown, because the chorded
+// button rules see the pointer as already pressed (PointerCaptureController.cpp:425-429). That is
+// the reported "a pin can be placed on the map exactly once". invalidateClick() first: this
+// release is repair work, it must not fire a click of its own.
+static void releaseDanglingPress(WebCore::LocalFrame& frame, const WebCore::DoublePoint& at,
+                                 OptionSet<WebCore::PlatformEvent::Modifier> modifiers)
+{
+    if (!frame.eventHandler().mousePressed())
+        return;
+    frame.eventHandler().invalidateClick();
+    DriverMouseEvent up(at, WebCore::MouseButton::Left, WebCore::PlatformEvent::Type::MouseReleased,
+                        /*clickCount*/ 0, modifiers, MonotonicTime::now(), /*buttons*/ 0);
+    frame.eventHandler().handleMouseReleaseEvent(up);
+}
+
+// Apotheosis (map tap / long press, 2026-09-06): one plain line per input gesture into crash.txt,
+// the only writable path the driver knows. Same channel as pan-swap-drop / drag-press (no crash
+// record, no crash-entry budget), capped so a session of tapping cannot fill the file. The
+// caller formats the text with snprintf. Grep for "tap ", "drag-release", "long-press".
+static void inputNote(const char* text)
+{
+    static int notes = 0;
+    if (!text || !g_crashLogPath[0] || notes >= 24)
+        return;
+    ++notes;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "%s %02u:%02u:%02u.%03u\n", text, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    std::fclose(fp);
+}
+
+// Apotheosis (0.1.9.40, double-tap-at-zoom fix): every (x,y) this driver passes around is
+// viewport/BITMAP px (WebCoreClickAt's convention — see WebCoreDriver.h). WebCore::Document::
+// elementFromPoint() (TreeScope::nodeFromPoint -> absolutePointIfNotClipped(), dom/TreeScope.cpp)
+// wants something different: a CSS CLIENT point in the unscaled layout viewport, which it then
+// multiplies by frame->pageZoomFactor()*frame->frameScaleFactor() itself before comparing against
+// visibleContentRect(). The two coincide only at pageScaleFactor()==1 — at any other scale, passing
+// bitmap px straight through overshoots the real "absolute" point by a factor of the scale and the
+// hit test misses everything but points very close to the origin (at scale 2.9 the layout viewport
+// is only screenWidth/2.9 CSS px wide). That is why WebCoreTapPolicyAt's hit test failed at scale
+// 2.9 on the device and returned "not zoomable" before the already-zoomed rule even got a chance to
+// run. Actual mouse EVENT dispatch (clickAtImpl's move/down/up) is NOT affected: EventHandler
+// converts its "window" point via ScrollView::windowToContents(), which only adds the scroll
+// position (itself already in the same scaled/absolute space — see WebCoreSetPageScale's own
+// derivation above) with no separate multiply, landing directly in the space the layout tree's
+// RenderView scale transform produces. Apply this ONLY to elementFromPoint()-style client-coordinate
+// calls, never to PlatformMouseEvent positions.
+//
+// Apotheosis (page width, 0.1.9.58): the page-width factor is the SECOND half of the same
+// conversion. A client point is plain CSS px; an engine px is one CSS px times the page scale times
+// the device scale factor, so both divisions belong here. Without the factor every hit test in this
+// driver would land at 1/f of the point the finger actually touched.
+static WebCore::DoublePoint clientPointForEnginePoint(WebCore::Page* page, int x, int y)
+{
+    const double d = wkClientToEngineScale(page);
+    return WebCore::DoublePoint(static_cast<double>(x) / d, static_cast<double>(y) / d);
+}
+
+// Apotheosis: the drag-widget walk (canvas / touch-action:none), defined with WebCoreWantsDragAt
+// further down — the tap and long-press paths want the same answer about the same point.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y);
+
+// Apotheosis (long press, 2026-09-06): turn the run loop for `seconds` with the mouse button held
+// down. A touch long press is a *timed* gesture: the widget starts a timer on pointerdown and does
+// its thing (a map site drops a pin) when the timer fires, with the pointer still down. Nothing in
+// this driver ever kept a button pressed across time before — WebCoreClickAt presses and releases
+// in the same call, and WebCoreDragAt only holds the press between two harness calls — so the hold
+// needs its own pump. Same shape as pumpLoop's settle timer (isolatedUpdateRendering per tick to
+// keep rAF/animations running, microtask checkpoint, bail out if a navigation replaces the main
+// frame), but it stops on the clock instead of on idleness.
+static void holdPump(WebCore::LocalFrame& frame, WebCore::Page* pageForRendering, double seconds)
+{
+    using namespace WebCore;
+    if (seconds <= 0.0)
+        return;
+    bool stopped = false;
+    auto stopLoop = [&stopped] {
+        if (stopped)
+            return;
+        stopped = true;
+        RunLoop::currentSingleton().stop();
+    };
+    MonotonicTime deadline = MonotonicTime::now() + WTF::Seconds(seconds);
+    RefPtr<LocalFrame> frameRef = &frame;
+    RunLoop::Timer hold(Ref { RunLoop::currentSingleton() }, "WebCorePort.longpress.hold"_s,
+        WTF::Function<void()> { [&stopLoop, deadline, frameRef, pageForRendering] {
+            if (pageForRendering) {
+                pageForRendering->isolatedUpdateRendering();
+                RefPtr<LocalFrame> mf = pageForRendering->localMainFrame();
+                if (mf.get() != frameRef.get()) {   // navigated away under us: the caller re-fetches
+                    stopLoop();
+                    return;
+                }
+            }
+            if (RefPtr<Document> doc = frameRef->document())
+                doc->eventLoop().performMicrotaskCheckpoint();
+            if (MonotonicTime::now() >= deadline)
+                stopLoop();
+        } });
+    hold.startRepeating(0.05_s);
+    RunLoop::Timer watchdog(Ref { RunLoop::currentSingleton() }, "WebCorePort.longpress.watchdog"_s,
+        WTF::Function<void()> { [&stopLoop] { stopLoop(); } });
+    watchdog.startOneShot(WTF::Seconds(seconds + 2.0));   // a stuck tick must not hold the button for ever
+    RunLoop::run();
+    hold.stop();
+    watchdog.stop();
 }
 
 // 在 (x,y)(位图/视口像素,无需减 scroll —— EventHandler 内部 windowToContents 会加 scrollY)派发一次
 // 完整鼠标点击 move→down→up 到活文档,经真实命中测试 + 默认动作(链接导航 / 表单提交 / 按钮 onclick /
 // SPA 交互)。之后等待可能的异步导航 settle、每 tick 驱动 rAF,然后重布局/提链接/重绘。返回 0 成功。
-int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
+// Apotheosis (double-tap zoom, 2026-09-09): factored out with a clickCount parameter so
+// WebCoreClickAtCount() (the second tap of a double-tap-to-zoom decision, clickCount=2 — WebCore's
+// EventHandler dispatches 'dblclick' off exactly this number, see PlatformMouseEvent::clickCount())
+// can share every line of this with the ordinary single click. WebCoreClickAt below is unchanged
+// (clickCount=1); no existing caller's signature moves.
+static int clickAtImpl(int x, int y, int clickCount, uint8_t* outRGBA)
 {
     using namespace WebCore;
     if (!outRGBA)
@@ -1578,6 +4861,7 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;   // 任何返回路径复位 g_inPump
+    PerfOpGuard perfOp("click", nullptr, 0, 0);   // M4
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
@@ -1586,7 +4870,32 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
+    // Apotheosis (2026-09-04): a press from an earlier gesture must not still be "down" here, or
+    // this click's mousedown becomes a pointermove and the page never sees a press at all - see
+    // releaseDanglingPress(). Normally a no-op; WebCoreDragAt now unwinds its own presses.
+    const bool tapUnwound = lf->eventHandler().mousePressed();
+    if (tapUnwound) {
+        releaseDanglingPress(*lf, wkEventPointFromEngine(x, y), { });
+        // That release dispatches a mouseup, which runs script and in the worst case navigates.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (!lf)
+            return kErrFrameGone;
+        g_session->mainFrame = lf;
+        view = lf->view();
+        if (!view)
+            return kErrNoView;
+        doc = lf->document();
+        if (!doc)
+            return kErrNoDocument;
+    }
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();   // 命中测试需要最新布局(尤其滚动后)
+    }
+    // Apotheosis (map tap, 2026-09-06): does this tap land on something that drags itself (map,
+    // canvas)? Diagnostics only — asked here, before dispatching, because the click can navigate
+    // and `doc` would then be a detached document.
+    const bool tapWantsDrag = dragWidgetAtPoint(*doc, x, y);
 
     // 重新武装加载检测:点击触发的导航能被 pump 捕获。关键:signalLoadComplete 触发一次后会把完成回调
     // move 走(LoadingFrameLoaderClient.cpp:131),初次加载完成后回调已空 —— 故每次点击都必须重装,否则
@@ -1603,21 +4912,43 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         });
     }
 
-    DoublePoint p(static_cast<double>(x), static_cast<double>(y));
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
     OptionSet<PlatformEvent::Modifier> mods;
     MonotonicTime t = MonotonicTime::now();
-    PlatformMouseEvent move(p, p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0.0, SyntheticClickType::NoTap);
+    // Apotheosis (2026-09-04): the press carries buttons=1, the release buttons=0, exactly as the
+    // Windows port derives them from the WM_ message (see DriverMouseEvent). Without it the page
+    // got pointerdown/pointerup with buttons=0 and pressure=0, which is what a hover looks like.
+    DriverMouseEvent move(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
     lf->eventHandler().handleMouseMoveEvent(move);     // 设 :hover / elementUnderMouse
-    PlatformMouseEvent down(p, p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, 0.0, SyntheticClickType::NoTap);
-    lf->eventHandler().handleMousePressEvent(down);    // 安装 UserGestureIndicator
-    PlatformMouseEvent up(p, p, MouseButton::Left, PlatformEvent::Type::MouseReleased, 1, mods, MonotonicTime::now(), 0.0, SyntheticClickType::NoTap);
-    lf->eventHandler().handleMouseReleaseEvent(up);    // 派发 DOM 'click' + 默认动作(导航/提交)
+    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, clickCount, mods, t, kButtonsLeftDown);
+    const bool tapDownHandled = lf->eventHandler().handleMousePressEvent(down).wasHandled();   // 安装 UserGestureIndicator
+    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, clickCount, mods, MonotonicTime::now(), 0);
+    const bool tapUpHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();     // 派发 DOM 'click'(clickCount>=2 时 EventHandler 接着派发 'dblclick')+ 默认动作(导航/提交)
+    // Apotheosis (map tap, 2026-09-06): settle on device what a plain tap actually delivers. The
+    // sequence above IS a clean click - hover move, press (clickCount 1, buttons 1), release
+    // (buttons 0, which is what makes EventHandler dispatch the DOM 'click'), all three at exactly
+    // the same point - so if a tap on a map does not do what a tap in a real browser does, the
+    // cause is on the page's side (Maps' mobile UI wants a LONG press for a pin, see
+    // WebCoreLongPressAt) and not a missing or mismatched event here. `wants` says whether the tap
+    // landed on a drag widget, i.e. whether the drag route would have claimed the same point.
+    {
+        char note[160];
+        std::snprintf(note, sizeof note, "tap at=%d,%d cc=%d wants=%d down=%d up=%d unwound=%d",
+            x, y, clickCount, tapWantsDrag ? 1 : 0, tapDownHandled ? 1 : 0,
+            tapUpHandled ? 1 : 0, tapUnwound ? 1 : 0);
+        inputNote(note);
+    }
 
     // ★ 显式聚焦命中点的可编辑元素:headless 下合成点击对"设置焦点"的副作用不稳定(时灵时不灵 → 键盘
     //   时弹时不弹)。这里命中测试点击点,若落在 text input / textarea / contenteditable 上就直接 focus(),
     //   让 WebCoreFocusedEditable 稳定返回 1(弹键盘)、后续 WebCoreTypeText 有确定的插入目标。
     if (RefPtr<Document> hdoc = lf->document()) {
-        if (RefPtr<Element> hit = hdoc->elementFromPoint(static_cast<double>(x), static_cast<double>(y))) {
+        // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+        // clientPointForEnginePoint's comment. Without this, focusing an input on tap while the page
+        // is zoomed silently failed (hit test missed, keyboard never popped) the same way
+        // WebCoreTapPolicyAt's hit test did.
+        WebCore::DoublePoint hcp = clientPointForEnginePoint(g_session->page.get(), x, y);
+        if (RefPtr<Element> hit = hdoc->elementFromPoint(hcp.x(), hcp.y())) {
             RefPtr<Element> target;
             for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
                 if ((is<HTMLInputElement>(*e) && downcast<HTMLInputElement>(*e).isTextField())
@@ -1631,8 +4962,11 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
     }
 
     // 同步处理器(JS onclick 等)已返回;导航(若有)异步 → settle。无导航则空闲早停。
-    pumpLoop(*lf, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ true,
-             /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ g_session->page.get());
+    {
+        PerfPhase perfSettle(&g_perfCur.settle);   // M4
+        pumpLoop(*lf, &g_session->load.mainDone, /*allowEarlyStopWithoutNav*/ true,
+                 /*settleCapTicks*/ 160, /*watchdog*/ 30.0, /*pageForRendering*/ g_session->page.get());
+    }
 
     // 导航会重建 view/frame,重新校验 + 重取。
     lf = g_session->page->localMainFrame();
@@ -1646,11 +4980,14 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         return kErrNoView;
     view->setTransparent(false);
     view->setBaseBackgroundColor(Color::white);
-    view->resize(IntSize(g_session->w, g_session->h));
+    view->resize(wkViewSizeFromEngine(g_session->w, g_session->h));
     doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();
+    }
     extractLinks(doc.get(), g_session->h);
 
     int nonWhite = 0;
@@ -1659,6 +4996,20 @@ int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
         return prc;
     writeDiag(*doc, *view, g_session->w, g_session->h, nonWhite);
     return kOK;
+}
+
+int WebCoreClickAt(int x, int y, uint8_t* outRGBA)
+{
+    return clickAtImpl(x, y, /*clickCount*/ 1, outRGBA);
+}
+
+// Apotheosis (double-tap zoom, 2026-09-09): the second tap of a double tap the harness decided is
+// NOT going to zoom (WebCoreTapPolicyAt said not-zoomable) — dispatched with clickCount=2 so the
+// page gets the 'dblclick' a two-click page (e.g. text selection, some custom widgets) expects,
+// exactly like a real touch browser forwards it when double-tap-to-zoom does not apply.
+int WebCoreClickAtCount(int x, int y, int clickCount, uint8_t* outRGBA)
+{
+    return clickAtImpl(x, y, clickCount, outRGBA);
 }
 
 // 垂直滚动 dy 像素(正=向下)并重绘。每 tick isolatedUpdateRendering 驱动 IntersectionObserver,
@@ -1674,6 +5025,16 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;
+    PerfOpGuard perfOp("scroll", nullptr, 0, 0);   // M4
+
+    // Apotheosis (M4): large images now decode on WebCore's ImageFrameWorkQueue
+    // (RenderBoxModelObject::decodingModeForImageDraw, WK_WINUWP). The decoder
+    // hands the NativeImage back via callOnMainThread, i.e. through the RunLoop
+    // function queue - without draining it here a finished decode would only
+    // become visible on the next live tick, so images would never appear while
+    // the finger keeps scrolling. One iteration is enough and is what
+    // WebCoreLiveTick already does (three times).
+    RunLoop::cycle();
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
@@ -1682,13 +5043,30 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     RefPtr<Document> doc = lf->document();
     if (!doc)
         return kErrNoDocument;
-    doc->updateLayoutIgnorePendingStylesheets();   // contentsSize/最大滚动有效
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);
+        doc->updateLayoutIgnorePendingStylesheets();   // contentsSize/最大滚动有效
+    }
 
     ScrollPosition cur = view->scrollPosition();
     ScrollPosition minP = view->minimumScrollPosition();
     ScrollPosition maxP = view->maximumScrollPosition();
-    int tx = cur.x() + dx;
-    int ty = cur.y() + dy;
+    // Apotheosis (page width, 0.1.9.58): dx/dy arrive in engine px and a scroll position is in
+    // event px (CSS px * page scale), so the delta is divided by the page-width factor. The
+    // remainder is CARRIED rather than rounded away: at 1.5 one engine px is 0.67 scroll units, and
+    // rounding every step on its own would make a slow fling either 50 % too fast (each step
+    // rounded up) or completely motionless (each step rounded down). At a factor of 1 the division
+    // is exact, the remainders stay zero and this is the arithmetic it always was.
+    static double scrollResidualX = 0.0;
+    static double scrollResidualY = 0.0;
+    const double wantX = scrollResidualX + wkEventFromEngine(static_cast<double>(dx));
+    const double wantY = scrollResidualY + wkEventFromEngine(static_cast<double>(dy));
+    const int stepX = wkRoundToInt(wantX);
+    const int stepY = wkRoundToInt(wantY);
+    scrollResidualX = wantX - static_cast<double>(stepX);
+    scrollResidualY = wantY - static_cast<double>(stepY);
+    int tx = cur.x() + stepX;
+    int ty = cur.y() + stepY;
     if (tx < minP.x()) tx = minP.x();
     if (tx > maxP.x()) tx = maxP.x();
     if (ty < minP.y()) ty = minP.y();
@@ -1699,7 +5077,10 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     //   —— 那是"很卡"的元凶。这里只一次 isolatedUpdateRendering(驱动 scroll steps/IntersectionObserver 注册,
     //   轻量)+ 刷新链接表 + 合成。懒加载图片/动画交给滚动停止后的 StartLiveMode(WebCoreLiveTick 逐帧补)。
     //   纯滚动不跑 JS 不会导航,故不重取帧(导航只发生在 click/输入/load)。
-    g_session->page->isolatedUpdateRendering();
+    {
+        PerfPhase perfRender(&g_perfCur.renderUpdate);   // M4
+        g_session->page->isolatedUpdateRendering();
+    }
     // ★ 提速:滚动期间不再每帧 extractLinks(其对每个锚点调 boundingClientRect,长页/链接多时是每帧大头)
     //   也不写诊断串。点击走引擎真实命中测试(权威,不依赖链接表);链接表由滚动停止后 WebCoreSyncLinks 一次性刷新。
     int nonWhite = 0;
@@ -1707,6 +5088,784 @@ int WebCoreScrollBy(int dx, int dy, uint8_t* outRGBA)
     int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
     if (prc != kOK)
         return prc;
+    return kOK;
+}
+
+// Apotheosis (instant pan): where the main frame actually is, so the harness can turn "what the
+// finger asked for" into "what the engine has not applied yet" and clamp its own pan preview to the
+// document. Deliberately does NO layout and NO paint: it is called straight after a
+// WebCoreScrollBy on the same engine-thread hop, whose updateLayoutIgnorePendingStylesheets() has
+// just run, and at gesture start where a stale-by-one-frame answer is harmless. Not gated on
+// g_inPump either — it changes nothing, so it cannot re-enter anything.
+//
+// viewW/viewH are reported as contentsSize - maximumScrollPosition rather than as
+// visibleContentRect(), so that the harness' max = content - view is *exactly* the position
+// WebCoreScrollBy clamps to (headers/footers and the minimum scroll position included). Everything
+// is in the same units as WebCoreScrollBy's dx/dy.
+int WebCoreGetScrollState(int* x, int* y, int* contentW, int* contentH, int* viewW, int* viewH)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    RefPtr<LocalFrameView> view = g_session->mainFrame->view();
+    if (!view)
+        return kErrNoView;
+
+    const ScrollPosition cur = view->scrollPosition();
+    const ScrollPosition maxP = view->maximumScrollPosition();
+    const IntSize contents = view->contentsSize();
+    // Apotheosis (page width, 0.1.9.58): the frame view answers in event px; the harness asks in
+    // engine px, exactly the units it passes to WebCoreScrollBy. Convert on the way out so the two
+    // keep agreeing, whatever the page-width factor is.
+    if (x) *x = wkEngineFromEvent(cur.x());
+    if (y) *y = wkEngineFromEvent(cur.y());
+    if (contentW) *contentW = wkEngineFromEvent(contents.width());
+    if (contentH) *contentH = wkEngineFromEvent(contents.height());
+    if (viewW) *viewW = wkEngineFromEvent(contents.width() - maxP.x());
+    if (viewH) *viewH = wkEngineFromEvent(contents.height() - maxP.y());
+    return kOK;
+}
+
+// Apotheosis: register the harness' present wake-up. Pass
+// nullptr to go back to pure polling (the fixed-interval live tick). See the "event-driven
+// present" block near the top of this file for the threading contract: the callback can be
+// invoked on the engine thread OR on a raster worker, must not block and must not re-enter the
+// engine - it may only post to a queue. Registration itself is expected on the engine thread,
+// once at startup, but the atomics make a late or repeated registration harmless.
+void WebCoreSetPresentRequestCallback(void (*cb)(void*), void* ctx)
+{
+    g_presentCbCtx.store(ctx, std::memory_order_release);
+    g_presentCb.store(cb, std::memory_order_release);
+    g_presentWakeArmed.store(0, std::memory_order_release);
+}
+
+// Apotheosis (nested-scroll support): cheap probe so the harness can decide, at gesture start,
+// whether a touch-pan should route through WebCoreWheelAt (nested scroller under the finger) or
+// go straight to the WebCoreScrollBy main-frame fast path — without dispatching a real event.
+// Hit test only (elementFromPoint(), same call WebCoreClickAt already uses to find the focus
+// target); walks the render tree up from the hit element the same way WebCore's own wheel/touch
+// default-action target search does (Source/WebCore/dom/Node.cpp defaultEventHandler(), the
+// PAN_SCROLLING and TOUCH_EVENTS legs both walk renderer()->parent() looking for the first
+// RenderBox::canBeScrolledAndHasScrollableArea()). Also counts an ancestor <iframe> as scrollable
+// (its own EventHandler/FrameView owns that, not this frame's). Stops at the RenderView — the
+// main frame itself is never "nested". (x,y) = viewport/bitmap px, same convention as
+// WebCoreClickAt/WebCoreScrollBy. Returns 1/0; no session or bad hit test also returns 0.
+int WebCoreIsScrollableAt(int x, int y)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    // Apotheosis (review 2026-09-03): hold the pump guard for the layout below, like every other
+    // entry point that runs one (WebCoreScrollBy/WebCoreWheelAt/WebCoreClickAt). This function
+    // only *checked* g_inPump and never set it, so its updateLayoutIgnorePendingStylesheets() —
+    // which can run scripts through pending-stylesheet/font callbacks and re-enter the driver —
+    // was the one layout in the driver with nothing serialising it against a concurrent op.
+    g_inPump = true;
+    PumpGuard guard;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment. Without this, a nested-scroll probe on a zoomed page
+    // always missed and the harness fell back to the (wrong) main-frame scroll route.
+    WebCore::DoublePoint cp = clientPointForEnginePoint(doc->page(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
+    if (!hit)
+        return 0;
+
+    // Apotheosis (review 2026-09-03): TreeScope::elementFromPoint retargets its result to the tree
+    // scope it was called on (TreeScope.cpp: retargetToScope() after nodeFromPoint), so on the
+    // document scope a point inside a web component always resolves to the *host* element, not to
+    // the overflow:auto div the finger is actually over. Cookie banners and consent modals are
+    // routinely built that way, and the walk below then only sees the host's (unscrollable)
+    // renderer chain. Descend instead: as long as the current hit is a shadow host whose root is
+    // open, ask that root the same question — its elementFromPoint retargets to *its* scope, one
+    // level deeper. Closed and UA shadow roots are deliberately skipped: they are not script-
+    // reachable either, and DisallowUserAgentShadowContent is what the hit test uses anyway.
+    // (Element::shadowRoot() is inline in ElementRareData.h, which this port does not export as a
+    // private header — openOrClosedShadowRoot() is the out-of-line accessor for the same field.)
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    for (RenderObject* r = hit->renderer(); r; r = r->parent()) {
+        if (r->isRenderView())
+            break;   // reached the main frame's own box — not nested, stop here
+        if (Node* node = r->node()) {
+            if (is<HTMLIFrameElement>(*node))
+                return 1;
+        }
+        if (is<RenderBox>(*r) && downcast<RenderBox>(*r).canBeScrolledAndHasScrollableArea())
+            return 1;
+    }
+    return 0;
+}
+
+// Apotheosis (nested-scroll support): dispatch a synthetic wheel event at (x,y) so WebCore's own
+// scroll routing — the same default-action walk WebCoreIsScrollableAt above inspects
+// (EventHandler::handleWheelEventInAppropriateEnclosingBox, Source/WebCore/page/EventHandler.cpp)
+// — can hand the delta to the innermost overflow:auto container, a modal, or an iframe under the
+// point, instead of only ever moving the main frame the way WebCoreScrollBy does. (x,y) =
+// viewport/bitmap px, same convention as WebCoreClickAt/ScrollBy (EventHandler's
+// windowToContents() adds the scroll offset internally, see the comment on WebCoreClickAt).
+// deltaX/deltaY = px, granularity ScrollByPixelWheelEvent. `phase` (0 none/1 began/2 changed/
+// 3 ended) is accepted for a future gesture-latching port but currently inert: OptionsWinUWP.cmake
+// sets ENABLE_ASYNC_SCROLLING OFF (KINETIC_SCROLLING is likewise off), so on this port
+// PlatformWheelEventPhase has only the `None` enumerator — Began/Changed/Ended do not exist to
+// name — and PlatformWheelEvent's only public constructor (the one used below) does not expose a
+// phase setter regardless. EventHandler still routes the event correctly with Phase::None;
+// phases only ever refine latching/momentum on the platforms that have them.
+//
+// Returns 1 if a nested scroller consumed the event (WebCore reported it handled AND the
+// main-frame scroll position did not move), 0 to tell the harness to fall back to its
+// WebCoreScrollBy path for this delta. handleWheelEvent()'s own default action can itself scroll
+// the main FrameView when nothing nested claims the delta first
+// (EventHandler::processWheelEventForScrolling -> handleWheelEventInScrollableArea(view)) — so
+// whenever that happens (or nothing was handled at all) the main-frame scroll position is
+// explicitly restored here before returning 0. That keeps WebCoreScrollBy the *only* thing that
+// ever moves the main frame, so the harness can always call it unconditionally on a 0 return
+// without risking a double-scroll.
+//
+// outRGBA: on a 1 (consumed) return this composites/presents the frame the same way
+// WebCoreScrollBy does (paintToRGBA — direct swap in GPU present mode, cairo readback into
+// outRGBA otherwise), so the harness's per-gesture coalescing loop (PumpNestedScroll) gets exactly
+// one frame per flushed job instead of waiting for the next live tick to notice m_lastFrameHash
+// changed. A null outRGBA is tolerated (no present attempted, same as passing one in but the
+// caller not looking at it) — kept optional-by-null rather than added to the bad-args check
+// because a failed present must not turn a real "consumed" answer into a 0 (that would risk
+// WebCoreScrollBy double-moving the main frame for the same delta).
+// Apotheosis (pinch on map widgets, 2026-09-06): the body of WebCoreWheelAt, with the two knobs
+// the zoom variant below needs.
+//   ctrlKey     — a wheel with ctrl held is what a page reads as "zoom me" (Leaflet, MapLibre
+//                 and OpenLayers all zoom on a plain wheel over the map AND on ctrl+wheel; the
+//                 modifier is what stops an embedded map from merely scrolling the page).
+//   zoomMode    — changes what counts as "the page took it" and what happens to the main frame.
+//                 For the scroll route only an actual nested scroll counts (a preventDefault that
+//                 scrolled nothing must fall back to WebCoreScrollBy, see the long comment above).
+//                 A zooming map does exactly that, though: it preventDefaults the wheel and moves
+//                 nothing scrollable — so in zoom mode "handled OR default-prevented" is the
+//                 answer, and the main frame is restored unconditionally, because a pinch must
+//                 never scroll the document underneath it.
+// ticksX/ticksY are the wheel's tick count (DOM wheelDelta = ticks x 120); the scroll route passes
+// its pixel deltas there as it always did.
+static int wheelAtImpl(int x, int y, float deltaX, float deltaY, float ticksX, float ticksY,
+                       bool ctrlKey, bool zoomMode, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    // Same reason WebCoreScrollBy does this first: drain a decode callback that finished mid-
+    // gesture so it is visible before we hit-test/scroll, not one tick later.
+    RunLoop::cycle();
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return 0;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test + scrollable-area lookup need current layout
+
+    const ScrollPosition beforeMain = view->scrollPosition();
+
+    // Apotheosis (page width, 0.1.9.58): the position is engine px on the way in, event px for
+    // WebCore. The deltas are converted by WebCoreWheelAt (the scroll route, where they are pixel
+    // distances); WebCoreZoomWheelAt's are wheel notches and must not be scaled.
+    const IntPoint p(wkRoundToInt(wkEventFromEngine(static_cast<double>(x))),
+        wkRoundToInt(wkEventFromEngine(static_cast<double>(y))));
+    PlatformWheelEvent wheelEvent(p, p, deltaX, deltaY, ticksX, ticksY,
+        PlatformWheelEventGranularity::ScrollByPixelWheelEvent,
+        /* shiftKey */ false, ctrlKey, /* altKey */ false, /* metaKey */ false);
+    OptionSet<WheelEventProcessingSteps> steps { WheelEventProcessingSteps::SynchronousScrolling,
+        WheelEventProcessingSteps::BlockingDOMEventDispatch };   // the default/synchronous steps (see EventHandlerMac/IOS)
+    auto [result, handling] = lf->eventHandler().handleWheelEvent(wheelEvent, steps);
+
+    const ScrollPosition afterMain = view->scrollPosition();
+    // Apotheosis: "consumed by a nested scroller" must mean something actually scrolled.
+    // HandleUserInputEventResult::wasHandled() is ALSO true when the page's own wheel listener
+    // merely called preventDefault() and scrolled nothing: EventHandler::handleWheelEventInternal
+    // (Source/WebCore/page/EventHandler.cpp, the `if (!element->dispatchWheelEvent(...))` leg)
+    // returns handled and records EventHandling::DefaultPrevented in `handling`. Reporting that as
+    // 1 made the harness skip its WebCoreScrollBy fallback for the delta, so every site carrying a
+    // non-passive wheel listener (analytics/sticky-header scripts, most cookie banners) became
+    // completely unscrollable. Require all three: handled, not default-prevented, main frame
+    // still where it was.
+    const bool consumedByNested = zoomMode
+        ? (result.wasHandled() || handling.contains(EventHandling::DefaultPrevented))
+        : (result.wasHandled()
+            && !handling.contains(EventHandling::DefaultPrevented)
+            && (afterMain == beforeMain));
+
+    if ((zoomMode || !consumedByNested) && afterMain != beforeMain)
+        view->setScrollPosition(beforeMain);   // undo any main-frame move: that is WebCoreScrollBy's job
+                                               // (and in zoom mode nothing may scroll the page at all)
+
+    if (consumedByNested) {
+        // Same present path WebCoreScrollBy uses (578cbc3/82c5cef): commit the moved layer's
+        // compositing update now — this is what arms PortChromeClient::m_needsPresent, via
+        // scheduleRenderingUpdate().
+        g_session->page->isolatedUpdateRendering();
+        // NOTE: deliberately NOT g_gpuScrollFast here (unlike WebCoreScrollBy). That flag skips
+        // forceDirtyTree for the next composite, which is only correct when the moved content has
+        // its own composited layer whose tiles are already painted — true for the main frame's
+        // scrolled-contents layer, but an overflow:auto container usually has no compositing layer
+        // of its own and is painted into its enclosing layer's backing store. Skipping the dirty
+        // pass there would re-present the identical tiles, i.e. the nested scroller would not move
+        // on screen at all.
+        // Coalescing fix: without this, the moved nested scroller only reached the screen on the
+        // next live tick (up to 200ms later, or never mid-drag since ticks pause while a gesture
+        // holds the engine busy) — a consumed wheel event changed the DOM/layer position but this
+        // function returned before anyone composited/presented it. Present now, right here, so
+        // PumpNestedScroll's one-job-in-flight loop yields one frame per flush, same as
+        // WebCoreScrollBy below.
+        if (outRGBA) {
+            int nonWhite = 0;
+            paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // best-effort: a paint
+            // failure must not flip this back to 0 — the main frame is already confirmed untouched
+            // above, so WebCoreScrollBy must NOT also run for this delta regardless of paint outcome.
+        }
+    }
+
+    return consumedByNested ? 1 : 0;
+}
+
+int WebCoreWheelAt(int x, int y, float deltaX, float deltaY, int phase, uint8_t* outRGBA)
+{
+    (void)phase;   // see comment above: inert on this port (no ASYNC/KINETIC scrolling, no phase setter)
+    // Apotheosis (page width, 0.1.9.58): deltaX/deltaY are pixel distances in engine px, like every
+    // other length in this ABI, and a wheel delta scrolls a nested box by exactly that many event
+    // px - so the page-width factor divides them the same way WebCoreScrollBy's dx/dy are divided.
+    const float dxEvent = static_cast<float>(wkEventFromEngine(static_cast<double>(deltaX)));
+    const float dyEvent = static_cast<float>(wkEventFromEngine(static_cast<double>(deltaY)));
+    return wheelAtImpl(x, y, dxEvent, dyEvent, dxEvent, dyEvent, /*ctrlKey*/ false, /*zoomMode*/ false, outRGBA);
+}
+
+// Apotheosis (pinch on map widgets, 2026-09-06): `notches` wheel clicks with ctrl held at (x,y),
+// positive = wheel up = zoom in. A pinch over a map has to become this: the harness' pinch scales
+// the whole page (WebCoreSetPageScale), which on a map means zooming a picture of the map instead
+// of asking the map for more detail — the tiles stay at the old zoom level and the labels grow
+// blurry. One notch is 120 px of delta and one wheel tick, i.e. exactly what a mouse wheel sends
+// (DOM deltaY = -120 per notch up, wheelDeltaY = +120), so the map's own wheel handler applies its
+// normal one-step zoom around the point. Returns 1 if the page took it, 0 if nothing did — on a 0
+// the caller can fall back to page zoom. The document itself never scrolls on this path.
+int WebCoreZoomWheelAt(int x, int y, int notches, uint8_t* outRGBA)
+{
+    if (!notches)
+        return 0;
+    if (notches > 8) notches = 8;            // one gesture step should never be a whole zoom range
+    if (notches < -8) notches = -8;
+    const float ticks = static_cast<float>(notches);
+    return wheelAtImpl(x, y, /*deltaX*/ 0.0f, /*deltaY*/ ticks * 120.0f, /*ticksX*/ 0.0f, ticks,
+                       /*ctrlKey*/ true, /*zoomMode*/ true, outRGBA);
+}
+
+// ===========================================================================
+// Apotheosis (drag as pointer events): map widgets — Leaflet, MapLibre /
+// Leaflet, canvas apps — pan by listening to pointerdown/mousedown themselves and
+// moving their own content. They scroll no scrollable box at all, so BOTH of the
+// harness' existing gesture routes are wrong for them: the main-frame fast path
+// (WebCoreScrollBy) scrolls the document behind the map, and the nested route
+// (WebCoreWheelAt) finds nothing that consumes a wheel and falls back to exactly
+// that. WebCore already knows what such a page wants — it only never receives the
+// events, because a touch pan in this port is translated to scrolling, never to
+// input. The two exports below give the harness (a) a cheap "does this point
+// belong to something that drags itself?" probe to run at gesture start, next to
+// WebCoreIsScrollableAt, and (b) a way to feed the gesture to the page as a real
+// left-button mouse drag (mousedown → mousemove* → mouseup, which the engine also
+// turns into pointerdown/pointermove/pointerup — PointerEvent is built in this
+// port even though ENABLE_TOUCH_EVENTS is off, so pointer-first libraries like
+// Leaflet and MapLibre get the events they actually listen for).
+// ===========================================================================
+
+// Hit test only, no event dispatched — same shape as WebCoreIsScrollableAt above
+// (pump guard, layout, elementFromPoint, open-shadow descent, walk up the element
+// chain). Returns 1 when the element under (x,y) or one of its ancestors looks
+// like it handles dragging itself:
+//   * a JS listener for pointerdown / mousedown / touchstart / pointermove /
+//     touchmove (Leaflet, OpenLayers, MapLibre and every canvas app
+//     register at least one of these on their container; hasEventListeners() is a
+//     hash lookup on the target's listener map, so this stays cheap even though
+//     five names are asked per ancestor). touchstart/touchmove are worth asking
+//     even though ENABLE_TOUCH_EVENTS is 0 here: addEventListener() stores the
+//     listener regardless of whether the engine ever fires that event, so the
+//     name is still a reliable marker of "this widget wants the gesture".
+//   * a <canvas> (the app draws and pans its own content — there is nothing else
+//     a drag over it could sensibly mean)
+//   * CSS touch-action other than auto/manipulation: none / pan-x / pan-y is
+//     precisely how a widget tells the UA "I take this gesture", and it is what
+//     .leaflet-container, .maplibregl-canvas and the map roots all set.
+// The walk deliberately stops at <body>/<html>: page-wide mousedown handlers
+// (dropdown menus, "click outside to close", analytics) sit on the document and
+// body of half the web, and treating those as drag widgets would make ordinary
+// pages stop scrolling. (x,y) = viewport/bitmap px, same convention as
+// WebCoreClickAt/WebCoreScrollBy/WebCoreIsScrollableAt. No session, no hit, or a
+// concurrent engine op all answer 0 — the harness then keeps its scroll routing.
+// Apotheosis (2026-09-04): the walk itself, factored out of WebCoreWantsDragAt() so WebCoreDragAt()
+// can ask the same question about the same point. Requires current layout (both callers run
+// updateLayoutIgnorePendingStylesheets() first) and dispatches nothing.
+// Apotheosis (2026-09-04, device package 14): ONE criterion, used by both callers. There used to be
+// a loose variant for the routing probe (WebCoreWantsDragAt) that accepted a bare
+// pointerdown/mousedown/touchstart listener, on the theory that being wrong only costs one engine
+// hop. It costs more than that - practically every interactive container on a normal page has such
+// a listener, so every pan on such a page was routed as a drag first, and the press round trip put
+// a visible hitch at the start of each gesture even when it was unwound. And because the routing
+// probe and the ownership decision must agree anyway (the harness only calls WebCoreDragAt after
+// the probe said yes), a criterion that only one of them applies is a bug generator: 037eef0's
+// `handled || wants` with the loose walk handed EVERY gesture on an ordinary page to the document
+// as a mouse drag and the page stopped scrolling altogether.
+//
+// What is left is the evidence that actually means "this element drags itself": a canvas (Google
+// Maps, the widget 037eef0 was written for, is one), or touch-action: none. Note that pan-x/pan-y
+// deliberately do NOT count: they say the page wants the BROWSER to pan in the other axis, which is
+// the opposite of claiming the gesture, and a `touch-action: pan-y` wrapper (an extremely common
+// way to suppress horizontal overscroll - a news site has one) is exactly what stole every vertical pan
+// on device package 14 with `wants=1 own=1` on ordinary article text.
+static bool dragWidgetAtPoint(WebCore::Document& doc, int x, int y)
+{
+    using namespace WebCore;
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment. Without this, a pinch-zoomed map/canvas widget stopped
+    // being recognised as a drag widget (the hit test missed) and its gesture was misrouted to the
+    // page scroll fast path — the zoomed-Maps-drag case this bug family covers.
+    WebCore::DoublePoint cp = clientPointForEnginePoint(doc.page(), x, y);
+    RefPtr<Element> hit = doc.elementFromPoint(cp.x(), cp.y());
+    if (!hit)
+        return false;
+
+    // Same open-shadow descent as WebCoreIsScrollableAt: TreeScope::elementFromPoint retargets its
+    // result to the scope it was called on, so on the document scope a point inside a web component
+    // resolves to the host element and the listeners on the real target would never be seen. Map
+    // widgets are increasingly shipped as custom elements (gmp-map is one), so this matters here too.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    Element* root = doc.documentElement();
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (e.get() == root || is<HTMLBodyElement>(*e))
+            break;   // page-wide handlers are not a drag widget — see the comment above
+        if (is<HTMLCanvasElement>(*e))
+            return true;
+        if (RenderObject* r = e->renderer()) {
+            if (r->style().touchAction().isNone())
+                return true;   // none: the element takes the whole gesture, in both axes
+        }
+    }
+    return false;
+}
+
+int WebCoreWantsDragAt(int x, int y)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return 0;
+    if (g_inPump)
+        return 0;
+    g_inPump = true;
+    PumpGuard guard;
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return 0;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+    return dragWidgetAtPoint(*doc, x, y) ? 1 : 0;
+}
+
+// Apotheosis (drag as pointer events): drive one touch pan through WebCore as a left-button mouse
+// drag. `phase`: 0 = press, 1 = move, 2 = release, 3 = cancel. (x,y) = viewport/bitmap px, same
+// convention as every other input export (EventHandler's windowToContents() adds the scroll offset
+// internally). Returns 1 while the page owns the gesture, 0 to tell the harness to route the rest
+// of it down its normal scroll path.
+//
+// The press is the decision point, and (2026-09-04) it is NOT decided by handleMousePressEvent()'s
+// result alone. That result is only true when a listener called preventDefault() or a WebCore
+// default action took the press, and the widgets this export exists for do neither: a map site
+// listens for pointerdown, stores the anchor and lets the event through. On device every press on
+// the map site answered `handled=0`, so the gesture was handed back before a single mousemove was
+// sent. The press is therefore owned when EITHER it was handled OR the point still looks like a drag
+// widget (dragWidgetAtPoint(), the same walk WebCoreWantsDragAt() runs - the harness has already
+// asked it once at gesture start, and asking again here costs one hit test and keeps the two
+// answers from drifting apart across the press).
+//
+// Phases 1–3 are inert unless the press was taken (g_dragActive). That keeps the contract simple for
+// the caller — once the press answers 0 the whole gesture is the harness' again, and no half-drag can
+// leak into the page — and it means individual mousemove results are never consulted: a map that
+// preventDefaults pointerdown but not mousemove (most of them) would otherwise look "not consumed"
+// on its second event and have the gesture yanked away mid-pan. (g_dragActive is declared with the
+// other engine-thread session flags at the top of this file, because teardownSession() clears it.)
+//
+// outRGBA (optional, may be null): on a 1 return the moved content is composited/presented exactly
+// the way WebCoreWheelAt does it — isolatedUpdateRendering() to arm PortChromeClient::m_needsPresent,
+// then paintToRGBA. Without this the page would only reach the screen on the next live tick, i.e.
+// never during a gesture that keeps the engine busy. Deliberately NOT g_gpuScrollFast: the widget
+// repaints its own content into an ordinary backing store, so the dirty pass must run.
+// Apotheosis (drag as pointer events, diagnostics 2026-09-04): one line per gesture into crash.txt,
+// the only writable path the driver knows. Same plain-line channel as pan-swap-drop (no crash
+// record, no crash-entry budget), capped so a session of panning cannot fill the file.
+// Grep for "drag-press".
+static void dragPressNote(int x, int y, bool handled, bool wants, bool own)
+{
+    static int notes = 0;
+    if (!g_crashLogPath[0] || notes >= 12)
+        return;
+    ++notes;
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, g_crashLogPath, "ab") != 0 || !fp)
+        return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(fp, "drag-press %02u:%02u:%02u.%03u at=%d,%d handled=%d wants=%d own=%d move buttons=%u unwound=%d\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, x, y, handled ? 1 : 0, wants ? 1 : 0,
+        own ? 1 : 0, static_cast<unsigned>(own ? kButtonsLeftDown : 0), own ? 0 : 1);
+    std::fclose(fp);
+}
+
+int WebCoreDragAt(int phase, int x, int y, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame) {
+        g_dragActive = false;
+        return 0;
+    }
+    if (g_inPump)
+        return 0;
+    if (phase != 0 && !g_dragActive)
+        return 0;   // nothing took the press (or there was none): the gesture is not ours
+    g_inPump = true;
+    PumpGuard guard;
+
+    // Same reason WebCoreScrollBy/WebCoreWheelAt do this first: drain a decode callback that
+    // finished mid-gesture so it is visible before we dispatch, not one tick later.
+    RunLoop::cycle();
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view) {
+        g_dragActive = false;
+        return 0;
+    }
+    RefPtr<Document> doc = lf->document();
+    if (!doc) {
+        g_dragActive = false;
+        return 0;
+    }
+    if (phase == 0)
+        doc->updateLayoutIgnorePendingStylesheets();   // the press hit-tests; moves reuse that layout
+
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
+    OptionSet<PlatformEvent::Modifier> mods;
+    MonotonicTime t = MonotonicTime::now();
+    bool handled = false;
+
+    if (phase == 0) {
+        // Apotheosis (2026-09-04): a press left over from a gesture that was abandoned without a
+        // release turns this mousedown into a pointermove (the chorded-button rules see the pointer
+        // as already pressed), so the page would never see a press at all. Same guard, same reason,
+        // as at the top of WebCoreClickAt.
+        if (lf->eventHandler().mousePressed())
+            releaseDanglingPress(*lf, p, mods);
+        // Apotheosis (map site, 2026-09-04): ask the SAME question WebCoreWantsDragAt asked, on
+        // the same point and the layout we just updated, BEFORE dispatching - the press itself can
+        // run script that changes the tree. See the decision below.
+        const bool wants = dragWidgetAtPoint(*doc, x, y);
+        // Hover first, exactly as WebCoreClickAt does: it sets elementUnderMouse/:hover, which is
+        // what several widgets key their pointerdown handling off.
+        DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
+        lf->eventHandler().handleMouseMoveEvent(hover);
+        DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
+        handled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
+        // Apotheosis (map site, 2026-09-04): "the press was handled" was the WRONG criterion for
+        // owning the gesture. handleMousePressEvent() reports handled only when a listener called
+        // preventDefault() or a WebCore default action took the press - and a map does neither: it
+        // listens for pointerdown, records the anchor and returns without preventing anything
+        // (preventing it would break its own click handling). Device evidence: every single
+        // drag-press line on the map site read `handled=0 unwound=1`, so not one mousemove was
+        // ever dispatched, while the canvas visibly grew on first contact - the events did arrive,
+        // we just threw the gesture away one event in. The honest question is the one
+        // WebCoreWantsDragAt already answers ("does this point belong to something that drags
+        // itself?"), and the harness only calls us after it has said yes; so own the gesture when
+        // EITHER the press was handled OR the point is still a drag widget. Everything else is
+        // unchanged: phases 1-3 stay gated on g_dragActive, and a press nothing wanted is still
+        // unwound here (the harness drops the queued move/release the moment we answer 0, so no
+        // phase 2 would ever arrive to undo it, and a stuck press breaks every later click on the
+        // page - see releaseDanglingPress).
+        const bool own = handled || wants;
+        g_dragActive = own;
+        // Apotheosis (map tap, 2026-09-06): remember where the gesture pressed, so the release can
+        // tell a pan (no click) from a gesture that never really moved (click, exactly as a tap).
+        g_dragPressX = x; g_dragPressY = y; g_dragMoved = false;
+        if (!own)
+            releaseDanglingPress(*lf, p, mods);
+        dragPressNote(x, y, handled, wants, own);
+        handled = own;
+    } else if (phase == 1) {
+        // Button held: EventHandler's m_mousePressed is still set from the press, so this is a drag
+        // move, not a hover move. clickCount 0 is what a real platform move carries, and buttons=1
+        // is what makes it a drag for the page - a pointermove with buttons=0 is a hover, which is
+        // precisely what map widgets ignore (see DriverMouseEvent).
+        DriverMouseEvent move(p, MouseButton::Left, PlatformEvent::Type::MouseMoved, 0, mods, t, kButtonsLeftDown);
+        lf->eventHandler().handleMouseMoveEvent(move);
+        if (!g_dragMoved) {
+            const int mdx = x - g_dragPressX, mdy = y - g_dragPressY;
+            if (mdx * mdx + mdy * mdy > kDragTapSlopPx * kDragTapSlopPx)
+                g_dragMoved = true;   // past the slop: this gesture is a pan, its release fires no click
+        }
+        handled = true;   // see the header comment: the press decided, per-move results are noise
+    } else {
+        // 2 = release, 3 = cancel (and any unknown phase): both must end with a mouseup, otherwise
+        // EventHandler keeps m_mousePressed set and every later hover/tap behaves like a drag.
+        // buttons=0: the button being released is no longer down (WM_LBUTTONUP does the same), and
+        // a mouseup that still claimed a pressed button would be turned into a pointermove by the
+        // chorded-button rules (PointerCaptureController.cpp:432) - no pointerup, pointer stays
+        // pressed for ever. A cancel additionally drops the click: an aborted gesture must not
+        // activate what happens to be under the finger.
+        //
+        // Apotheosis (map tap, 2026-09-06): a gesture that actually travelled must not end in a
+        // click either. WebCore fires the DOM 'click' on the release whenever press and release
+        // share the same target — on a map that is the one canvas for the whole pan, so every
+        // finger pan on the map site ended with a click on the map, which is the site's own
+        // "toggle full-screen map view" action. A touch pan never produces a click in a real
+        // browser; a gesture that stayed inside the slop is a tap that only reached this route
+        // because XAML raised a manipulation, and it keeps its click.
+        // Apotheosis (2026-09-07): g_dragMoved is only ever updated in phase 1 (above), which assumed
+        // every intermediate move gets dispatched before the release. That is not guaranteed — a
+        // coalesced or dropped PumpDrag move, or a gesture whose whole travel happened between two
+        // posts, would reach here with g_dragMoved still false and fire a click at the release point
+        // regardless of how far the finger actually travelled from the press. Compare the release
+        // point to the press point directly so the click decision does not depend on move delivery.
+        if (phase == 2 && !g_dragMoved) {
+            const int rdx = x - g_dragPressX, rdy = y - g_dragPressY;
+            if (rdx * rdx + rdy * rdy > kDragTapSlopPx * kDragTapSlopPx)
+                g_dragMoved = true;   // travelled, however the moves were coalesced
+        }
+        const bool fireClick = (phase == 2 && !g_dragMoved);
+        if (!fireClick)
+            lf->eventHandler().invalidateClick();
+        DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, fireClick ? 1 : 0, mods, t, 0);
+        lf->eventHandler().handleMouseReleaseEvent(up);
+        g_dragActive = false;
+        handled = true;
+        {
+            char note[160];
+            std::snprintf(note, sizeof note, "drag-release at=%d,%d from=%d,%d phase=%d moved=%d click=%d",
+                x, y, g_dragPressX, g_dragPressY, phase, g_dragMoved ? 1 : 0, fireClick ? 1 : 0);
+            inputNote(note);
+        }
+    }
+
+    if (!handled)
+        return 0;
+
+    // A mouseup can navigate (a link inside the widget), which rebuilds frame and view — re-fetch
+    // before painting, the way WebCoreClickAt does after its pump.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf)
+        return 1;
+    view = lf->view();
+    if (!view)
+        return 1;
+
+    g_session->page->isolatedUpdateRendering();   // arms PortChromeClient::m_needsPresent (578cbc3/82c5cef)
+    if (outRGBA) {
+        int nonWhite = 0;
+        paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // best-effort, as in WebCoreWheelAt
+    }
+    return 1;
+}
+
+// ===========================================================================
+// Apotheosis (map-site pin, 2026-09-06): LONG PRESS.
+//
+// What a long press is on this port: ENABLE_TOUCH_EVENTS is 0 (OptionsWinUWP.cmake) and nothing
+// synthesises Touch or raw Pointer input, so every gesture reaches the page as mouse input, which
+// the engine then also turns into pointer events (pointerType "mouse"). A touch long press is
+// therefore not expressible one-to-one; what IS expressible is everything a widget can key a long
+// press off with a mouse:
+//   * mousedown / pointerdown, then the button STAYS DOWN while the run loop turns, so a
+//     press-and-hold timer inside the page (a map site drops its pin from exactly such a timer)
+//     gets the time it is waiting for. This is the part no existing export could do: WebCoreClickAt
+//     releases in the same call, and WebCoreDragAt's press is only held between harness calls
+//     during which the engine dispatches nothing.
+//   * the release afterwards, with the DOM 'click' (Maps' mobile UI reacts to a click on the map)
+//     unless the caller suppresses it.
+//   * a 'contextmenu' event at the same point (flag 1) — on desktop Maps the right-click menu is
+//     the usable "drop a pin / What's here?" path, and a touch long press is exactly what a browser
+//     turns into a contextmenu. Sent through EventHandler::sendContextMenuEvent(), i.e. the same
+//     entry the Windows port uses for WM_CONTEXTMENU: it hit-tests, clears the press state and
+//     dispatches the DOM event. ENABLE_CONTEXT_MENUS is 0 here, so there is no UA menu to show and
+//     nothing but the page's own listener can react — which is what we want.
+//
+// flags (WEBCORE_LONGPRESS_* in WebCoreDriver.h): 1 = also send contextmenu, 2 = suppress the
+// click, 4 = do nothing unless the point is a drag widget (canvas / touch-action:none — the same
+// walk WebCoreWantsDragAt runs). 4 is what the harness passes: a long press anywhere else on the
+// page must keep behaving the way it does today (XAML raises Holding over ordinary text too, and a
+// press-hold-click on a link would open it).
+//
+// holdMs: how long the button stays down (default 600, capped at 2000). (x,y) = viewport/bitmap px,
+// same convention as every other input export. Returns kOK once the gesture was delivered — and
+// also on the "not a drag widget" skip, with the current frame painted into outRGBA, so the caller
+// never has to tell a skip from a failure to keep its screen correct. Engine thread only.
+int WebCoreLongPressAt(int x, int y, int holdMs, int flags, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;
+    PerfOpGuard perfOp("longpress", nullptr, 0, 0);
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // the press hit-tests, as in WebCoreClickAt
+
+    const bool wants = dragWidgetAtPoint(*doc, x, y);
+    if ((flags & 4) && !wants) {
+        char note[128];
+        std::snprintf(note, sizeof note, "long-press skip at=%d,%d wants=0", x, y);
+        inputNote(note);
+        if (outRGBA) {
+            int nonWhite = 0;
+            paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);   // keep the caller's frame valid
+        }
+        return kOK;
+    }
+
+    DoublePoint p = wkEventPointFromEngine(x, y);   // Apotheosis: engine px -> event px, see wkPageWidthFactor
+    OptionSet<PlatformEvent::Modifier> mods;
+    MonotonicTime t = MonotonicTime::now();
+
+    // A press left down by an abandoned gesture would turn this mousedown into a pointermove — same
+    // guard, same reason, as at the top of WebCoreClickAt/WebCoreDragAt.
+    const bool unwound = lf->eventHandler().mousePressed();
+    if (unwound) {
+        releaseDanglingPress(*lf, p, mods);
+        // That release dispatches a mouseup, which runs script and in the worst case navigates —
+        // re-fetch before pressing, exactly as WebCoreClickAt does.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (!lf)
+            return kErrFrameGone;
+        g_session->mainFrame = lf;
+        view = lf->view();
+        if (!view)
+            return kErrNoView;
+    }
+    g_dragActive = false;   // this call owns the press from here to its release
+
+    DriverMouseEvent hover(p, MouseButton::None, PlatformEvent::Type::MouseMoved, 0, mods, t, 0);
+    lf->eventHandler().handleMouseMoveEvent(hover);   // :hover / elementUnderMouse, as in WebCoreClickAt
+    DriverMouseEvent down(p, MouseButton::Left, PlatformEvent::Type::MousePressed, 1, mods, t, kButtonsLeftDown);
+    const bool downHandled = lf->eventHandler().handleMousePressEvent(down).wasHandled();
+
+    int hold = holdMs <= 0 ? 600 : holdMs;
+    if (hold > 2000)
+        hold = 2000;
+    holdPump(*lf, g_session->page.get(), hold / 1000.0);
+
+    // The hold ran script (timers, rAF) and can have navigated — re-fetch before the release, the
+    // way WebCoreClickAt does after its pump.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+
+    const bool fireClick = !(flags & 2);
+    if (!fireClick)
+        lf->eventHandler().invalidateClick();
+    DriverMouseEvent up(p, MouseButton::Left, PlatformEvent::Type::MouseReleased, fireClick ? 1 : 0,
+                        mods, MonotonicTime::now(), 0);
+    const bool upHandled = lf->eventHandler().handleMouseReleaseEvent(up).wasHandled();
+
+    bool ctxSwallowed = false;
+    bool ctxSent = false;
+#if ENABLE(CONTEXT_MENU_EVENT)
+    if (flags & 1) {
+        // The release can navigate too (a link under the finger): re-fetch once more before asking
+        // for a context menu on a frame that may be gone.
+        lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+        if (lf) {
+            g_session->mainFrame = lf;
+            DriverMouseEvent ctx(p, MouseButton::Right, PlatformEvent::Type::MousePressed, 1, mods,
+                                 MonotonicTime::now(), kButtonsRightDown);
+            ctxSwallowed = lf->eventHandler().sendContextMenuEvent(ctx);
+            ctxSent = true;
+        }
+    }
+#endif
+    {
+        char note[192];
+        std::snprintf(note, sizeof note,
+            "long-press at=%d,%d wants=%d hold=%d down=%d up=%d click=%d ctx=%d/%d unwound=%d",
+            x, y, wants ? 1 : 0, hold, downHandled ? 1 : 0, upHandled ? 1 : 0, fireClick ? 1 : 0,
+            ctxSent ? 1 : 0, ctxSwallowed ? 1 : 0, unwound ? 1 : 0);
+        inputNote(note);
+    }
+
+    // Let the synchronous handlers land (pumpQuick, the same light settle typing uses — the pin's
+    // own network work streams into the live tick), then present.
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+    pumpQuick(*lf, g_session->page.get());
+    lf = g_session->page ? g_session->page->localMainFrame() : nullptr;
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    g_session->mainFrame = lf;
+    view = lf->view();
+    if (!view)
+        return kErrNoView;
+    if (RefPtr<Document> d2 = lf->document()) {
+        d2->updateLayoutIgnorePendingStylesheets();
+        extractLinks(d2.get(), g_session->h);
+    }
+    if (outRGBA) {
+        int nonWhite = 0;
+        paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    }
     return kOK;
 }
 
@@ -1815,7 +5974,8 @@ int WebCoreFindClear(uint8_t* outRGBA)
 // M4 捏合缩放:把页面缩放因子设为 scale(钳到 [0.5,6.0]),以屏幕焦点 (focalX,focalY) 为锚 —— 缩放后让焦点
 //   下的内容点仍停在焦点处(据此算新滚动原点)。setPageScaleFactor 触发按新尺度重栅格(TextureMapper backing 的
 //   contentsScale = pageScaleFactor*deviceScale → 文字清晰)。重绘到 outRGBA。引擎线程串行调。返回 0。
-//   注:焦点/滚动坐标空间在本无头配置下可能略有偏差,真机微调;核心(缩放生效+按新尺度重栅格)是主目标。
+//   focalX/focalY are ENGINE VIEWPORT PIXELS (0..w, 0..h) — the same space the harness paints
+//   into, not CSS/document coordinates. See the anchor derivation below for the scroll units.
 int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
 {
     using namespace WebCore;
@@ -1827,6 +5987,7 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
         return kErrBusy;
     g_inPump = true;
     PumpGuard guard;
+    PerfOpGuard perfOp("scale", nullptr, 0, 0);   // Apotheosis (M4): pinch/double-tap zoom gets its own perf.csv row
 
     RefPtr<LocalFrame> lf = g_session->mainFrame;
     RefPtr<LocalFrameView> view = lf->view();
@@ -1843,18 +6004,48 @@ int WebCoreSetPageScale(float scale, int focalX, int focalY, uint8_t* outRGBA)
     float oldScale = g_session->page->pageScaleFactor();
     if (oldScale <= 0.0f) oldScale = 1.0f;
     ScrollPosition scroll = view->scrollPosition();
-    // FrameView 的 scrollPosition 已是 CSS 内容坐标，pageScale 改变的是视口中每个设备像素
-    // 对应的 CSS 距离。因此焦点内容点 = scroll + focal / oldScale；新 scroll = 内容点 - focal / newScale。
-    // 旧公式把 scroll 也除以 oldScale、又把结果乘 scale，缩回 1x 时常被钳到 (0,0)。
-    double cx = static_cast<double>(scroll.x()) + static_cast<double>(focalX) / oldScale;
-    double cy = static_cast<double>(scroll.y()) + static_cast<double>(focalY) / oldScale;
-    int nsx = static_cast<int>(cx - static_cast<double>(focalX) / scale + 0.5);
-    int nsy = static_cast<int>(cy - static_cast<double>(focalY) / scale + 0.5);
-    if (nsx < 0) nsx = 0;
-    if (nsy < 0) nsy = 0;
+    // Apotheosis (M4): pinch anchor. Page::setPageScaleFactor(scale, origin) hands `origin`
+    // straight to LocalFrameView::setScrollPosition() — it is the NEW SCROLL POSITION, not a
+    // focal point. Its unit is the frame view's own scroll space, and that space is SCALED:
+    //   * ScrollView::contentsSize() comes from LocalFrameView::adjustViewSize() ->
+    //     RenderView::documentRect(), which maps unscaledDocumentRect() through the RenderView
+    //     layer transform (i.e. multiplies by the page scale) — see RenderView.cpp:779.
+    //   * LocalFrameView::getPossiblyFixedRectToExpose() says it outright ("exposeRect is in
+    //     absolute coords, affected by page scale") and scales its result by frameScaleFactor()
+    //     before returning it as a scroll position — LocalFrameView.cpp:7141/7159.
+    // So one viewport pixel is one scroll unit at every scale, and the document (CSS) point
+    // under a viewport-pixel focal F is doc = (P0 + F) / s0. Keeping it under the finger:
+    //
+    //     P1 = doc * s1 - F = (P0 + F) * (s1 / s0) - F
+    //
+    // Worked example s0 = 1, s1 = 2, P0 = (0, 1000), F = (360, 540):
+    //     doc = (360, 1540)  ->  P1 = (720, 3080) - (360, 540) = (360, 2540).
+    // The old code treated P0 as CSS units (doc = P0 + F/s0, P1 = doc - F/s1) and produced
+    // (180, 1270) here — roughly half the intended offset, i.e. the page jumped a long way
+    // towards the top on release, exactly the reported symptom. The error grows with P0, so
+    // it looked like "it snaps to the top-of-page view" far down a long page.
+    double ratio = static_cast<double>(scale) / static_cast<double>(oldScale);
+    // Apotheosis (page width, 0.1.9.58): the focal point arrives in engine px and every term of
+    // this derivation is in the frame view's own scroll space (event px), so convert it once here.
+    const double focalEventX = wkEventFromEngine(static_cast<double>(focalX));
+    const double focalEventY = wkEventFromEngine(static_cast<double>(focalY));
+    double nx = (static_cast<double>(scroll.x()) + focalEventX) * ratio - focalEventX;
+    double ny = (static_cast<double>(scroll.y()) + focalEventY) * ratio - focalEventY;
+    int nsx = static_cast<int>(nx < 0 ? nx - 0.5 : nx + 0.5);
+    int nsy = static_cast<int>(ny < 0 ? ny - 0.5 : ny + 0.5);
+    IntPoint wanted = view->constrainedScrollPosition(IntPoint(nsx, nsy));
 
-    g_session->page->setPageScaleFactor(scale, IntPoint(nsx, nsy));
+    g_session->page->setPageScaleFactor(scale, wanted);
     g_session->page->isolatedUpdateRendering();
+    // Apotheosis: re-apply the anchor AFTER the relayout at the new scale. setPageScaleFactor
+    // clamps `origin` inside setScrollPosition against the contents size of that moment, and
+    // when zooming in that is still the OLD (smaller) scaled document — the clamp then eats
+    // most of the new offset near the bottom of a page. Constraining again once adjustViewSize()
+    // has published the new scaled contents size gives the correct final position.
+    doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });
+    IntPoint settled = view->constrainedScrollPosition(IntPoint(nsx, nsy));
+    if (view->scrollPosition() != settled)
+        view->setScrollPosition(settled);
     doc->updateLayoutIgnorePendingStylesheets();
 
     int nonWhite = 0;
@@ -1876,11 +6067,371 @@ int WebCoreGetPageScale()
     return static_cast<int>(s * 1000.0f + 0.5f);
 }
 
+// Apotheosis (double-tap zoom, 2026-09-09): read-only tap policy for double-tap-to-zoom — see the
+// full contract in WebCoreDriver.h. Hit-tests (x,y) and answers whether a second tap here should
+// zoom the page (mobile-Safari/Chrome semantics) rather than being forwarded as an ordinary second
+// click, and if so, to what scale. No event dispatched, no session/document state changed — safe to
+// call from the harness' tap-hold path before it has decided whether to click at all.
+// Apotheosis (0.1.9.40): outReason says which rule decided the answer, so a device trace can tell
+// "opted out" apart from "hit test missed" apart from "already zoomed" instead of everything
+// collapsing into zoomable=0. Values: 0 = zoomable (target computed), 1 = zoomed IN
+// (curScale > 1.05), 7 = zoomed OUT (curScale < 0.95 — 0.1.9.50, the other half of rule 1),
+// 2 = no element under the point, 3 = viewport meta disables zoom, 4 = mobile-optimised viewport,
+// 5 = touch-action opt-out, 6 = target within 5% of curScale (not worth animating). Left at -1 on
+// every early/error return above (no session, busy, no document) — those are not a rule decision,
+// and the caller already has rc for that.
+int WebCoreTapPolicyAt(int x, int y, int* outZoomable, float* outTargetScale, int* outAnchorX, int* outAnchorY, int* outReason)
+{
+    using namespace WebCore;
+    if (outZoomable) *outZoomable = 0;
+    if (outTargetScale) *outTargetScale = 1.0f;
+    if (outAnchorX) *outAnchorX = x;
+    if (outAnchorY) *outAnchorY = y;
+    if (outReason) *outReason = -1;
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;   // 任何返回路径复位 g_inPump
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+
+    // Apotheosis (0.1.9.40): "already zoomed" moved BEFORE the hit test (0.1.9.38 put it after
+    // elementFromPoint(), which is why it never actually ran at scale — see below). The rule needs
+    // no element at all: a page scale that is not 1:1 is the harness' own pinch zoom, not something
+    // the page asked for, so a double tap must always be able to undo it — otherwise a page that
+    // opts out of double-tap-to-zoom (a map, a site with touch-action or user-scalable=no) traps
+    // the user at whatever scale the pinch left behind.
+    //
+    // Apotheosis (0.1.9.50): the rule is SYMMETRIC. It used to read curScale > 1.05, so it only
+    // undid a pinch IN; a page the user had pinched OUT (this harness commits down to 0.5, the
+    // "survey a long page" overview) fell through to the viewport rules below and was refused —
+    // the device trace of 0.1.9.49 is exactly that, "zoomable=0 ... why=4 target=1.0 ... act=wait"
+    // at a scale below 1. Undoing a zoom must not depend on which way it went, so the test is now
+    // the distance from 1:1 in either direction, with its own reason code per direction so a trace
+    // still says which half fired.
+    RefPtr<Page> page = g_session->page;
+    float curScale = page ? page->pageScaleFactor() : 1.0f;
+    if (!(curScale > 0.0f)) curScale = 1.0f;
+    const float offOneToOne = (curScale > 1.0f) ? (curScale - 1.0f) : (1.0f - curScale);
+    if (offOneToOne > 0.05f) {
+        if (outZoomable) *outZoomable = 1;
+        if (outTargetScale) *outTargetScale = 1.0f;
+        const bool zoomedOut = !(curScale > 1.0f);
+        if (outReason) *outReason = zoomedOut ? 7 : 1;   // zoomed out / zoomed in
+        // Apotheosis (0.1.9.51): the zoomed-OUT half needs its horizontal anchor pre-clamped, or
+        // the animation ends somewhere the committed frame is not and the page slides sideways
+        // after it. Below 1:1 the document is narrower than the viewport (contentsWidth scales
+        // with the page scale, see WebCoreSetPageScale's derivation), so it is drawn from the
+        // viewport's left edge with the remainder in the base background colour — ScrollView::paint
+        // translates by -scrollPosition and nothing centres it — and scrollPosition().x() is pinned
+        // at 0 because constrainedScrollPosition() has no range to give. Zooming back to 1:1 around
+        // the tap x therefore asks for a scroll position the new layout cannot honour either
+        // (the document then exactly fills the viewport again: max scroll x = 0), the commit clamps
+        // it, and the difference is the slide the caller just animated into.
+        //
+        // So solve the anchor for the position the commit will actually settle on. With target
+        // scale 1 and r = 1/curScale, WebCoreSetPageScale computes P1 = (P0 + F) * r - F and then
+        // constrains it to [0, maxX1]; that is linear in F, so the F landing on a chosen P1 is
+        // F = (P1 - P0 * r) / (r - 1), and r - 1 > 0.05 here. At the overview position (P0 = 0,
+        // P1 = 0) that is F = 0 — the document's own left edge, i.e. the content simply grows to
+        // the right until it fills the screen. A tap whose P1 needs no clamping (a page still
+        // wider than the viewport at 1:1) keeps the tap x, unchanged.
+        //
+        // The vertical anchor stays the tap y, and needs no such correction: for r > 1 the same
+        // formula gives P1 = P0 * r + F * (r - 1), which is >= 0 for every F >= 0, and at the
+        // bottom of the document (P0 = contentsHeight * curScale - viewH) it stays <= the new
+        // maximum for every F <= viewH — i.e. for every anchor inside the viewport. The zoomed-IN
+        // half (r < 1) can clamp vertically, but that is the behaviour 0.1.9.50 shipped and the
+        // device round accepted; it is deliberately left alone.
+        if (zoomedOut && outAnchorX) {
+            if (RefPtr<LocalFrameView> view = lf->view()) {
+                const double r = 1.0 / static_cast<double>(curScale);
+                const double p0 = static_cast<double>(view->scrollPosition().x());
+                // Apotheosis (page width, 0.1.9.58): scroll positions and contentsSize() are event
+                // px, so the viewport width and the tap x are converted into that space and the
+                // anchor is converted back to engine px where it is written out.
+                const double viewW = wkEventFromEngine(static_cast<double>(g_session->w));
+                const double xEvent = wkEventFromEngine(static_cast<double>(x));
+                double maxX1 = static_cast<double>(view->contentsSize().width()) * r - viewW;
+                if (!(maxX1 > 0.0)) maxX1 = 0.0;
+                const double p1 = (p0 + xEvent) * r - xEvent;
+                const double settled = (p1 < 0.0) ? 0.0 : (p1 > maxX1 ? maxX1 : p1);
+                if (settled != p1) {
+                    double anchor = (settled - p0 * r) / (r - 1.0);
+                    // Keep it inside the viewport: the caller's own anchor plumbing clamps the
+                    // engine-px focal to [0, width] before it reaches WebCoreSetPageScale, so an
+                    // anchor outside would only reintroduce a mismatch between the preview's
+                    // transform centre and the commit's.
+                    if (anchor < 0.0) anchor = 0.0;
+                    if (anchor > viewW) anchor = viewW;
+                    *outAnchorX = wkEngineFromEvent(anchor);
+                }
+            }
+        }
+        return kOK;
+    }
+
+    // Apotheosis (0.1.9.40): elementFromPoint() wants a CSS client point, not bitmap px — see
+    // clientPointForEnginePoint's comment above (near dragWidgetAtPoint). This is the actual bug the
+    // 0.1.9.39 device log showed: at scale 2.9 the layout viewport is only ~screenWidth/2.9 CSS px
+    // wide, so a raw bitmap-px point like x=566 named a client coordinate far outside
+    // visibleContentRect() and TreeScope::nodeFromPoint() returned null every time — which meant the
+    // "already zoomed" rule above, that 0.1.9.38 had placed AFTER this call, never got a chance to
+    // run at any scale worth mentioning. curScale is within 5 % of 1:1 here (the branch above
+    // already returned otherwise, in both directions since 0.1.9.50), so this conversion is a
+    // no-op in practice at this point in the function, but it keeps this call consistent with the
+    // other three hit-test sites that had the identical bug at higher scales (WebCoreClickAt's
+    // focus-on-editable, WebCoreIsScrollableAt, dragWidgetAtPoint).
+    DoublePoint cp = clientPointForEnginePoint(page.get(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
+    if (!hit) {
+        if (outReason) *outReason = 2;   // no element
+        return kOK;   // nothing under the point: leave *outZoomable at 0, not an error
+    }
+
+    // Apotheosis: document-level opt-out (cheap, one struct already on Document) — a page
+    // whose viewport meta disables zoom is asking every zoom gesture, not just pinch, to leave it
+    // alone. userZoom is a tri-state float (ValueAuto=-1 unset, else the parsed boolean as 0.0/1.0 —
+    // see ViewportArguments.h / dom/ViewportArguments.cpp findBooleanValue()); minZoom==maxZoom only
+    // counts when BOTH were actually set (ValueAuto==ValueAuto would otherwise always match).
+    ViewportArguments va = doc->viewportArguments();
+    const bool viewportDisablesZoom = (va.userZoom == 0.0f)
+        || (va.minZoom != ViewportArguments::ValueAuto && va.maxZoom != ViewportArguments::ValueAuto
+            && va.minZoom == va.maxZoom);
+    if (viewportDisablesZoom) {
+        if (outReason) *outReason = 3;   // viewport disables zoom
+        return kOK;
+    }
+
+    // Apotheosis (0.1.9.38): a mobile-optimised page is not double-tap-zoomable at all, which is
+    // what Chrome does and the single biggest reason double-tap-to-zoom feels right there. Blink
+    // calls this WebViewImpl::ShouldDisableDesktopWorkarounds(): a <meta name=viewport> that either
+    // asks for width=device-width, or leaves the width alone and pins initial-scale to 1, has laid
+    // itself out for this screen already — there is no "column narrower than the viewport" to zoom
+    // to, so the zoom would be a no-op, and the price of asking is that EVERY tap on such a page is
+    // held for the double-tap interval before it reaches the DOM. The 0.1.9.38 device log is that
+    // price being paid for nothing: three double taps on a mobile news article all came back
+    // zoomable=1 with target 1.0/1.1/1.3, i.e. the block heuristic below found the article column
+    // to be as wide as the viewport and asked to "zoom" to the scale we were already at.
+    // Type::Implicit means no viewport meta tag at all, i.e. a desktop-layout page.
+    const bool mobileOptimizedViewport = va.type != ViewportArguments::Type::Implicit
+        && (va.width == ViewportArguments::ValueDeviceWidth
+            || (va.width == ViewportArguments::ValueAuto && va.zoom == 1.0f));
+    if (mobileOptimizedViewport) {
+        if (outReason) *outReason = 4;   // mobile-optimised viewport
+        return kOK;
+    }
+
+    // Apotheosis: same open-shadow descent as dragWidgetAtPoint()/WebCoreIsScrollableAt — a point
+    // inside a web component's shadow tree would otherwise only ever see the host element.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    // Apotheosis: element-level opt-out. Mirrors WebKit's own Element::allowsDoubleTapGesture()
+    // (dom/Element.cpp) — compiled out on this port under !ENABLE_TOUCH_EVENTS, so re-derived here —
+    // which disallows the gesture when ANY ancestor (hit element included) has a touch-action other
+    // than auto, not just none/manipulation: pan-x/pan-y are as much an opt-out for double-tap-zoom
+    // as they are there, because a page that has claimed one axis for its own panning has claimed
+    // the gesture, not just a rectangle (see the same reasoning in dragWidgetAtPoint's comment).
+    Element* root = doc->documentElement();
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (RenderObject* r = e->renderer()) {
+            if (!r->style().touchAction().isAuto()) {
+                if (outReason) *outReason = 5;   // touch-action opt-out
+                return kOK;   // opted out; *outZoomable stays 0
+            }
+        }
+        if (e.get() == root)
+            break;
+    }
+
+    // Apotheosis: "zoom to column" — the innermost block-level ancestor of the hit point that is
+    // narrower than the layout viewport (Safari's own double-tap-zoom heuristic), walked from the
+    // hit element up towards <html> so the FIRST candidate found is the innermost/smallest one.
+    // Everything in this block is in CSS CLIENT px - boundingClientRect()'s own space, and `cp`'s -
+    // so the comparison and the ratio below need no conversion at all; the two conversions are at
+    // the edges (viewportW in, the anchor out). curScale is within 5 % of 1:1 here, the branch
+    // above having returned otherwise, so the page-scale half of the client/engine factor is
+    // ~1 in practice; it is carried anyway rather than assumed.
+    //
+    // Apotheosis (0.1.9.38): a block only counts as a "column" if it is meaningfully narrower than
+    // the viewport. The old test was w < viewportW, and on a page whose content block fills the
+    // screen that yields viewportW/(viewportW + 8) ≈ 1.0 — a "zoom" to the scale we are already at,
+    // i.e. a dead double tap, which is what the device log showed as target=1.0/1.1/1.3. Anything
+    // from 90 % of the viewport upwards is the page's own full-width layout, not a column, and the
+    // right answer there is the plain 2× a touch browser gives you.
+    // Apotheosis (page width, 0.1.9.58): boundingClientRect() answers in CSS client px, so the
+    // viewport this compares against has to be in CSS client px too - otherwise at a factor of 1.5
+    // every block would look 1.5x narrower than the screen and the "zoom to column" rule would fire
+    // on a full-width layout. The ratio viewportW / (w + padding) is then unit-free, so the target
+    // scale it produces is a page scale exactly as before, and the anchor is converted back to
+    // engine px where it is written out.
+    const float viewportW = static_cast<float>(wkClientLengthFromEngine(page.get(), static_cast<double>(g_session->w)));
+    const float kZoomPadding = 8.0f;   // small breathing room so the column edge is not flush with the screen edge
+    const float kColumnMaxWidth = 0.9f * viewportW;
+    const float kFallbackScale = 2.0f; // no narrower block ancestor: what Safari/Chrome zoom to
+    const float kMinZoomTarget = 1.25f;// below this the zoom is not worth the animation
+    const float kMaxZoomTarget = 3.0f;
+    float targetScale = kFallbackScale;
+    // Apotheosis (0.1.9.40): the column's horizontal centre, in CSS client px like the rects it is
+    // read from. Defaults to the tap point itself: the fallback 2x zoom (no narrower block ancestor
+    // found) has no column to centre on, and Safari leaves the tap x alone in that case too, only
+    // the vertical stays under the finger either way.
+    float anchorXf = static_cast<float>(cp.x());   // CSS client px, like the rects below
+    for (RefPtr<Element> e = hit; e; e = e->parentElement()) {
+        if (RenderObject* r = e->renderer()) {
+            if (r->isRenderBlock()) {
+                FloatRect rect = e->boundingClientRect();
+                float w = rect.width();
+                if (w > 0.0f && w < kColumnMaxWidth) {
+                    targetScale = viewportW / (w + kZoomPadding);
+                    // Apotheosis (0.1.9.40): centre the column horizontally (Safari's own double-
+                    // tap-zoom behaviour) instead of anchoring on the tap x — a tap near a column's
+                    // edge previously zoomed in with most of the column off-screen, which is what
+                    // "jumps to the middle of the page" was: the anchor was always the tap point,
+                    // never the block the zoom was actually computed for.
+                    anchorXf = rect.x() + rect.width() / 2.0f;
+                    break;
+                }
+            }
+        }
+        if (e.get() == root)
+            break;
+    }
+    if (targetScale < kMinZoomTarget) targetScale = kMinZoomTarget;
+    if (targetScale > kMaxZoomTarget) targetScale = kMaxZoomTarget;
+    if (anchorXf < 0.0f) anchorXf = 0.0f;
+    if (anchorXf > viewportW) anchorXf = viewportW;
+    const int anchorEngineX = wkRoundToInt(wkEngineLengthFromClient(page.get(), static_cast<double>(anchorXf)));
+
+    // Apotheosis (0.1.9.38): a target within ±5 % of where we already are is not a zoom. Report it
+    // as "not zoomable" so the harness forwards the second tap as a clickCount=2 click instead of
+    // running a spring animation that ends exactly where it started. With the clamp above this
+    // cannot trigger from the block heuristic any more; it is the invariant the caller relies on.
+    const float delta = (targetScale > curScale) ? (targetScale - curScale) : (curScale - targetScale);
+    if (delta <= 0.05f * curScale) {
+        if (outZoomable) *outZoomable = 0;
+        if (outReason) *outReason = 6;   // target within 5% of curScale
+        return kOK;
+    }
+
+    if (outZoomable) *outZoomable = 1;
+    if (outTargetScale) *outTargetScale = targetScale;
+    // Apotheosis (0.1.9.40): outAnchorX becomes the column centre when the zoom is to a column;
+    // outAnchorY stays the tap y (set at function entry, never touched again) — vertically the
+    // tapped point must stay under the finger regardless of the horizontal case.
+    if (outAnchorX) *outAnchorX = anchorEngineX;
+    if (outReason) *outReason = 0;   // zoomable, target computed
+    return kOK;
+}
+
+// Apotheosis (link context menu, 0.1.9.42): the absolute href of the innermost <a href> under
+// (x,y), or nothing. Read-only - no event dispatched, nothing in the session or the frame
+// mutated - so the harness can ask it from the long-press route and only then decide whether the
+// hold becomes a menu or is forwarded to the page as a real press.
+//
+// Why an engine call and not the harness' own link table (WebCoreGetLink): that table is a list
+// of rectangles harvested by extractLinks() after a load or a scroll settle. It is capped at 4000
+// entries and it knows nothing about what COVERS a link (a sticky header, a consent overlay, an
+// absolutely positioned box). This runs the same hit test the click path runs, so it is right at
+// every scale and it respects z-order.
+//
+// A drag widget wins: when the point belongs to something that drags itself (canvas /
+// touch-action:none - the same dragWidgetAtPoint() probe the pinch, drag and tap routes use)
+// this answers "no link", so a hold there keeps reaching the page exactly as it did before. Such
+// a widget owns the gesture, and a menu over a link it happens to have painted into its own
+// surface would take the press-and-hold away from it.
+//
+// x, y: viewport/BITMAP px, WebCoreClickAt's convention.
+// outUrl/cap: UTF-8 absolute URL, NUL-terminated, emptied on every path that is not a hit. Only
+//   http(s) is reported (the same filter extractLinks() applies) - javascript:, mailto: and
+//   fragment-only anchors are not something "open in a new tab" can do anything with.
+// Returns 1 = link written, 0 = no link under the point, or a negative driver error (no session,
+//   busy, no document, or a buffer too small for the URL).
+int WebCoreLinkAt(int x, int y, char* outUrl, int cap)
+{
+    using namespace WebCore;
+    if (outUrl && cap > 0)
+        outUrl[0] = '\0';
+    if (!g_session || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    g_inPump = true;
+    PumpGuard guard;   // 任何返回路径复位 g_inPump
+
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+    doc->updateLayoutIgnorePendingStylesheets();   // hit test needs current layout, as in WebCoreClickAt
+    if (dragWidgetAtPoint(*doc, x, y))
+        return 0;
+
+    DoublePoint cp = clientPointForEnginePoint(doc->page(), x, y);
+    RefPtr<Element> hit = doc->elementFromPoint(cp.x(), cp.y());
+    if (!hit)
+        return 0;
+
+    // Same open-shadow descent as dragWidgetAtPoint()/WebCoreTapPolicyAt: elementFromPoint()
+    // retargets its result to the scope it was called on, so a link inside a custom element would
+    // otherwise only ever resolve to the host.
+    for (int depth = 0; depth < 16; ++depth) {
+        RefPtr<ShadowRoot> shadow = hit->openOrClosedShadowRoot();
+        if (!shadow || shadow->mode() != ShadowRootMode::Open)
+            break;
+        RefPtr<Element> inner = shadow->elementFromPoint(cp.x(), cp.y());
+        if (!inner || inner == hit)
+            break;
+        hit = WTF::move(inner);
+    }
+
+    // Walk the COMPOSED tree upwards, not the node tree: a link that wraps a custom element has a
+    // shadow boundary between it and the node the hit landed on, and parentElement() stops there.
+    for (RefPtr<Element> e = hit; e; e = e->parentElementInComposedTree()) {
+        if (!is<HTMLAnchorElement>(*e))
+            continue;
+        auto href = downcast<HTMLAnchorElement>(*e).href();
+        if (href.isEmpty() || !href.isValid() || !href.protocolIsInHTTPFamily())
+            return 0;   // an anchor, but not one a new tab could load
+        auto utf8 = href.string().utf8();   // WTF::CString, owns the buffer until the end of this scope
+        if (!outUrl || cap <= static_cast<int>(utf8.length()))
+            return kErrBadArgs;
+        std::memcpy(outUrl, utf8.data(), utf8.length());
+        outUrl[utf8.length()] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 // 当前会话是否有可编辑元素聚焦(输入框/textarea/contenteditable)→ harness 据此弹/收输入法。
 // UA 切换:mobile=1 移动 iPhone UA(默认),0 桌面 Windows UA。切后由 UI 重新加载页面生效。
 void WebCoreSetUserAgentMobile(int mobile)
 {
     g_apoUaMobile = (mobile != 0);
+}
+
+// Apotheosis (0.1.9.45): tell the engine how much of the BOTTOM of the viewport the user cannot
+// actually see. The soft keyboard is an OS overlay over the window, not a change of the viewport,
+// and while a page field has focus the harness moves nothing out of its way - so without this the
+// engine's idea of "visible" includes the strip behind the keyboard. Sticky and cheap (one int);
+// call it from the engine thread with 0 as soon as the keyboard goes away again.
+void WebCoreSetBottomOcclusion(int enginePx)
+{
+    g_bottomOcclusionPx = (enginePx > 0) ? enginePx : 0;
 }
 
 // 自定义 UA:非空则 userAgent() 直接返回它(覆盖 mobile/desktop);空串=清除回退开关。切后 UI 重载生效。
@@ -1895,6 +6446,69 @@ void WebCoreSetUserAgentString(const char* ua)
 
 // M1 验证:GPU 合成是否在跑。PortChromeClient 的 attachRootGraphicsLayer 被调=合成激活+图层树已建;
 // 根图层非空即证。加载后查(图层树在布局/合成更新时建)。返回 1=合成在跑,0=未。
+// Apotheosis (privacy review): switch speculation-rules prefetch on/off.
+// enabled!=0 -> a page's <script type="speculationrules"> may prefetch URLs the user has not clicked.
+// Engine thread only (touches the live Page). Sticky: applies to the current session and to every
+// session created afterwards, so the harness sets it at startup and on every network-cost change.
+void WebCoreSetSpeculativePrefetch(int enabled)
+{
+    g_apoSpecPrefetch = (enabled != 0);
+    if (g_session && g_session->page)
+        g_session->page->settings().setSpeculationRulesPrefetchEnabled(g_apoSpecPrefetch);
+}
+
+// Apotheosis (page width, 0.1.9.58): set the page-width factor - see the contract in
+// WebCoreDriver.h and the derivation next to wkPageWidthFactor() at the top of this file.
+//
+// Stores only. A live document does NOT relayout here: the whole of that work (device scale factor
+// on the Page, a LocalFrameView sized in the new CSS px, full relayout, scroll re-clamp, focused
+// field reveal, link table, a composite that trusts no tile painted for the old layout) is
+// WebCoreResize()'s job and it does all of it already, so the harness writes the factor and then
+// forces a viewport update. An out-of-range value falls back to the default rather than being
+// clamped silently to an edge: a caller that passes 0 or a NaN has a bug, and 1.5 is the answer
+// that leaves the user with a readable page while it is found.
+void WebCoreSetPageWidthFactor(float factor)
+{
+    if (!(factor >= kPageWidthFactorMin) || !(factor <= kPageWidthFactorMax))
+        factor = kPageWidthFactorDefault;
+    g_pageWidthFactor = factor;
+}
+
+// Apotheosis (M4): warm up an origin the user is about to visit - the harness calls this while
+// a URL is being typed, so the name is resolved before Enter.
+//
+// DNS is all a "preconnect" can be in this port, and that is a deliberate finding, not a stub:
+// libcurl has no preconnect primitive, and its closest relative CURLOPT_CONNECT_ONLY (including
+// =2, which does complete the TLS handshake) takes the connection *out* of the pool and binds it
+// to the one easy handle that opened it, so a warm-up would burn a TCP+TLS connection the real
+// request can never reuse. What CurlContext's CURLSH handle does share across handles is DNS,
+// TLS sessions and cookies (CURL_LOCK_DATA_DNS / SSL_SESSION / COOKIE with WTF::Lock callbacks,
+// CurlContext.cpp; every CurlHandle opts in via enableShareHandle()), which means the second
+// request to a host reuses its TLS session anyway - the resolver is the part still worth
+// warming. Same conclusion as WebResourceLoadScheduler::preconnectTo() for <link rel=preconnect>.
+//
+// Accepts a full URL or a bare host ("example.com"); anything else is ignored. Idempotent and cheap
+// (apotheosisPrefetchDNS resolves on a work queue and keeps a capped set of hosts it has already
+// done), and it never touches the live Page.
+void WebCorePreconnect(const char* url)
+{
+    using namespace WebCore;
+    if (!url || !*url)
+        return;
+    String input = String::fromUTF8(url);
+    if (input.isEmpty())
+        return;
+    URL parsed { input };
+    if (!parsed.isValid() || parsed.host().isEmpty())
+        parsed = URL { makeString("https://"_s, input) };   // still being typed: no scheme yet
+    if (!parsed.isValid() || !parsed.protocolIsInHTTPFamily())
+        return;
+    String host = parsed.host().toString();
+    if (host.isEmpty())
+        return;
+    ::apotheosisPrefetchDNS(host);
+}
+
 int WebCoreEnableCompositing()
 {
     if (!g_session || !g_session->chrome)
@@ -1915,7 +6529,13 @@ int WebCoreGpuInit(void* nativeWindow, int w, int h)
     if (g_gpuActive)
         return kOK;   // 幂等
     ensureWebCoreInitialized();
+    // Apotheosis (package 5): tile rasterisation always runs on the engine's worker pool, so the
+    // completion hook is installed once here rather than by a runtime switch. It is called ON A
+    // WORKER THREAD (see rasterCompletedOnWorker) and must exist before the first composite can
+    // post a replay; WebCoreGpuInit is idempotent and is the only way a tile ever gets created.
+    wkWinUWPSetRasterCompletionHandler(&rasterCompletedOnWorker);
     PlatformDisplay& display = PlatformDisplay::sharedDisplay();   // WIN → PlatformDisplayWin,起 ANGLE EGLDisplay
+
     std::unique_ptr<GLContext> ctx = nativeWindow
         ? GLContext::create(display, reinterpret_cast<GLNativeWindowType>(nativeWindow))   // 窗口表面:指针经纯 C cast 直传 eglCreateWindowSurface
         : GLContext::createOffscreen(display);                                              // 离屏:surfaceless→pbuffer
@@ -1989,11 +6609,8 @@ int WebCoreGpuLayerInfo(char* out, int len)
     std::string s;
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     RefPtr<LocalFrameView> view = lf ? lf->view() : nullptr;
-    IntPoint origScroll;
-    bool didProbe = false;
     if (view) {
         IntPoint sp = view->scrollPosition();
-        origScroll = sp;
         IntPoint minP = view->minimumScrollPosition();
         IntPoint maxP = view->maximumScrollPosition();
         IntSize cs = view->contentsSize();
@@ -2009,29 +6626,38 @@ int WebCoreGpuLayerInfo(char* out, int len)
                  sp.x(), sp.y(), minP.x(), minP.y(), maxP.x(), maxP.y(),
                  cs.width(), cs.height(), g_session->w, g_session->h, usesComp ? 1 : 0);
         s += h;
-        // 探针滚动:setScrollPosition(0,300)+frameViewDidScroll,看 ① 滚动量是否被钳到 0(maxScroll=0?)
-        // ② scrolled-contents 层是否真移到 (0,-300)。其后的 layerTreeAsText 即反映探针后的层位置。最后复位。
-        view->setScrollPosition(ScrollPosition(0, 300));
-        if (auto* rv = view->renderView())
-            rv->compositor().frameViewDidScroll();
-        IntPoint sp2 = view->scrollPosition();
-        char h2[160];
-        snprintf(h2, sizeof h2, "-- after setScrollPosition(0,300)+frameViewDidScroll: scrollPos=%d,%d (层树为此刻状态) --\n",
-                 sp2.x(), sp2.y());
-        s += h2;
-        didProbe = true;
+        // Apotheosis (2026-09-07): the scroll probe this used to do here - setScrollPosition(0,300)
+        // + frameViewDidScroll, to see whether the scrolled-contents layer really moves - is gone.
+        // It was bring-up code for "the page does not scroll" and it is actively harmful now: the
+        // dump is taken *while* a rendering artefact is on screen, and scrolling the view moves
+        // every visible rect, re-tiles the backing stores and repaints the tree, so the state the
+        // dump is supposed to describe is destroyed before it is written. It also left the layer
+        // tree below describing scroll position 300 rather than the page the user is looking at.
+    }
+    // Apotheosis (2026-09-07): the texmap diagnostics before the layer tree, and the tree capped to
+    // whatever is left. Device (0.1.9.25, layertree.txt): the file
+    // was exactly 65535 bytes of layerTreeAsText() and did not contain a single texmap line - the
+    // tree of a real page fills any buffer, so everything appended after it is lost. The per-store
+    // block is the smaller and, for a ghost/stale-tile question, the only useful half.
+    {
+        std::vector<char> texmap(64 * 1024, 0);
+        const size_t used = WebCore::wkWinUWPDumpTexmap(texmap.data(), texmap.size());
+        s.append(texmap.data(), used);
     }
     if (GraphicsLayer* root = g_session->chrome->rootLayer()) {
         String tree = root->layerTreeAsText(AllLayerTreeAsTextOptions);   // 全调试标志:paintsIntoWindow/tileCache/drawsContent/backingStoreAttached
         CString u = tree.utf8();
-        s.append(u.data(), u.length());
+        // Truncated here rather than by the memcpy below, so that "the tree was cut off" is visible
+        // in the file instead of looking like a dump that simply ends.
+        const size_t room = (s.size() + 1 < static_cast<size_t>(len)) ? static_cast<size_t>(len) - 1 - s.size() : 0;
+        if (u.length() <= room)
+            s.append(u.data(), u.length());
+        else if (room > 64) {
+            s.append(u.data(), room - 64);
+            s += "\n-- layer tree truncated --\n";
+        }
     } else {
         s += "(no root GraphicsLayer)\n";
-    }
-    if (didProbe && view) {   // 复位滚动,别让调试 tap 把页面留在 300
-        view->setScrollPosition(origScroll);
-        if (auto* rv = view->renderView())
-            rv->compositor().frameViewDidScroll();
     }
     int n = static_cast<int>(s.size());
     if (n > len - 1) n = len - 1;
@@ -2240,6 +6866,251 @@ int WebCoreSessionPaint(uint8_t* outRGBA)
     return kOK;
 }
 
+// Apotheosis (landscape/rotation, 0.1.9.41): the size of the EGL window surface currently bound to
+// the engine's context, or 0x0 when there is none (offscreen mode, or no context current). Pure
+// diagnostic: the harness computes the size it wants from the panel and ANGLE computes the surface
+// from the same panel times the resolution scale, and this is how a device log can show the two
+// agreeing. Never used to drive layout - a mismatch must be fixed in the formula, not papered over
+// by rendering at a size the harness does not know about.
+static void querySurfaceSize(int* outW, int* outH)
+{
+    if (!outW && !outH)
+        return;
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+    if (dpy == EGL_NO_DISPLAY || surf == EGL_NO_SURFACE)
+        return;
+    EGLint value = 0;
+    if (outW && eglQuerySurface(dpy, surf, EGL_WIDTH, &value))
+        *outW = static_cast<int>(value);
+    value = 0;
+    if (outH && eglQuerySurface(dpy, surf, EGL_HEIGHT, &value))
+        *outH = static_cast<int>(value);
+}
+
+// Apotheosis (rotation with the keyboard up, 0.1.9.43): the focused text field is normally
+// kept in view by the engine itself - but only when something SCROLLS. A rotation changes the
+// viewport instead: the field the user is typing into can end up anywhere in the new layout
+// (in landscape the visible strip above the keyboard is a fraction of what it was), and the
+// keyboard stays up, so typing continued into a field nobody could see. Only editable
+// elements, and only when the relayout actually moved it out of view - scrollIntoViewIfNeeded
+// is a no-op for a field that is still visible, so an ordinary rotation costs nothing.
+//
+// Apotheosis (0.1.9.45): with a MARGIN, and the margin is the whole point. scrollIntoViewIfNeeded
+// reveals a field into the VIEWPORT, and the viewport is not what the user can see: the soft
+// keyboard is an OS overlay over the bottom of the window, and while a PAGE field has focus the
+// harness deliberately does not shift anything (only address-bar editing moves the chrome - see
+// ApplyKeyboardShift), so the bottom g_bottomOcclusionPx of our own viewport are behind the
+// keyboard. On top of that, alignCenterIfNeeded's PARTIAL behaviour is "align to the closest
+// edge", which for a field hanging off the bottom means exactly one sliver of it comes back -
+// which is what a rotation with the keyboard up produced on the device.
+//
+// So expand the rect to be revealed DOWNWARDS by the occluded strip plus a comfort gap, and
+// reveal that: partial then lands the expanded rect's bottom on the viewport's bottom, i.e. the
+// field's bottom a full gap above the keyboard, and hidden centres the expanded rect, which puts
+// the field itself into the upper, visible part of the band. The margin is applied as a FRACTION
+// of the visible content rect, so it is right at any page scale without converting anything:
+// engine px and layout px differ by exactly that scale, and the fraction cancels it.
+//
+// Apotheosis (0.1.9.46): a function of its own, because the rotation is no longer the only moment
+// that needs it. On a rotation the harness does not yet KNOW the occlusion: the shell answers with
+// the previous orientation's keyboard rectangle for a few dispatcher hops and 0.1.9.44 refuses to
+// believe it, so the reveal inside WebCoreResize runs with 0 and the field comes back as the sliver
+// this margin exists to prevent. WebCoreRevealFocusedElement() re-runs exactly this, once the real
+// rectangle is in.
+//
+// viewportH is the viewport's height in engine px (WebCoreResize's new h; g_session->h otherwise).
+// Returns true when a focused editable element was found (and therefore revealed).
+static bool revealFocusedEditable(WebCore::Document& doc, WebCore::LocalFrameView& view, int viewportH)
+{
+    using namespace WebCore;
+    RefPtr<Element> focused = doc.focusedElement();
+    if (!focused)
+        return false;
+    bool editable = focused->hasEditableStyle();
+    if (!editable && is<HTMLInputElement>(*focused))
+        editable = downcast<HTMLInputElement>(*focused).isTextField();
+    if (!editable && is<HTMLTextAreaElement>(*focused))
+        editable = true;
+    if (!editable)
+        return false;
+    CheckedPtr renderer = focused->renderer();
+    LayoutRect visible = view.visibleContentRect();
+    const int occluded = (g_bottomOcclusionPx > 0 && g_bottomOcclusionPx < viewportH) ? g_bottomOcclusionPx : 0;
+    const int comfort = std::max(96, viewportH / 8);   // one line of chrome, never less than ~40 DIP
+    const double wanted = (viewportH > 0) ? static_cast<double>(occluded + comfort) / viewportH : 0.0;
+    if (!renderer || wanted <= 0.0 || visible.height() <= 0) {
+        focused->scrollIntoViewIfNeeded(/*centerIfNeeded*/ true);
+    } else {
+        bool insideFixed = false;
+        LayoutRect bounds = renderer->absoluteAnchorRectWithScrollMargin(&insideFixed).marginRect;
+        // The expanded rect must stay SMALLER than the viewport: getRectToExposeForScrollIntoView
+        // treats a rect as big as the visible area as "visible" and does not scroll at all.
+        LayoutUnit pad { visible.height() * std::min(wanted, 0.8) };
+        LayoutUnit room = visible.height() - bounds.height() - LayoutUnit(2);
+        if (pad > room)
+            pad = room;
+        auto alignX = ScrollAlignment::alignCenterIfNeeded;
+        alignX.disableLegacyHorizontalVisibilityThreshold();
+        auto alignY = ScrollAlignment::alignCenterIfNeeded;
+        if (pad > 0)
+            bounds.setHeight(bounds.height() + pad);
+        else
+            alignY = ScrollAlignment::alignTopAlways;   // field taller than the free band: show its top
+        LocalFrameView::scrollRectToVisible(bounds, *renderer, insideFixed,
+            { SelectionRevealMode::Reveal, alignX, alignY, ShouldAllowCrossOriginScrolling::No });
+    }
+    doc.updateLayoutIgnorePendingStylesheets();
+    return true;
+}
+
+// Apotheosis (landscape/rotation, 0.1.9.41): re-establish the engine viewport at w*h and re-lay
+// out the live page for it. See the contract in WebCoreDriver.h.
+//
+// Everything the driver renders is sized from exactly two places - g_gpuW/g_gpuH (the GL viewport
+// gpuPresent() paints into) and g_session->w/h (the LocalFrameView, every paintToRGBA and every
+// writeDiag). Both were written once, at WebCoreGpuInit / WebCoreSessionLoad, and never again, so
+// a device rotation left the engine laying out and compositing at the portrait size while the
+// window surface underneath it had become landscape-shaped: the same picture stretched over the
+// new panel, which is what it looked like on the phone.
+//
+// The relayout is deliberately the full one (updateLayoutIgnorePendingStylesheets, not the
+// isolated rendering update a tick uses): a viewport change moves every media query, every
+// percentage width and the layout viewport itself. g_gpuForceFullNext makes the next composite
+// re-raster the whole tree instead of trusting tiles that were painted for the old viewport - the
+// same lever WebCoreSessionLoad's teardown path uses.
+int WebCoreResize(int w, int h, int* outSurfaceW, int* outSurfaceH, uint8_t* outRGBA)
+{
+    using namespace WebCore;
+    if (outSurfaceW) *outSurfaceW = 0;
+    if (outSurfaceH) *outSurfaceH = 0;
+    if (!isValidSurfaceSize(w, h))
+        return kErrBadArgs;
+    if (g_inPump)
+        return kErrBusy;
+
+    // No live page: nothing to lay out, so the GL viewport - read by gpuPresent() on every
+    // composite, including composites that happen while there is no session at all, and by
+    // WebCoreCompositeReadback - is the whole job. The next WebCoreSessionLoad carries the new size
+    // itself, so this is a complete answer rather than an error, and there is nothing this size
+    // could fall out of step with.
+    if (!g_session || !g_session->page) {
+        g_gpuW = w;
+        g_gpuH = h;
+        querySurfaceSize(outSurfaceW, outSurfaceH);
+        return kOK;
+    }
+
+    // Apotheosis (review fix, 0.1.9.48): with a session live this call is ALL-OR-NOTHING, so every
+    // remaining failure exit is resolved BEFORE the first write. The GL viewport and the
+    // LocalFrameView are the two things everything the driver renders is sized from, and moving one
+    // of them and then returning an error split them for the rest of the session: the caller keeps
+    // the size it asked for (it has no way of knowing which half took), the composite paints into a
+    // viewport the layout does not have, and nothing ever brings the two back together because the
+    // next resize to the same size is a no-op. The header documents the whole error set.
+    if (!outRGBA)
+        return kErrBadArgs;
+
+    RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
+    if (!lf) {
+        teardownSession();
+        return kErrFrameGone;
+    }
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+
+    // Past the last exit: commit both sizes together.
+    g_gpuW = w;
+    g_gpuH = h;
+    g_session->mainFrame = lf;
+    g_session->w = w;
+    g_session->h = h;
+    // Apotheosis (page width, 0.1.9.58): this is also the path a CHANGED page-width factor takes to
+    // a live document - the harness writes the setting and then forces a viewport update, because
+    // everything that has to happen afterwards (full relayout, scroll re-clamp, focused-field
+    // reveal, link table, a composite that trusts no tile painted for the old layout) is what this
+    // function already does. Page::setDeviceScaleFactor() is a no-op when the value is unchanged,
+    // so an ordinary rotation pays nothing for it.
+    wkApplyPageWidthFactor(*g_session->page);
+
+    g_inPump = true;
+    PumpGuard guard;
+    PerfOpGuard perfOp("resize", nullptr, w, h);
+
+    view->resize(wkViewSizeFromEngine(w, h));   // Widget::resize -> setFrameRect -> layout viewport + needsLayout
+    doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });
+    // A viewport change can shorten the document (a wider layout is a shorter one), so the scroll
+    // position that was valid a moment ago may now be past the end. Pull it back the same way
+    // WebCoreSetPageScale does after its relayout.
+    IntPoint settled = view->constrainedScrollPosition(view->scrollPosition());
+    if (view->scrollPosition() != settled) {
+        view->setScrollPosition(settled);
+        doc->updateLayoutIgnorePendingStylesheets();
+    }
+
+    // The field the user is typing into has to survive the rotation the keyboard survives - see
+    // revealFocusedEditable() above. A no-op for a field that is still comfortably visible, so an
+    // ordinary rotation costs nothing.
+    revealFocusedEditable(*doc, *view, h);
+    extractLinks(doc.get(), h);
+
+    g_gpuForceFullNext = true;   // tiles were rastered for the old viewport - none of them is trustworthy
+    g_gpuScrollFast = false;
+    int nonWhite = 0;
+    int prc = paintToRGBA(*view, w, h, outRGBA, nonWhite);
+    // After the composite: the swap is what makes ANGLE pick up the panel's new size, so this is
+    // the first moment the real surface can be read back.
+    querySurfaceSize(outSurfaceW, outSurfaceH);
+    if (prc != kOK)
+        return prc;
+    writeDiag(*doc, *view, w, h, nonWhite);
+    return kOK;
+}
+
+// Apotheosis (0.1.9.46): run the focused-field reveal on its own, WITHOUT a resize.
+//
+// Why it has to be callable separately: the reveal is only as good as g_bottomOcclusionPx, and on a
+// rotation that number is not knowable yet. The soft keyboard's rectangle for the new orientation
+// reaches the harness a few dispatcher hops after the panel has resized (until then the shell
+// answers with the previous orientation's rectangle, which must not be believed - it would move the
+// whole chrome by half a screen), so WebCoreResize's own reveal runs with an occlusion of 0 and
+// leaves the field at the bottom edge, behind the keyboard. The harness calls this once the real
+// rectangle is in, after WebCoreSetBottomOcclusion().
+//
+// Cheap by design: layout only if the document needs it, no composite of its own - the scroll arms
+// the chrome's needsPresent, so the next live tick shows the result.
+// Returns kOK (also when nothing editable is focused, which is a complete answer), or the usual
+// negative errors.
+int WebCoreRevealFocusedElement(void)
+{
+    using namespace WebCore;
+    if (!g_session || !g_session->page || !g_session->mainFrame)
+        return kErrNoSession;
+    if (g_inPump)
+        return kErrBusy;
+    RefPtr<LocalFrame> lf = g_session->mainFrame;
+    RefPtr<LocalFrameView> view = lf->view();
+    if (!view)
+        return kErrNoView;
+    RefPtr<Document> doc = lf->document();
+    if (!doc)
+        return kErrNoDocument;
+
+    g_inPump = true;
+    PumpGuard guard;
+    doc->updateLayoutIgnorePendingStylesheets();   // no-op when nothing is dirty
+    const IntPoint before = view->scrollPosition();
+    if (revealFocusedEditable(*doc, *view, g_session->h) && view->scrollPosition() != before) {
+        if (g_session->chrome)
+            g_session->chrome->setNeedsPresent();
+    }
+    return kOK;
+}
+
 // 实时一帧:推进 rAF/动画/IntersectionObserver(isolatedUpdateRendering)+ 布局 + 重绘,不发起导航、不 pump、
 // 不写 diag(高频低开销)。供 harness 定时器以低帧率驱动:让 CSS/JS 动画动起来、SPA 多帧渐进挂载。
 // 帧像素哈希存 g_lastFrameHash(WebCoreGetFrameHash 取),harness 据此在画面静止时停帧省电。
@@ -2253,11 +7124,25 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (g_inPump)
         return kErrBusy;
 
+    // Apotheosis (event-driven present): the composite the last wake-up asked for starts here, so
+    // re-arm the wake path. Anything invalidated from now on - including from inside this very
+    // tick's isolatedUpdateRendering (a rAF callback re-registering, a CSS animation asking for the
+    // next frame) - fires a fresh wake and therefore schedules the next tick. Nothing asking =
+    // no wake = the harness goes idle after this tick. This is what makes the loop event-driven.
+    presentWakeDisarm();
+
     // 网络 / 图片解码完成回调经 RunLoop 任务投递。仅 isolatedUpdateRendering 不会取这些任务,
     // 所以空白占位图会一直等到下一次点击/滚动的 pumpLoop 才刷新。实时 tick 先轻量转几轮队列。
+    PerfOpGuard perfOp("tick", nullptr, 0, 0);   // M4
+    // After perfBegin() (it resets the row): wake-ups fired since the previous tick -> wake_count.
+    if (g_perfOn)
+        g_perfCur.wakes = static_cast<int>(g_presentWakes.exchange(0, std::memory_order_relaxed));
     for (int i = 0; i < 3; ++i)
         RunLoop::cycle();
-    g_session->page->isolatedUpdateRendering();   // 推进一帧动画/rAF/IO(可能跑 JS,甚至导航/换帧)
+    {
+        PerfPhase perfRender(&g_perfCur.renderUpdate);   // M4
+        g_session->page->isolatedUpdateRendering();   // 推进一帧动画/rAF/IO(可能跑 JS,甚至导航/换帧)
+    }
     RefPtr<LocalFrame> lf = g_session->page->localMainFrame();
     if (!lf)
         return kErrFrameGone;
@@ -2269,10 +7154,77 @@ int WebCoreLiveTick(uint8_t* outRGBA)
     if (!doc)
         return kErrNoDocument;
     doc->eventLoop().performMicrotaskCheckpoint();
-    doc->updateLayoutIgnorePendingStylesheets();
+    {
+        PerfPhase perfLayout(&g_perfCur.styleLayout);   // M4
+        doc->updateLayoutIgnorePendingStylesheets({ WebCore::LayoutOptions::UpdateCompositingLayers });   // see gpuPrepare
+    }
     g_lastPendingResources = countPendingResources(*doc);
+    // Apotheosis (M4 load throttle): while the main document loads everything above has
+    // run (parser-driven layout, rAF, finished decodes), only the composite - the most expensive
+    // thing on this thread - is limited to one per 250 ms, so the arriving subresources get the
+    // engine thread instead of repeatedly rasterising a half-built page. The frame that first
+    // qualifies as visually non-empty is never skipped. needsPresent stays set, so the next tick
+    // composites everything at once. Only in event-driven mode: a fixed-tick harness stops its
+    // timer when the frame hash does not change, and nothing would restart it.
+    const bool navFirstPaintFrame = g_navFirstPaintPending.exchange(0, std::memory_order_acq_rel);
+    if (!navFirstPaintFrame && g_presentCb.load(std::memory_order_acquire) && navLoadThrottleActive()) {
+        const double nowSec = monotonicSeconds();
+        if (nowSec - g_navTickCompositeSec < kNavWakeIntervalSec) {
+            WebCorePort::presentRequested();   // throttled: comes back as the next allowed wake
+            return kOK;
+        }
+        g_navTickCompositeSec = nowSec;
+    }
     int nonWhite = 0;
-    return paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    // Apotheosis (M4): perf.csv showed every idle tick paying ~1 s in
+    // updateBackingStoreIncludingSubLayers because gpuPrepare force-dirties the
+    // whole layer tree. If WebCore did not ask for a rendering update since the
+    // last present and no layer animation is running, nothing can have changed:
+    // take the scroll fast path and keep the uploaded tiles. Any invalidation
+    // (JS/DOM change, image decode, new layers) sets needsPresent through
+    // triggerRenderingUpdate and still gets the full dirty-tree composite.
+    // Experiment F (2026-09-02) then set it on EVERY tick, because on a code-hosting site not
+    // one of 84 ticks took the fast path - the page requests a rendering update every
+    // tick, so each tick still re-rasterised the whole tree (0.8-1.1 s).
+    //
+    // Apotheosis (review 2026-09-04 item 6) then narrowed it to "riding on a scroll the
+    // engine has just applied AND nothing asked for a rendering update since the last
+    // present", on the theory that a tick which fails either test may have changed
+    // content that only forceDirtyTree can recover.
+    //
+    // Apotheosis (2026-09-06, package 0.1.9.16 device regression): that theory is wrong
+    // and its cost is the stall the user sees. peekNeedsPresent() is "somebody asked for
+    // a rendering update", which on any page with a timer, an animation or an
+    // IntersectionObserver is EVERY tick - on a news site all 626 ticks of session
+    // 20260906-180145 force-dirtied all ~90 layers at 400-1100 ms of ms_backing each,
+    // against 15 such ticks in ~900 rows of the 0.1.9.15 session (20260904-161535) and 17
+    // in 1895 rows of 0.1.9.12. Scrolling is smooth until a tick lands, then stalls for
+    // most of a second - a quarter page apart, exactly as reported.
+    //
+    // forceDirtyTree() only ever existed to recover content the BACKING STORE lost, never
+    // content the page changed: a real change arrives as m_needsDisplay/m_needsDisplayRect
+    // from RenderLayerBacking and is repainted on the fast path too, and gpuPrepare()
+    // runs updateBackingStoreIncludingSubLayers() either way. Every way a store can end up
+    // without its pixels is now detected per layer, so the sledgehammer has nothing left to
+    // fix and only repaints what is already correct:
+    //   - store freshly created            -> m_wkNeedsFullRepaint (GraphicsLayerTextureMapper.cpp
+    //                                         :413, the "images flicker to a white box" fix that
+    //                                         experiment F used to expose)
+    //   - layer resized / contents rescaled -> m_wkBackingStoreSize / m_wkBackingStoreScale (:718)
+    //   - tiles entering the viewport       -> m_wkVisibleRectChanged, they paint themselves in full
+    //   - tiles that lost their rasterisation -> wkHasUnpaintedVisibleTiles() (035bae976c, 9ac9296254)
+    // and the composite that still comes out short of pixels is redone in full by the
+    // unpainted-tile repair in gpuPresent() - the safety net, now back to being rare.
+    if (g_gpuActive)
+        g_gpuScrollFast = true;
+    const int prc = paintToRGBA(*view, g_session->w, g_session->h, outRGBA, nonWhite);
+    // Apotheosis (event-driven present): belt and braces for the "still dirty when the tick ended"
+    // case - a repaint request that landed after gpuPresent() consumed takeNeedsPresent(), or one
+    // notePendingRasterTiles() re-armed. presentRequested() is a no-op when a wake is already armed
+    // (the usual case for an animating page, which armed one during isolatedUpdateRendering above).
+    if (g_session && g_session->chrome && g_session->chrome->peekNeedsPresent())
+        WebCorePort::presentRequested();
+    return prc;
 }
 
 int WebCoreGetPendingResourceCount()

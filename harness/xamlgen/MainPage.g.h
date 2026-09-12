@@ -58,7 +58,7 @@ namespace Harness
     
     
         private: ::Windows::UI::Xaml::Controls::Grid^ RootGrid;
-        private: ::Windows::UI::Xaml::Media::TranslateTransform^ RootShift;
+        private: ::Windows::UI::Xaml::Media::TranslateTransform^ NavBarShift;
         private: ::Windows::UI::Xaml::Controls::Grid^ OobePanel;
         private: ::Windows::UI::Xaml::Controls::Grid^ ActionMenu;
         private: ::Windows::UI::Xaml::Controls::Grid^ Drawer;
@@ -66,14 +66,23 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::Grid^ TabSwitcher;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ TabList;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TabSwitcherTitle;
+        private: ::Windows::UI::Xaml::Controls::ComboBox^ SetLangCombo;
         private: ::Windows::UI::Xaml::Controls::ComboBox^ SetSearchCombo;
         private: ::Windows::UI::Xaml::Controls::TextBox^ SetHomeBox;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetUaSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBox^ SetUaCustomBox;
         private: ::Windows::UI::Xaml::Controls::Slider^ SetZoomSlider;
-        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetTabModeSwitch;
         private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetGpuSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetUpdateSwitch;
+        private: ::Windows::UI::Xaml::Controls::ComboBox^ SetPrefetchCombo;
+        private: ::Windows::UI::Xaml::Controls::ComboBox^ SetPageWidthCombo;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetScrollFabSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetAxisLockSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetDtapZoomSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideNavBarSwitch;
+        private: ::Windows::UI::Xaml::Controls::ToggleSwitch^ SetHideStatusBarSwitch;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ VersionText;
+        private: ::Windows::UI::Xaml::Controls::TextBlock^ AboutFooterText;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ SetZoomLabel;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ DrawerList;
         private: ::Windows::UI::Xaml::Controls::Button^ TabFav;
@@ -91,10 +100,16 @@ namespace Harness
         private: ::Windows::UI::Xaml::Controls::TextBlock^ LockIcon;
         private: ::Windows::UI::Xaml::Controls::TextBox^ UrlBox;
         private: ::Windows::UI::Xaml::Controls::Button^ UrlActionBtn;
+        private: ::Windows::UI::Xaml::Controls::TextBlock^ UrlActionGlyph;
+        private: ::Windows::UI::Xaml::Controls::Button^ UrlClearBtn;
         private: ::Windows::UI::Xaml::Controls::TextBlock^ TabCountText;
-        private: ::Windows::UI::Xaml::Controls::TextBlock^ TitleText;
+        private: ::Windows::UI::Xaml::Controls::Border^ ContentBorder;
         private: ::Windows::UI::Xaml::Controls::SwapChainPanel^ GpuPanel;
         private: ::Windows::UI::Xaml::Controls::TextBox^ ImeBox;
+        private: ::Windows::UI::Xaml::Controls::Border^ TitleRow;
+        private: ::Windows::UI::Xaml::Media::TranslateTransform^ TitleRowShift;
+        private: ::Windows::UI::Xaml::Controls::TextBlock^ TitleText;
+        private: ::Windows::UI::Xaml::Controls::Border^ ProgressStrip;
         private: ::Windows::UI::Xaml::Controls::ProgressBar^ Progress;
         private: ::Windows::UI::Xaml::Controls::StackPanel^ ScrollFab;
         private: ::Windows::UI::Xaml::Controls::Border^ FindBar;

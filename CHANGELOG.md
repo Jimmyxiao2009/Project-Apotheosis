@@ -1,0 +1,235 @@
+# Changelog
+
+Notable changes to the port layer, the UWP harness and the WebKit patch set.
+Version numbers are the packaging counter the work was tested under on a
+Lumia 950 (Windows 10 Mobile 15254.603); the app manifest carries the
+project's own version.
+
+## 0.1.9.48 (2026-09-10) — TileGrid v2 and mobile interaction
+
+### Engine and tiling
+
+- The tile bookkeeping in `TextureMapperTiledBackingStore` is rebuilt as
+  **TileGrid v2**: a pure model plus a thin WebCore adapter.
+- Every pass derives the desired tile set from layer bounds, scale, visible
+  rect and budget and reconciles the grid to it; nothing survives by accident.
+- A tile is addressed by `(column, row)` on a lattice anchored at the layer
+  origin, so a clamp or a rounding can no longer produce a second grid.
+- There are no grace counters and no timeouts: a raster or upload request is
+  served in priority order or fails explicitly, and a failure is an event.
+- Holes are counted over the desired cells, so the driver asks for one more
+  present instead of dirtying the layer tree.
+- `tests/tilegrid/` builds the real model and core sources against fake
+  backends — no WebKit build, no ANGLE, no device — and runs the design
+  invariants, scripted scenarios, a fuzzer and replays of captured device
+  traces: 2.5 million checks in well under a minute.
+- `docs/TILEGRID-DESIGN.md` is the design document that the sources and the
+  tests cite by section number.
+- The previous tile management is gone with it: `TextureMapperTile` is
+  byte-identical to the tag again and `TextureMapperTiledBackingStore` is back
+  to upstream plus about forty lines of viewport-limited 1024-pixel tiling.
+- An off-screen layer store no longer keeps raster work alive for ever.
+
+### Rendering correctness
+
+- `Cairo::OperationRecorder::applyDeviceScaleFactor()` is an empty override, so
+  a recorded tile paint was translated but never scaled. Both recording call
+  sites scale explicitly now — this was the cause of every white or misplaced
+  pixel while zoomed since rasterisation moved off the engine thread.
+- Sticky and fixed elements get a compositing layer
+  (`AcceleratedCompositingForFixedPosition` was never enabled), instead of
+  being repainted into the scrolling layer on every frame.
+- `ImageBackingStore::create()` returns null when its pixel reservation fails.
+  It used to hand back a live store with an empty buffer, and a large photo
+  then made the JPEG decoder write a scanline to a null address.
+- A failed asynchronous decode notifies its waiting clients instead of leaving
+  a white box, and an already decoded image is drawn rather than decoded again
+  at a new scale.
+- The software present blits each frame at the viewport the engine actually
+  rendered it at, not at the viewport the harness currently wants. A frame in
+  flight across a viewport change was read at the new, larger rectangle out of
+  a buffer allocated for the old one, which walked past the end of the block
+  into reserved address space and killed the app.
+- Text: glyphs no longer rasterise with subpixel antialiasing and the synthetic
+  bold offset walks in device-pixel steps, which removes the doubled text after
+  a pinch when only the regular font cuts are installed.
+- The package carries fallback faces for the characters the eight Latin cuts do
+  not have: Simplified Chinese, the symbol blocks (arrows, check marks,
+  technical and miscellaneous symbols) and emoji as monochrome outlines. They
+  are Noto under the SIL Open Font License 1.1, fetched by `port/fetch-fonts.ps1`
+  against pinned URLs and SHA-256 hashes, and the generated `fonts.conf` orders
+  them after the Latin faces so a missing glyph is filled instead of drawn as a
+  box. The fontconfig cache is stamped with the font set it was built for and
+  dropped when that changes.
+- A character outside the Basic Multilingual Plane is no longer followed by an
+  empty box. The simple text path appends a placeholder glyph after every
+  surrogate pair for a shaping routine to remove again; this port has none, and
+  glyph 0 is the font's `.notdef`, so emoji, plane-2 ideographs and mathematical
+  alphanumerics each drew a box flush against them.
+
+### Performance
+
+- Tile rasterisation runs off the engine thread by default: a paint is recorded
+  into a display list and replayed by a worker pool. Measured on the device,
+  2.9 ms instead of 25 ms of engine-thread time per scroll tick.
+- Tile uploads have a per-composite time budget, and a deferred upload
+  schedules the composite that lands it.
+- The baseline JIT is actually enabled on ARMv7 (`APOTHEOSIS_JIT`), including
+  the `replaceWithJump` displacement fix that used to corrupt the JIT pool.
+  Animation-heavy pages got 20 to 30 percent faster.
+- Networking: HTTP/2 multiplexing, 32 connections, eight parallel loads per
+  host, deferred transfers paused instead of cancelled, DNS prefetch for
+  `preconnect` hints. Time to commit on a news site went from 14.8 s to 0.4 s.
+- Three loader defects came out of that work: a cancelled `ResourceHandle` left
+  a dangling client, every finished load leaked handle, delegate, request and
+  response, and a paused redirect was never cancelled on the terminal paths.
+- WTF threads get a stack reservation per thread type (JavaScript 8 MB, the
+  rest 1 MB). The inherited 16 MB default exhausted the 32-bit address space on
+  a page with many workers and aborted in `WTF::Thread::create`.
+- Memory: the JavaScript heap is sized from the application's own cap, UWP
+  memory pressure reaches WebCore, and the texture pool is accounted and
+  bounded.
+- Page load: images below the fold are loaded lazily, DOM timers are aligned
+  onto a coarse grid while a load owns the engine thread, and a navigation
+  settles on the viewport instead of on trailing beacons.
+
+### Interaction
+
+- **Page width**: the engine lays a page out at a phone-sized CSS viewport
+  instead of a tablet-sized one. The panel is 360 DIP wide and the engine runs
+  at two engine pixels per DIP, so WebKit was handed a 720 CSS pixel layout
+  viewport at device scale factor 1 - every site answered with its wide layout
+  and 16 pixel text came out half the height it has in any phone browser. The
+  factor is WebKit's device scale factor, so the layout narrows while tiles
+  still rasterise at the full engine resolution and text stays sharp. Settings
+  offers five steps from 1.0x (720 px) to 2.0x (360 px); the default is 1.5x,
+  i.e. 480 CSS px. Changing it re-lays the page out without a reload. Every
+  coordinate crossing the driver's C ABI is still in engine pixels - the
+  conversion happens inside the driver.
+- **Double-tap zoom** with the tap policy a mobile browser is expected to have:
+  a page that opts out of zooming or declares itself mobile-optimised is not
+  zoomable, a pinch is always undoable, and the target is the innermost block
+  under the finger, anchored on that block's centre.
+- **Double tap returns to 1:1 from either direction**: the undo-a-pinch rule
+  measures the distance from 1:1 instead of only the scale above it, so a page
+  the user pinched out below 1:1 is brought back by a double tap as well. From
+  below 1:1 the content grows to the right from its own left edge, where the
+  committed frame lands, instead of growing around the tap and sliding back.
+- **Long press on a link** opens a context menu with one action, open in new
+  tab. The card is placed clear of the finger, shows a long target that can be
+  dragged sideways, and is dismissed by a rotation or a window change.
+- **Landscape**: `WebCoreResize` gives the engine a viewport it can change, the
+  ANGLE window surface follows the panel instead of being created at a fixed
+  size, and the built-in start and error pages are re-rendered on a rotation.
+- **Keyboard**: the focused field is brought above the on-screen keyboard —
+  on the first tap after a load and after a rotation as well — and the chrome
+  is inset by the rectangle the input pane really occludes.
+- Panning has an axis lock, a pinch is anchored on the finger and snaps back to
+  1:1, nested scrollers are found through open shadow roots, and a pan over a
+  map or canvas widget is delivered as pointer events.
+- Address bar: the text is selected on focus, Enter hides the keyboard, a
+  tapped suggestion navigates exactly like Enter, and the text area spans the
+  whole field.
+- The loading strip and the page title row are overlays: neither displaces the
+  page nor costs a relayout when it appears.
+- A tab switch shows the target tab's last frame while it reloads.
+
+### Start page
+
+- The built-in start page is BUILT for the viewport and the language it is
+  shown at, every time it is shown, instead of being rendered once and replayed:
+  the page at app start, the page a new tab gets and the page after a rotation
+  or a language change are the same page.
+- A language change reaches it as well. Before, the page that was on screen when
+  the first-run language choice was made kept the language it was built with -
+  and with no CJK face in the package, Chinese strings on an engine-rendered
+  page are empty boxes.
+- The speed-dial grid is exactly two columns in portrait and four in landscape.
+  The auto-fill rule it replaces was written for a 360 px CSS viewport and fitted
+  four postage stamps across a portrait screen.
+
+### Settings and cleanup
+
+- Every user-visible string goes through the language table, and the language
+  can be chosen in Settings.
+- Privacy defaults: the update check is opt-in, DuckDuckGo is the default search
+  engine, speculation-rules prefetch is off, and `<a ping>` is never sent.
+  DuckDuckGo replaces Qwant as the fresh-install default — both state that they
+  do not track or profile their users, but Qwant's results page is one of the
+  pages this engine cannot get past a bot check (see Known limitations), so a
+  search ended on a white page. Qwant is still in the list, and a settings file
+  that already names an engine keeps it: the indices are part of the stored
+  settings and are never renumbered.
+- The developer switches that carried features through bring-up — the two tile
+  grids, off-thread rasterisation, the presenter thread, stale placeholders,
+  event-driven present — are deleted now that the features are proven; axis
+  lock moved to its own Scrolling section.
+- The presenter thread is gone: ANGLE 2.1.13 on D3D11 cannot be driven from two
+  GL threads, and serialising every call behind one lock removed its advantage.
+
+### Networking and cookies
+
+- The engine ships the Public Suffix List, so it can tell a registry apart from
+  a site. Without it `PublicSuffixStore` answered "no top-private domain" and
+  `RegistrableDomain` fell back to the whole host name, which made every host
+  its own site: the cookie jar's accept policy then refused a cookie that one
+  subdomain sets for another, and the read path — which filters by registrable
+  domain too — would not have sent it either. Anything that signs in, keeps a
+  session or clears a bot check on one host and uses it on a sibling host was
+  silently broken, while plain first-party cookies worked, so it looked like a
+  rendering fault rather than a cookie one. The list is fetched by
+  `port/fetch-publicsuffix.ps1` (pinned and hash-checked, internationalised
+  rules punycoded at fetch time) and handed to the engine as a blob, like the
+  CA bundle; without the file the engine falls back to a last-two-labels guess
+  instead of the whole host.
+- A navigation whose transport never came up is retried once. The curl backend
+  has no retry of its own, so a single failed name lookup or TLS handshake —
+  routine on a phone's Wi-Fi, and in the device logs always the first contact
+  with a host in an app session — went straight to the error page, while the
+  same address typed again loaded normally. Only a main-frame provisional
+  failure counts (a failed subresource must never restart a page), only the
+  codes that mean the connection never happened (6, 7, 28, 35, 56 — never a
+  certificate rejection), and only when the first attempt gave up in under
+  eight seconds, so a slow link is not made to wait twice. Each retry writes
+  one `netretry` line naming the host, the code and the resolve mode.
+
+### Known limitations
+
+- Sites behind a commercial bot-protection service can be unreachable. The
+  cookie half is fixed (see the Public Suffix List above), but the script these
+  services run also fingerprints the browser, and this port compiles out most
+  of what it looks for — Web Audio, WebRTC, WebAssembly, gamepads, WebGL — so
+  the score is refused, the document comes back as a challenge, and the
+  challenge frame itself does not render here. The page is then a white
+  full-viewport overlay above content that loaded correctly underneath; the
+  render diagnostic's opaque-cover field is what identifies it.
+
+### Diagnostics
+
+- Opt-in `perf.csv` columns and `stage.txt` trace families cover loads,
+  scrolling, tiles, gestures and the keyboard, `crash.txt` records the aborts an
+  App Container leaves no dump for, and everything stays off without its file.
+- The render diagnostic answers "is this page blank?" again. Its non-white pixel
+  count came from the software readback, which the direct GPU present does not
+  do, so it read zero for every page; it is now taken once per document from a
+  quarter-size probe paint. The same line carries a short content summary of the
+  finished document — element, link, box and text-length counts, laid-out height
+  and the body colours — in counts and lengths only, never page text or a query.
+  It also reports how many in-view elements are transparent or hidden, the
+  mount point's own first three levels, how many full-viewport opaque elements
+  sit outside it (which is how a third-party interstitial covers a page that
+  rendered correctly underneath), and how many cookies the document can see —
+  again as counts and lengths, never a name or a value.
+
+### Build and packaging
+
+- `port/build-harness.ps1` takes the engine and driver directories as
+  parameters, for the XAML code generation pass as well, so the two-Visual-Studio
+  pipeline no longer depends on one fixed build directory name.
+- The host tests look for a WebKit checkout beside the repository instead of an
+  absolute path, and say so when there is none.
+- `nghttp2.dll` and the bold font cuts are packaged with the application.
+- `.gitattributes` keeps `wk-winuwp.patch` out of the CRLF conversion, so the
+  file a checkout produces is byte-for-byte the one `git diff` wrote.
+- `wk-winuwp.patch` is regenerated from the whole patched tree, and
+  `WK_WINUWP-PATCH.md` groups every commit over the base tag by area.

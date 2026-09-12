@@ -25,6 +25,11 @@
     <ApotheosisRoot>$(MSBuildThisFileDirectory)..\</ApotheosisRoot>
     <ApotheosisVcpkgRoot Condition="'$(ApotheosisVcpkgRoot)' == ''">C:\vcpkg</ApotheosisVcpkgRoot>
     <ApotheosisIcuRoot Condition="'$(ApotheosisIcuRoot)' == ''">C:\icu-arm-uwp</ApotheosisIcuRoot>
+    <!-- Apotheosis (M4): engine tree and driver directory are overridable so an A/B engine
+         (e.g. build-clang-gpu-jit with its own WebCoreDriver-gpu.lib/.dll) can be packaged
+         without touching the baseline. Defaults keep the original layout. -->
+    <ApotheosisEngineBuildDir Condition="'$(ApotheosisEngineBuildDir)' == ''">$(ApotheosisRoot)build-clang-gpu</ApotheosisEngineBuildDir>
+    <ApotheosisDriverDir Condition="'$(ApotheosisDriverDir)' == ''">$(ApotheosisRoot)port</ApotheosisDriverDir>
     <ApotheosisUseOfficialXaml Condition="'$(ApotheosisUseOfficialXaml)' == ''">false</ApotheosisUseOfficialXaml>
     <ApotheosisConsumeOfficialXaml Condition="'$(ApotheosisConsumeOfficialXaml)' == ''">false</ApotheosisConsumeOfficialXaml>
     <ApotheosisXamlIncludeDir Condition="'$(ApotheosisUseOfficialXaml)' == 'true' Or '$(ApotheosisConsumeOfficialXaml)' == 'true'">$(ProjectDir)Generated Files\</ApotheosisXamlIncludeDir>
@@ -42,6 +47,14 @@
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- Apotheosis: Windows::UI::ViewManagement::StatusBar (status-bar overlay, item 1 of the
+       2026-09-03 UI package) is declared in the Windows Mobile Extension SDK, not the base
+       Windows.winmd — without this reference the type does not exist at compile time even
+       behind an ApiInformation::IsTypePresent guard (that only gates the call at runtime). -->
+  <ItemGroup>
+    <SDKReference Include="WindowsMobile, Version=$(ApotheosisWindowsSdkVersion)" />
+  </ItemGroup>
 
   <PropertyGroup>
     <AppxBundle>Never</AppxBundle>
@@ -66,7 +79,7 @@
       <!-- Phase 1b: 链接 build-clang-webcore 的 4 个引擎库 + 驱动/stub 库 + 全部软渲染依赖。
            顺序 WebCore->JSC->PAL->WTF(被依赖者在后);MS link.exe 多遍解析,顺序容错。 -->
       <AdditionalDependencies>libEGL.lib;libGLESv2.lib;WebCoreDriver-gpu.lib;WebCore.lib;JavaScriptCore.lib;PAL.lib;WTF.lib;JavaScriptCore.lib;WTF.lib;libcurl.lib;libssl.lib;libcrypto.lib;cairo.lib;pixman-1.lib;freetype.lib;fontconfig.lib;libexpat.lib;harfbuzz.lib;jpeg.lib;libpng16.lib;libwebp.lib;libwebpdemux.lib;libsharpyuv.lib;libxml2.lib;sqlite3.lib;z.lib;bz2.lib;brotlidec.lib;brotlicommon.lib;icuuc.lib;icuin.lib;icudt.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(ApotheosisRoot)angle\arm;$(ApotheosisRoot)port;$(ApotheosisRoot)build-clang-gpu\lib;$(ApotheosisVcpkgRoot)\installed\arm-uwp\lib;$(ApotheosisIcuRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ApotheosisRoot)angle\arm;$(ApotheosisDriverDir);$(ApotheosisEngineBuildDir)\lib;$(ApotheosisVcpkgRoot)\installed\arm-uwp\lib;$(ApotheosisIcuRoot)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- 与 lld-link 验证一致:/OPT:REF 死剥未引用代码,只保留渲染路径闭包(146 stub 覆盖之)。 -->
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>false</EnableCOMDATFolding>
@@ -158,6 +171,8 @@
          vcpkg tree with static sqlite3 / iconv-less libxml2 keeps working. -->
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\sqlite3.dll" Condition="Exists('$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\sqlite3.dll')"><DeploymentContent>true</DeploymentContent><Link>sqlite3.dll</Link></None>
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\iconv-2.dll" Condition="Exists('$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\iconv-2.dll')"><DeploymentContent>true</DeploymentContent><Link>iconv-2.dll</Link></None>
+    <!-- Apotheosis: curl[http2] links nghttp2 (HTTP/2 multiplexing - the port was HTTP/1.1 only before). -->
+    <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\nghttp2.dll" Condition="Exists('$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\nghttp2.dll')"><DeploymentContent>true</DeploymentContent><Link>nghttp2.dll</Link></None>
     <!-- 网络栈(Phase 1b):curl + OpenSSL 3.6.3(TLS 1.3)。 -->
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libcurl.dll"><DeploymentContent>true</DeploymentContent><Link>libcurl.dll</Link></None>
     <None Include="$(ApotheosisVcpkgRoot)\installed\arm-uwp\bin\libssl-3-arm.dll"><DeploymentContent>true</DeploymentContent><Link>libssl-3-arm.dll</Link></None>
@@ -166,17 +181,45 @@
     <None Include="$(ApotheosisRoot)angle\arm\libEGL.dll"><DeploymentContent>true</DeploymentContent><Link>libEGL.dll</Link></None>
     <None Include="$(ApotheosisRoot)angle\arm\libGLESv2.dll"><DeploymentContent>true</DeploymentContent><Link>libGLESv2.dll</Link></None>
     <!-- WebCore 驱动 DLL(port/*.cpp 编成的 clang-cl ARM32 引擎桥接层,含全部 C ABI 导出)。 -->
-    <None Include="$(ApotheosisRoot)port\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
+    <None Include="$(ApotheosisDriverDir)\WebCoreDriver-gpu.dll"><DeploymentContent>true</DeploymentContent><Link>WebCoreDriver-gpu.dll</Link></None>
     <!-- CA 根证书包(App Container 无系统证书库,curl 用 CURLOPT_CAINFO 指向它做 TLS 校验)。 -->
     <None Include="Assets\cacert.pem"><DeploymentContent>true</DeploymentContent><Link>cacert.pem</Link></None>
+    <!-- Public Suffix List (port\fetch-publicsuffix.ps1, gitignored like the fonts): the engine
+         needs it to tell a registry apart from a site, which is what cookie sharing between the
+         subdomains of one site is built on. Conditional, so a clone that has not fetched it
+         still builds - the engine falls back to a last-two-labels guess. -->
+    <None Include="Assets\public_suffix_list.dat" Condition="Exists('$(ProjectDir)Assets\public_suffix_list.dat')"><DeploymentContent>true</DeploymentContent><Link>public_suffix_list.dat</Link></None>
+    <None Include="Assets\MPL-2.0-PublicSuffixList.txt" Condition="Exists('$(ProjectDir)Assets\MPL-2.0-PublicSuffixList.txt')"><DeploymentContent>true</DeploymentContent><Link>MPL-2.0-PublicSuffixList.txt</Link></None>
     <!-- 字体(App Container 拿不到设备系统字体,必须打包;fontconfig 在运行期经 LocalFolder\fonts.conf 指向这里)。 -->
     <None Include="Assets\fonts\segoeui.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeui.ttf</Link></None>
     <None Include="Assets\fonts\arial.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arial.ttf</Link></None>
     <None Include="Assets\fonts\times.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\times.ttf</Link></None>
     <None Include="Assets\fonts\cour.ttf"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\cour.ttf</Link></None>
-    <!-- CJK 字体:打包字体无中文字形,网页中文会变 □。SimHei 提供全简中覆盖(fontconfig 弱回退)。 -->
-    <!-- Apotheosis: fonts are gitignored; skip SimHei on machines that do not have it instead of failing the package step. -->
-    <None Include="Assets\fonts\simhei.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\simhei.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\simhei.ttf</Link></None>
+    <!-- Apotheosis: the bold cuts. Without them fontconfig answers every `font-weight: bold` with
+         the regular file, WebCore turns that into a *synthetic* bold and draws the whole glyph run
+         twice, offset by one CSS pixel - which the page-scale factor multiplies, so a pinch-zoomed
+         headline shows two copies of every letter about ten device pixels apart (the "doubled
+         text" of packages 11-16). Real bold faces make syntheticBold false and cost ~3.8 MB.
+         Conditional like the Noto faces below: fonts are gitignored, so a fresh clone may not have them. -->
+    <None Include="Assets\fonts\segoeuib.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\segoeuib.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\segoeuib.ttf</Link></None>
+    <None Include="Assets\fonts\arialbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\arialbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\arialbd.ttf</Link></None>
+    <None Include="Assets\fonts\timesbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\timesbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\timesbd.ttf</Link></None>
+    <None Include="Assets\fonts\courbd.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\courbd.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\courbd.ttf</Link></None>
+    <!-- Apotheosis: the fallback faces for everything the eight Latin cuts above do not cover -
+         Simplified Chinese, the symbol blocks (arrows, check marks, technical and miscellaneous
+         symbols) and emoji as monochrome outlines. All four are Noto under the SIL Open Font
+         License 1.1, so they may travel inside the package; the licence text of each ships next
+         to it. Fetch them with port\fetch-fonts.ps1 - the binaries are gitignored like the
+         Microsoft cuts, so the entries stay conditional and a clone that has not run the script
+         still packages (it will draw boxes for those characters, which is the old behaviour). -->
+    <None Include="Assets\fonts\NotoSansSC-Regular.otf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSC-Regular.otf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSC-Regular.otf</Link></None>
+    <None Include="Assets\fonts\NotoSansSymbols-Regular.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSymbols-Regular.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSymbols-Regular.ttf</Link></None>
+    <None Include="Assets\fonts\NotoSansSymbols2-Regular.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoSansSymbols2-Regular.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoSansSymbols2-Regular.ttf</Link></None>
+    <None Include="Assets\fonts\NotoEmoji-VariableFont_wght.ttf" Condition="Exists('$(ProjectDir)Assets\fonts\NotoEmoji-VariableFont_wght.ttf')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\NotoEmoji-VariableFont_wght.ttf</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSC.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSC.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSC.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSymbols.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSymbols.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSymbols.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoSansSymbols2.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoSansSymbols2.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoSansSymbols2.txt</Link></None>
+    <None Include="Assets\fonts\OFL-NotoEmoji.txt" Condition="Exists('$(ProjectDir)Assets\fonts\OFL-NotoEmoji.txt')"><DeploymentContent>true</DeploymentContent><Link>Assets\fonts\OFL-NotoEmoji.txt</Link></None>
   </ItemGroup>
 
   <ItemGroup>

@@ -1,0 +1,4 @@
+# wk-winuwp.patch is a git diff: byte-for-byte what `git diff --output=` wrote,
+# LF, whatever core.autocrlf says. Everything else keeps the repository's
+# existing behaviour.
+wk-winuwp.patch -text
